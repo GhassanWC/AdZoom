@@ -1,0 +1,618 @@
+"use client";
+
+import * as React from "react";
+import { createPortal } from "react-dom";
+import { AnimatePresence, motion } from "framer-motion";
+import {
+  Check,
+  X,
+  AlertCircle,
+  Minimize2,
+  ChevronDown,
+  ChevronUp,
+  RefreshCcw,
+  Sparkles,
+  Loader2,
+  Clock,
+  AlertTriangle,
+  Info,
+} from "lucide-react";
+import { useEditorReal } from "./context";
+import {
+  ANALYSIS_STAGES,
+  ERROR_RECOVERY,
+  fmtElapsed,
+  isProcessing,
+} from "@/lib/analysis-stages";
+import type {
+  AnalysisActivityEvent,
+  AnalysisErrorKind,
+} from "@/lib/firebase/schema";
+import { cn } from "@/lib/cn";
+
+const LONG_PROCESS_WARN_MS = 90_000;
+
+export function RealProcessingOverlay() {
+  const {
+    project,
+    startAnalyze,
+    cancelAnalyze,
+    cvProgress,
+    processingMinimized,
+    setProcessingMinimized,
+  } = useEditorReal();
+
+  const status = project.status;
+  const analysis = project.analysis;
+  const failed = analysis?.status === "failed" || status === "failed";
+  const cancelled = analysis?.status === "cancelled" || status === "cancelled";
+  const currentlyProcessing = isProcessing(status);
+
+  // Show the overlay when:
+  //   - actively processing AND user hasn't minimized
+  //   - terminal failure (so the user sees what happened)
+  // After the user closes a failed/cancelled state, hide.
+  const [dismissedTerminal, setDismissedTerminal] = React.useState<string | null>(
+    null
+  );
+  React.useEffect(() => {
+    // If the user starts a fresh analysis, forget the previous dismissal.
+    if (currentlyProcessing) setDismissedTerminal(null);
+  }, [currentlyProcessing]);
+
+  const terminalKey = failed
+    ? `failed:${analysis?.errorKind ?? "unknown"}:${analysis?.completedAt ?? ""}`
+    : cancelled
+      ? `cancelled:${analysis?.completedAt ?? ""}`
+      : null;
+  const showTerminal = Boolean(terminalKey) && dismissedTerminal !== terminalKey;
+
+  const visible =
+    (currentlyProcessing && !processingMinimized) || showTerminal;
+
+  // Mount portal only after client-side hydration.
+  const [mounted, setMounted] = React.useState(false);
+  React.useEffect(() => setMounted(true), []);
+
+  // Elapsed time — must be called unconditionally, before any early return.
+  const elapsedMs = useTickingElapsed(analysis?.startedAt);
+  const estimateSeconds = analysis?.estimateSeconds;
+  const longRunning = elapsedMs > LONG_PROCESS_WARN_MS && currentlyProcessing;
+
+  if (!mounted) return null;
+
+  const onMinimize = () => setProcessingMinimized(true);
+  const onCloseTerminal = () => terminalKey && setDismissedTerminal(terminalKey);
+  const onCancel = async () => {
+    await cancelAnalyze();
+  };
+  const onRetry = async () => {
+    setDismissedTerminal(null);
+    await startAnalyze();
+  };
+
+  const stage = analysis?.stage ?? "Preparing analysis";
+
+  return createPortal(
+    <AnimatePresence>
+      {visible && (
+        <motion.div
+          key="overlay"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.22 }}
+          className="fixed inset-0 z-[120] flex items-center justify-center bg-ink/85 px-4 py-6 backdrop-blur-2xl"
+        >
+          <motion.div
+            initial={{ opacity: 0, y: 16, scale: 0.97 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: 16, scale: 0.97 }}
+            transition={{ duration: 0.32, ease: [0.22, 1, 0.36, 1] }}
+            className="glass-strong relative w-full max-w-3xl overflow-hidden rounded-2xl shadow-cinematic"
+          >
+            {/* close / minimize header */}
+            <div className="flex items-center justify-between border-b border-white/[0.06] px-5 py-3">
+              <div className="flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.22em] text-violet-300">
+                <Sparkles size={11} />
+                AdZoom AI
+              </div>
+              <div className="flex items-center gap-1.5">
+                {currentlyProcessing && (
+                  <button
+                    onClick={onMinimize}
+                    aria-label="Continue in background"
+                    title="Continue in background"
+                    className="inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-white/[0.02] px-3 py-1 text-[11px] font-medium text-fog transition-colors duration-200 hover:border-white/20 hover:text-white"
+                  >
+                    <Minimize2 size={11} />
+                    Run in background
+                  </button>
+                )}
+                {showTerminal && !currentlyProcessing && (
+                  <button
+                    onClick={onCloseTerminal}
+                    aria-label="Close"
+                    className="inline-flex size-8 items-center justify-center rounded-full border border-white/10 bg-white/[0.02] text-fog transition-colors duration-200 hover:border-white/20 hover:text-white"
+                  >
+                    <X size={13} />
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Body */}
+            {failed ? (
+              <FailedBody
+                errorKind={analysis?.errorKind}
+                errorMessage={analysis?.errorMessage}
+                onRetry={onRetry}
+                onClose={onCloseTerminal}
+              />
+            ) : cancelled ? (
+              <CancelledBody onRetry={onRetry} onClose={onCloseTerminal} />
+            ) : (
+              <ActiveBody
+                stage={stage}
+                status={status}
+                elapsedMs={elapsedMs}
+                estimateSeconds={estimateSeconds}
+                activity={analysis?.activity ?? []}
+                longRunning={longRunning}
+                cvProgress={cvProgress}
+                onCancel={onCancel}
+                onMinimize={onMinimize}
+              />
+            )}
+          </motion.div>
+        </motion.div>
+      )}
+    </AnimatePresence>,
+    document.body
+  );
+}
+
+// ─── ACTIVE BODY ─────────────────────────────────────────────────────────────
+
+function ActiveBody({
+  stage,
+  status,
+  elapsedMs,
+  estimateSeconds,
+  activity,
+  longRunning,
+  cvProgress,
+  onCancel,
+  onMinimize,
+}: {
+  stage: string;
+  status: string | undefined;
+  elapsedMs: number;
+  estimateSeconds: number | undefined;
+  activity: AnalysisActivityEvent[];
+  longRunning: boolean;
+  cvProgress: number | null;
+  onCancel: () => Promise<void>;
+  onMinimize: () => void;
+}) {
+  const [detailsOpen, setDetailsOpen] = React.useState(false);
+  const stageIdx = Math.max(
+    0,
+    ANALYSIS_STAGES.findIndex((s) => s.id === status)
+  );
+  // During the on-device CV scan, drive the bar from real frame progress.
+  const scanning = status === "scanning_frames" && cvProgress !== null;
+  const pct = scanning
+    ? Math.max(0.02, Math.min(0.99, cvProgress ?? 0))
+    : estimateSeconds && estimateSeconds > 0
+      ? Math.min(0.97, elapsedMs / (estimateSeconds * 1000))
+      : (stageIdx + 1) / ANALYSIS_STAGES.length;
+  const estLow = Math.max(15, Math.round((estimateSeconds ?? 60) * 0.7));
+  const estHigh = Math.round((estimateSeconds ?? 90) * 1.4);
+
+  return (
+    <div className="p-6">
+      <div className="grid grid-cols-1 gap-6 md:grid-cols-[1.05fr_1fr]">
+        {/* Left: stage list */}
+        <div>
+          <AnimatePresence mode="wait">
+            <motion.div
+              key={stage}
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -6 }}
+              transition={{ duration: 0.25 }}
+            >
+              <h3 className="font-display text-2xl font-semibold tracking-tight text-white">
+                {stage}…
+              </h3>
+            </motion.div>
+          </AnimatePresence>
+          <p className="mt-1.5 text-sm text-fog">
+            {ANALYSIS_STAGES.find((s) => s.id === status)?.description ||
+              "AdZoom is processing your recording."}
+          </p>
+
+          <ul className="mt-5 space-y-2.5">
+            {ANALYSIS_STAGES.map((s, i) => {
+              const done = i < stageIdx;
+              const active = i === stageIdx;
+              return (
+                <li key={s.id} className="flex items-start gap-2.5 text-sm">
+                  <StageDot done={done} active={active} />
+                  <div className="min-w-0">
+                    <div
+                      className={cn(
+                        "text-sm",
+                        done && "text-white/85",
+                        active && "text-white",
+                        !done && !active && "text-fog/70"
+                      )}
+                    >
+                      {s.label}
+                    </div>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+
+        {/* Right: activity feed */}
+        <div className="flex min-h-0 flex-col">
+          <div className="mb-2 flex items-center justify-between">
+            <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-fog">
+              Activity
+            </div>
+            <span className="font-mono text-[10px] text-fog">{activity.length} events</span>
+          </div>
+          <ActivityFeed activity={activity} />
+        </div>
+      </div>
+
+      {/* Progress bar + time chips */}
+      <div className="mt-6 space-y-2">
+        <div className="h-1 overflow-hidden rounded-full bg-white/[0.06]">
+          <motion.div
+            initial={{ width: 0 }}
+            animate={{ width: `${pct * 100}%` }}
+            transition={{ duration: 0.5, ease: [0.22, 1, 0.36, 1] }}
+            className="h-full rounded-full bg-gradient-to-r from-violet-500 to-cyan-400 shadow-[0_0_16px_rgba(139,92,246,0.6)]"
+          />
+        </div>
+        <div className="flex flex-wrap items-center gap-2 text-[11px] text-fog">
+          <span className="inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-white/[0.02] px-2 py-0.5">
+            <Clock size={10} className="text-violet-300" />
+            Elapsed{" "}
+            <span className="font-mono tabular-nums text-white/85">
+              {fmtElapsed(elapsedMs)}
+            </span>
+          </span>
+          {estimateSeconds && (
+            <span className="inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-white/[0.02] px-2 py-0.5">
+              <Info size={10} />
+              Est.{" "}
+              <span className="font-mono tabular-nums text-white/85">
+                {estLow}–{estHigh}s
+              </span>
+            </span>
+          )}
+          <button
+            onClick={() => setDetailsOpen((v) => !v)}
+            className="ml-auto inline-flex items-center gap-1 rounded-full border border-white/10 bg-white/[0.02] px-2 py-0.5 text-[11px] text-fog transition-colors duration-200 hover:border-white/20 hover:text-white"
+          >
+            {detailsOpen ? <ChevronUp size={10} /> : <ChevronDown size={10} />}
+            Processing details
+          </button>
+        </div>
+      </div>
+
+      {/* Expandable details */}
+      <AnimatePresence initial={false}>
+        {detailsOpen && (
+          <motion.div
+            key="details"
+            initial={{ opacity: 0, height: 0 }}
+            animate={{ opacity: 1, height: "auto" }}
+            exit={{ opacity: 0, height: 0 }}
+            transition={{ duration: 0.25, ease: [0.22, 1, 0.36, 1] }}
+            className="overflow-hidden"
+          >
+            <ProcessingDetails
+              status={status}
+              stage={stage}
+              elapsedMs={elapsedMs}
+              estimateSeconds={estimateSeconds}
+              activity={activity}
+            />
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Long-running warning */}
+      {longRunning && (
+        <div className="mt-4 flex items-start gap-2 rounded-lg border border-amber-400/30 bg-amber-500/[0.06] px-3 py-2.5 text-xs text-amber-100">
+          <AlertTriangle size={13} className="mt-0.5 shrink-0 text-amber-300" />
+          <div className="min-w-0">
+            <div className="font-semibold text-amber-200">
+              This is taking longer than expected.
+            </div>
+            <p className="mt-1 leading-relaxed text-amber-100/85">
+              Likely causes: very large video, Gemini congestion, or high-resolution file. You can keep waiting or run it in the background while you do something else.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Actions */}
+      <div className="mt-5 flex flex-wrap justify-end gap-2">
+        <button
+          onClick={onMinimize}
+          className="rounded-full border border-white/10 bg-white/[0.02] px-4 py-2 text-sm text-fog transition-colors duration-200 hover:border-white/20 hover:text-white"
+        >
+          Continue in background
+        </button>
+        <button
+          onClick={onCancel}
+          className="rounded-full border border-rose-400/30 bg-rose-500/[0.06] px-4 py-2 text-sm text-rose-200 transition-colors duration-200 hover:border-rose-400/50 hover:bg-rose-500/[0.12]"
+        >
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function StageDot({ done, active }: { done: boolean; active: boolean }) {
+  if (done) {
+    return (
+      <span className="mt-0.5 inline-flex size-4 items-center justify-center rounded-full bg-violet-500 text-white">
+        <Check size={9} />
+      </span>
+    );
+  }
+  if (active) {
+    return (
+      <span className="mt-0.5 inline-flex size-4 items-center justify-center rounded-full border border-violet-400/60 bg-violet-500/15">
+        <Loader2 size={9} className="animate-spin text-violet-300" />
+      </span>
+    );
+  }
+  return (
+    <span className="mt-0.5 inline-flex size-4 items-center justify-center rounded-full border border-white/10" />
+  );
+}
+
+function ActivityFeed({ activity }: { activity: AnalysisActivityEvent[] }) {
+  const ref = React.useRef<HTMLDivElement | null>(null);
+  React.useEffect(() => {
+    ref.current?.scrollTo({ top: ref.current.scrollHeight, behavior: "smooth" });
+  }, [activity.length]);
+
+  return (
+    <div
+      ref={ref}
+      className="min-h-[200px] max-h-[260px] overflow-y-auto rounded-lg border border-white/[0.06] bg-white/[0.015] p-3"
+    >
+      {activity.length === 0 ? (
+        <div className="grid h-full place-items-center text-xs text-fog/70">
+          Waiting for first signal…
+        </div>
+      ) : (
+        <ul className="space-y-1.5">
+          {activity.map((e, i) => (
+            <li key={`${e.ts}-${i}`} className="flex items-start gap-2 text-xs">
+              <ActivityIcon kind={e.kind} />
+              <span className="font-mono text-[10px] text-fog/70">
+                {new Date(e.ts).toLocaleTimeString([], {
+                  hour12: false,
+                  minute: "2-digit",
+                  second: "2-digit",
+                })}
+              </span>
+              <span className="min-w-0 flex-1 break-words text-white/85">
+                {e.text}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function ActivityIcon({ kind }: { kind: AnalysisActivityEvent["kind"] }) {
+  if (kind === "ok") {
+    return <Check size={11} className="mt-0.5 shrink-0 text-emerald-400" />;
+  }
+  if (kind === "warn") {
+    return <AlertTriangle size={11} className="mt-0.5 shrink-0 text-amber-300" />;
+  }
+  if (kind === "error") {
+    return <AlertCircle size={11} className="mt-0.5 shrink-0 text-rose-400" />;
+  }
+  return <Info size={11} className="mt-0.5 shrink-0 text-fog" />;
+}
+
+function ProcessingDetails({
+  status,
+  stage,
+  elapsedMs,
+  estimateSeconds,
+  activity,
+}: {
+  status: string | undefined;
+  stage: string;
+  elapsedMs: number;
+  estimateSeconds: number | undefined;
+  activity: AnalysisActivityEvent[];
+}) {
+  const ok = activity.filter((a) => a.kind === "ok").length;
+  const errors = activity.filter((a) => a.kind === "error").length;
+
+  return (
+    <div className="mt-3 rounded-lg border border-white/[0.06] bg-white/[0.015] p-3">
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+        <Stat label="Status" value={status ?? "—"} />
+        <Stat label="Stage" value={stage} />
+        <Stat label="Elapsed" value={fmtElapsed(elapsedMs)} mono />
+        <Stat
+          label="Estimate"
+          value={estimateSeconds ? `${estimateSeconds}s` : "—"}
+          mono
+        />
+        <Stat label="Events" value={String(activity.length)} mono />
+        <Stat label="Success" value={String(ok)} mono />
+        <Stat label="Errors" value={String(errors)} mono />
+      </div>
+    </div>
+  );
+}
+
+function Stat({
+  label,
+  value,
+  mono,
+}: {
+  label: string;
+  value: string;
+  mono?: boolean;
+}) {
+  return (
+    <div className="min-w-0">
+      <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-fog">
+        {label}
+      </div>
+      <div
+        className={cn(
+          "mt-0.5 truncate text-sm text-white/90",
+          mono && "font-mono tabular-nums"
+        )}
+      >
+        {value}
+      </div>
+    </div>
+  );
+}
+
+// ─── FAILED BODY ────────────────────────────────────────────────────────────
+
+function FailedBody({
+  errorKind,
+  errorMessage,
+  onRetry,
+  onClose,
+}: {
+  errorKind: AnalysisErrorKind | undefined;
+  errorMessage: string | undefined;
+  onRetry: () => void;
+  onClose: () => void;
+}) {
+  const kind = errorKind ?? "unknown";
+  const rec = ERROR_RECOVERY[kind];
+  return (
+    <div className="p-6">
+      <div className="flex items-start gap-3">
+        <span className="inline-flex size-10 shrink-0 items-center justify-center rounded-xl border border-rose-400/30 bg-rose-500/10 text-rose-300">
+          <AlertCircle size={18} />
+        </span>
+        <div className="min-w-0 flex-1">
+          <h3 className="font-display text-xl font-semibold tracking-tight text-white">
+            {rec.title}
+          </h3>
+          <p className="mt-1 text-sm leading-relaxed text-fog">{rec.reason}</p>
+        </div>
+      </div>
+
+      <div className="mt-4 rounded-lg border border-violet-400/20 bg-violet-500/[0.06] px-3 py-2.5 text-sm text-violet-100">
+        <span className="text-[10px] font-semibold uppercase tracking-[0.18em] text-violet-300">
+          What to try
+        </span>
+        <p className="mt-1 leading-relaxed">{rec.suggestion}</p>
+      </div>
+
+      {errorMessage && (
+        <details className="mt-3 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-xs text-fog">
+          <summary className="cursor-pointer text-[10px] font-semibold uppercase tracking-[0.18em]">
+            Technical details
+          </summary>
+          <pre className="mt-2 max-h-32 overflow-auto whitespace-pre-wrap break-all font-mono text-[10px] text-fog/85">
+            {errorMessage}
+          </pre>
+        </details>
+      )}
+
+      <div className="mt-5 flex flex-wrap justify-end gap-2">
+        <button
+          onClick={onClose}
+          className="rounded-full border border-white/10 bg-white/[0.02] px-4 py-2 text-sm text-fog transition-colors duration-200 hover:border-white/20 hover:text-white"
+        >
+          Close
+        </button>
+        <button
+          onClick={onRetry}
+          className="inline-flex items-center gap-2 rounded-full bg-violet-500 px-4 py-2 text-sm font-medium text-white shadow-[0_8px_24px_-8px_rgba(139,92,246,0.6)] transition-colors duration-200 hover:bg-violet-500/90"
+        >
+          <RefreshCcw size={13} />
+          Retry analysis
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ─── CANCELLED BODY ─────────────────────────────────────────────────────────
+
+function CancelledBody({
+  onRetry,
+  onClose,
+}: {
+  onRetry: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <div className="p-6">
+      <div className="flex items-start gap-3">
+        <span className="inline-flex size-10 shrink-0 items-center justify-center rounded-xl border border-white/10 bg-white/[0.04] text-fog">
+          <X size={18} />
+        </span>
+        <div className="min-w-0 flex-1">
+          <h3 className="font-display text-xl font-semibold tracking-tight text-white">
+            Analysis cancelled
+          </h3>
+          <p className="mt-1 text-sm text-fog">
+            You stopped this run. Your video is still uploaded — you can re-run analysis whenever you're ready.
+          </p>
+        </div>
+      </div>
+      <div className="mt-5 flex flex-wrap justify-end gap-2">
+        <button
+          onClick={onClose}
+          className="rounded-full border border-white/10 bg-white/[0.02] px-4 py-2 text-sm text-fog transition-colors duration-200 hover:border-white/20 hover:text-white"
+        >
+          Close
+        </button>
+        <button
+          onClick={onRetry}
+          className="inline-flex items-center gap-2 rounded-full bg-violet-500 px-4 py-2 text-sm font-medium text-white shadow-[0_8px_24px_-8px_rgba(139,92,246,0.6)] transition-colors duration-200 hover:bg-violet-500/90"
+        >
+          <RefreshCcw size={13} />
+          Start again
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ─── HOOKS ──────────────────────────────────────────────────────────────────
+
+function useTickingElapsed(startedAt?: number): number {
+  const [now, setNow] = React.useState(() => Date.now());
+  React.useEffect(() => {
+    if (!startedAt) return;
+    const id = setInterval(() => setNow(Date.now()), 500);
+    return () => clearInterval(id);
+  }, [startedAt]);
+  if (!startedAt) return 0;
+  return Math.max(0, now - startedAt);
+}

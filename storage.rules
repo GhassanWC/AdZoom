@@ -1,0 +1,29 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    // Users can only read/write under their own uid prefix.
+    match /users/{uid}/{allPaths=**} {
+      allow read: if isOwner(uid);
+      // Limit uploads to videos < 2 GB and exports < 4 GB
+      allow write: if isOwner(uid)
+        && request.resource.size < 4 * 1024 * 1024 * 1024
+        && (request.resource.contentType.matches("video/.*")
+            || request.resource.contentType == "application/octet-stream");
+    }
+
+    // Deny everything else
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

@@ -1,26 +1,236 @@
 @import "tailwindcss";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
+@theme {
+  /* Brand color tokens */
+  --color-ink: #08090C;
+  --color-panel: #0E1014;
+  --color-edge: #16181D;
+  --color-fog: #9BA1AD;
+  --color-violet-300: #C4B5FD;
+  --color-violet-400: #A78BFA;
+  --color-violet-500: #8B5CF6;
+  --color-violet-600: #7C3AED;
+  --color-cyan-400: #22D3EE;
+  --color-cyan-500: #06B6D4;
+
+  /* Surface aliases */
+  --color-app: #08090C;
+  --color-surface: #0E1014;
+  --color-hairline: rgba(255, 255, 255, 0.06);
+
+  /* Typography */
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-display: var(--font-sora), var(--font-inter), ui-sans-serif, system-ui;
+
+  /* Motion */
+  --ease-cinematic: cubic-bezier(0.22, 1, 0.36, 1);
 }
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
+/* Custom utilities + bases */
+@layer base {
+  * {
+    border-color: rgba(255, 255, 255, 0.06);
+  }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+  html,
+  body {
+    background-color: var(--color-ink);
+    color: #E6E8EC;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    overflow-x: hidden;
+  }
+
+  ::selection {
+    background: rgba(139, 92, 246, 0.35);
+    color: #ffffff;
+  }
+
+  /* Custom scrollbar — restrained */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.06);
+    border-radius: 999px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.12);
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    font-family: var(--font-display);
+    letter-spacing: -0.025em;
+  }
+
+  *:focus-visible {
+    outline: 2px solid rgba(139, 92, 246, 0.6);
+    outline-offset: 2px;
+    border-radius: 6px;
   }
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+@layer utilities {
+  .font-display {
+    font-family: var(--font-display);
+  }
+
+  /* Subtle grid mask for hero / CTA backgrounds */
+  .bg-grid {
+    background-image:
+      linear-gradient(rgba(255, 255, 255, 0.04) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255, 255, 255, 0.04) 1px, transparent 1px);
+    background-size: 48px 48px;
+  }
+
+  .bg-grid-sm {
+    background-image:
+      linear-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px);
+    background-size: 24px 24px;
+  }
+
+  /* Radial mask helpers */
+  .mask-radial {
+    mask-image: radial-gradient(ellipse at center, black 30%, transparent 75%);
+    -webkit-mask-image: radial-gradient(ellipse at center, black 30%, transparent 75%);
+  }
+
+  /* Glass card surface */
+  .glass {
+    background-color: rgba(255, 255, 255, 0.02);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  }
+
+  .glass-strong {
+    background-color: rgba(14, 16, 20, 0.6);
+    backdrop-filter: blur(28px);
+    -webkit-backdrop-filter: blur(28px);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  }
+
+  /* Soft floating shadow preset */
+  .shadow-cinematic {
+    box-shadow: 0 24px 80px -32px rgba(0, 0, 0, 0.7), 0 8px 24px -16px rgba(0, 0, 0, 0.5);
+  }
+
+  .shadow-violet-glow {
+    box-shadow: 0 0 40px -8px rgba(139, 92, 246, 0.35), 0 0 80px -20px rgba(139, 92, 246, 0.25);
+  }
+
+  /* Text gradient — subtle, restrained */
+  .text-gradient {
+    background: linear-gradient(180deg, #ffffff 0%, #E6E8EC 50%, #9BA1AD 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    color: transparent;
+  }
+
+  .text-gradient-violet {
+    background: linear-gradient(135deg, #ffffff 0%, #C4B5FD 50%, #8B5CF6 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    color: transparent;
+  }
+
+  /* Spotlight hover surface (used by GlassCard) */
+  .spotlight {
+    position: relative;
+    overflow: hidden;
+  }
+  .spotlight::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(
+      400px circle at var(--mx, 50%) var(--my, 50%),
+      rgba(139, 92, 246, 0.12),
+      transparent 40%
+    );
+    opacity: 0;
+    transition: opacity 240ms var(--ease-cinematic);
+    pointer-events: none;
+  }
+  .spotlight:hover::before {
+    opacity: 1;
+  }
+
+  /* Animated marquee for logos */
+  @keyframes marquee {
+    0% { transform: translateX(0); }
+    100% { transform: translateX(-50%); }
+  }
+  .animate-marquee {
+    animation: marquee 36s linear infinite;
+  }
+
+  /* Subtle shimmer for loading states */
+  @keyframes shimmer {
+    0% { background-position: -200% 0; }
+    100% { background-position: 200% 0; }
+  }
+  .shimmer {
+    background: linear-gradient(
+      90deg,
+      transparent 0%,
+      rgba(255, 255, 255, 0.06) 50%,
+      transparent 100%
+    );
+    background-size: 200% 100%;
+    animation: shimmer 2.4s linear infinite;
+  }
+
+  /* Custom range slider thumb (used by Slider) */
+  .range-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    background: transparent;
+  }
+  .range-thumb::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 16px;
+    height: 16px;
+    border-radius: 9999px;
+    background: #ffffff;
+    box-shadow: 0 0 0 4px rgba(139, 92, 246, 0.25), 0 1px 2px rgba(0, 0, 0, 0.6);
+    cursor: grab;
+    border: 0;
+  }
+  .range-thumb::-webkit-slider-thumb:active {
+    cursor: grabbing;
+    box-shadow: 0 0 0 6px rgba(139, 92, 246, 0.35), 0 1px 2px rgba(0, 0, 0, 0.6);
+  }
+  .range-thumb::-moz-range-thumb {
+    width: 16px;
+    height: 16px;
+    border-radius: 9999px;
+    background: #ffffff;
+    box-shadow: 0 0 0 4px rgba(139, 92, 246, 0.25), 0 1px 2px rgba(0, 0, 0, 0.6);
+    border: 0;
+    cursor: grab;
+  }
+
+  /* Glow ring used sparingly */
+  .ring-violet-soft {
+    box-shadow: 0 0 0 1px rgba(139, 92, 246, 0.4), 0 0 32px -4px rgba(139, 92, 246, 0.3);
+  }
 }

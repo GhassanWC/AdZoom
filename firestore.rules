@@ -1,0 +1,39 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    // User profile document
+    match /users/{uid} {
+      allow read, write: if isOwner(uid);
+
+      // Projects subcollection
+      match /projects/{projectId} {
+        allow read, create, update, delete: if isOwner(uid);
+      }
+
+      // Exports subcollection
+      match /exports/{exportId} {
+        allow read, create, update, delete: if isOwner(uid);
+      }
+
+      // Custom presets created by this user
+      match /presets/{presetId} {
+        allow read, create, update, delete: if isOwner(uid);
+      }
+    }
+
+    // Everything else is denied
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

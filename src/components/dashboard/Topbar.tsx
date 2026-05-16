@@ -1,0 +1,123 @@
+"use client";
+
+import * as React from "react";
+import { Bell, Menu, Search, LogOut } from "lucide-react";
+import { cn } from "@/lib/cn";
+import { useAuth } from "@/lib/firebase/AuthProvider";
+
+interface TopbarProps {
+  onOpenSidebar: () => void;
+  className?: string;
+}
+
+export function Topbar({ onOpenSidebar, className }: TopbarProps) {
+  const { user, signOut } = useAuth();
+  const [open, setOpen] = React.useState(false);
+  const ref = React.useRef<HTMLDivElement | null>(null);
+
+  React.useEffect(() => {
+    const onClick = (e: MouseEvent) => {
+      if (!ref.current || ref.current.contains(e.target as Node)) return;
+      setOpen(false);
+    };
+    document.addEventListener("mousedown", onClick);
+    return () => document.removeEventListener("mousedown", onClick);
+  }, []);
+
+  const initials = user?.displayName
+    ? user.displayName
+        .split(" ")
+        .map((s) => s[0])
+        .slice(0, 2)
+        .join("")
+        .toUpperCase()
+    : user?.email?.[0]?.toUpperCase() ?? "?";
+
+  return (
+    <header
+      className={cn(
+        "sticky top-0 z-30 flex h-16 items-center gap-3 border-b border-white/[0.06] bg-ink/70 px-4 backdrop-blur-xl lg:px-8",
+        className
+      )}
+    >
+      <button
+        aria-label="Open menu"
+        onClick={onOpenSidebar}
+        className="inline-flex size-9 items-center justify-center rounded-lg border border-white/10 bg-white/[0.02] text-white lg:hidden"
+      >
+        <Menu size={16} />
+      </button>
+
+      <div className="relative max-w-md flex-1">
+        <Search
+          size={14}
+          className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-fog"
+        />
+        <input
+          type="text"
+          placeholder="Search projects, presets, exports…"
+          className="h-9 w-full rounded-lg border border-white/10 bg-white/[0.02] pl-9 pr-16 text-sm text-white placeholder:text-fog/70 outline-none transition-colors duration-200 focus:border-white/20 focus:bg-white/[0.04]"
+        />
+        <kbd className="pointer-events-none absolute right-2 top-1/2 hidden -translate-y-1/2 items-center gap-0.5 rounded border border-white/10 bg-white/[0.04] px-1.5 py-0.5 font-mono text-[10px] text-fog sm:inline-flex">
+          ⌘K
+        </kbd>
+      </div>
+
+      <button
+        aria-label="Notifications"
+        className="relative inline-flex size-9 items-center justify-center rounded-lg border border-white/10 bg-white/[0.02] text-fog transition-colors duration-200 hover:text-white"
+      >
+        <Bell size={15} />
+        <span className="absolute right-2 top-2 size-1.5 rounded-full bg-violet-400 shadow-[0_0_8px_rgba(139,92,246,0.6)]" />
+      </button>
+
+      <div ref={ref} className="relative">
+        <button
+          aria-label="Account"
+          onClick={() => setOpen((v) => !v)}
+          className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.02] p-1 pr-3 transition-colors duration-200 hover:border-white/20"
+        >
+          {user?.photoURL ? (
+            <img
+              src={user.photoURL}
+              alt=""
+              className="size-7 rounded-full"
+              referrerPolicy="no-referrer"
+            />
+          ) : (
+            <span
+              className="inline-flex size-7 items-center justify-center rounded-full bg-gradient-to-br from-violet-500 to-cyan-400 text-[11px] font-semibold text-white"
+              aria-hidden
+            >
+              {initials}
+            </span>
+          )}
+          <span className="hidden text-xs font-medium text-white sm:inline">
+            {user?.displayName?.split(" ")[0] ?? "Account"}
+          </span>
+        </button>
+
+        {open && (
+          <div className="absolute right-0 top-12 z-40 w-64 overflow-hidden rounded-xl border border-white/10 bg-surface/95 shadow-cinematic backdrop-blur-xl">
+            <div className="border-b border-white/[0.06] px-4 py-3">
+              <div className="truncate text-sm font-medium text-white">
+                {user?.displayName || "Anonymous"}
+              </div>
+              <div className="truncate text-[11px] text-fog">{user?.email}</div>
+            </div>
+            <button
+              onClick={() => {
+                setOpen(false);
+                signOut();
+              }}
+              className="flex w-full items-center gap-2 px-4 py-2.5 text-left text-sm text-white/85 transition-colors duration-150 hover:bg-white/[0.04] hover:text-white"
+            >
+              <LogOut size={14} />
+              Sign out
+            </button>
+          </div>
+        )}
+      </div>
+    </header>
+  );
+}

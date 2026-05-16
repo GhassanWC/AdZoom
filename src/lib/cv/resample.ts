@@ -1,0 +1,191 @@
+/**
+ * Resampling + quantization — turns the dense per-frame signal (4 fps) into the
+ * compact `VisualAnalysis` that gets persisted to Firestore.
+ *
+ * Per-second buckets, 8-bit quantized arrays. At 1 Hz a 3-min video is ~180
+ * samples × 6 arrays ≈ 12 KB encoded — comfortably under the 1 MB doc limit.
+ */
+
+import type { VisualAnalysis, VisualEvent } from "../firebase/schema";
+import type { RawFrameSignal } from "./types";
+
+/** Above this many samples (~40 min @ 1 Hz) drop to 0.5 Hz. */
+const MAX_SAMPLES_AT_1HZ = 2400;
+
+/** Scene-proximity falloff for the attention curve, in seconds. */
+const SCENE_FALLOFF = 2;
+
+/** 0..1 → 0..255. */
+export function quantize(v: number): number {
+  if (!Number.isFinite(v)) return 0;
+  return Math.max(0, Math.min(255, Math.round(v * 255)));
+}
+
+/** 0..255 → 0..1. */
+export function dequantize(b: number): number {
+  return Math.max(0, Math.min(255, b)) / 255;
+}
+
+/** Whole-array 0..255 → 0..1. */
+export function dequantizeArray(arr: number[] | undefined): number[] {
+  return (arr ?? []).map(dequantize);
+}
+
+export interface ResampleInput {
+  signals: RawFrameSignal[];
+  duration: number;
+  sceneChanges: VisualEvent[];
+  clickEvents: VisualEvent[];
+  computeMs: number;
+}
+
+/** Build the persisted `VisualAnalysis` from dense per-frame signals. */
+export function resample(input: ResampleInput): VisualAnalysis {
+  const { signals, duration, sceneChanges, clickEvents, computeMs } = input;
+
+  const sampleRate =
+    Math.ceil(duration) > MAX_SAMPLES_AT_1HZ ? 0.5 : 1;
+  const bucketLen = 1 / sampleRate; // seconds per bucket
+  const sampleCount = Math.max(1, Math.ceil(duration * sampleRate));
+
+  const motion = new Array<number>(sampleCount).fill(0);
+  const delta = new Array<number>(sampleCount).fill(0);
+  const density = new Array<number>(sampleCount).fill(0);
+  const centroidX = new Array<number>(sampleCount).fill(0);
+  const centroidY = new Array<number>(sampleCount).fill(0);
+
+  // Accumulators for the mean fields.
+  const deltaSum = new Float64Array(sampleCount);
+  const densitySum = new Float64Array(sampleCount);
+  const counts = new Float64Array(sampleCount);
+  // Motion-weighted centroid accumulators.
+  const cxSum = new Float64Array(sampleCount);
+  const cySum = new Float64Array(sampleCount);
+  const cWeight = new Float64Array(sampleCount);
+  // Raw (0..1) motion max per bucket, kept for the attention curve.
+  const motionRaw = new Float64Array(sampleCount);
+
+  for (const s of signals) {
+    const b = Math.min(sampleCount - 1, Math.max(0, Math.floor(s.t / bucketLen)));
+    counts[b]++;
+    deltaSum[b] += s.meanDelta;
+    densitySum[b] += s.visualDensity;
+    if (s.motionIntensity > motionRaw[b]) motionRaw[b] = s.motionIntensity;
+    if (s.centroid) {
+      // Weight the hotspot by motion so noisy near-static frames don't drag it.
+      const w = Math.max(0.01, s.motionIntensity);
+      cxSum[b] += s.centroid.x * w;
+      cySum[b] += s.centroid.y * w;
+      cWeight[b] += w;
+    }
+  }
+
+  // Carry-forward state for buckets with no centroid this second.
+  let lastCx = 0.5;
+  let lastCy = 0.5;
+
+  for (let b = 0; b < sampleCount; b++) {
+    const c = counts[b];
+    motion[b] = quantize(motionRaw[b]);
+    delta[b] = quantize(c > 0 ? deltaSum[b] / c : 0);
+    density[b] = quantize(c > 0 ? densitySum[b] / c : 0);
+
+    if (cWeight[b] > 0) {
+      lastCx = cxSum[b] / cWeight[b];
+      lastCy = cySum[b] / cWeight[b];
+    }
+    centroidX[b] = quantize(lastCx);
+    centroidY[b] = quantize(lastCy);
+  }
+
+  const attentionCurve = buildAttentionCurve(
+    motionRaw,
+    deltaSum,
+    densitySum,
+    counts,
+    sceneChanges,
+    bucketLen,
+    sampleCount
+  );
+
+  return {
+    version: 1,
+    sampleRate,
+    sampleCount,
+    motion,
+    delta,
+    density,
+    centroidX,
+    centroidY,
+    sceneChanges,
+    clickEvents,
+    attentionCurve,
+    computeMs: Math.round(computeMs),
+  };
+}
+
+/**
+ * Continuous attention curve — a CV-only signal (Gemini moments are sparse).
+ * Weighted blend, then a 3-tap smoothing pass, then normalize 0..1.
+ */
+function buildAttentionCurve(
+  motionRaw: Float64Array,
+  deltaSum: Float64Array,
+  densitySum: Float64Array,
+  counts: Float64Array,
+  sceneChanges: VisualEvent[],
+  bucketLen: number,
+  sampleCount: number
+): number[] {
+  const raw = new Float64Array(sampleCount);
+
+  for (let b = 0; b < sampleCount; b++) {
+    const c = counts[b];
+    const m = motionRaw[b];
+    const d = c > 0 ? deltaSum[b] / c : 0;
+    const dens = c > 0 ? densitySum[b] / c : 0;
+    const t = (b + 0.5) * bucketLen;
+    raw[b] =
+      0.4 * m +
+      0.25 * d +
+      0.2 * dens +
+      0.15 * sceneProximity(t, sceneChanges);
+  }
+
+  // 3-tap moving average to kill single-second spikes.
+  const smoothed = new Float64Array(sampleCount);
+  for (let b = 0; b < sampleCount; b++) {
+    let sum = raw[b];
+    let n = 1;
+    if (b > 0) {
+      sum += raw[b - 1];
+      n++;
+    }
+    if (b < sampleCount - 1) {
+      sum += raw[b + 1];
+      n++;
+    }
+    smoothed[b] = sum / n;
+  }
+
+  // Normalize to 0..1 against the peak, then quantize.
+  let peak = 0;
+  for (let b = 0; b < sampleCount; b++) if (smoothed[b] > peak) peak = smoothed[b];
+  const out = new Array<number>(sampleCount).fill(0);
+  if (peak > 0) {
+    for (let b = 0; b < sampleCount; b++) out[b] = quantize(smoothed[b] / peak);
+  }
+  return out;
+}
+
+/** 1.0 at a scene cut, decaying linearly to 0 over SCENE_FALLOFF seconds. */
+export function sceneProximity(t: number, sceneChanges: VisualEvent[]): number {
+  let best = 0;
+  for (const e of sceneChanges) {
+    const dist = Math.abs(e.t - t);
+    if (dist >= SCENE_FALLOFF) continue;
+    const prox = (1 - dist / SCENE_FALLOFF) * e.strength;
+    if (prox > best) best = prox;
+  }
+  return best;
+}

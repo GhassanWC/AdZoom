@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AdZoom - Dynamic Zoom Effects for Screen Recordings</title>
+  <link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+  <div class="app" role="application">
+    <header class="header">
+      <h1 class="header__title">AdZoom</h1>
+      <p class="header__subtitle">Add dynamic zoom effects to screen recordings</p>
+    </header>
+
+    <main class="main">
+      <!-- Video source section: upload or URL -->
+      <section class="source-section" aria-label="Video source">
+        <div class="source-tabs" role="tablist">
+          <button type="button" class="source-tab source-tab--active" data-tab="upload" role="tab" aria-selected="true">Upload file</button>
+          <button type="button" class="source-tab" data-tab="url" role="tab" aria-selected="false">Video URL</button>
+        </div>
+
+        <div class="source-panel source-panel--upload" id="panel-upload" role="tabpanel">
+          <label class="file-label" for="video-file">Select video file</label>
+          <div class="file-input-wrapper">
+            <input type="file" id="video-file" class="file-input" accept="video/mp4,video/quicktime,video/webm,video/x-msvideo,video/x-matroska" aria-describedby="file-name file-error">
+            <span class="file-name" id="file-name" aria-live="polite">No file selected</span>
+          </div>
+          <p class="input-hint">Accepted: MP4, MOV, WebM, AVI, MKV. Max size: 500 MB.</p>
+          <p class="error-message" id="file-error" role="alert" aria-live="assertive" hidden></p>
+        </div>
+
+        <div class="source-panel source-panel--url hidden" id="panel-url" role="tabpanel">
+          <label class="url-label" for="video-url">Video URL</label>
+          <div class="url-input-wrapper">
+            <input type="url" id="video-url" class="url-input" placeholder="https://example.com/video.mp4" autocomplete="url" aria-describedby="url-error">
+            <button type="button" class="btn btn--primary" id="load-url-btn">Load URL</button>
+          </div>
+          <p class="error-message" id="url-error" role="alert" aria-live="assertive" hidden></p>
+        </div>
+      </section>
+
+      <!-- Video player area -->
+      <section class="player-section" aria-label="Video player">
+        <div class="player-container" id="player-container">
+          <div class="video-wrapper" id="video-wrapper">
+            <video id="video" class="video" playsinline preload="metadata" crossorigin="anonymous">
+              Your browser does not support the video tag.
+            </video>
+          </div>
+          <p class="placeholder-message" id="placeholder-message">Upload a video or enter a URL to get started.</p>
+          <p class="error-message player-error" id="player-error" role="alert" hidden></p>
+
+          <div class="controls" id="video-controls" hidden>
+            <div class="controls__playback">
+              <button type="button" class="btn-icon btn-icon--play" id="play-pause-btn" aria-label="Play" title="Play"></button>
+              <div class="seek-wrapper">
+                <input type="range" class="seek-bar" id="seek-bar" min="0" max="100" value="0" step="0.1" aria-label="Seek">
+                <span class="time-display" id="time-display">0:00 / 0:00</span>
+              </div>
+            </div>
+            <div class="controls__volume">
+              <button type="button" class="btn-icon btn-icon--volume" id="mute-btn" aria-label="Mute" title="Mute"></button>
+              <input type="range" class="volume-slider" id="volume-slider" min="0" max="100" value="100" aria-label="Volume">
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Zoom controls -->
+      <section class="zoom-section" aria-label="Zoom controls">
+        <h2 class="zoom-section__title">Zoom effect</h2>
+        <div class="zoom-controls">
+          <div class="zoom-control">
+            <label for="zoom-level">Zoom level</label>
+            <div class="slider-row">
+              <input type="range" id="zoom-level" class="slider" min="100" max="300" value="100" step="1" aria-valuetext="100%">
+              <span class="slider-value" id="zoom-level-value">100%</span>
+            </div>
+          </div>
+          <div class="zoom-control">
+            <label for="zoom-speed">Zoom speed (transition duration)</label>
+            <div class="slider-row">
+              <input type="range" id="zoom-speed" class="slider" min="0" max="3" value="0.5" step="0.1" aria-valuetext="0.5s">
+              <span class="slider-value" id="zoom-speed-value">0.5s</span>
+            </div>
+          </div>
+          <div class="zoom-control">
+            <label for="zoom-origin">Zoom origin</label>
+            <select id="zoom-origin" class="select" aria-label="Zoom origin">
+              <option value="center">Center</option>
+              <option value="top">Top</option>
+              <option value="bottom">Bottom</option>
+              <option value="left">Left</option>
+              <option value="right">Right</option>
+              <option value="top-left">Top left</option>
+              <option value="top-right">Top right</option>
+              <option value="bottom-left">Bottom left</option>
+              <option value="bottom-right">Bottom right</option>
+            </select>
+          </div>
+        </div>
+        <p class="error-message" id="zoom-error" role="alert" aria-live="assertive" hidden></p>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <p>AdZoom &mdash; Zoom effects for screen recordings</p>
+    </footer>
+  </div>
+
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
