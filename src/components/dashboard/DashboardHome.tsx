@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { ArrowRight, Plus, Sparkles, Upload as UploadIcon } from "lucide-react";
+import { ArrowRight, Plus, Sparkles, Upload as UploadIcon, Video } from "lucide-react";
 import { useAuth } from "@/lib/firebase/AuthProvider";
 import { subscribeProjects } from "@/lib/firebase/projects";
 import type { ProjectDoc } from "@/lib/firebase/schema";
@@ -43,8 +43,11 @@ export function DashboardHome() {
         title={greeting(user?.displayName)}
         subtitle="Upload a recording, let the AI plan the cinematic cut, then export it cleanly."
         action={
-          <div className="flex gap-2">
-            <Button href="/dashboard/upload" variant="primary" size="md" leftIcon={<UploadIcon size={14} />}>
+          <div className="flex flex-wrap gap-2">
+            <Button href="/dashboard/record" variant="primary" size="md" leftIcon={<Video size={14} />}>
+              Record
+            </Button>
+            <Button href="/dashboard/upload" variant="ghost" size="md" leftIcon={<UploadIcon size={14} />}>
               Upload
             </Button>
             {projects.length > 0 && (

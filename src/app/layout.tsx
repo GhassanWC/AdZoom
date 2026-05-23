@@ -4,6 +4,7 @@ import "./globals.css";
 import { NoiseOverlay } from "@/components/ui/NoiseOverlay";
 import { AuthProvider } from "@/lib/firebase/AuthProvider";
 import { ToastProvider } from "@/components/ui/Toast";
+import { ThemeProvider, themeInitScript } from "@/lib/theme";
 
 const inter = Inter({
   variable: "--font-inter",
@@ -39,8 +40,12 @@ export default function RootLayout({
   return (
     <html
       lang="en"
-      className={`dark ${inter.variable} ${sora.variable} h-full antialiased`}
+      className={`${inter.variable} ${sora.variable} h-full antialiased`}
+      suppressHydrationWarning
     >
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: themeInitScript }} />
+      </head>
       <body className="relative min-h-full bg-ink text-white/90 selection:bg-violet-500/35">
         <NoiseOverlay />
         <a
@@ -49,9 +54,11 @@ export default function RootLayout({
         >
           Skip to content
         </a>
-        <AuthProvider>
-          <ToastProvider>{children}</ToastProvider>
-        </AuthProvider>
+        <ThemeProvider>
+          <AuthProvider>
+            <ToastProvider>{children}</ToastProvider>
+          </AuthProvider>
+        </ThemeProvider>
       </body>
     </html>
   );

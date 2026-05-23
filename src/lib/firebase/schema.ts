@@ -96,6 +96,82 @@ export interface FocusRegion {
 /** Where a timeline edit came from — drives UI affordances + the AI/human split. */
 export type MomentSource = "ai" | "user";
 
+/**
+ * Detailed origin of a moment in the hybrid pipeline. Distinct from
+ * `MomentSource`: `source` answers "did the user make this", while
+ * `provenance` answers "which signal produced it".
+ *
+ * Priority order baked into selection: EVENT > CV > AI. `ai-override` exists
+ * only when an AI proposal won over a low-confidence event candidate — it
+ * stays visibly labelled in the UI so the user can revert.
+ */
+export type MomentProvenance =
+  | "event"
+  | "cv"
+  | "ai"
+  | "ai-override"
+  | "user";
+
+/** Selection-time rank used by the balancer. EVENT > CV > AI. */
+export const PROVENANCE_RANK: Record<MomentProvenance, number> = {
+  user: 4,
+  event: 3,
+  cv: 2,
+  "ai-override": 1,
+  ai: 1,
+};
+
+/** Maximum share of `detectedMoments` that may have `provenance: "ai"`. */
+export const AI_MOMENT_QUOTA = 0.15;
+
+/**
+ * Identifies which underlying signal produced a moment's confidence score.
+ * Surfaced in the inspector + debug overlay so every moment is explainable.
+ */
+export type ConfidenceSource =
+  | "real-click"
+  | "real-double-click"
+  | "real-right-click"
+  | "real-typing-burst"
+  | "real-scroll-pause"
+  | "real-hover-settle"
+  | "cursor-intent-hesitation"
+  | "cursor-intent-settle"
+  | "cv-motion-peak"
+  | "cv-scene-change"
+  | "cv-click-heuristic"
+  | "cv-no-target-fallback"
+  | "ai-section-anchor"
+  | "ai-gap-fill"
+  | "ai-rescue-rebalance"
+  | "user-manual";
+
+/**
+ * Where the `focusRegion` of a moment came from. Used so the inspector /
+ * debug overlay can show whether the camera target is grounded in a real
+ * signal (click coords, motion centroid, UI region) or is a generic default
+ * the balancer should treat as low-confidence.
+ */
+export type TargetRegionSource =
+  | "click-event"
+  | "motion-centroid"
+  | "ui-region"
+  | "ai-proposal"
+  | "default"
+  | "user";
+
+/**
+ * Compact record of a candidate that was rejected near a surviving moment.
+ * Kept short so it doesn't blow up Firestore doc size — capped at 5 per
+ * surviving moment and 50 in `analysis.rejectedPool`.
+ */
+export interface RejectedCandidateRef {
+  ts: number;
+  reason: string;
+  provenance: MomentProvenance;
+  effectType?: EffectType;
+}
+
 export type EaseKind = "linear" | "ease-in" | "ease-out" | "ease-in-out";
 
 /**
@@ -141,8 +217,6 @@ export interface DetectedMoment {
    * across the moment window instead of holding a static focusRegion.
    */
   keyframes?: MomentKeyframe[];
-  /** True if a caption should be shown for this moment. */
-  caption?: boolean;
 
   // ── Attention-aware fields (Gemini-supplied, post-processed by balancer) ──
   /** Composite priority (0..1) — replaces importance going forward. */
@@ -158,11 +232,81 @@ export interface DetectedMoment {
   /** Gemini's per-moment intensity recommendation (0..1). Used by the editor + export. */
   recommendedIntensity?: number;
 
+  // ── Hybrid pipeline provenance + confidence (V2) ──
+  /**
+   * Which signal produced this moment. EVENT > CV > AI > USER in selection
+   * priority. Absent on projects analyzed before the hybrid engine shipped —
+   * readers should fall back to `source` and treat as "ai".
+   */
+  provenance?: MomentProvenance;
+  /** Back-pointer to raw `Interaction.id`(s) that fed this moment. */
+  eventIds?: string[];
+  /** Composite confidence in this moment (0..1). Events ~0.9+, CV ~0.5-0.8, AI ~0.3-0.6. */
+  confidenceScore?: number;
+  /** Dominant signal class behind `confidenceScore`. */
+  confidenceSource?: ConfidenceSource;
+  /** One-line, user-facing explanation of why this moment exists. */
+  confidenceReason?: string;
+
   /**
    * Legacy field. New code reads `attentionScore`; falls back here for old projects.
    * @deprecated use attentionScore
    */
   importance?: number;
+
+  // ── Explainability (V3) — populated by the balancer / events.ts / Gemini ──
+  /** One-line explanation of why the balancer kept this moment. */
+  whySelected?: string;
+  /** One-line explanation of why this `effectType` was chosen. */
+  whyEffectType?: string;
+  /** Where the `focusRegion` value originated. */
+  targetRegionSource?: TargetRegionSource;
+  /**
+   * Short tags of the signals that fed this moment, in fired-order.
+   * Examples: ["click@12.42", "hover-settle@12.18", "cursor-hesitation@0.72"].
+   */
+  sourceSignals?: string[];
+  /**
+   * Set by the balancer when this candidate was dropped from the active
+   * timeline. The candidate is still kept in `rawMoments` so a preset change
+   * (e.g. denser pacing) can un-reject it without re-calling Gemini.
+   */
+  rejected?: boolean;
+  /** Short tag explaining the rejection (e.g. `"boring-section"`, `"in-idle"`, `"no-target"`). */
+  rejectedReason?: string;
+  /** Candidates that competed with this moment in the same time neighbourhood and lost. */
+  rejectedCandidates?: RejectedCandidateRef[];
+}
+
+/**
+ * Coarse UI region detected by the lightweight CV layer. Shape + motion stats,
+ * NOT semantic — `labelGuess` is a hint to the AI refinement layer, never an
+ * authoritative class. Confidence is clamped ≤ 0.7 unless a click landed
+ * inside the region.
+ */
+export interface UIRegion {
+  id: string;
+  /** Time window this region was active in (seconds). */
+  t0: number;
+  t1: number;
+  /** Normalized rect in frame coords (0..1). */
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  /** Coarse shape guess — NOT semantic vision. */
+  labelGuess:
+    | "button"
+    | "card"
+    | "modal"
+    | "input"
+    | "sidebar"
+    | "toolbar"
+    | "menu"
+    | "dialog"
+    | "unknown";
+  /** 0..1 — clamped ≤ 0.7 without click corroboration. */
+  confidence: number;
 }
 
 export interface NarrativeSegment {
@@ -172,10 +316,10 @@ export interface NarrativeSegment {
   label: string;
 }
 
-export interface SuggestedCaption {
-  startTime: number;
-  text: string;
-}
+// NOTE (V1): caption generation was removed to refocus AdZoom on attention /
+// zoom direction. If/when captions return as an optional plugin they should
+// live in their own subcollection (e.g. `projects/{id}/captions/{id}`) rather
+// than being inlined into `Analysis`, so the core pipeline stays minimal.
 
 export interface BoringSection {
   startTime: number;
@@ -236,7 +380,8 @@ export interface VisualEvent {
  * cursor — it tracks where inter-frame change concentrates.
  */
 export interface VisualAnalysis {
-  version: 1;
+  /** v1 = CV-only, ad-hoc attentionCurve. v2 = hybrid-ready (curve from src/lib/attention/score.ts). */
+  version: 1 | 2;
   /** Samples per second of the per-second arrays. v1 = 1 (0.5 for very long videos). */
   sampleRate: number;
   /** Length of the per-second arrays. */
@@ -259,6 +404,11 @@ export interface VisualAnalysis {
   attentionCurve: number[];
   /** Wall-clock the CV pass took, ms — surfaced for the honest report. */
   computeMs: number;
+  /**
+   * Detected UI regions (V2). Optional — absent on projects analyzed before
+   * region detection shipped. Shape + motion stats, not semantic.
+   */
+  uiRegions?: UIRegion[];
 }
 
 export interface Analysis {
@@ -271,7 +421,6 @@ export interface Analysis {
    * Kept so we can re-balance on preset change without re-calling Gemini.
    */
   rawMoments?: DetectedMoment[];
-  suggestedCaptions: SuggestedCaption[];
   boringSections: BoringSection[];
   /** Preset ids Gemini thinks fit this recording best (built-in or user). */
   recommendedPresetIds?: string[];
@@ -295,9 +444,28 @@ export interface Analysis {
   completedAt?: number;
   /** Set by the client when the user clicks Cancel. */
   cancelRequested?: boolean;
+
+  // ── Hybrid pipeline (V2) ──
+  /**
+   * Per-bucket attention score (0..255, 8-bit quantized — divide by 255).
+   * Canonical importance signal across the product. Produced by
+   * `src/lib/attention/score.ts`; consumed via `getAttentionAt(t)`.
+   */
+  attentionCurve?: number[];
+  /**
+   * Samples per second for `attentionCurve`. Defaults to `visualAnalysis.sampleRate`
+   * when both are present.
+   */
+  attentionSampleRate?: number;
+  /**
+   * Flat mirror of candidates rejected by the balancer's reject pass, capped
+   * at 50. Surface for the debug overlay so the user can see what was
+   * filtered out and why. The full list lives in `rawMoments` with
+   * `rejected: true` so rebalance can re-introduce them under denser presets.
+   */
+  rejectedPool?: DetectedMoment[];
 }
 
-export type CaptionStyle = "none" | "minimal" | "bold-pop" | "tutorial-tooltip" | "subtitle";
 export type Pacing = "slow" | "moderate" | "fast";
 export type TargetPlatform = "youtube" | "tiktok" | "reels" | "twitter" | "internal";
 export type ExportFormat = "1080p" | "4K" | "TikTok 9:16" | "YouTube 16:9" | "Custom";
@@ -314,7 +482,6 @@ export interface EffectsSettings {
   clickHighlights: boolean;
   motionTracking: boolean;
   // ── preset-driven ──
-  captionStyle: CaptionStyle;
   pacing: Pacing;
   targetPlatform: TargetPlatform;
   defaultExportFormat: ExportFormat;
@@ -331,7 +498,6 @@ export const DEFAULT_EFFECTS_SETTINGS: EffectsSettings = {
   verticalExport: false,
   clickHighlights: true,
   motionTracking: true,
-  captionStyle: "minimal",
   pacing: "moderate",
   targetPlatform: "youtube",
   defaultExportFormat: "YouTube 16:9",
@@ -403,6 +569,18 @@ export interface ProjectDoc {
   /** The preset that was last applied. May be a built-in id or a custom preset id. */
   selectedPresetId?: string;
   exportUrl?: string;
+  /**
+   * "tab" when the recording surface was the AdZoom tab itself (events are
+   * authoritative). "external" for any other surface (browser-captured events
+   * are noise — pipeline relies on CV only). Absent on uploads, treated as
+   * "external" by the analyzer.
+   */
+  interactionScope?: "tab" | "external";
+  /**
+   * Storage path of the serialized `Interaction[]` JSON, written next to the
+   * video. Absent for uploads and for in-tab recordings with zero events.
+   */
+  interactionsPath?: string;
   createdAt: number;
   updatedAt: number;
 }
@@ -412,6 +590,52 @@ export interface UserDoc {
   displayName: string | null;
   email: string | null;
   photoURL: string | null;
+  createdAt: number;
+  updatedAt: number;
+  /**
+   * Active plan tier. Mirrored from `subscriptions/{uid}.plan` by the
+   * Lemon Squeezy webhook so the client (sidebar, gating) can read it from
+   * the user doc without joining. Absent = treat as "free".
+   */
+  plan?: "free" | "creator" | "pro";
+}
+
+/**
+ * Lifecycle status of a Lemon Squeezy subscription, normalised to our
+ * internal vocabulary. Maps to LS `status` strings with a small switch in
+ * `src/lib/lemonsqueezy/webhook.ts`.
+ */
+export type SubscriptionStatus =
+  | "active"
+  | "on_trial"
+  | "paused"
+  | "past_due"
+  | "unpaid"
+  | "cancelled"
+  | "expired";
+
+/**
+ * Live subscription state for one user. Stored at top-level
+ * `subscriptions/{userId}`. The plan tier is mirrored to `users/{uid}.plan`
+ * for cheap client reads; this doc is the source of truth.
+ */
+export interface Subscription {
+  userId: string;
+  plan: "free" | "creator" | "pro";
+  status: SubscriptionStatus;
+  lemonCustomerId: string;
+  lemonSubscriptionId: string;
+  variantId: string;
+  /** Next renewal time, epoch ms. */
+  renewsAt?: number;
+  /** When access actually ends (set after a cancel — until then, plan stays paid). */
+  endsAt?: number;
+  /** Trial period end, epoch ms. */
+  trialEndsAt?: number;
+  /** LS-hosted customer portal URL — kept fresh from each subscription_* event. */
+  customerPortalUrl?: string;
+  /** LS-hosted payment update URL. */
+  updateUrl?: string;
   createdAt: number;
   updatedAt: number;
 }

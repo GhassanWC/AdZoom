@@ -129,7 +129,7 @@ export default function PresetsPage() {
       <PageHeader
         eyebrow="Presets"
         title="Preset library"
-        subtitle="Each preset is a real bundle of editor settings. Apply one to any project to retune zoom, captions, cursor, and export format."
+        subtitle="Each preset is a real bundle of editor settings. Apply one to any project to retune zoom, cursor, pacing, and export format."
       />
 
       <div className="flex flex-wrap items-center gap-3">
@@ -234,7 +234,7 @@ function ApplyToProjectDialog({
           Apply {preset.name} to…
         </h3>
         <p className="mt-1 text-sm text-fog">
-          Pick a project to retune. The preset rewrites zoom, cursor, captions, pacing, and export format.
+          Pick a project to retune. The preset rewrites zoom, cursor, pacing, and export format.
         </p>
 
         <div className="mt-5 max-h-80 overflow-y-auto rounded-lg border border-white/10 bg-white/[0.02]">

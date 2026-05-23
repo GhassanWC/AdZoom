@@ -14,7 +14,6 @@ import {
   ChevronDown,
   Clock,
   Camera,
-  Type,
   Brain,
   Crop,
   Zap,
@@ -30,7 +29,50 @@ import type {
   EaseKind,
   EffectType,
   MomentKeyframe,
+  MomentProvenance,
 } from "@/lib/firebase/schema";
+
+const PROVENANCE_PRESENTATION: Record<
+  MomentProvenance,
+  { label: string; dot: string; chip: string; text: string }
+> = {
+  event: {
+    label: "Real event",
+    dot: "bg-emerald-400",
+    chip: "bg-emerald-400/15 text-emerald-200",
+    text: "Derived from a real interaction in your recording.",
+  },
+  cv: {
+    label: "Motion",
+    dot: "bg-sky-400",
+    chip: "bg-sky-400/15 text-sky-200",
+    text: "Inferred from on-device motion analysis.",
+  },
+  ai: {
+    label: "AI",
+    dot: "bg-violet-400",
+    chip: "bg-violet-500/15 text-violet-200",
+    text: "AI suggestion in a coverage gap.",
+  },
+  "ai-override": {
+    label: "AI override",
+    dot: "bg-fuchsia-400",
+    chip: "bg-fuchsia-500/15 text-fuchsia-200",
+    text: "AI overrode a low-confidence event candidate here.",
+  },
+  user: {
+    label: "Yours",
+    dot: "bg-amber-300",
+    chip: "bg-cyan-400/15 text-cyan-200",
+    text: "Created by you.",
+  },
+};
+
+function provenanceOf(m: DetectedMoment): MomentProvenance {
+  if (m.provenance) return m.provenance;
+  if (m.source === "user") return "user";
+  return "ai";
+}
 
 const EFFECTS: { id: EffectType; label: string; Icon: typeof Sparkles }[] = [
   { id: "zoom", label: "Zoom", Icon: Zap },
@@ -72,15 +114,7 @@ export function MomentInspector() {
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.18em] text-fog">
               Inspector
-              {moment.source === "user" ? (
-                <span className="rounded bg-cyan-400/15 px-1.5 py-0.5 text-[9px] font-semibold text-cyan-200">
-                  Yours
-                </span>
-              ) : (
-                <span className="rounded bg-violet-500/15 px-1.5 py-0.5 text-[9px] font-semibold text-violet-200">
-                  AI
-                </span>
-              )}
+              <ProvenanceChip moment={moment} />
             </div>
             <input
               value={moment.label}
@@ -199,16 +233,14 @@ export function MomentInspector() {
         </CollapsibleGroup>
 
         <CollapsibleGroup
-          icon={<Type size={14} />}
-          title="Captions"
-          subtitle={moment.caption ? "On for this moment" : "Off"}
+          icon={<Sparkles size={14} className="text-emerald-300" />}
+          title="Source"
+          subtitle={`${PROVENANCE_PRESENTATION[provenanceOf(moment)].label} · confidence ${(
+            (moment.confidenceScore ?? moment.attentionScore ?? 0.5) * 100
+          ).toFixed(0)}`}
+          defaultOpen
         >
-          <Toggle
-            label="Show caption"
-            description="Display the AI-suggested caption during this moment."
-            checked={Boolean(moment.caption)}
-            onChange={(v) => updateMoment(moment.id, { caption: v })}
-          />
+          <SourceSection moment={moment} />
         </CollapsibleGroup>
 
         {moment.reason && (
@@ -231,6 +263,62 @@ export function MomentInspector() {
         >
           Clear selection
         </button>
+      </div>
+    </div>
+  );
+}
+
+function ProvenanceChip({ moment }: { moment: DetectedMoment }) {
+  const p = provenanceOf(moment);
+  const pres = PROVENANCE_PRESENTATION[p];
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[9px] font-semibold",
+        pres.chip
+      )}
+      title={pres.text}
+    >
+      <span className={cn("inline-block size-1.5 rounded-full", pres.dot)} />
+      {pres.label}
+    </span>
+  );
+}
+
+function SourceSection({ moment }: { moment: DetectedMoment }) {
+  const p = provenanceOf(moment);
+  const pres = PROVENANCE_PRESENTATION[p];
+  const conf = moment.confidenceScore ?? moment.attentionScore ?? 0.5;
+  return (
+    <div className="space-y-3">
+      <div className="rounded-xl border border-white/10 bg-white/[0.02] px-3.5 py-3">
+        <div className="flex items-center gap-2">
+          <span className={cn("inline-block size-2.5 rounded-full", pres.dot)} />
+          <span className="text-[12px] font-semibold text-white">{pres.label}</span>
+          <span className="ml-auto font-mono text-[10px] tabular-nums text-fog">
+            {(conf * 100).toFixed(0)} / 100
+          </span>
+        </div>
+        {/* Confidence bar */}
+        <div className="mt-2 h-1 w-full overflow-hidden rounded-full bg-white/5">
+          <div
+            className={cn("h-full rounded-full", pres.dot)}
+            style={{ width: `${Math.round(conf * 100)}%` }}
+          />
+        </div>
+        <p className="mt-2 text-[12px] leading-relaxed text-fog">
+          {moment.confidenceReason || pres.text}
+        </p>
+        {moment.confidenceSource && (
+          <p className="mt-1 font-mono text-[10px] uppercase tracking-wider text-white/40">
+            {moment.confidenceSource}
+          </p>
+        )}
+        {moment.eventIds && moment.eventIds.length > 0 && (
+          <p className="mt-1 font-mono text-[10px] tabular-nums text-white/40">
+            {moment.eventIds.length} event{moment.eventIds.length === 1 ? "" : "s"}
+          </p>
+        )}
       </div>
     </div>
   );

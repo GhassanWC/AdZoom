@@ -38,6 +38,15 @@ interface EditorRealContextValue {
   setDuration: (d: number) => void;
   selectedMomentId: string | null;
   setSelectedMomentId: (id: string | null) => void;
+  /** Extra moments selected via shift/ctrl/cmd-click for bulk operations. */
+  multiSelectIds: string[];
+  toggleMultiSelect: (id: string) => void;
+  clearMultiSelect: () => void;
+  deleteMultiSelected: () => Promise<void>;
+  /** Modal "moment editor" — opens on add or via the pill's Edit button. */
+  inspectorOpen: boolean;
+  openInspector: () => void;
+  closeInspector: () => void;
   previewMode: boolean;
   setPreviewMode: (v: boolean) => void;
   /** Developer overlay: CV signal curves, scene markers, centroid path. */
@@ -77,6 +86,28 @@ interface EditorRealContextValue {
 
 const Ctx = React.createContext<EditorRealContextValue | null>(null);
 
+/**
+ * Firestore rejects writes that contain `undefined` *values* anywhere in
+ * the document. Spreading existing moments (or any doc previously read from
+ * Firestore) preserves their explicit-`undefined` optional fields, which is
+ * how a copy/duplicate write blows up with "Unsupported field value:
+ * undefined". This recursively scrubs them.
+ */
+function stripUndefined<T>(value: T): T {
+  if (Array.isArray(value)) {
+    return value.map((v) => stripUndefined(v)) as unknown as T;
+  }
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (v === undefined) continue;
+      out[k] = stripUndefined(v);
+    }
+    return out as T;
+  }
+  return value;
+}
+
 const DEFAULT_EFFECT_LABEL: Record<EffectType, string> = {
   zoom: "Zoom",
   "click-highlight": "Click emphasis",
@@ -100,6 +131,10 @@ export function EditorRealProvider({
   const [playing, setPlaying] = React.useState(false);
   const [duration, setDuration] = React.useState(project.duration ?? 0);
   const [selectedMomentId, setSelectedMomentId] = React.useState<string | null>(null);
+  const [multiSelectIds, setMultiSelectIds] = React.useState<string[]>([]);
+  const [inspectorOpen, setInspectorOpen] = React.useState(false);
+  const openInspector = React.useCallback(() => setInspectorOpen(true), []);
+  const closeInspector = React.useCallback(() => setInspectorOpen(false), []);
   const [previewMode, setPreviewMode] = React.useState(true);
   const [cvDebug, setCvDebug] = React.useState(false);
   const [analyzing, setAnalyzing] = React.useState(false);
@@ -169,9 +204,36 @@ export function EditorRealProvider({
         { merge: true }
       );
       if (selectedMomentId === id) setSelectedMomentId(null);
+      setMultiSelectIds((ids) => ids.filter((x) => x !== id));
     },
     [project.analysis, projectRef, selectedMomentId]
   );
+
+  const toggleMultiSelect = React.useCallback((id: string) => {
+    setMultiSelectIds((ids) =>
+      ids.includes(id) ? ids.filter((x) => x !== id) : [...ids, id]
+    );
+  }, []);
+
+  const clearMultiSelect = React.useCallback(() => setMultiSelectIds([]), []);
+
+  const deleteMultiSelected: EditorRealContextValue["deleteMultiSelected"] =
+    React.useCallback(async () => {
+      if (multiSelectIds.length === 0) return;
+      const kill = new Set(multiSelectIds);
+      const moments = project.analysis?.detectedMoments ?? [];
+      const next = moments.filter((m) => !kill.has(m.id));
+      await setDoc(
+        projectRef,
+        {
+          analysis: { ...(project.analysis ?? {}), detectedMoments: next },
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+      if (selectedMomentId && kill.has(selectedMomentId)) setSelectedMomentId(null);
+      setMultiSelectIds([]);
+    }, [multiSelectIds, project.analysis, projectRef, selectedMomentId]);
 
   const addMoment: EditorRealContextValue["addMoment"] = React.useCallback(
     async (m) => {
@@ -206,7 +268,7 @@ export function EditorRealProvider({
         const dur = Math.max(0.4, src.endTime - src.startTime);
         const maxEnd = duration || src.endTime + dur;
         const start = Math.min(src.endTime + 0.2, Math.max(0, maxEnd - dur));
-        const copy: DetectedMoment = {
+        const copy: DetectedMoment = stripUndefined({
           ...src,
           id: newMomentId(),
           startTime: start,
@@ -214,13 +276,20 @@ export function EditorRealProvider({
           label: `${src.label} copy`,
           source: "user",
           edited: true,
-          keyframes: src.keyframes ? src.keyframes.map((k) => ({ ...k })) : undefined,
-        };
+          // Conditional spread keeps `keyframes` off the object entirely when
+          // the source has none — Firestore rejects literal `undefined`.
+          ...(src.keyframes && src.keyframes.length > 0
+            ? { keyframes: src.keyframes.map((k) => ({ ...k })) }
+            : {}),
+        });
         const next = [...moments, copy].sort((a, b) => a.startTime - b.startTime);
         await setDoc(
           projectRef,
           {
-            analysis: { ...(project.analysis ?? {}), detectedMoments: next },
+            analysis: stripUndefined({
+              ...(project.analysis ?? {}),
+              detectedMoments: next,
+            }),
             updatedAt: serverTimestamp(),
           },
           { merge: true }
@@ -260,6 +329,7 @@ export function EditorRealProvider({
           { merge: true }
         );
         setSelectedMomentId(m.id);
+        setInspectorOpen(true);
       },
       [project.analysis, project.duration, projectRef, currentTime, duration, newMomentId]
     );
@@ -517,20 +587,34 @@ export function EditorRealProvider({
   }, [idTokenGetter, project.id, project.duration, projectRef, videoRef]);
 
   /**
-   * "Cancel" sets a flag in Firestore. The server route polls it between
-   * stages and during the Gemini-files ACTIVE wait, and terminates the run.
+   * "Cancel" both flags the server route AND optimistically writes the
+   * cancelled terminal state. The flag lets a live server shut down gracefully
+   * between stages (its next `markCancelled` write is idempotent with what we
+   * write here). The status write also unsticks runs whose server function
+   * already terminated — e.g. after a serverless timeout or page reload — in
+   * which case nothing would be polling the flag.
+   *
    * The Gemini generateContent call itself can't be aborted mid-flight — but
-   * once it returns, the server discards the result and marks the project
-   * cancelled.
+   * once it returns, the server discards the result.
    */
   const cancelAnalyze: EditorRealContextValue["cancelAnalyze"] = React.useCallback(async () => {
-    // Abort the client-side CV pass (if running) …
+    // Abort the client-side CV pass (if running).
     cvAbortRef.current?.abort();
-    // … and flag the server route, which polls this between stages.
+    // Reset local processing state immediately so the overlay isn't held open
+    // by stale React state if it was minimized.
+    setAnalyzing(false);
+    setCvProgress(null);
+    setProcessingMinimized(false);
     await setDoc(
       projectRef,
       {
-        analysis: { cancelRequested: true },
+        status: "cancelled",
+        analysis: {
+          status: "cancelled",
+          stage: "Cancelled",
+          cancelRequested: true,
+          completedAt: Date.now(),
+        },
         updatedAt: serverTimestamp(),
       },
       { merge: true }
@@ -553,6 +637,13 @@ export function EditorRealProvider({
     setDuration,
     selectedMomentId,
     setSelectedMomentId,
+    multiSelectIds,
+    toggleMultiSelect,
+    clearMultiSelect,
+    deleteMultiSelected,
+    inspectorOpen,
+    openInspector,
+    closeInspector,
     previewMode,
     setPreviewMode,
     cvDebug,
@@ -592,7 +683,6 @@ export function emptyAnalysis(): Analysis {
   return {
     status: "idle",
     detectedMoments: [],
-    suggestedCaptions: [],
     boringSections: [],
   };
 }

@@ -3,6 +3,7 @@
 import {
   addDoc,
   collection,
+  getDoc,
   serverTimestamp,
   setDoc,
   doc,
@@ -15,8 +16,8 @@ import type {
   DetectedMoment,
   EffectsSettings,
   ExportFormat,
-  SuggestedCaption,
 } from "@/lib/firebase/schema";
+import { normalizePlan, planMeetsMinimum } from "@/lib/usage/plan";
 
 const PREFERRED_MIMES = [
   "video/mp4;codecs=avc1.42E01E",
@@ -56,7 +57,6 @@ interface RenderInput {
   video: HTMLVideoElement;
   duration: number;
   moments: DetectedMoment[];
-  captions: SuggestedCaption[];
   effects: EffectsSettings;
   resolution: "1080p" | "4K";
   fps: 30 | 60;
@@ -81,7 +81,6 @@ export async function renderProjectClientSide(
   const {
     video,
     moments,
-    captions,
     effects,
     resolution,
     fps,
@@ -103,29 +102,36 @@ export async function renderProjectClientSide(
 
   onProgress({ stage: "preparing", pct: 0 });
 
-  // Canvas size — keep aspect ratio of source if possible
-  const sourceW = video.videoWidth || 1280;
-  const sourceH = video.videoHeight || 720;
-  const aspect = sourceW / sourceH;
+  // Source video dims — used by drawCover. Default to 16:9 if not yet known.
+  const sourceW = video.videoWidth || 1920;
+  const sourceH = video.videoHeight || 1080;
 
-  let canvasW = resolution === "4K" ? 1920 : 1280;
-  let canvasH = Math.round(canvasW / aspect);
-
-  // Vertical reframe
-  if (format === "TikTok 9:16" || effects.verticalExport) {
-    canvasW = resolution === "4K" ? 1080 : 720;
-    canvasH = Math.round((canvasW / 9) * 16);
+  // Fixed output size — independent of source dimensions. The export must
+  // be a clean container aspect (16:9 horizontal or 9:16 vertical) so the
+  // file plays predictably in every player. Source aspect mismatch is
+  // handled by `drawCover` (object-fit: cover semantics, center-cropped).
+  const vertical = format === "TikTok 9:16" || effects.verticalExport;
+  let canvasW: number;
+  let canvasH: number;
+  if (vertical) {
+    canvasW = resolution === "4K" ? 2160 : 1080;
+    canvasH = resolution === "4K" ? 3840 : 1920;
+  } else {
+    canvasW = resolution === "4K" ? 3840 : 1920;
+    canvasH = resolution === "4K" ? 2160 : 1080;
   }
-
-  // Avoid odd sizes some encoders dislike
-  if (canvasW % 2) canvasW++;
-  if (canvasH % 2) canvasH++;
 
   const canvas = document.createElement("canvas");
   canvas.width = canvasW;
   canvas.height = canvasH;
-  const ctx = canvas.getContext("2d");
+  const ctx = canvas.getContext("2d", { alpha: false });
   if (!ctx) throw new Error("Could not get 2D context");
+
+  // Pre-fill black BEFORE the canvas is captured so MediaRecorder never
+  // sees uninitialised GPU pixels (which often encode as green/magenta on
+  // H.264 — that was the "green bar" in the broken export).
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, canvasW, canvasH);
 
   // Stream from canvas + audio from video element if possible
   const canvasStream = canvas.captureStream(fps);
@@ -174,6 +180,30 @@ export async function renderProjectClientSide(
     video.addEventListener("seeked", onSeek);
   });
 
+  // Paint the t=0 frame BEFORE the recorder picks up its first chunk so the
+  // start of the export isn't a green/black flash. Also re-fills black under
+  // the video in case the canvas got reset by the captureStream pipeline.
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, canvasW, canvasH);
+  const startMoment = moments.find(
+    (m) => video.currentTime >= m.startTime && video.currentTime <= m.endTime
+  );
+  const startCam = startMoment
+    ? computeTransform(
+        startMoment,
+        effects.autoZoom / 100,
+        canvasW,
+        canvasH,
+        video.currentTime
+      )
+    : { tx: 0, ty: 0, scale: 1 };
+  ctx.save();
+  ctx.translate(canvasW / 2, canvasH / 2);
+  ctx.scale(startCam.scale, startCam.scale);
+  ctx.translate(startCam.tx, startCam.ty);
+  drawCover(ctx, video, sourceW, sourceH, canvasW, canvasH);
+  ctx.restore();
+
   recorder.start(500);
 
   onProgress({ stage: "rendering", pct: 0 });
@@ -203,29 +233,22 @@ export async function renderProjectClientSide(
     const t = video.currentTime;
 
     const moment = moments.find((m) => t >= m.startTime && t <= m.endTime);
-    const cap = captions.find((c) => t >= c.startTime && t <= c.startTime + 3);
 
-    if (moment) {
-      const { tx, ty, scale } = computeTransform(
-        moment,
-        effects.autoZoom / 100,
-        canvasW,
-        canvasH,
-        t
-      );
-      ctx.save();
-      ctx.translate(canvasW / 2, canvasH / 2);
-      ctx.scale(scale, scale);
-      ctx.translate(tx, ty);
-      drawCover(ctx, video, sourceW, sourceH, canvasW, canvasH);
-      ctx.restore();
-    } else {
-      drawCover(ctx, video, sourceW, sourceH, canvasW, canvasH);
-    }
+    // Identity camera when no moment is active. Critical: the no-moment
+    // branch must use the SAME transform chain as the moment branch so
+    // `drawCover` is consistently centered. The previous code skipped the
+    // translate and the video drew at (-drawW/2, -drawH/2) in raw canvas
+    // coords — i.e. pushed into the top-left, exactly the bug reported.
+    const cam = moment
+      ? computeTransform(moment, effects.autoZoom / 100, canvasW, canvasH, t)
+      : { tx: 0, ty: 0, scale: 1 };
 
-    if (moment?.caption !== false && cap) {
-      drawCaption(ctx, cap.text, canvasW, canvasH);
-    }
+    ctx.save();
+    ctx.translate(canvasW / 2, canvasH / 2);
+    ctx.scale(cam.scale, cam.scale);
+    ctx.translate(cam.tx, cam.ty);
+    drawCover(ctx, video, sourceW, sourceH, canvasW, canvasH);
+    ctx.restore();
 
     // progress
     if (input.duration > 0) {
@@ -318,43 +341,6 @@ function drawCover(
   ctx.drawImage(video, dx, dy, drawW, drawH);
 }
 
-function drawCaption(ctx: CanvasRenderingContext2D, text: string, w: number, h: number) {
-  ctx.save();
-  ctx.font = `600 ${Math.round(w / 28)}px Inter, system-ui, sans-serif`;
-  ctx.textAlign = "center";
-  ctx.textBaseline = "alphabetic";
-  const padX = Math.round(w / 40);
-  const padY = Math.round(w / 80);
-  const m = ctx.measureText(text);
-  const tw = m.width + padX * 2;
-  const th = Math.round(w / 24);
-  const x = w / 2 - tw / 2;
-  const y = h - h * 0.13;
-  ctx.fillStyle = "rgba(0,0,0,0.65)";
-  roundRect(ctx, x, y - th + padY, tw, th, 8);
-  ctx.fill();
-  ctx.fillStyle = "#fff";
-  ctx.fillText(text, w / 2, y);
-  ctx.restore();
-}
-
-function roundRect(
-  ctx: CanvasRenderingContext2D,
-  x: number,
-  y: number,
-  w: number,
-  h: number,
-  r: number
-) {
-  ctx.beginPath();
-  ctx.moveTo(x + r, y);
-  ctx.arcTo(x + w, y, x + w, y + h, r);
-  ctx.arcTo(x + w, y + h, x, y + h, r);
-  ctx.arcTo(x, y + h, x, y, r);
-  ctx.arcTo(x, y, x + w, y, r);
-  ctx.closePath();
-}
-
 export async function uploadExport({
   uid,
   projectId,
@@ -375,6 +361,20 @@ export async function uploadExport({
   ext: string;
 }): Promise<{ exportId: string; downloadURL: string }> {
   const { db, storage } = getFirebase();
+
+  // Defensive plan check — 4K exports are Pro-only. The UI already hides
+  // the 4K segment for non-Pro users, but a hand-crafted resolution prop
+  // (or a mid-session downgrade) would slip past. The authoritative
+  // enforcement lives in Firestore Security Rules + Storage Rules; this is
+  // a friendlier client-side guard so the user sees a clear message rather
+  // than a rules denied error.
+  if (resolution === "4K") {
+    const userSnap = await getDoc(doc(db, "users", uid));
+    const plan = normalizePlan((userSnap.data() as { plan?: unknown } | undefined)?.plan);
+    if (!planMeetsMinimum(plan, "pro")) {
+      throw new Error("4K exports require a Pro plan — upgrade in /pricing.");
+    }
+  }
 
   const exportsCol = collection(db, "users", uid, "exports");
   const exportDoc = await addDoc(exportsCol, {

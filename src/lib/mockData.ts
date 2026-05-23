@@ -74,13 +74,13 @@ export const presets: Preset[] = [
   { id: "p1", name: "MrBeast", vibe: "mrbeast", description: "High-contrast, oversized text, punchy cuts.", category: "creator", isInDashboard: true },
   { id: "p2", name: "Cinematic", vibe: "cinematic", description: "Letterboxed, warm grade, slow zooms.", category: "creator", isInDashboard: true },
   { id: "p3", name: "Tutorial", vibe: "tutorial", description: "Annotated callouts and steady cursor focus.", category: "tutorial", isInDashboard: true },
-  { id: "p4", name: "TikTok", vibe: "tiktok", description: "9:16 vertical with caption-safe framing.", category: "creator", isInDashboard: true },
+  { id: "p4", name: "TikTok", vibe: "tiktok", description: "9:16 vertical with hook-first framing.", category: "creator", isInDashboard: true },
   { id: "p5", name: "Coding", vibe: "coding", description: "Editor-aware zoom on code blocks.", category: "tutorial", isInDashboard: true },
   { id: "p6", name: "Product Demo", vibe: "product", description: "Clean SaaS UI, soft cursor glow.", category: "product", isInDashboard: false },
   { id: "p7", name: "SaaS Pitch", vibe: "saas", description: "Polished for investor decks.", category: "product", isInDashboard: false },
   { id: "p8", name: "YouTube Long", vibe: "youtube", description: "Long-form pacing, 16:9 zoom rhythm.", category: "creator", isInDashboard: false },
   { id: "p9", name: "Vlog Style", vibe: "vlog", description: "Loose pacing, generous cursor smoothing.", category: "creator", isInDashboard: false },
-  { id: "p10", name: "Podcast Clip", vibe: "podcast", description: "Caption-first, minimal motion.", category: "creator", isInDashboard: false },
+  { id: "p10", name: "Podcast Clip", vibe: "podcast", description: "Minimal motion, calm pacing.", category: "creator", isInDashboard: false },
   { id: "p11", name: "Live Demo", vibe: "demo", description: "Real-time pacing for live calls.", category: "product", isInDashboard: false },
   { id: "p12", name: "Shorts", vibe: "shorts", description: "Hook-first, sub-60s pacing.", category: "creator", isInDashboard: false },
 ];
@@ -210,6 +210,7 @@ export const navLinks = [
 
 export const sidebarItems = [
   { label: "Dashboard", href: "/dashboard", icon: "LayoutDashboard" as const },
+  { label: "Record", href: "/dashboard/record", icon: "Video" as const },
   { label: "Projects", href: "/dashboard/projects", icon: "Folder" as const },
   { label: "Upload", href: "/dashboard/upload", icon: "Upload" as const },
   { label: "Presets", href: "/dashboard/presets", icon: "Wand2" as const },

@@ -1,13 +1,13 @@
 "use client";
 
 import * as React from "react";
-import { motion, AnimatePresence } from "framer-motion";
 import {
   Play,
   Pause,
   Volume2,
   VolumeX,
   Maximize2,
+  Minimize2,
   Sparkles,
   Eye,
   EyeOff,
@@ -152,6 +152,18 @@ export function RealVideoPlayer() {
   const transformWrapRef = React.useRef<HTMLDivElement | null>(null);
   const [muted, setMuted] = React.useState(false);
   const [volume, setVolume] = React.useState(1);
+  const [isFullscreen, setIsFullscreen] = React.useState(false);
+
+  // Track fullscreen state so we can swap the layout from "aspect-locked
+  // card centered in the page" to "fill the viewport, letterboxed by the
+  // video itself via object-contain".
+  React.useEffect(() => {
+    const onChange = () => {
+      setIsFullscreen(document.fullscreenElement === containerRef.current);
+    };
+    document.addEventListener("fullscreenchange", onChange);
+    return () => document.removeEventListener("fullscreenchange", onChange);
+  }, []);
 
   // Wire video element events
   React.useEffect(() => {
@@ -232,14 +244,29 @@ export function RealVideoPlayer() {
   const va = project.visualAnalysis;
 
   return (
-    <div ref={containerRef} className="relative">
+    <div
+      ref={containerRef}
+      className={cn(
+        "relative",
+        // In native fullscreen the container becomes the viewport, so let it
+        // fill it and let the inner card stretch to match. The video element
+        // already uses `object-contain`, so any letterboxing happens cleanly
+        // inside the frame instead of as page chrome around it.
+        isFullscreen && "h-screen w-screen bg-black"
+      )}
+    >
       <div
         ref={aspectRef}
         className={cn(
-          "relative w-full overflow-hidden rounded-xl border border-white/[0.06] bg-black shadow-cinematic",
-          verticalPreview
-            ? "mx-auto aspect-[9/16] max-h-[72vh]"
-            : "mx-auto aspect-video max-h-[56vh] max-w-[100vh]"
+          "relative overflow-hidden bg-black shadow-cinematic",
+          isFullscreen
+            ? "h-full w-full rounded-none border-0"
+            : cn(
+                "w-full rounded-xl border border-white/[0.06]",
+                verticalPreview
+                  ? "mx-auto aspect-[9/16] max-h-[72vh]"
+                  : "mx-auto aspect-video max-h-[56vh] max-w-[100vh]"
+              )
         )}
       >
         {/* The real <video>. The cinematic camera writes `transform` directly
@@ -255,9 +282,7 @@ export function RealVideoPlayer() {
             playsInline
             crossOrigin="anonymous"
             preload="metadata"
-          >
-            <track kind="captions" />
-          </video>
+          />
           {!project.originalVideoUrl && (
             <div className="pointer-events-none absolute inset-0 grid place-items-center text-sm text-fog">
               No video loaded.
@@ -274,20 +299,14 @@ export function RealVideoPlayer() {
           )}
         </div>
 
-        {/* Overlays — click highlights + captions */}
+        {/* Overlays — click highlights */}
         {activeMoment && (
           <OverlayLayer
             moment={activeMoment}
             currentTime={currentTime}
-            captionStyle={project.effectsSettings.captionStyle}
             clickHighlightStyle={project.effectsSettings.clickHighlightStyle}
             clickHighlightSize={project.effectsSettings.clickHighlightSize}
             clickHighlightsEnabled={project.effectsSettings.clickHighlights}
-            caption={
-              project.effectsSettings.captionStyle === "none"
-                ? null
-                : findCaptionAt(project.analysis?.suggestedCaptions ?? [], currentTime)
-            }
           />
         )}
 
@@ -404,29 +423,17 @@ export function RealVideoPlayer() {
             </span>
             <button
               onClick={requestFullscreen}
-              aria-label="Fullscreen"
+              aria-label={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
+              title={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
               className="text-fog transition-colors duration-200 hover:text-white"
             >
-              <Maximize2 size={14} />
+              {isFullscreen ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
             </button>
           </div>
         </div>
       </div>
     </div>
   );
-}
-
-function findCaptionAt(
-  captions: { startTime: number; text: string }[],
-  t: number
-): string | null {
-  let best: { startTime: number; text: string } | null = null;
-  for (const c of captions) {
-    if (t >= c.startTime && t <= c.startTime + 3) {
-      if (!best || c.startTime > best.startTime) best = c;
-    }
-  }
-  return best?.text ?? null;
 }
 
 type FocusHandle =
@@ -662,70 +669,31 @@ function CentroidPath({
 function OverlayLayer({
   moment,
   currentTime,
-  caption,
-  captionStyle,
   clickHighlightStyle,
   clickHighlightSize,
   clickHighlightsEnabled,
 }: {
   moment: DetectedMoment;
   currentTime: number;
-  caption: string | null;
-  captionStyle: "none" | "minimal" | "bold-pop" | "tutorial-tooltip" | "subtitle";
   clickHighlightStyle: "ring" | "pulse" | "burst";
   clickHighlightSize: number;
   clickHighlightsEnabled: boolean;
 }) {
-  return (
-    <>
-      {clickHighlightsEnabled && moment.effectType === "click-highlight" && (
-        <ClickHighlight
-          x={moment.focusRegion.x + moment.focusRegion.width / 2}
-          y={moment.focusRegion.y + moment.focusRegion.height / 2}
-          progress={
-            (currentTime - moment.startTime) /
-            Math.max(0.1, moment.endTime - moment.startTime)
-          }
-          style={clickHighlightStyle}
-          sizePct={clickHighlightSize}
-        />
-      )}
-
-      <AnimatePresence>
-        {caption && captionStyle !== "none" && (
-          <motion.div
-            key={`${caption}-${captionStyle}`}
-            initial={{ opacity: 0, y: 6 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -6 }}
-            transition={{ duration: 0.3 }}
-            className={cn(
-              "pointer-events-none absolute z-30 flex px-6",
-              captionStyle === "tutorial-tooltip"
-                ? "left-1/2 top-1/3 -translate-x-1/2"
-                : "inset-x-0 bottom-20 justify-center"
-            )}
-          >
-            <span className={captionClass(captionStyle)}>{caption}</span>
-          </motion.div>
-        )}
-      </AnimatePresence>
-    </>
-  );
-}
-
-function captionClass(style: string): string {
-  switch (style) {
-    case "bold-pop":
-      return "rounded-md bg-white px-3 py-1.5 text-base font-extrabold uppercase tracking-tight text-black shadow-cinematic";
-    case "tutorial-tooltip":
-      return "rounded-lg border border-violet-400/40 bg-violet-500/90 px-3 py-1.5 text-[13px] font-semibold text-white shadow-violet-glow";
-    case "subtitle":
-      return "rounded bg-black/85 px-2 py-1 text-[13px] font-medium text-white";
-    case "minimal":
-    default:
-      return "rounded-lg bg-black/70 px-3 py-1.5 text-[13px] font-semibold text-white shadow-cinematic backdrop-blur-md";
+  if (!clickHighlightsEnabled || moment.effectType !== "click-highlight") {
+    return null;
   }
+  return (
+    <ClickHighlight
+      x={moment.focusRegion.x + moment.focusRegion.width / 2}
+      y={moment.focusRegion.y + moment.focusRegion.height / 2}
+      progress={
+        (currentTime - moment.startTime) /
+        Math.max(0.1, moment.endTime - moment.startTime)
+      }
+      style={clickHighlightStyle}
+      sizePct={clickHighlightSize}
+    />
+  );
 }
 
 function ClickHighlight({

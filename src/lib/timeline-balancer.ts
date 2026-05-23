@@ -19,15 +19,21 @@
  */
 
 import type {
+  BoringSection,
+  ConfidenceSource,
   DetectedMoment,
   EffectType,
+  MomentProvenance,
   Pacing,
+  RejectedCandidateRef,
   UIContext,
   VideoType,
   VisualAnalysis,
 } from "./firebase/schema";
+import { AI_MOMENT_QUOTA, PROVENANCE_RANK } from "./firebase/schema";
 import { sampleCvForMoment, fuseAttention, nearestClickEvent } from "./cv/fusion";
 import { cvCandidateMoments } from "./cv/peaks";
+import type { Interaction } from "./recording/types";
 
 export interface PacingProfile {
   /** Target moments per minute. */
@@ -81,6 +87,11 @@ const VIDEO_TYPE_BIAS: Record<VideoType, { rateMult: number; spacingMult: number
 };
 
 export interface BalancerInput {
+  /**
+   * Raw moment proposals from Gemini. In the hybrid pipeline these are treated
+   * as `provenance: "ai"` unless already tagged otherwise. Kept named `raw`
+   * for backward compatibility with the analyze route.
+   */
   raw: DetectedMoment[];
   duration: number;
   pacing: Pacing;
@@ -92,6 +103,13 @@ export interface BalancerInput {
    */
   preserved?: DetectedMoment[];
   /**
+   * Moment candidates derived from real interaction events (clicks, typing,
+   * scroll-pauses, etc.). These get `provenance: "event"` and rank above all
+   * other sources. AI can only override an event candidate when the event's
+   * own confidence is below 0.25.
+   */
+  eventMoments?: DetectedMoment[];
+  /**
    * Client-side CV pass output. When present, every raw moment's attention
    * score and `attentionFactors` are fused with measured frame signals before
    * selection (see `fuseMomentsWithCv`).
@@ -102,10 +120,35 @@ export interface BalancerInput {
    * are added to the candidate pool. Gated so v1 can ship fusion-only.
    */
   useCvCandidates?: boolean;
+  /**
+   * Sections Gemini classified as quiet/boring. AI candidates that fall
+   * mostly inside one of these AND have no CV motion get rejected by the
+   * reject pass. Event candidates always survive — they're ground truth.
+   */
+  boringSections?: BoringSection[];
+  /**
+   * Raw interaction events from the recording. Used by the reject pass to
+   * detect long idle stretches and by the relaxed `ai-override` rule to
+   * confirm there isn't a real click near the overlap.
+   */
+  interactions?: Interaction[];
+  /**
+   * Treat `rejected: true` candidates in `raw` as advisory rather than
+   * hard-dropped — used by the rebalance endpoint under "dense" pacing.
+   */
+  unrejectRebalance?: boolean;
 }
 
 export interface BalancerResult {
   moments: DetectedMoment[];
+  /**
+   * Candidates the reject pass dropped from the active timeline. Mirrored
+   * (capped at 50) onto `analysis.rejectedPool` and individually tagged with
+   * `rejected: true` for storage in `rawMoments`. Each carries
+   * `rejectedReason`. Surfaced so the inspector / debug overlay can show
+   * what the AI considered and chose not to commit.
+   */
+  rejectedPool: DetectedMoment[];
   /** Diagnostics for the timeline UI to render coverage warnings. */
   stats: {
     inputCount: number;
@@ -128,11 +171,271 @@ export interface BalancerResult {
     clickRefinedCount: number;
     /** CV attention-curve peaks added to the candidate pool. */
     cvCandidatesAdded: number;
+    /** Provenance histogram of kept moments. */
+    provenanceCounts: Record<MomentProvenance, number>;
+    /** AI moments dropped to honor the 15% quota. */
+    quotaDropped: number;
+    /** Events that lost to a higher-confidence neighbor (collapsed overlaps). */
+    eventOverlapsResolved: number;
+    /** AI candidates rejected because they sat inside a boring section + low CV motion. */
+    aiRejectedBoring: number;
+    /** AI candidates rejected because they sat inside a ≥4s idle stretch. */
+    aiRejectedIdle: number;
+    /** AI candidates rejected because they had no meaningful target. */
+    aiRejectedNoTarget: number;
+    /** Moments whose startTime was shifted to just AFTER a scene-change. */
+    sceneChangeNudged: number;
+    /** Quartiles left empty after honouring rejection (no rescue performed). */
+    quartileLeftEmpty: number;
   };
 }
 
 const MIN_MOMENTS = 3;
 const MAX_MOMENTS = 24;
+const REJECTED_POOL_CAP = 50;
+const REJECTED_PER_MOMENT_CAP = 5;
+const BORING_OVERLAP_THRESHOLD = 0.5;
+const IDLE_MIN_SECONDS = 4;
+const NO_TARGET_MOTION_FLOOR = 0.05;
+const SCENE_CHANGE_NUDGE_WINDOW = 0.3;
+const SCENE_CHANGE_NUDGE_OFFSET = 0.12;
+
+/** Fraction of a moment's time window that overlaps a boring section. */
+function boringOverlapFraction(
+  m: { startTime: number; endTime: number },
+  boringSections: BoringSection[]
+): number {
+  if (!boringSections || boringSections.length === 0) return 0;
+  const len = Math.max(0.0001, m.endTime - m.startTime);
+  let inside = 0;
+  for (const b of boringSections) {
+    const start = Math.max(m.startTime, b.startTime);
+    const end = Math.min(m.endTime, b.endTime);
+    if (end > start) inside += end - start;
+  }
+  return inside / len;
+}
+
+/**
+ * True when the moment is wholly inside a ≥IDLE_MIN_SECONDS idle stretch.
+ * Mirrors `events.ts` suppression but applies to AI gap-fills which are
+ * generated by Gemini without idle awareness.
+ */
+function isInIdle(
+  m: { startTime: number; endTime: number },
+  interactions: Interaction[] | undefined
+): boolean {
+  if (!interactions || interactions.length === 0) return false;
+  for (const e of interactions) {
+    if (e.type !== "idle") continue;
+    if (e.tEnd - e.t < IDLE_MIN_SECONDS) continue;
+    if (m.startTime >= e.t && m.endTime <= e.tEnd) return true;
+  }
+  return false;
+}
+
+/** Mean dequantized motion (0..1) across the moment's window. */
+function motionAt(va: VisualAnalysis | undefined, t: number): number {
+  if (!va || va.sampleCount === 0 || va.sampleRate <= 0) return 0;
+  const idx = Math.max(0, Math.min(va.sampleCount - 1, Math.floor(t * va.sampleRate)));
+  return (va.motion[idx] ?? 0) / 255;
+}
+
+/** True when a real `click` / `dblclick` / `rightclick` is within ±windowSec of t. */
+function hasRealClickNear(
+  interactions: Interaction[] | undefined,
+  t: number,
+  windowSec: number
+): boolean {
+  if (!interactions || interactions.length === 0) return false;
+  for (const e of interactions) {
+    if (e.type !== "click" && e.type !== "dblclick" && e.type !== "rightclick") continue;
+    if (Math.abs(e.t - t) <= windowSec) return true;
+  }
+  return false;
+}
+
+/**
+ * If a moment's start lands inside `SCENE_CHANGE_NUDGE_WINDOW` of a detected
+ * scene change, shift it to `sceneChange.t + SCENE_CHANGE_NUDGE_OFFSET` so
+ * the camera doesn't jump mid-transition. Returns the (possibly modified)
+ * moment + a boolean indicating whether nudging occurred.
+ */
+function nudgeAfterSceneChange(
+  m: DetectedMoment,
+  va: VisualAnalysis | undefined,
+  duration: number
+): { moment: DetectedMoment; nudged: boolean } {
+  if (!va || !va.sceneChanges || va.sceneChanges.length === 0) {
+    return { moment: m, nudged: false };
+  }
+  const len = m.endTime - m.startTime;
+  for (const sc of va.sceneChanges) {
+    const delta = m.startTime - sc.t;
+    // Only nudge if the moment starts close to or just *before* the scene
+    // change — we never push a moment back in time.
+    if (delta < -SCENE_CHANGE_NUDGE_WINDOW || delta > SCENE_CHANGE_NUDGE_WINDOW) {
+      continue;
+    }
+    const newStart = Math.min(duration - len, sc.t + SCENE_CHANGE_NUDGE_OFFSET);
+    if (newStart > m.startTime + 0.01) {
+      const moved: DetectedMoment = {
+        ...m,
+        startTime: newStart,
+        endTime: Math.min(duration, newStart + len),
+        whySelected: appendWhy(
+          m.whySelected,
+          `nudged ${(newStart - m.startTime).toFixed(2)}s after scene change @${sc.t.toFixed(2)}s`
+        ),
+      };
+      return { moment: moved, nudged: true };
+    }
+  }
+  return { moment: m, nudged: false };
+}
+
+function appendWhy(prev: string | undefined, suffix: string): string {
+  return prev && prev.length > 0 ? `${prev} · ${suffix}` : suffix;
+}
+
+interface RejectContext {
+  boringSections: BoringSection[];
+  interactions: Interaction[] | undefined;
+  visualAnalysis: VisualAnalysis | undefined;
+  videoType: VideoType | undefined;
+  unrejectRebalance: boolean;
+}
+
+/**
+ * Drop AI / `ai-override` candidates that fall into one of three quiet
+ * categories. Event and user moments always survive — they're ground truth.
+ * Each dropped candidate gets `rejected: true` + `rejectedReason` so the
+ * route can persist it for the rebalance endpoint.
+ *
+ * Rejection rules:
+ *   • In a boring section by >BORING_OVERLAP_THRESHOLD AND `motionAt(t) < NO_TARGET_MOTION_FLOOR`
+ *     AND no scene change within ±2s.
+ *   • Wholly inside a ≥IDLE_MIN_SECONDS idle interaction stretch.
+ *   • `targetRegionSource === "default"` AND `motionAt(t) < NO_TARGET_MOTION_FLOOR` AND provenance ∈ {ai, cv}.
+ *
+ * Talking-tutorial / presentation video types skip the motion floor (those
+ * videos legitimately have low frame motion).
+ */
+function rejectAiCandidates(
+  candidates: DetectedMoment[],
+  ctx: RejectContext
+): {
+  survivors: DetectedMoment[];
+  rejected: DetectedMoment[];
+  stats: { aiRejectedBoring: number; aiRejectedIdle: number; aiRejectedNoTarget: number };
+} {
+  const survivors: DetectedMoment[] = [];
+  const rejected: DetectedMoment[] = [];
+  let aiRejectedBoring = 0;
+  let aiRejectedIdle = 0;
+  let aiRejectedNoTarget = 0;
+
+  const motionExempt =
+    ctx.videoType === "talking-tutorial" || ctx.videoType === "presentation";
+  const va = ctx.visualAnalysis;
+  const sceneChanges = va?.sceneChanges ?? [];
+  const hasSceneNear = (t: number) =>
+    sceneChanges.some((sc) => Math.abs(sc.t - t) < 2);
+
+  const recordReject = (m: DetectedMoment, reason: string) => {
+    rejected.push({ ...m, rejected: true, rejectedReason: reason });
+  };
+
+  for (const m of candidates) {
+    const prov = m.provenance ?? "ai";
+    // Events + user moments are never rejected by this pass.
+    if (prov === "event" || prov === "user") {
+      survivors.push(m);
+      continue;
+    }
+    const midT = (m.startTime + m.endTime) / 2;
+    const motion = motionAt(va, midT);
+
+    // 1) Boring section + low motion + no nearby scene change.
+    const boringOverlap = boringOverlapFraction(m, ctx.boringSections);
+    if (
+      boringOverlap > BORING_OVERLAP_THRESHOLD &&
+      (motionExempt || motion < NO_TARGET_MOTION_FLOOR) &&
+      !hasSceneNear(midT)
+    ) {
+      aiRejectedBoring++;
+      recordReject(
+        m,
+        `boring-section (${Math.round(boringOverlap * 100)}% overlap, motion ${motion.toFixed(2)})`
+      );
+      continue;
+    }
+
+    // 2) Long idle stretch.
+    if (isInIdle(m, ctx.interactions)) {
+      aiRejectedIdle++;
+      recordReject(m, "in-idle (≥4s idle stretch)");
+      continue;
+    }
+
+    // 3) No meaningful target — generic default focus region + no motion.
+    if (
+      !motionExempt &&
+      (m.targetRegionSource === "default" || !m.targetRegionSource) &&
+      motion < NO_TARGET_MOTION_FLOOR &&
+      (prov === "ai" || prov === "cv")
+    ) {
+      aiRejectedNoTarget++;
+      recordReject(
+        m,
+        `no-target (default region, motion ${motion.toFixed(2)})`
+      );
+      continue;
+    }
+
+    survivors.push(m);
+  }
+
+  return {
+    survivors,
+    rejected,
+    stats: { aiRejectedBoring, aiRejectedIdle, aiRejectedNoTarget },
+  };
+}
+
+/**
+ * Walk the kept set after greedy pick and attach each rejected candidate to
+ * its nearest temporal neighbour as a `rejectedCandidates` entry. Cap per
+ * survivor at REJECTED_PER_MOMENT_CAP so docs don't bloat.
+ */
+function attachRejections(
+  kept: DetectedMoment[],
+  rejected: DetectedMoment[]
+): void {
+  if (rejected.length === 0 || kept.length === 0) return;
+  for (const r of rejected) {
+    let nearest: DetectedMoment | null = null;
+    let bestDist = Infinity;
+    for (const k of kept) {
+      const d = Math.abs(((k.startTime + k.endTime) / 2) - ((r.startTime + r.endTime) / 2));
+      if (d < bestDist) {
+        bestDist = d;
+        nearest = k;
+      }
+    }
+    if (!nearest) continue;
+    const entry: RejectedCandidateRef = {
+      ts: r.startTime,
+      reason: r.rejectedReason ?? "rejected",
+      provenance: r.provenance ?? "ai",
+      effectType: r.effectType,
+    };
+    if (!nearest.rejectedCandidates) nearest.rejectedCandidates = [];
+    if (nearest.rejectedCandidates.length < REJECTED_PER_MOMENT_CAP) {
+      nearest.rejectedCandidates.push(entry);
+    }
+  }
+}
 
 /** ── 1. CONTEXTUAL EFFECT REWRITING ──────────────────────────────────────
  *
@@ -142,24 +445,28 @@ const MAX_MOMENTS = 24;
 function rewriteEffectByContext(m: DetectedMoment): {
   effectType: EffectType;
   rewritten: boolean;
+  reason: string | null;
 } {
   const ctx = m.uiContext;
-  if (!ctx) return { effectType: m.effectType, rewritten: false };
+  if (!ctx) return { effectType: m.effectType, rewritten: false, reason: null };
 
   const original = m.effectType;
   let next: EffectType = original;
+  let reason: string | null = null;
 
   switch (ctx) {
     case "code":
       // Code activity rarely deserves a hard zoom — prefer cursor-focus.
       if (original === "zoom" && (m.attentionScore ?? 0.5) < 0.75) {
         next = "cursor-focus";
+        reason = "code context → cursor-focus (zoom too aggressive on editor)";
       }
       break;
     case "scroll":
       // Scrolling never deserves zoom — speed-up if low attention, else cursor-focus.
       if (original === "zoom" || original === "click-highlight") {
         next = (m.attentionScore ?? 0.5) < 0.4 ? "speed-up" : "cursor-focus";
+        reason = `scroll context → ${next} (${original} doesn't fit a scrolling viewport)`;
       }
       break;
     case "modal":
@@ -168,23 +475,28 @@ function rewriteEffectByContext(m: DetectedMoment): {
       // Reveals should always be zooms (or click-highlight if already that).
       if (original === "cursor-focus" || original === "speed-up") {
         next = "zoom";
+        reason = `${ctx} reveal → zoom (cinematic emphasis on a state change)`;
       }
       break;
     case "form":
       // Form fields prefer gentle cursor-focus over hard zoom (unless reveal).
       if (original === "zoom" && (m.attentionScore ?? 0.5) < 0.6) {
         next = "cursor-focus";
+        reason = "form context → cursor-focus (gentle focus on input)";
       }
       break;
     case "navigation":
       // Navigation = scene change = zoom.
-      if (m.sceneChange && original !== "click-highlight") next = "zoom";
+      if (m.sceneChange && original !== "click-highlight") {
+        next = "zoom";
+        reason = "navigation + scene change → zoom (page transition reveal)";
+      }
       break;
     default:
       break;
   }
 
-  return { effectType: next, rewritten: next !== original };
+  return { effectType: next, rewritten: next !== original, reason };
 }
 
 /** ── 2. ADAPTIVE INTENSITY ──────────────────────────────────────────────
@@ -266,14 +578,31 @@ function rhythmPenalty(
 
   let penalty = 0;
   let sameTypeStreak = 0;
+  let sameContextStreak = 0;
   for (let i = lastFew.length - 1; i >= 0; i--) {
     if (lastFew[i].effectType === candidateEffect) sameTypeStreak++;
     else break;
+  }
+  // uiContext-aware streak — three cursor-focus moments all on the same
+  // context (e.g. `code`) is repetitive; spread across contexts it's fine.
+  if (candidate.uiContext) {
+    for (let i = lastFew.length - 1; i >= 0; i--) {
+      if (
+        lastFew[i].effectType === candidateEffect &&
+        lastFew[i].uiContext === candidate.uiContext
+      ) {
+        sameContextStreak++;
+      } else break;
+    }
   }
   // Two in a row of the same effect: small penalty. Three in a row: bigger.
   if (sameTypeStreak === 1) penalty += 0.08;
   if (sameTypeStreak === 2) penalty += 0.18;
   if (sameTypeStreak >= 3) penalty += 0.35;
+  // Extra penalty when the streak is also same-uiContext — three cursor-focus
+  // all on `code` is worse than three across `code`, `form`, `code`.
+  if (sameContextStreak >= 2) penalty += 0.1;
+  if (sameContextStreak >= 3) penalty += 0.15;
 
   const prev = kept[kept.length - 1];
   if (prev) {
@@ -367,6 +696,13 @@ function fuseMomentsWithCv(
           width: w,
           height: h,
         };
+        // Upgrade the targetRegionSource — the focus box is no longer a
+        // generic AI proposal but grounded in a measured motion hotspot.
+        next.targetRegionSource = "motion-centroid";
+        next.sourceSignals = [
+          ...(next.sourceSignals ?? []),
+          `cv-centroid@${cv.centroid.x.toFixed(2)},${cv.centroid.y.toFixed(2)}`,
+        ];
       }
     }
 
@@ -376,9 +712,233 @@ function fuseMomentsWithCv(
   return { moments, fusedCount: moments.length, clickRefinedCount };
 }
 
+/** Legacy floor — events with confidence below this can always be overridden. */
+const EVENT_OVERRIDE_THRESHOLD = 0.25;
+/**
+ * Confidence delta required for an AI candidate to beat a healthy event
+ * candidate. Combined with "no real click within ±1s" + "uiContext disagrees".
+ * Designed so override is rare but possible (e.g. AI sees a modal reveal at
+ * the same instant as a stray click on something unrelated).
+ */
+const EVENT_OVERRIDE_AI_DELTA = 0.15;
+const EVENT_OVERRIDE_CLICK_GUARD_S = 1.0;
+
+/** Effective provenance of a moment, defaulting to "ai" for un-tagged legacy moments. */
+function provenanceOf(m: DetectedMoment): MomentProvenance {
+  if (m.provenance) return m.provenance;
+  if (m.source === "user") return "user";
+  return "ai";
+}
+
+/** Confidence floor that aligns with provenance ranking. */
+function defaultConfidenceFor(p: MomentProvenance): number {
+  switch (p) {
+    case "user":
+      return 1.0;
+    case "event":
+      return 0.9;
+    case "cv":
+      return 0.6;
+    case "ai-override":
+      return 0.5;
+    case "ai":
+      return 0.45;
+  }
+}
+
+function defaultConfidenceSource(p: MomentProvenance, m: DetectedMoment): ConfidenceSource {
+  if (p === "event") {
+    if (m.confidenceSource) return m.confidenceSource;
+    return "real-click";
+  }
+  if (p === "cv") {
+    if (m.sceneChange) return "cv-scene-change";
+    return "cv-motion-peak";
+  }
+  if (p === "user") return "user-manual";
+  return "ai-gap-fill";
+}
+
+/**
+ * Ensure every moment has confidenceScore / Source / Reason. Idempotent —
+ * existing values are preserved.
+ */
+function ensureConfidence(m: DetectedMoment): DetectedMoment {
+  const p = provenanceOf(m);
+  if (
+    typeof m.confidenceScore === "number" &&
+    m.confidenceSource &&
+    m.confidenceReason
+  ) {
+    return m;
+  }
+  const score =
+    typeof m.confidenceScore === "number"
+      ? m.confidenceScore
+      : Math.max(defaultConfidenceFor(p), m.attentionScore ?? 0);
+  const source = m.confidenceSource ?? defaultConfidenceSource(p, m);
+  const reason =
+    m.confidenceReason ??
+    `${score.toFixed(2)} — ${
+      p === "event"
+        ? "real interaction event"
+        : p === "cv"
+        ? m.sceneChange
+          ? "CV scene change"
+          : "CV motion / signal peak"
+        : p === "user"
+        ? "user-created"
+        : "AI proposal"
+    }`;
+  return { ...m, provenance: p, confidenceScore: score, confidenceSource: source, confidenceReason: reason };
+}
+
+/**
+ * Collapse overlapping candidates by priority (EVENT > CV > AI > USER for
+ * conflicts; USER preserved separately so this never collides). Two candidates
+ * "overlap" when their time windows intersect AND their focusRegion centers
+ * are within EPS_FOCUS of each other.
+ *
+ * AI may only beat an event when the event's confidenceScore is below
+ * EVENT_OVERRIDE_THRESHOLD — the winner inherits `provenance: "ai-override"`
+ * so the override stays visible in the UI.
+ */
+function resolveOverlaps(
+  candidates: DetectedMoment[],
+  interactions: Interaction[] | undefined
+): { kept: DetectedMoment[]; eventOverlapsResolved: number } {
+  const EPS_FOCUS = 0.18;
+  const sorted = [...candidates].sort((a, b) => {
+    const ra = PROVENANCE_RANK[provenanceOf(a)];
+    const rb = PROVENANCE_RANK[provenanceOf(b)];
+    if (ra !== rb) return rb - ra;
+    return (b.confidenceScore ?? 0) - (a.confidenceScore ?? 0);
+  });
+  const kept: DetectedMoment[] = [];
+  let eventOverlapsResolved = 0;
+  for (const cand of sorted) {
+    const cCx = cand.focusRegion.x + cand.focusRegion.width / 2;
+    const cCy = cand.focusRegion.y + cand.focusRegion.height / 2;
+    let overlapsExisting: DetectedMoment | null = null;
+    for (const k of kept) {
+      const overlapsTime = !(k.endTime <= cand.startTime || k.startTime >= cand.endTime);
+      const kCx = k.focusRegion.x + k.focusRegion.width / 2;
+      const kCy = k.focusRegion.y + k.focusRegion.height / 2;
+      const closeFocus = Math.hypot(kCx - cCx, kCy - cCy) < EPS_FOCUS;
+      if (overlapsTime && closeFocus) {
+        overlapsExisting = k;
+        break;
+      }
+    }
+    if (!overlapsExisting) {
+      kept.push(cand);
+      continue;
+    }
+    // Resolve: cand's rank ≤ existing's by sort order. Special case AI override.
+    const existingProv = provenanceOf(overlapsExisting);
+    const candProv = provenanceOf(cand);
+    if (existingProv === "event" && candProv === "ai") {
+      const eventConf = overlapsExisting.confidenceScore ?? 1;
+      const aiConf = cand.confidenceScore ?? 0;
+      const midT = (cand.startTime + cand.endTime) / 2;
+      const noClickNear = !hasRealClickNear(
+        interactions,
+        midT,
+        EVENT_OVERRIDE_CLICK_GUARD_S
+      );
+      const contextDisagrees =
+        !!cand.uiContext &&
+        !!overlapsExisting.uiContext &&
+        cand.uiContext !== overlapsExisting.uiContext;
+
+      const legacyOverride = eventConf < EVENT_OVERRIDE_THRESHOLD;
+      const strongDelta =
+        aiConf > eventConf + EVENT_OVERRIDE_AI_DELTA &&
+        noClickNear &&
+        contextDisagrees;
+
+      if (legacyOverride || strongDelta) {
+        const idx = kept.indexOf(overlapsExisting);
+        const reason = legacyOverride
+          ? `override: weak event conf ${eventConf.toFixed(2)} < ${EVENT_OVERRIDE_THRESHOLD}`
+          : `override: AI conf ${aiConf.toFixed(2)} > event conf ${eventConf.toFixed(2)}, no click within ±${EVENT_OVERRIDE_CLICK_GUARD_S}s, context mismatch (${overlapsExisting.uiContext} → ${cand.uiContext})`;
+        kept[idx] = {
+          ...cand,
+          provenance: "ai-override",
+          whySelected: appendWhy(cand.whySelected, reason),
+        };
+        eventOverlapsResolved++;
+        continue;
+      }
+      eventOverlapsResolved++;
+    } else if (existingProv === "event") {
+      eventOverlapsResolved++;
+    }
+    // Otherwise drop the candidate.
+  }
+  return { kept, eventOverlapsResolved };
+}
+
+/**
+ * Enforce the AI moment quota — ≤ AI_MOMENT_QUOTA share of the final timeline.
+ * Drops lowest-confidence AI moments until the ratio is satisfied. Returns the
+ * pruned list and the count dropped.
+ */
+function enforceAiQuota(
+  moments: DetectedMoment[]
+): { kept: DetectedMoment[]; quotaDropped: number } {
+  if (moments.length === 0) return { kept: moments, quotaDropped: 0 };
+  // ai-override counts as AI for quota purposes.
+  let aiCount = 0;
+  for (const m of moments) {
+    const p = provenanceOf(m);
+    if (p === "ai" || p === "ai-override") aiCount++;
+  }
+  const allowed = Math.floor(moments.length * AI_MOMENT_QUOTA);
+  if (aiCount <= allowed) return { kept: moments, quotaDropped: 0 };
+  // Pick AI moments to drop, lowest confidence first.
+  const aiSorted = moments
+    .map((m, i) => ({ m, i, p: provenanceOf(m) }))
+    .filter((x) => x.p === "ai" || x.p === "ai-override")
+    .sort((a, b) => (a.m.confidenceScore ?? 0) - (b.m.confidenceScore ?? 0));
+  const dropIdxs = new Set<number>();
+  let toDrop = aiCount - allowed;
+  for (const x of aiSorted) {
+    if (toDrop <= 0) break;
+    dropIdxs.add(x.i);
+    toDrop--;
+  }
+  const kept = moments.filter((_, i) => !dropIdxs.has(i));
+  return { kept, quotaDropped: dropIdxs.size };
+}
+
+/**
+ * Runtime assertion that the quota holds after selection. Throws in dev,
+ * warns in prod (and emits to telemetry if available). Catches accidental
+ * future regressions.
+ */
+export function assertAiQuota(moments: DetectedMoment[]): void {
+  if (moments.length === 0) return;
+  let aiCount = 0;
+  for (const m of moments) {
+    const p = provenanceOf(m);
+    if (p === "ai" || p === "ai-override") aiCount++;
+  }
+  const ratio = aiCount / moments.length;
+  if (ratio > AI_MOMENT_QUOTA + 1e-6) {
+    const msg = `[balancer] AI moment quota breached — ${(ratio * 100).toFixed(1)}% AI (cap ${(
+      AI_MOMENT_QUOTA * 100
+    ).toFixed(0)}%)`;
+    if (process.env.NODE_ENV !== "production") {
+      throw new Error(msg);
+    }
+    console.warn(msg);
+  }
+}
+
 /** Main entry. See file header for the layering. */
 export function balanceTimeline(input: BalancerInput): BalancerResult {
-  const { raw, duration, pacing, videoType, visualAnalysis } = input;
+  const { duration, pacing, videoType, visualAnalysis } = input;
   const profile = PACING_PROFILES[pacing] ?? PACING_PROFILES.moderate;
   const bias = VIDEO_TYPE_BIAS[videoType ?? "mixed"];
 
@@ -388,19 +948,56 @@ export function balanceTimeline(input: BalancerInput): BalancerResult {
   const maxPerMin = profile.maxPerMin * Math.min(1.4, bias.rateMult);
   const zoomCooldown = profile.zoomCooldown * bias.spacingMult;
 
-  // ── 0. CV fusion + optional peak-rescue candidates ──────────────────────
+  const boringSections = input.boringSections ?? [];
+  const interactions = input.interactions;
+  const unrejectRebalance = !!input.unrejectRebalance;
+
+  // ── 0a. Build the unified candidate pool with provenance tagging. ────────
+  // Event moments are authoritative (rank EVENT > CV > AI). AI proposals
+  // ("raw") are tagged with provenance "ai" unless they already carry one
+  // (re-balance passes preserve previous tagging).
+  //
+  // When `raw` carries `rejected: true` candidates (preserved by the analyze
+  // route in `rawMoments` for rebalance compatibility), we drop them here by
+  // default; the rebalance endpoint sets `unrejectRebalance: true` under
+  // dense pacing to bring them back into consideration.
   let fusedCount = 0;
   let clickRefinedCount = 0;
   let cvCandidatesAdded = 0;
-  let effectiveRaw = raw;
+
+  const rawIn = unrejectRebalance
+    ? input.raw.map((m) => ({ ...m, rejected: false, rejectedReason: undefined }))
+    : input.raw.filter((m) => m.rejected !== true);
+
+  const taggedRaw: DetectedMoment[] = rawIn.map((m) =>
+    m.provenance
+      ? m
+      : { ...m, provenance: "ai" as MomentProvenance, source: m.source ?? "ai" }
+  );
+  const eventMoments = (input.eventMoments ?? []).map((m) => ({
+    ...m,
+    provenance: "event" as MomentProvenance,
+    source: m.source ?? "ai",
+  }));
+
+  let effectiveRaw: DetectedMoment[] = [...eventMoments, ...taggedRaw];
+
   if (visualAnalysis && visualAnalysis.sampleCount > 0) {
-    const fusion = fuseMomentsWithCv(raw, visualAnalysis, duration);
+    // CV fusion still adjusts the AI/Gemini moments — keep events untouched.
+    const aiOnly = effectiveRaw.filter((m) => provenanceOf(m) !== "event");
+    const evOnly = effectiveRaw.filter((m) => provenanceOf(m) === "event");
+    const fusion = fuseMomentsWithCv(aiOnly, visualAnalysis, duration);
     fusedCount = fusion.fusedCount;
     clickRefinedCount = fusion.clickRefinedCount;
-    effectiveRaw = fusion.moments;
+    effectiveRaw = [...evOnly, ...fusion.moments];
 
     if (input.useCvCandidates) {
-      const candidates = cvCandidateMoments(visualAnalysis, duration, minSpacing);
+      const candidates = cvCandidateMoments(visualAnalysis, duration, minSpacing).map((c) => ({
+        ...c,
+        provenance: "cv" as MomentProvenance,
+        source: c.source ?? "ai",
+        targetRegionSource: c.targetRegionSource ?? ("motion-centroid" as const),
+      }));
       const fresh = candidates.filter(
         (c) =>
           !effectiveRaw.some(
@@ -410,6 +1007,41 @@ export function balanceTimeline(input: BalancerInput): BalancerResult {
       cvCandidatesAdded = fresh.length;
       effectiveRaw = [...effectiveRaw, ...fresh];
     }
+  }
+
+  // ── 0b. Reject pass: drop AI / ai-override candidates that fall into
+  // quiet stretches (boring section + low motion, ≥4s idle, or no
+  // meaningful target). Event + user moments always survive. Rejected
+  // candidates are preserved with `rejected: true` so the analyze route can
+  // persist them in `rawMoments` for the rebalance endpoint.
+  const rejectPass = rejectAiCandidates(effectiveRaw, {
+    boringSections,
+    interactions,
+    visualAnalysis,
+    videoType,
+    unrejectRebalance,
+  });
+  effectiveRaw = rejectPass.survivors;
+  const rejectedAll: DetectedMoment[] = rejectPass.rejected;
+
+  // ── 0c. Backfill confidence on every candidate, then resolve overlaps by
+  // priority. Events with confidence < threshold can be overridden by AI;
+  // the winner is marked "ai-override" so it stays visibly labelled. The
+  // relaxed rule also lets a strongly-disagreeing AI candidate override a
+  // healthy event when no real click sits within ±1s — see resolveOverlaps.
+  effectiveRaw = effectiveRaw.map(ensureConfidence);
+  const overlapResolved = resolveOverlaps(effectiveRaw, interactions);
+  effectiveRaw = overlapResolved.kept;
+
+  // ── 0d. Scene-change nudge — shift moment starts that land right on a
+  // detected scene change so the camera doesn't jump mid-transition.
+  let sceneChangeNudged = 0;
+  if (visualAnalysis && visualAnalysis.sceneChanges?.length > 0) {
+    effectiveRaw = effectiveRaw.map((m) => {
+      const r = nudgeAfterSceneChange(m, visualAnalysis, duration);
+      if (r.nudged) sceneChangeNudged++;
+      return r.moment;
+    });
   }
 
   const preserved = input.preserved ?? [];
@@ -427,10 +1059,13 @@ export function balanceTimeline(input: BalancerInput): BalancerResult {
     .filter((m) => !preservedIds.has(m.id) && Number.isFinite(m.startTime))
     .map((m) => normalize(m, duration))
     .map((m) => {
-      const { effectType, rewritten } = rewriteEffectByContext(m);
+      const { effectType, rewritten, reason } = rewriteEffectByContext(m);
       if (rewritten) rewrittenEffects++;
       const intensity = computeIntensity({ ...m, effectType });
-      return { ...m, effectType, intensity };
+      const whyEffectType = rewritten
+        ? appendWhy(m.whyEffectType, reason ?? "context rewrite")
+        : m.whyEffectType;
+      return { ...m, effectType, intensity, whyEffectType };
     });
 
   // Target count: bounded by pacing rate and duration.
@@ -458,9 +1093,9 @@ export function balanceTimeline(input: BalancerInput): BalancerResult {
   // each pick so rhythm memory updates dynamically. O(n^2) but n is tiny.
   const remaining = [...annotated];
   while (kept.length < targetCount && remaining.length > 0) {
-    // Score each candidate against the current kept set
     let bestIdx = -1;
     let bestScore = -Infinity;
+    let bestPenalty = 0;
     for (let i = 0; i < remaining.length; i++) {
       const c = remaining[i];
       const q = whichQuartile(c.startTime, quartileLen, QUARTILES);
@@ -478,13 +1113,14 @@ export function balanceTimeline(input: BalancerInput): BalancerResult {
 
       const intensity = c.intensity ?? 0.5;
       const penalty = rhythmPenalty(c, kept, c.effectType, intensity);
-      const score = (c.attentionScore ?? 0.5) - penalty;
-      if (penalty > 0) {
-        // Pre-counted; only commit when we actually pick this candidate.
-      }
+      const p = provenanceOf(c);
+      const provBoost = p === "event" ? 0.3 : p === "cv" ? 0.1 : 0;
+      const conf = c.confidenceScore ?? 0.5;
+      const score = (c.attentionScore ?? 0.5) + provBoost * (0.5 + conf / 2) - penalty;
       if (score > bestScore) {
         bestScore = score;
         bestIdx = i;
+        bestPenalty = penalty;
       }
     }
 
@@ -492,22 +1128,30 @@ export function balanceTimeline(input: BalancerInput): BalancerResult {
 
     const picked = remaining.splice(bestIdx, 1)[0];
     const q = whichQuartile(picked.startTime, quartileLen, QUARTILES);
-    // For stats accounting: check whether rhythm cost factored in
-    const finalPenalty = rhythmPenalty(
-      picked,
-      kept,
-      picked.effectType,
-      picked.intensity ?? 0.5
-    );
-    if (finalPenalty > 0.05) rhythmPenalized++;
+    if (bestPenalty > 0.05) rhythmPenalized++;
+
+    const provBoost =
+      provenanceOf(picked) === "event"
+        ? 0.3
+        : provenanceOf(picked) === "cv"
+          ? 0.1
+          : 0;
+    const conf = picked.confidenceScore ?? 0.5;
+    const att = picked.attentionScore ?? 0.5;
+    const finalScore = att + provBoost * (0.5 + conf / 2) - bestPenalty;
+    const explanation = `attention ${att.toFixed(2)} + provBoost ${provBoost.toFixed(
+      2
+    )} (${provenanceOf(picked)}, conf ${conf.toFixed(2)}) - rhythm ${bestPenalty.toFixed(
+      2
+    )} = ${finalScore.toFixed(2)}`;
+    picked.whySelected = appendWhy(picked.whySelected, explanation);
 
     kept.push(picked);
     quartileCounts[q]++;
   }
 
-  // Count what got filtered out for diagnostics
+  // Diagnostics for what didn't make it.
   for (const c of remaining) {
-    // Approximate why we dropped it
     if (kept.some((k) => Math.abs(k.startTime - c.startTime) < minSpacing)) {
       droppedTooClose++;
     } else if (
@@ -524,12 +1168,16 @@ export function balanceTimeline(input: BalancerInput): BalancerResult {
     }
   }
 
-  // ── 3. QUARTILE COVERAGE RESCUE ────────────────────────────────────────
+  // ── 3. QUARTILE COVERAGE — HONOUR REJECTION ────────────────────────────
+  // The reject pass already removed candidates that don't deserve emphasis.
+  // We do NOT rescue from `rejectedAll`. If a quartile is empty after the
+  // greedy pick AND no surviving candidate sits inside it, leave it empty —
+  // surface that to the user via `quartileLeftEmpty`.
+  let quartileLeftEmpty = 0;
   for (let q = 0; q < QUARTILES; q++) {
     if (quartileCounts[q] > 0) continue;
     const qStart = q * quartileLen;
     const qEnd = (q + 1) * quartileLen;
-    // Take the highest-attention candidate inside the empty quartile, relaxing spacing to half.
     const inside = annotated
       .filter(
         (c) =>
@@ -540,22 +1188,38 @@ export function balanceTimeline(input: BalancerInput): BalancerResult {
       )
       .sort((a, b) => (b.attentionScore ?? 0.5) - (a.attentionScore ?? 0.5))[0];
     if (inside) {
+      inside.whySelected = appendWhy(
+        inside.whySelected,
+        `quartile rescue: only survivor in Q${q + 1}`
+      );
       kept.push(inside);
       quartileCounts[q]++;
+    } else {
+      quartileLeftEmpty++;
     }
   }
 
   // Sort by start time
   kept.sort((a, b) => a.startTime - b.startTime);
 
+  // Enforce the AI quota (≤ 15% of final timeline).
+  const quotaResult = enforceAiQuota(kept.map(ensureConfidence));
+  const final: DetectedMoment[] = quotaResult.kept;
+  const quotaDropped = quotaResult.quotaDropped;
+
+  assertAiQuota(final);
+
   // Re-id non-preserved
   let counter = 1;
-  for (const m of kept) {
+  for (const m of final) {
     if (!preservedIds.has(m.id)) {
       m.id = `m${counter}`;
       counter++;
     }
   }
+
+  // Attach rejected candidates to the nearest surviving moment (cap 5 each).
+  attachRejections(final, rejectedAll);
 
   const quartileCoverage: BalancerResult["stats"]["quartileCoverage"] = [
     quartileCounts[0] > 0,
@@ -565,18 +1229,32 @@ export function balanceTimeline(input: BalancerInput): BalancerResult {
   ];
 
   const avgAttention =
-    kept.length > 0
-      ? kept.reduce((sum, m) => sum + (m.attentionScore ?? 0.5), 0) / kept.length
+    final.length > 0
+      ? final.reduce((sum, m) => sum + (m.attentionScore ?? 0.5), 0) / final.length
       : 0;
 
+  const provenanceCounts: Record<MomentProvenance, number> = {
+    user: 0,
+    event: 0,
+    cv: 0,
+    ai: 0,
+    "ai-override": 0,
+  };
+  for (const m of final) provenanceCounts[provenanceOf(m)]++;
+
+  // Cap the flat rejected pool — only what's worth surfacing in the debug
+  // overlay. The full set still lives in `rawMoments` via `rejected: true`.
+  const rejectedPool = rejectedAll.slice(0, REJECTED_POOL_CAP);
+
   return {
-    moments: kept,
+    moments: final,
+    rejectedPool,
     stats: {
-      inputCount: raw.length,
-      keptCount: kept.length,
+      inputCount: input.raw.length,
+      keptCount: final.length,
       duration,
       quartileCoverage,
-      densityPerMin: minutes > 0 ? kept.length / minutes : 0,
+      densityPerMin: minutes > 0 ? final.length / minutes : 0,
       pacing,
       videoType,
       droppedTooClose,
@@ -588,6 +1266,14 @@ export function balanceTimeline(input: BalancerInput): BalancerResult {
       fusedCount,
       clickRefinedCount,
       cvCandidatesAdded,
+      provenanceCounts,
+      quotaDropped,
+      eventOverlapsResolved: overlapResolved.eventOverlapsResolved,
+      aiRejectedBoring: rejectPass.stats.aiRejectedBoring,
+      aiRejectedIdle: rejectPass.stats.aiRejectedIdle,
+      aiRejectedNoTarget: rejectPass.stats.aiRejectedNoTarget,
+      sceneChangeNudged,
+      quartileLeftEmpty,
     },
   };
 }

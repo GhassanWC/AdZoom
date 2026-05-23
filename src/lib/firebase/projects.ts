@@ -18,9 +18,11 @@ import {
   deleteObject,
   getDownloadURL,
   ref as storageRef,
+  uploadBytes,
   uploadBytesResumable,
   type UploadTaskSnapshot,
 } from "firebase/storage";
+import type { Interaction } from "@/lib/recording/types";
 import { getFirebase } from "./client";
 import {
   DEFAULT_EFFECTS_SETTINGS,
@@ -54,6 +56,10 @@ interface CreateProjectInput {
   width?: number;
   height?: number;
   onProgress?: (pct: number, snap: UploadTaskSnapshot) => void;
+  /** Real interaction events captured during recording (in-tab only). */
+  interactions?: Interaction[];
+  /** "tab" means events are authoritative; "external" means rely on CV. */
+  interactionScope?: "tab" | "external";
 }
 
 export async function createProjectFromFile({
@@ -64,6 +70,8 @@ export async function createProjectFromFile({
   width,
   height,
   onProgress,
+  interactions,
+  interactionScope,
 }: CreateProjectInput): Promise<UploadResult> {
   if (!isVideoAccepted(file)) {
     throw new Error(`Unsupported file type: ${file.type || file.name}`);
@@ -112,10 +120,33 @@ export async function createProjectFromFile({
 
   // 3. Get the download URL and finalize the Firestore doc.
   const downloadURL = await getDownloadURL(sRef);
+
+  // 4. Upload interactions.json if we have any (in-tab recordings only). Done
+  // after the video lands so the project is usable even if this step fails.
+  let interactionsPath: string | null = null;
+  if (interactions && interactions.length > 0 && interactionScope === "tab") {
+    const interactionsBlob = new Blob(
+      [JSON.stringify({ version: 1, scope: interactionScope, events: interactions })],
+      { type: "application/json" }
+    );
+    interactionsPath = `users/${uid}/projects/${projectId}/original/interactions.json`;
+    try {
+      await uploadBytes(storageRef(storage, interactionsPath), interactionsBlob, {
+        contentType: "application/json",
+      });
+    } catch (err) {
+      // Non-fatal — analysis will fall back to CV-only.
+      console.warn("[createProjectFromFile] interactions upload failed", err);
+      interactionsPath = null;
+    }
+  }
+
   await updateDoc(doc(db, "users", uid, "projects", projectId), {
     status: "uploaded" as ProjectStatus,
     storagePath: path,
     originalVideoUrl: downloadURL,
+    interactionScope: interactionScope ?? "external",
+    ...(interactionsPath ? { interactionsPath } : {}),
     updatedAt: serverTimestamp(),
   });
 
@@ -222,6 +253,8 @@ function materializeProject(id: string, data: Record<string, unknown>): ProjectD
     effectsSettings:
       (data.effectsSettings as ProjectDoc["effectsSettings"]) ?? DEFAULT_EFFECTS_SETTINGS,
     exportUrl: (data.exportUrl as string) ?? undefined,
+    interactionScope: (data.interactionScope as ProjectDoc["interactionScope"]) ?? undefined,
+    interactionsPath: (data.interactionsPath as string) ?? undefined,
     createdAt: tsMs(data.createdAt) ?? Date.now(),
     updatedAt: tsMs(data.updatedAt) ?? Date.now(),
   };

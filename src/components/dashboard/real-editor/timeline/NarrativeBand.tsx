@@ -1,0 +1,106 @@
+"use client";
+
+import * as React from "react";
+import type { NarrativeRole } from "@/lib/firebase/schema";
+import { cn } from "@/lib/cn";
+import {
+  NARRATIVE_COLORS,
+  NARRATIVE_LABEL,
+  NARRATIVE_TEXT,
+  TRACK_HEIGHTS,
+} from "./constants";
+
+interface Segment {
+  startTime: number;
+  endTime: number;
+  role: NarrativeRole;
+  label: string;
+}
+
+/**
+ * Netflix-style chapter strip. Each AI-classified segment becomes a card
+ * with a role tag, a title, and a duration — clicking jumps the playhead to
+ * the chapter's start. Active chapter glows. Wide enough segments expand
+ * to show the full label; narrow ones collapse to the role only.
+ */
+export function NarrativeBand({
+  segments,
+  duration,
+  currentTime,
+  onSeek,
+}: {
+  segments: Segment[];
+  duration: number;
+  currentTime: number;
+  onSeek: (t: number) => void;
+}) {
+  if (segments.length === 0 || duration <= 0) return null;
+  return (
+    <div
+      style={{ height: TRACK_HEIGHTS.chapters }}
+      className="relative flex w-full items-stretch gap-[3px]"
+    >
+      {segments.map((s, i) => {
+        const widthPct = ((s.endTime - s.startTime) / duration) * 100;
+        const active = currentTime >= s.startTime && currentTime <= s.endTime;
+        const gradient = NARRATIVE_COLORS[s.role];
+        const textTone = NARRATIVE_TEXT[s.role];
+        const tag = NARRATIVE_LABEL[s.role];
+        const dur = s.endTime - s.startTime;
+        const isWide = widthPct > 14;
+        return (
+          <button
+            key={`${s.startTime}-${i}`}
+            type="button"
+            onClick={() => onSeek(s.startTime + 0.01)}
+            title={`${tag} · ${s.label} · ${dur.toFixed(1)}s`}
+            style={{ width: `${Math.max(2.4, widthPct)}%` }}
+            className={cn(
+              "group relative flex h-full min-w-0 items-stretch overflow-hidden rounded-[10px] border border-white/[0.06] bg-gradient-to-br text-left transition-all duration-200",
+              gradient,
+              "hover:border-white/35 hover:shadow-[0_8px_24px_-12px_rgba(0,0,0,0.7)]",
+              active &&
+                "border-white/60 ring-1 ring-white/40 shadow-[0_8px_28px_-10px_rgba(255,255,255,0.35)]"
+            )}
+          >
+            {/* Chapter number tab */}
+            <span
+              className={cn(
+                "flex shrink-0 items-center justify-center border-r border-white/10 bg-black/35 px-2 font-mono text-[10px] font-semibold tabular-nums",
+                textTone,
+                isWide ? "min-w-[28px]" : "min-w-[20px] px-1.5"
+              )}
+            >
+              {String(i + 1).padStart(2, "0")}
+            </span>
+            <span className="relative flex min-w-0 flex-1 flex-col justify-center px-2 py-1">
+              <span
+                className={cn(
+                  "truncate text-[10px] font-semibold uppercase tracking-[0.16em] leading-none",
+                  textTone
+                )}
+              >
+                {tag}
+              </span>
+              {isWide && (
+                <span className="mt-1 truncate text-[11.5px] font-medium leading-tight text-white/85">
+                  {s.label || tag}
+                </span>
+              )}
+              <span className="mt-auto pt-0.5 font-mono text-[9px] tabular-nums text-white/55">
+                {dur.toFixed(1)}s
+              </span>
+            </span>
+            {/* Active glow indicator */}
+            {active && (
+              <span
+                aria-hidden
+                className="pointer-events-none absolute inset-x-0 bottom-0 h-[2px] bg-gradient-to-r from-transparent via-white/80 to-transparent"
+              />
+            )}
+          </button>
+        );
+      })}
+    </div>
+  );
+}

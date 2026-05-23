@@ -1,9 +1,11 @@
 "use client";
 
 import * as React from "react";
-import { Bell, Menu, Search, LogOut } from "lucide-react";
+import Link from "next/link";
+import { Bell, Menu, Search, LogOut, Video, Sun, Moon } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { useAuth } from "@/lib/firebase/AuthProvider";
+import { useTheme } from "@/lib/theme";
 
 interface TopbarProps {
   onOpenSidebar: () => void;
@@ -12,6 +14,7 @@ interface TopbarProps {
 
 export function Topbar({ onOpenSidebar, className }: TopbarProps) {
   const { user, signOut } = useAuth();
+  const { theme, toggleTheme } = useTheme();
   const [open, setOpen] = React.useState(false);
   const ref = React.useRef<HTMLDivElement | null>(null);
 
@@ -62,6 +65,29 @@ export function Topbar({ onOpenSidebar, className }: TopbarProps) {
           ⌘K
         </kbd>
       </div>
+
+      <Link
+        href="/dashboard/record"
+        title="Start a new recording (⌘⇧R)"
+        className="group inline-flex h-9 items-center gap-2 rounded-full bg-gradient-to-r from-violet-500 to-violet-600 px-4 text-sm font-semibold text-white shadow-[0_10px_24px_-12px_rgba(139,92,246,0.7)] transition-all duration-200 hover:from-violet-500 hover:to-violet-500 hover:shadow-[0_14px_30px_-12px_rgba(139,92,246,0.9)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/60"
+      >
+        <span className="relative inline-flex size-4 items-center justify-center">
+          <span className="absolute inset-0 -m-0.5 rounded-full bg-rose-400/60 opacity-80 transition-opacity duration-200 group-hover:opacity-100 animate-pulse" />
+          <span className="relative size-2 rounded-full bg-white" />
+        </span>
+        <span className="hidden sm:inline">Record</span>
+        <Video size={14} className="sm:hidden" />
+      </Link>
+
+      <button
+        type="button"
+        onClick={toggleTheme}
+        aria-label={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+        title={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+        className="inline-flex size-9 items-center justify-center rounded-lg border border-white/10 bg-white/[0.02] text-fog transition-colors duration-200 hover:text-white"
+      >
+        {theme === "dark" ? <Sun size={15} /> : <Moon size={15} />}
+      </button>
 
       <button
         aria-label="Notifications"

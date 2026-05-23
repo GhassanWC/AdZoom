@@ -9,6 +9,7 @@ import {
   AlertCircle,
   RefreshCcw,
   Download,
+  SlidersHorizontal,
 } from "lucide-react";
 import { useAuth } from "@/lib/firebase/AuthProvider";
 import { subscribeProject } from "@/lib/firebase/projects";
@@ -17,17 +18,17 @@ import { Button } from "@/components/ui/Button";
 import { EditorRealProvider, useEditorReal } from "./context";
 import { RealVideoPlayer } from "./RealVideoPlayer";
 import { RealTimeline } from "./RealTimeline";
-import { MomentInspector } from "./MomentInspector";
-import { RealEffectsPanel } from "./RealEffectsPanel";
-import { RealExportPanel } from "./RealExportPanel";
+import { MomentInspectorModal } from "./MomentInspectorModal";
+import { EffectsModal } from "./EffectsModal";
+import { ExportModal } from "./ExportModal";
 import { RealProcessingOverlay } from "./RealProcessingOverlay";
 import { PresetsRail } from "./PresetsRail";
 import { RecommendedPresets } from "./RecommendedPresets";
 import { ProcessingMiniPill } from "./ProcessingMiniPill";
-import { AIConfidencePanel } from "./AIConfidencePanel";
-import { SuggestionsPanel } from "./SuggestionsPanel";
 import { WorkflowStepper, type WorkflowStep } from "./WorkflowStepper";
 import { EditorToolbar } from "./EditorToolbar";
+import { DebugOverlay } from "./DebugOverlay";
+import { disposeThumbnails } from "./timeline/thumbnails";
 
 export function RealEditorPage({ projectId }: { projectId: string }) {
   const { user, getIdToken } = useAuth();
@@ -46,6 +47,15 @@ export function RealEditorPage({ projectId }: { projectId: string }) {
     });
     return () => unsub();
   }, [user, projectId]);
+
+  // Release decoded thumbnail frames + the hidden <video> when the editor
+  // unmounts — keeps memory bounded across project navigations.
+  React.useEffect(
+    () => () => {
+      disposeThumbnails();
+    },
+    []
+  );
 
   if (!user) return null;
 
@@ -91,6 +101,7 @@ export function RealEditorPage({ projectId }: { projectId: string }) {
       <Body />
       <RealProcessingOverlay />
       <ProcessingMiniPill />
+      <MomentInspectorModal />
     </EditorRealProvider>
   );
 }
@@ -99,6 +110,16 @@ function Body() {
   const { project, startAnalyze, analyzing, analyzeError } = useEditorReal();
   const hasAnalysis = (project.analysis?.detectedMoments?.length ?? 0) > 0;
   const isFailed = project.analysis?.status === "failed";
+  // A draft is "missing" whenever there's nothing to edit — fresh upload,
+  // failed run, or a completed run that produced zero moments (e.g. a quiet
+  // recording or a preset rebalance that dropped everything below the floor).
+  // In every such case the primary "Analyze with AI" CTA must be reachable;
+  // before the fix this button vanished after `project.status` moved off
+  // "uploaded" yet `detectedMoments` stayed empty.
+  const isAnalyzingNow = analyzing || project.status === "analyzing";
+  const canAnalyze = !isAnalyzingNow && !!project.originalVideoUrl;
+  const [effectsOpen, setEffectsOpen] = React.useState(false);
+  const [exportOpen, setExportOpen] = React.useState(false);
 
   const currentStep: WorkflowStep = !hasAnalysis
     ? "analyze"
@@ -109,7 +130,7 @@ function Body() {
   return (
     <div className="space-y-7 pb-12">
       {/* ── 1. Title row ─────────────────────────────────────────────────── */}
-      <div className="flex flex-wrap items-start justify-between gap-4">
+      <div className="flex flex-wrap items-start justify-between gap-5">
         <div className="min-w-0">
           <Link
             href="/dashboard/projects"
@@ -118,21 +139,26 @@ function Body() {
             <ArrowLeft size={12} />
             All projects
           </Link>
-          <h1 className="mt-2 font-display text-3xl font-semibold tracking-tight text-white sm:text-4xl">
+          <h1 className="mt-2 font-display text-[34px] font-semibold leading-[1.05] tracking-tight text-white sm:text-[42px]">
             {project.title}
           </h1>
-          <p className="mt-1.5 max-w-2xl text-[14px] leading-relaxed text-fog">
+          <p className="mt-2.5 max-w-2xl text-[14.5px] leading-relaxed text-fog">
             {summaryLine(project)}
           </p>
           {project.analysis?.videoType && (
-            <div className="mt-3 flex flex-wrap items-center gap-2">
-              <span className="inline-flex items-center gap-1.5 rounded-full border border-violet-400/30 bg-violet-500/10 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-violet-200">
+            <div className="mt-4 flex flex-wrap items-center gap-2">
+              <span className="inline-flex items-center gap-1.5 rounded-full border border-violet-400/40 bg-gradient-to-r from-violet-500/15 to-violet-500/[0.04] px-3 py-1.5 text-[11px] font-semibold uppercase tracking-[0.2em] text-violet-100 shadow-[0_6px_20px_-14px_rgba(139,92,246,0.7)]">
                 <Sparkles size={11} />
                 {prettyVideoType(project.analysis.videoType)}
               </span>
               {(project.analysis.narrativeStructure?.length ?? 0) > 0 && (
-                <span className="rounded-full border border-white/10 bg-white/[0.03] px-3 py-1 text-[11px] font-medium text-fog">
-                  {project.analysis.narrativeStructure!.length}-act structure
+                <span className="rounded-full border border-white/10 bg-white/[0.03] px-3 py-1.5 text-[11px] font-medium uppercase tracking-[0.16em] text-fog">
+                  {project.analysis.narrativeStructure!.length}-act narrative
+                </span>
+              )}
+              {(project.analysis.detectedMoments?.length ?? 0) > 0 && (
+                <span className="rounded-full border border-white/10 bg-white/[0.03] px-3 py-1.5 text-[11px] font-medium uppercase tracking-[0.16em] text-fog">
+                  {project.analysis.detectedMoments!.length} cinematic moments
                 </span>
               )}
             </div>
@@ -140,42 +166,56 @@ function Body() {
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          {project.status === "uploaded" && !hasAnalysis && (
+          {!hasAnalysis ? (
             <Button
               onClick={startAnalyze}
               variant="primary"
               size="md"
               leftIcon={
-                analyzing ? (
+                isAnalyzingNow ? (
                   <Loader2 size={14} className="animate-spin" />
                 ) : (
                   <Sparkles size={14} />
                 )
               }
-              disabled={analyzing || !project.originalVideoUrl}
+              disabled={!canAnalyze}
+              title={
+                isFailed
+                  ? "The previous analysis failed — try again."
+                  : project.analysis?.status === "complete"
+                    ? "No moments were produced — re-run to try again."
+                    : undefined
+              }
             >
-              {analyzing ? "Analyzing…" : "Analyze with AI"}
+              {isAnalyzingNow ? "Analyzing…" : "Analyze with AI"}
             </Button>
-          )}
-          {(hasAnalysis || isFailed) && project.status !== "analyzing" && (
+          ) : (
             <Button
               onClick={startAnalyze}
               variant="ghost"
               size="md"
               leftIcon={
-                analyzing ? (
+                isAnalyzingNow ? (
                   <Loader2 size={14} className="animate-spin" />
                 ) : (
                   <RefreshCcw size={13} />
                 )
               }
-              disabled={analyzing}
+              disabled={isAnalyzingNow}
             >
               Re-analyze
             </Button>
           )}
           <Button
-            href="#export"
+            onClick={() => setEffectsOpen(true)}
+            variant="ghost"
+            size="md"
+            leftIcon={<SlidersHorizontal size={14} />}
+          >
+            Effects
+          </Button>
+          <Button
+            onClick={() => setExportOpen(true)}
             variant="primary"
             size="md"
             leftIcon={<Download size={14} />}
@@ -195,17 +235,18 @@ function Body() {
         </div>
       )}
 
-      {/* ── 3. Hero: cinematic preview + edit toolbar | inspector column ── */}
-      <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1fr)_400px]">
-        <div className="min-w-0 space-y-4">
-          <RealVideoPlayer />
-          {hasAnalysis && <EditorToolbar />}
-        </div>
-        <div className="space-y-5 xl:sticky xl:top-24 xl:max-h-[calc(100vh-7rem)] xl:overflow-y-auto xl:overflow-x-hidden xl:pr-1">
-          <AIConfidencePanel />
-          <MomentInspector />
-          <SuggestionsPanel />
-        </div>
+      {/* ── 3. Hero: cinematic preview spanning full width ──────────────── */}
+      {!hasAnalysis && (
+        <p className="text-sm text-fog">
+          Run <strong className="text-white">Analyze with AI</strong> to generate a
+          first-draft edit you can refine.
+        </p>
+      )}
+      <div className="min-w-0 space-y-4">
+        <RealVideoPlayer />
+        {/* Toolbar is always available — manual editing shouldn't require
+            running AI analysis first. */}
+        <EditorToolbar />
       </div>
 
       {/* ── 4. Full-width timeline ───────────────────────────────────────── */}
@@ -215,14 +256,12 @@ function Body() {
       <RecommendedPresets />
       <PresetsRail />
 
-      {/* ── 6. Export + global settings ──────────────────────────────────── */}
-      <div
-        id="export"
-        className="grid grid-cols-1 gap-6 scroll-mt-24 xl:grid-cols-[minmax(0,1fr)_400px]"
-      >
-        <RealEffectsPanel />
-        <RealExportPanel />
-      </div>
+      {/* ── 6. Sheets: Effects + Export are now modal dialogs ──────────────── */}
+      <EffectsModal open={effectsOpen} onClose={() => setEffectsOpen(false)} />
+      <ExportModal open={exportOpen} onClose={() => setExportOpen(false)} />
+
+      {/* Debug overlay — Ctrl+Shift+D in dev / ?debug=1 anywhere. */}
+      <DebugOverlay />
     </div>
   );
 }

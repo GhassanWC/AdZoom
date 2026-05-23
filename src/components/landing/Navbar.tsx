@@ -2,16 +2,18 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { Menu, X } from "lucide-react";
+import { Menu, X, LayoutDashboard } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { cn } from "@/lib/cn";
 import { Button } from "@/components/ui/Button";
 import { navLinks } from "@/lib/mockData";
 import { Logo } from "./Logo";
+import { useAuth } from "@/lib/firebase/AuthProvider";
 
 export function Navbar() {
   const [scrolled, setScrolled] = React.useState(false);
   const [open, setOpen] = React.useState(false);
+  const { user, loading } = useAuth();
 
   React.useEffect(() => {
     const onScroll = () => setScrolled(window.scrollY > 16);
@@ -19,6 +21,17 @@ export function Navbar() {
     window.addEventListener("scroll", onScroll, { passive: true });
     return () => window.removeEventListener("scroll", onScroll);
   }, []);
+
+  const signedIn = !loading && !!user;
+  const firstName = user?.displayName?.split(" ")[0] ?? "Dashboard";
+  const initials = user?.displayName
+    ? user.displayName
+        .split(" ")
+        .map((s) => s[0])
+        .slice(0, 2)
+        .join("")
+        .toUpperCase()
+    : user?.email?.[0]?.toUpperCase() ?? "?";
 
   return (
     <header
@@ -47,12 +60,35 @@ export function Navbar() {
         </nav>
 
         <div className="hidden items-center gap-3 md:flex">
-          <Button href="/dashboard" variant="ghost" size="sm">
-            Sign in
-          </Button>
-          <Button href="/dashboard" variant="primary" size="sm">
-            Open App
-          </Button>
+          {signedIn ? (
+            <Link
+              href="/dashboard"
+              className="group inline-flex h-9 items-center gap-2 rounded-full border border-white/10 bg-white/[0.02] py-1 pl-1 pr-4 text-sm font-medium text-white/90 transition-colors duration-200 hover:border-white/25 hover:bg-white/[0.04] hover:text-white"
+            >
+              {user?.photoURL ? (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img
+                  src={user.photoURL}
+                  alt=""
+                  className="size-7 rounded-full"
+                  referrerPolicy="no-referrer"
+                />
+              ) : (
+                <span
+                  aria-hidden
+                  className="inline-flex size-7 items-center justify-center rounded-full bg-gradient-to-br from-violet-500 to-cyan-400 text-[11px] font-semibold text-white"
+                >
+                  {initials}
+                </span>
+              )}
+              <LayoutDashboard size={13} className="opacity-80 group-hover:opacity-100" />
+              <span className="hidden lg:inline">{firstName}</span>
+            </Link>
+          ) : (
+            <Button href="/dashboard" variant="ghost" size="sm">
+              Sign in
+            </Button>
+          )}
         </div>
 
         <button
@@ -85,12 +121,21 @@ export function Navbar() {
                 </Link>
               ))}
               <div className="flex gap-3 pt-3">
-                <Button href="/dashboard" variant="ghost" size="sm" className="flex-1">
-                  Sign in
-                </Button>
-                <Button href="/dashboard" variant="primary" size="sm" className="flex-1">
-                  Open App
-                </Button>
+                {signedIn ? (
+                  <Button
+                    href="/dashboard"
+                    variant="primary"
+                    size="sm"
+                    className="flex-1"
+                    leftIcon={<LayoutDashboard size={14} />}
+                  >
+                    {firstName === "Dashboard" ? "Dashboard" : `Continue as ${firstName}`}
+                  </Button>
+                ) : (
+                  <Button href="/dashboard" variant="ghost" size="sm" className="flex-1">
+                    Sign in
+                  </Button>
+                )}
               </div>
             </div>
           </motion.div>

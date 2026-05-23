@@ -1,8 +1,13 @@
 "use client";
 
+import * as React from "react";
 import Link from "next/link";
-import { Play, Clock, Sparkles, AlertCircle, Loader2 } from "lucide-react";
+import { createPortal } from "react-dom";
+import { Play, Clock, Sparkles, AlertCircle, Loader2, Trash2, Pencil } from "lucide-react";
 import type { ProjectDoc, ProjectStatus } from "@/lib/firebase/schema";
+import { useAuth } from "@/lib/firebase/AuthProvider";
+import { deleteProject, updateProject } from "@/lib/firebase/projects";
+import { useToast } from "@/components/ui/Toast";
 import { cn } from "@/lib/cn";
 
 function fmtDuration(sec?: number) {
@@ -57,11 +62,67 @@ export function RealProjectCard({ project }: { project: ProjectDoc }) {
   const moments = project.analysis?.detectedMoments?.length ?? 0;
   const previewURL = project.originalVideoUrl;
 
+  const { user } = useAuth();
+  const toast = useToast();
+  const [confirmOpen, setConfirmOpen] = React.useState(false);
+  const [deleting, setDeleting] = React.useState(false);
+  const [renameOpen, setRenameOpen] = React.useState(false);
+  const [renaming, setRenaming] = React.useState(false);
+
+  const askDelete = (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setConfirmOpen(true);
+  };
+
+  const askRename = (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setRenameOpen(true);
+  };
+
+  const handleConfirm = async () => {
+    if (!user || deleting) return;
+    setDeleting(true);
+    try {
+      await deleteProject(user.uid, project.id, project.storagePath);
+      toast.success("Project deleted", project.title);
+      setConfirmOpen(false);
+    } catch (err) {
+      console.error("[delete project]", err);
+      toast.error("Couldn't delete project", err instanceof Error ? err.message : undefined);
+    } finally {
+      setDeleting(false);
+    }
+  };
+
+  const handleRename = async (next: string) => {
+    if (!user || renaming) return;
+    const trimmed = next.trim();
+    if (!trimmed || trimmed === project.title) {
+      setRenameOpen(false);
+      return;
+    }
+    setRenaming(true);
+    try {
+      await updateProject(user.uid, project.id, { title: trimmed });
+      toast.success("Project renamed", trimmed);
+      setRenameOpen(false);
+    } catch (err) {
+      console.error("[rename project]", err);
+      toast.error("Couldn't rename project", err instanceof Error ? err.message : undefined);
+    } finally {
+      setRenaming(false);
+    }
+  };
+
   return (
-    <Link
-      href={`/dashboard/projects/${project.id}`}
-      className="group glass block overflow-hidden rounded-xl transition-colors duration-200 hover:border-white/[0.12]"
-    >
+    <div className="group glass relative overflow-hidden rounded-xl transition-colors duration-200 hover:border-white/[0.12]">
+      <Link
+        href={`/dashboard/projects/${project.id}`}
+        aria-label={`Open ${project.title}`}
+        className="absolute inset-0 z-10 rounded-xl focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/50"
+      />
       <div className="relative aspect-[16/10] overflow-hidden border-b border-white/[0.06] bg-black">
         {previewURL ? (
           <video
@@ -74,9 +135,7 @@ export function RealProjectCard({ project }: { project: ProjectDoc }) {
               isVertical ? "h-full w-full object-contain" : "h-full w-full object-cover"
             )}
             crossOrigin="anonymous"
-          >
-            <track kind="captions" />
-          </video>
+          />
         ) : (
           <div className="absolute inset-0 grid place-items-center text-xs text-fog">
             No preview
@@ -108,17 +167,243 @@ export function RealProjectCard({ project }: { project: ProjectDoc }) {
           </span>
         </span>
       </div>
-      <div className="px-4 py-3.5">
-        <h3 className="truncate text-sm font-medium text-white">{project.title}</h3>
-        <div className="mt-1 flex items-center gap-3 text-[11px] text-fog">
-          <span className="inline-flex items-center gap-1">
-            <Clock size={10} />
-            {fmtDuration(project.duration)}
-          </span>
-          <span>·</span>
-          <span>Edited {relativeTime(project.updatedAt)}</span>
+      <div className="flex items-start gap-2 px-4 py-3.5">
+        <div className="min-w-0 flex-1">
+          <h3 className="truncate text-sm font-medium text-white">{project.title}</h3>
+          <div className="mt-1 flex items-center gap-3 text-[11px] text-fog">
+            <span className="inline-flex items-center gap-1">
+              <Clock size={10} />
+              {fmtDuration(project.duration)}
+            </span>
+            <span>·</span>
+            <span>Edited {relativeTime(project.updatedAt)}</span>
+          </div>
+        </div>
+        <div className="-mt-1 flex shrink-0 items-center gap-0.5">
+          <button
+            type="button"
+            onClick={askRename}
+            aria-label="Rename project"
+            title="Rename"
+            className="relative z-20 inline-flex size-8 items-center justify-center rounded-md text-fog opacity-0 transition-all duration-150 hover:bg-white/[0.06] hover:text-white focus:opacity-100 focus:outline-none focus-visible:ring-1 focus-visible:ring-violet-400/40 group-hover:opacity-100"
+          >
+            <Pencil size={13} />
+          </button>
+          <button
+            type="button"
+            onClick={askDelete}
+            aria-label="Delete project"
+            title="Delete"
+            className="relative z-20 -mr-1.5 inline-flex size-8 items-center justify-center rounded-md text-fog opacity-0 transition-all duration-150 hover:bg-rose-500/15 hover:text-rose-300 focus:opacity-100 focus:outline-none focus-visible:ring-1 focus-visible:ring-rose-400/40 group-hover:opacity-100"
+          >
+            <Trash2 size={14} />
+          </button>
         </div>
       </div>
-    </Link>
+
+      {confirmOpen && (
+        <DeleteConfirmModal
+          title={project.title}
+          deleting={deleting}
+          onCancel={() => {
+            if (!deleting) setConfirmOpen(false);
+          }}
+          onConfirm={() => {
+            void handleConfirm();
+          }}
+        />
+      )}
+
+      {renameOpen && (
+        <RenameProjectModal
+          initialTitle={project.title}
+          saving={renaming}
+          onCancel={() => {
+            if (!renaming) setRenameOpen(false);
+          }}
+          onSubmit={(next) => {
+            void handleRename(next);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function DeleteConfirmModal({
+  title,
+  deleting,
+  onCancel,
+  onConfirm,
+}: {
+  title: string;
+  deleting: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const [mounted, setMounted] = React.useState(false);
+  React.useEffect(() => setMounted(true), []);
+  React.useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !deleting) onCancel();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [deleting, onCancel]);
+
+  if (!mounted) return null;
+
+  return createPortal(
+    <div
+      className="fixed inset-0 z-[100] grid place-items-center bg-black/60 px-4 backdrop-blur-sm"
+      onClick={() => {
+        if (!deleting) onCancel();
+      }}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        onClick={(e) => e.stopPropagation()}
+        className="glass w-full max-w-sm rounded-2xl border border-white/10 bg-surface/95 p-5 shadow-cinematic"
+      >
+        <div className="flex items-start gap-3">
+          <span className="inline-flex size-9 shrink-0 items-center justify-center rounded-full border border-rose-400/30 bg-rose-500/15 text-rose-300">
+            <Trash2 size={16} />
+          </span>
+          <div className="min-w-0">
+            <h3 className="text-sm font-semibold text-white">Delete this project?</h3>
+            <p className="mt-1 text-[12px] leading-relaxed text-fog">
+              <span className="truncate text-white/80">&ldquo;{title}&rdquo;</span> and its original
+              recording will be permanently removed. This can&rsquo;t be undone.
+            </p>
+          </div>
+        </div>
+        <div className="mt-5 flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={deleting}
+            className="rounded-lg border border-white/10 bg-white/[0.03] px-3 py-1.5 text-xs font-medium text-white transition-colors duration-150 hover:bg-white/[0.07] disabled:opacity-50"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            disabled={deleting}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-rose-400/30 bg-rose-500/20 px-3 py-1.5 text-xs font-medium text-rose-100 transition-colors duration-150 hover:bg-rose-500/30 disabled:opacity-60"
+          >
+            {deleting && <Loader2 size={11} className="animate-spin" />}
+            {deleting ? "Deleting…" : "Delete"}
+          </button>
+        </div>
+      </div>
+    </div>,
+    document.body
+  );
+}
+
+function RenameProjectModal({
+  initialTitle,
+  saving,
+  onCancel,
+  onSubmit,
+}: {
+  initialTitle: string;
+  saving: boolean;
+  onCancel: () => void;
+  onSubmit: (next: string) => void;
+}) {
+  const [mounted, setMounted] = React.useState(false);
+  const [value, setValue] = React.useState(initialTitle);
+  const inputRef = React.useRef<HTMLInputElement>(null);
+
+  React.useEffect(() => setMounted(true), []);
+
+  React.useEffect(() => {
+    const id = requestAnimationFrame(() => {
+      inputRef.current?.focus();
+      inputRef.current?.select();
+    });
+    return () => cancelAnimationFrame(id);
+  }, []);
+
+  React.useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !saving) onCancel();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [saving, onCancel]);
+
+  if (!mounted) return null;
+
+  const trimmed = value.trim();
+  const canSave = trimmed.length > 0 && trimmed !== initialTitle;
+
+  const submit = () => {
+    if (!canSave || saving) return;
+    onSubmit(trimmed);
+  };
+
+  return createPortal(
+    <div
+      className="fixed inset-0 z-[100] grid place-items-center bg-black/60 px-4 backdrop-blur-sm"
+      onClick={() => {
+        if (!saving) onCancel();
+      }}
+    >
+      <form
+        role="dialog"
+        aria-modal="true"
+        onClick={(e) => e.stopPropagation()}
+        onSubmit={(e) => {
+          e.preventDefault();
+          submit();
+        }}
+        className="glass w-full max-w-sm rounded-2xl border border-white/10 bg-surface/95 p-5 shadow-cinematic"
+      >
+        <div className="flex items-start gap-3">
+          <span className="inline-flex size-9 shrink-0 items-center justify-center rounded-full border border-violet-400/30 bg-violet-500/15 text-violet-300">
+            <Pencil size={15} />
+          </span>
+          <div className="min-w-0 flex-1">
+            <h3 className="text-sm font-semibold text-white">Rename project</h3>
+            <p className="mt-1 text-[12px] leading-relaxed text-fog">
+              Give this recording a new title.
+            </p>
+            <input
+              ref={inputRef}
+              type="text"
+              value={value}
+              onChange={(e) => setValue(e.target.value)}
+              disabled={saving}
+              maxLength={120}
+              placeholder="Project title"
+              className="mt-3 h-9 w-full rounded-lg border border-white/10 bg-white/[0.03] px-3 text-sm text-white placeholder:text-fog/70 outline-none transition-colors duration-150 focus:border-violet-400/40 disabled:opacity-60"
+            />
+          </div>
+        </div>
+        <div className="mt-5 flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={saving}
+            className="rounded-lg border border-white/10 bg-white/[0.03] px-3 py-1.5 text-xs font-medium text-white transition-colors duration-150 hover:bg-white/[0.07] disabled:opacity-50"
+          >
+            Cancel
+          </button>
+          <button
+            type="submit"
+            disabled={!canSave || saving}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-violet-400/30 bg-violet-500/25 px-3 py-1.5 text-xs font-medium text-violet-50 transition-colors duration-150 hover:bg-violet-500/35 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {saving && <Loader2 size={11} className="animate-spin" />}
+            {saving ? "Saving…" : "Save"}
+          </button>
+        </div>
+      </form>
+    </div>,
+    document.body
   );
 }

@@ -20,7 +20,6 @@ const settings = (over: Partial<EffectsSettings>): EffectsSettings => ({
   verticalExport: false,
   clickHighlights: true,
   motionTracking: true,
-  captionStyle: "minimal",
   pacing: "moderate",
   targetPlatform: "youtube",
   defaultExportFormat: "YouTube 16:9",
@@ -33,7 +32,7 @@ export const BUILTIN_PRESETS: Preset[] = [
     name: "MrBeast",
     category: "Creator",
     description:
-      "Punchy, high-contrast cuts. Aggressive zoom rhythm, bold pop captions, oversized click bursts.",
+      "Punchy, high-contrast cuts. Aggressive zoom rhythm, oversized click bursts.",
     useCase: "Vlogs, challenges, retention-driven YouTube content.",
     vibe: "mrbeast",
     effects: settings({
@@ -44,7 +43,6 @@ export const BUILTIN_PRESETS: Preset[] = [
       motionSensitivity: 78,
       clickHighlightSize: 90,
       clickHighlightStyle: "burst",
-      captionStyle: "bold-pop",
       pacing: "fast",
       targetPlatform: "youtube",
       defaultExportFormat: "YouTube 16:9",
@@ -55,7 +53,7 @@ export const BUILTIN_PRESETS: Preset[] = [
     name: "Cinematic Focus",
     category: "Creator",
     description:
-      "Slow, deliberate zooms. Soft cursor, ring highlights, minimal captions. Feels filmic.",
+      "Slow, deliberate zooms. Soft cursor, ring highlights. Feels filmic.",
     useCase: "Trailers, product reveals, founder updates.",
     vibe: "cinematic",
     effects: settings({
@@ -66,7 +64,6 @@ export const BUILTIN_PRESETS: Preset[] = [
       motionSensitivity: 55,
       clickHighlightSize: 55,
       clickHighlightStyle: "ring",
-      captionStyle: "minimal",
       pacing: "slow",
       targetPlatform: "youtube",
       defaultExportFormat: "YouTube 16:9",
@@ -77,7 +74,7 @@ export const BUILTIN_PRESETS: Preset[] = [
     name: "Tutorial",
     category: "Tutorial",
     description:
-      "Steady zooms held over UI focus. Larger cursor, tooltip-style captions.",
+      "Steady zooms held over UI focus. Larger cursor, tooltip-style emphasis.",
     useCase: "How-tos, courses, step-by-step walkthroughs.",
     vibe: "tutorial",
     effects: settings({
@@ -88,7 +85,6 @@ export const BUILTIN_PRESETS: Preset[] = [
       motionSensitivity: 65,
       clickHighlightSize: 70,
       clickHighlightStyle: "ring",
-      captionStyle: "tutorial-tooltip",
       pacing: "moderate",
       targetPlatform: "youtube",
       defaultExportFormat: "YouTube 16:9",
@@ -99,7 +95,7 @@ export const BUILTIN_PRESETS: Preset[] = [
     name: "TikTok / Reels",
     category: "Short-form",
     description:
-      "9:16 vertical reframe, fast pacing, oversized cursor, pulse clicks, big bold captions.",
+      "9:16 vertical reframe, fast pacing, oversized cursor, pulse clicks.",
     useCase: "TikTok, Reels, YouTube Shorts.",
     vibe: "tiktok",
     effects: settings({
@@ -111,7 +107,6 @@ export const BUILTIN_PRESETS: Preset[] = [
       clickHighlightSize: 85,
       clickHighlightStyle: "pulse",
       verticalExport: true,
-      captionStyle: "bold-pop",
       pacing: "fast",
       targetPlatform: "tiktok",
       defaultExportFormat: "TikTok 9:16",
@@ -122,7 +117,7 @@ export const BUILTIN_PRESETS: Preset[] = [
     name: "Coding Tutorial",
     category: "Coding",
     description:
-      "Editor-aware zoom rhythm. Small cursor, smooth motion, subtitle-style captions.",
+      "Editor-aware zoom rhythm. Small cursor, smooth motion.",
     useCase: "Code walkthroughs, dev blog clips, IDE tours.",
     vibe: "coding",
     effects: settings({
@@ -133,7 +128,6 @@ export const BUILTIN_PRESETS: Preset[] = [
       motionSensitivity: 60,
       clickHighlightSize: 45,
       clickHighlightStyle: "ring",
-      captionStyle: "subtitle",
       pacing: "moderate",
       targetPlatform: "youtube",
       defaultExportFormat: "YouTube 16:9",
@@ -155,7 +149,6 @@ export const BUILTIN_PRESETS: Preset[] = [
       motionSensitivity: 65,
       clickHighlightSize: 60,
       clickHighlightStyle: "ring",
-      captionStyle: "minimal",
       pacing: "moderate",
       targetPlatform: "internal",
       defaultExportFormat: "1080p",
@@ -166,7 +159,7 @@ export const BUILTIN_PRESETS: Preset[] = [
     name: "SaaS Pitch",
     category: "SaaS",
     description:
-      "Sales-grade demo: clean cursor, deliberate pacing, minimal captions.",
+      "Sales-grade demo: clean cursor, deliberate pacing.",
     useCase: "Outbound sales clips, pitch decks, partner demos.",
     vibe: "saas",
     effects: settings({
@@ -177,7 +170,6 @@ export const BUILTIN_PRESETS: Preset[] = [
       motionSensitivity: 60,
       clickHighlightSize: 58,
       clickHighlightStyle: "ring",
-      captionStyle: "minimal",
       pacing: "moderate",
       targetPlatform: "internal",
       defaultExportFormat: "1080p",
@@ -199,7 +191,6 @@ export const BUILTIN_PRESETS: Preset[] = [
       motionSensitivity: 62,
       clickHighlightSize: 60,
       clickHighlightStyle: "ring",
-      captionStyle: "minimal",
       pacing: "moderate",
       targetPlatform: "youtube",
       defaultExportFormat: "YouTube 16:9",
@@ -222,7 +213,6 @@ export const BUILTIN_PRESETS: Preset[] = [
       clickHighlightSize: 88,
       clickHighlightStyle: "pulse",
       verticalExport: true,
-      captionStyle: "bold-pop",
       pacing: "fast",
       targetPlatform: "youtube",
       defaultExportFormat: "TikTok 9:16",
@@ -244,7 +234,6 @@ export const BUILTIN_PRESETS: Preset[] = [
       motionSensitivity: 55,
       clickHighlightSize: 55,
       clickHighlightStyle: "ring",
-      captionStyle: "none",
       pacing: "slow",
       targetPlatform: "internal",
       defaultExportFormat: "1080p",
@@ -310,7 +299,6 @@ function settingsMatchScore(a: EffectsSettings, b: EffectsSettings): number {
     "verticalExport",
     "clickHighlights",
     "motionTracking",
-    "captionStyle",
     "pacing",
     "targetPlatform",
     "defaultExportFormat",

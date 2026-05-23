@@ -22,7 +22,7 @@ export function getGemini(): GoogleGenAI {
  */
 export const ANALYSIS_SCHEMA = {
   type: Type.OBJECT,
-  required: ["summary", "detectedMoments", "suggestedCaptions", "boringSections"],
+  required: ["summary", "detectedMoments", "boringSections"],
   properties: {
     summary: {
       type: Type.STRING,
@@ -160,21 +160,6 @@ export const ANALYSIS_SCHEMA = {
         },
       },
     },
-    suggestedCaptions: {
-      type: Type.ARRAY,
-      description: "Short on-screen captions (max 8) tied to specific timestamps.",
-      items: {
-        type: Type.OBJECT,
-        required: ["startTime", "text"],
-        properties: {
-          startTime: { type: Type.NUMBER },
-          text: {
-            type: Type.STRING,
-            description: "Punchy 3-7 word caption that summarizes what's happening.",
-          },
-        },
-      },
-    },
     boringSections: {
       type: Type.ARRAY,
       description: "Sections that should be sped up or trimmed. Maximum 4.",
@@ -268,7 +253,7 @@ WHAT YOU ARE DECIDING
 1. videoType — classify the overall recording (coding-tutorial, saas-demo, talking-tutorial, presentation, vertical-short, onboarding-flow, or mixed).
 2. narrativeStructure — segment the recording into 2-6 contiguous narrative beats covering the full duration. Use roles: intro, setup, action, explanation, result, transition, filler.
 3. detectedMoments — the editing decisions. Each moment carries an attentionScore, attentionFactors, uiContext, sceneChange flag, narrativeRole, and recommendedIntensity. NOT every click deserves emphasis. Ask yourself: "would a human editor cut to this?" If no, don't include it.
-4. suggestedCaptions, boringSections — supporting metadata.
+4. boringSections — sections that should be sped up or trimmed.
 5. recommendedPresetIds — up to 3 from this list:
 ${PRESET_CATALOG}
 
@@ -318,7 +303,7 @@ OTHER CONSTRAINTS
 - Never invent timestamps you cannot see. If the entire second half is genuinely static, prefer 1 low-attentionScore moment + a boringSection over hallucinating activity.
 - All times are seconds, non-negative, with endTime > startTime.
 - focusRegion coordinates must be in [0, 1] and the region must fit inside the frame.
-- Keep labels under 6 words and captions under 7 words.
+- Keep labels under 6 words.
 - recommendedPresetIds MUST be a subset of the preset ids listed above. Never invent new ids.
 - narrativeStructure segments must be contiguous and cover the full duration with no gaps.
 - Output ONLY data matching the provided JSON schema.`;
@@ -438,6 +423,509 @@ export class GeminiCancelled extends Error {
   }
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// REFINEMENT-ONLY API (V2)
+//
+// The new analyze pipeline drops the monolithic call above in favor of three
+// narrow calls. Gemini is no longer the primary moment generator — it labels,
+// classifies, and fills coverage gaps only.
+//
+// All three accept either an uploaded Gemini file (preferred when the video
+// is already there) or raw bytes (used by small-video / inline path). The
+// caller decides; we expose a unified `GeminiVideoRef`.
+// ════════════════════════════════════════════════════════════════════════════
+
+export type GeminiVideoRef =
+  | { kind: "file"; uri: string; mimeType: string }
+  | { kind: "inline"; buffer: Buffer; mimeType: string };
+
+function videoPart(ref: GeminiVideoRef) {
+  if (ref.kind === "file") {
+    return { fileData: { fileUri: ref.uri, mimeType: ref.mimeType } } as never;
+  }
+  return {
+    inlineData: {
+      data: ref.buffer.toString("base64"),
+      mimeType: ref.mimeType,
+    },
+  } as never;
+}
+
+// ── 1. SECTION CLASSIFICATION ────────────────────────────────────────────────
+
+const SECTION_SCHEMA = {
+  type: Type.OBJECT,
+  required: ["summary", "videoType", "narrativeStructure", "boringSections"],
+  properties: {
+    summary: {
+      type: Type.STRING,
+      description: "1-2 sentence overview of what happens in the recording.",
+    },
+    videoType: {
+      type: Type.STRING,
+      enum: [
+        "coding-tutorial",
+        "saas-demo",
+        "talking-tutorial",
+        "presentation",
+        "vertical-short",
+        "onboarding-flow",
+        "mixed",
+      ],
+    },
+    narrativeStructure: {
+      type: Type.ARRAY,
+      description:
+        "2-6 contiguous narrative segments covering the full duration. Roles drive pacing decisions downstream.",
+      items: {
+        type: Type.OBJECT,
+        required: ["startTime", "endTime", "role", "label"],
+        properties: {
+          startTime: { type: Type.NUMBER },
+          endTime: { type: Type.NUMBER },
+          role: {
+            type: Type.STRING,
+            enum: ["intro", "setup", "action", "explanation", "result", "transition", "filler"],
+          },
+          label: { type: Type.STRING, description: "3-6 word human label." },
+        },
+      },
+    },
+    boringSections: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        required: ["startTime", "endTime", "reason"],
+        properties: {
+          startTime: { type: Type.NUMBER },
+          endTime: { type: Type.NUMBER },
+          reason: { type: Type.STRING },
+        },
+      },
+    },
+    recommendedPresetIds: {
+      type: Type.ARRAY,
+      items: { type: Type.STRING },
+      description: "Up to 3 preset ids from the supplied catalog. No new ids.",
+    },
+  },
+} as const;
+
+const SECTION_SYSTEM = `You are a video classifier. You DO NOT pick zoom moments — the system already has them.
+
+Your job is to:
+1. Summarize the recording in 1-2 sentences.
+2. Classify videoType (coding-tutorial, saas-demo, talking-tutorial, presentation, vertical-short, onboarding-flow, or mixed).
+3. Segment the recording into 2-6 contiguous narrative beats covering the full duration.
+4. List any boring sections that should be sped up or trimmed.
+5. Recommend up to 3 preset ids from the supplied catalog. NEVER invent ids.
+
+Available preset ids:
+${PRESET_CATALOG}
+
+CONSTRAINTS
+- Narrative segments must be contiguous and cover the full duration.
+- All timestamps are seconds, non-negative, with endTime > startTime.
+- Output ONLY data matching the provided JSON schema. No moments. No focus regions. No effects.`;
+
+export interface SectionClassification {
+  summary: string;
+  videoType: VideoType;
+  narrativeStructure: NarrativeSegment[];
+  boringSections: Array<{ startTime: number; endTime: number; reason: string }>;
+  recommendedPresetIds: string[];
+}
+
+/**
+ * Section / narrative classification only — no moments are generated here.
+ * This is the first of three narrow Gemini calls in the refinement-only
+ * pipeline.
+ */
+export async function classifyVideoSections(opts: {
+  video: GeminiVideoRef;
+  hintedDuration?: number;
+}): Promise<SectionClassification> {
+  const ai = getGemini();
+  const userPrompt = opts.hintedDuration
+    ? `The video is ${opts.hintedDuration.toFixed(1)} seconds long. Classify it and segment its narrative beats. Do NOT produce moments — only structure.`
+    : "Classify this recording and segment its narrative beats. Do NOT produce moments — only structure.";
+  const response: GenerateContentResponse = await ai.models.generateContent({
+    model: ANALYSIS_MODEL,
+    contents: [
+      {
+        role: "user",
+        parts: [videoPart(opts.video), { text: userPrompt }],
+      },
+    ],
+    config: {
+      systemInstruction: SECTION_SYSTEM,
+      responseMimeType: "application/json",
+      responseSchema: SECTION_SCHEMA as never,
+      temperature: 0.3,
+    },
+  });
+  const text = response.text;
+  if (!text) throw new Error("Gemini section-classify returned empty.");
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error("Gemini section-classify returned non-JSON.");
+  }
+  const videoType = pickEnum<VideoType>(parsed.videoType, VIDEO_TYPES, "mixed");
+  const narrativeStructure: NarrativeSegment[] = Array.isArray(parsed.narrativeStructure)
+    ? (parsed.narrativeStructure as Array<Record<string, unknown>>)
+        .map((s) => ({
+          startTime: Math.max(0, Number(s.startTime) || 0),
+          endTime: Math.max(0, Number(s.endTime) || 0),
+          role: pickEnum<NarrativeRole>(s.role, NARRATIVE_ROLES, "action"),
+          label: ((s.label as string) || "").slice(0, 60),
+        }))
+        .filter((s) => s.endTime > s.startTime)
+        .sort((a, b) => a.startTime - b.startTime)
+    : [];
+  const boringSections = Array.isArray(parsed.boringSections)
+    ? (parsed.boringSections as Array<Record<string, unknown>>)
+        .map((b) => ({
+          startTime: Math.max(0, Number(b.startTime) || 0),
+          endTime: Math.max(0, Number(b.endTime) || 0),
+          reason: ((b.reason as string) || "").slice(0, 240),
+        }))
+        .filter((b) => b.endTime > b.startTime)
+    : [];
+  const recSeen = new Set<string>();
+  const recommendedPresetIds: string[] = [];
+  for (const id of (parsed.recommendedPresetIds as string[]) ?? []) {
+    if (typeof id === "string" && VALID_PRESET_IDS.has(id) && !recSeen.has(id)) {
+      recSeen.add(id);
+      recommendedPresetIds.push(id);
+      if (recommendedPresetIds.length >= 3) break;
+    }
+  }
+  return {
+    summary: (parsed.summary as string | undefined)?.slice(0, 480) ?? "",
+    videoType,
+    narrativeStructure,
+    boringSections,
+    recommendedPresetIds,
+  };
+}
+
+// ── 2. GAP-FILL ──────────────────────────────────────────────────────────────
+
+const GAPFILL_SCHEMA = {
+  type: Type.OBJECT,
+  required: ["moments"],
+  properties: {
+    moments: {
+      type: Type.ARRAY,
+      description:
+        "Moments STRICTLY inside one of the supplied empty windows. Never overlap each other. Up to maxMoments.",
+      items: {
+        type: Type.OBJECT,
+        required: [
+          "startTime",
+          "endTime",
+          "focusRegion",
+          "effectType",
+          "uiContext",
+          "attentionScore",
+          "recommendedIntensity",
+        ],
+        properties: {
+          startTime: { type: Type.NUMBER },
+          endTime: { type: Type.NUMBER },
+          focusRegion: {
+            type: Type.OBJECT,
+            required: ["x", "y", "width", "height"],
+            properties: {
+              x: { type: Type.NUMBER },
+              y: { type: Type.NUMBER },
+              width: { type: Type.NUMBER },
+              height: { type: Type.NUMBER },
+            },
+          },
+          effectType: {
+            type: Type.STRING,
+            enum: ["zoom", "click-highlight", "cursor-focus", "speed-up"],
+          },
+          uiContext: {
+            type: Type.STRING,
+            enum: [
+              "button",
+              "modal",
+              "dialog",
+              "form",
+              "code",
+              "navigation",
+              "scroll",
+              "result",
+              "media",
+              "text",
+              "menu",
+              "other",
+            ],
+          },
+          attentionScore: { type: Type.NUMBER },
+          recommendedIntensity: { type: Type.NUMBER },
+          label: { type: Type.STRING },
+          reason: { type: Type.STRING },
+        },
+      },
+    },
+  },
+} as const;
+
+const GAPFILL_SYSTEM = `You are filling coverage gaps in an existing timeline. You are NOT the primary editor — the system already has high-confidence moments from real interaction events. You only fill stretches the deterministic layer couldn't cover.
+
+You will receive:
+- The video.
+- A list of empty windows where no moment currently exists.
+- Optionally, a list of stretches Gemini has already classified as quiet/boring — AVOID proposing inside those.
+- A maxMoments budget.
+
+ABSTENTION IS THE DEFAULT
+- Prefer returning FEWER moments than maxMoments. Returning 0 moments for a quiet/idle/loading/app-switching window is correct behaviour, not failure.
+- If a window genuinely has no visible action worth a viewer's attention, omit it. Do NOT pad.
+- Never invent activity. If the screen is mostly static or repetitive, return nothing for that gap.
+
+EFFECT-TYPE GUIDANCE (do NOT default to zoom)
+Pick the effect that matches what is on screen at that moment:
+- modal / dialog / result reveals → zoom (cinematic emphasis, intensity 0.6-0.8).
+- navigation / scene transition → zoom AFTER the new view stabilises.
+- code editor activity → cursor-focus (low intensity 0.25-0.4). Reserve zoom for code compiles / errors / output reveals.
+- form fields → cursor-focus (gentle, 0.4-0.5).
+- ordinary CTA / single click → click-highlight.
+- scroll burst still in progress → speed-up. Only emit a moment AFTER the page settles.
+- repetitive identical actions → emphasise only the FIRST or LAST in the sequence.
+
+WINDOW HYGIENE
+- Every moment.startTime / endTime must fit entirely inside one of the supplied empty windows.
+- Never overlap moments with each other.
+- Never start a moment within 0.2s of a scene transition — let the new view settle first.
+
+OUTPUT FORMAT
+- Modest recommendedIntensity (0.3-0.6) — these are gap-fillers, not climaxes.
+- focusRegion coordinates in [0, 1], tightly framed around the meaningful UI element.
+- Output ONLY the JSON schema. No commentary.`;
+
+export interface GapFillCandidate {
+  startTime: number;
+  endTime: number;
+  focusRegion: { x: number; y: number; width: number; height: number };
+  effectType: "zoom" | "click-highlight" | "cursor-focus" | "speed-up";
+  uiContext: UIContext;
+  attentionScore: number;
+  recommendedIntensity: number;
+  label?: string;
+  reason?: string;
+}
+
+/**
+ * Ask Gemini to propose moments strictly inside the supplied empty windows.
+ * Returns at most `maxMoments` candidates, each clamped to its window.
+ *
+ * When `gaps` is empty, returns [] without calling Gemini.
+ *
+ * `boringSections` are stretches Gemini already classified as quiet/idle —
+ * Gemini will see them in its prompt and is instructed to avoid proposing
+ * inside them. The balancer still rejects anything that slips through.
+ */
+export async function proposeGapFills(opts: {
+  video: GeminiVideoRef;
+  gaps: Array<{ startTime: number; endTime: number }>;
+  maxMoments: number;
+  boringSections?: Array<{ startTime: number; endTime: number }>;
+}): Promise<GapFillCandidate[]> {
+  if (opts.maxMoments <= 0 || opts.gaps.length === 0) return [];
+  const ai = getGemini();
+  const gapList = opts.gaps
+    .map((g, i) => `  ${i + 1}. ${g.startTime.toFixed(1)}s → ${g.endTime.toFixed(1)}s`)
+    .join("\n");
+  const boringList = (opts.boringSections ?? [])
+    .map((b) => `  · ${b.startTime.toFixed(1)}s → ${b.endTime.toFixed(1)}s`)
+    .join("\n");
+  const userPrompt = [
+    `Existing timeline has gaps with no moments. Propose AT MOST ${opts.maxMoments} new moments — returning fewer (including 0) is the correct outcome when nothing in a gap deserves emphasis.`,
+    `Empty windows:`,
+    gapList,
+    boringList
+      ? `\nAVOID proposing moments that fall inside these quiet/boring stretches:\n${boringList}`
+      : "",
+    `Each moment's start/end MUST fall entirely inside one of the empty windows. If a window is truly idle, loading, or shows no meaningful action, return nothing for it. Never invent activity. Do NOT default to zoom — pick the effect that matches what is actually on screen.`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+  const response: GenerateContentResponse = await ai.models.generateContent({
+    model: ANALYSIS_MODEL,
+    contents: [
+      {
+        role: "user",
+        parts: [videoPart(opts.video), { text: userPrompt }],
+      },
+    ],
+    config: {
+      systemInstruction: GAPFILL_SYSTEM,
+      responseMimeType: "application/json",
+      responseSchema: GAPFILL_SCHEMA as never,
+      temperature: 0.3,
+    },
+  });
+  const text = response.text;
+  if (!text) return [];
+  let parsed: { moments?: Array<Record<string, unknown>> };
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return [];
+  }
+  const candidates = (parsed.moments ?? [])
+    .map<GapFillCandidate>((m) => ({
+      startTime: Math.max(0, Number(m.startTime) || 0),
+      endTime: Math.max(0, Number(m.endTime) || 0),
+      focusRegion: {
+        x: clamp01((m.focusRegion as Record<string, number>)?.x ?? 0.25),
+        y: clamp01((m.focusRegion as Record<string, number>)?.y ?? 0.25),
+        width: clamp01((m.focusRegion as Record<string, number>)?.width ?? 0.5),
+        height: clamp01((m.focusRegion as Record<string, number>)?.height ?? 0.5),
+      },
+      effectType:
+        (["zoom", "click-highlight", "cursor-focus", "speed-up"] as const).includes(
+          m.effectType as never
+        )
+          ? (m.effectType as GapFillCandidate["effectType"])
+          : "zoom",
+      uiContext: pickEnum<UIContext>(m.uiContext, UI_CONTEXTS, "other"),
+      attentionScore: clamp01(Number(m.attentionScore) || 0.4),
+      recommendedIntensity: clamp01(Number(m.recommendedIntensity) || 0.4),
+      label: typeof m.label === "string" ? m.label.slice(0, 80) : undefined,
+      reason: typeof m.reason === "string" ? m.reason.slice(0, 240) : undefined,
+    }))
+    .filter((c) => c.endTime > c.startTime)
+    // Enforce: must fit inside SOME gap window.
+    .filter((c) =>
+      opts.gaps.some((g) => c.startTime >= g.startTime - 0.05 && c.endTime <= g.endTime + 0.05)
+    )
+    .slice(0, opts.maxMoments)
+    .sort((a, b) => a.startTime - b.startTime);
+  return candidates;
+}
+
+// ── 3. MOMENT LABELING ───────────────────────────────────────────────────────
+
+const LABEL_SCHEMA = {
+  type: Type.OBJECT,
+  required: ["labels"],
+  properties: {
+    labels: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        required: ["id", "label", "reason"],
+        properties: {
+          id: { type: Type.STRING },
+          label: { type: Type.STRING, description: "3-6 word title." },
+          reason: { type: Type.STRING, description: "1 sentence rationale." },
+        },
+      },
+    },
+  },
+} as const;
+
+const LABEL_SYSTEM = `You are labeling moments a different system already selected. Your output is ONLY display text.
+
+You will receive:
+- The video.
+- A list of moments with id, time window, and a hint about what was happening.
+
+For each moment, return:
+- A 3-6 word label.
+- A 1-sentence reason a viewer should care.
+
+RULES
+- Return one entry per supplied id. Do NOT invent extra moments.
+- Do NOT alter timestamps, focus regions, effects, or anything else. Display text only.
+- Keep labels under 6 words. Keep reasons under 200 chars.
+- Output ONLY the JSON schema.`;
+
+export interface MomentLabelRequest {
+  id: string;
+  startTime: number;
+  endTime: number;
+  /** Hint about provenance / what we already know — drives Gemini's labeling. */
+  hint: string;
+  /** Optional uiContext to bias wording. */
+  uiContext?: string;
+}
+
+export interface MomentLabel {
+  id: string;
+  label: string;
+  reason: string;
+}
+
+/**
+ * Pure naming pass — Gemini reads the video, sees the selected moments
+ * (NOT proposed by it), and returns a label + reason per moment.
+ *
+ * Skipped automatically when `moments` is empty.
+ */
+export async function labelMoments(opts: {
+  video: GeminiVideoRef;
+  moments: MomentLabelRequest[];
+}): Promise<MomentLabel[]> {
+  if (opts.moments.length === 0) return [];
+  const ai = getGemini();
+  const list = opts.moments
+    .map(
+      (m, i) =>
+        `  ${i + 1}. id=${m.id} · ${m.startTime.toFixed(1)}s → ${m.endTime.toFixed(1)}s${
+          m.uiContext ? ` · ${m.uiContext}` : ""
+        } · ${m.hint}`
+    )
+    .join("\n");
+  const userPrompt = [
+    "Label the following moments. Watch the video, then return a short label + 1-sentence reason for each id.",
+    "Moments:",
+    list,
+    "Do NOT propose new moments. One label entry per id, exactly.",
+  ].join("\n");
+  const response: GenerateContentResponse = await ai.models.generateContent({
+    model: ANALYSIS_MODEL,
+    contents: [
+      {
+        role: "user",
+        parts: [videoPart(opts.video), { text: userPrompt }],
+      },
+    ],
+    config: {
+      systemInstruction: LABEL_SYSTEM,
+      responseMimeType: "application/json",
+      responseSchema: LABEL_SCHEMA as never,
+      temperature: 0.2,
+    },
+  });
+  const text = response.text;
+  if (!text) return [];
+  let parsed: { labels?: Array<Record<string, unknown>> };
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return [];
+  }
+  const byId = new Map<string, MomentLabel>();
+  for (const l of parsed.labels ?? []) {
+    const id = typeof l.id === "string" ? l.id : "";
+    const label = typeof l.label === "string" ? l.label.slice(0, 80) : "";
+    const reason = typeof l.reason === "string" ? l.reason.slice(0, 240) : "";
+    if (id && label) byId.set(id, { id, label, reason });
+  }
+  // Preserve order of `opts.moments`; drop ids Gemini didn't return.
+  return opts.moments
+    .map((m) => byId.get(m.id))
+    .filter((x): x is MomentLabel => Boolean(x));
+}
+
 import type {
   AttentionFactors,
   NarrativeRole,
@@ -465,7 +953,6 @@ export interface AnalysisJSON {
     /** legacy compatibility — older runs returned this; new ones return attentionScore */
     importance?: number;
   }>;
-  suggestedCaptions: Array<{ startTime: number; text: string }>;
   boringSections: Array<{ startTime: number; endTime: number; reason: string }>;
   recommendedPresetIds: string[];
   videoType: VideoType;
@@ -639,13 +1126,6 @@ function sanitizeAnalysis(a: AnalysisJSON): AnalysisJSON {
     .filter((m) => m.endTime > m.startTime)
     .sort((x, y) => x.startTime - y.startTime);
 
-  const captions = (a.suggestedCaptions ?? [])
-    .map((c) => ({
-      startTime: Math.max(0, Number(c.startTime) || 0),
-      text: (c.text || "").slice(0, 80),
-    }))
-    .filter((c) => c.text.length > 0);
-
   const boring = (a.boringSections ?? [])
     .map((b) => ({
       startTime: Math.max(0, Number(b.startTime) || 0),
@@ -680,7 +1160,6 @@ function sanitizeAnalysis(a: AnalysisJSON): AnalysisJSON {
   return {
     summary: (a.summary || "").slice(0, 480),
     detectedMoments: moments,
-    suggestedCaptions: captions,
     boringSections: boring,
     recommendedPresetIds: recommended,
     videoType,

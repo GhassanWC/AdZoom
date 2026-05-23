@@ -96,10 +96,33 @@ function bracket(
 }
 
 /**
+ * Clamp a viewport centre so that the zoomed window stays fully inside the
+ * source frame (no black bars from peeking off the edge). At `scale`, the
+ * visible window in source units has half-width `1/(2*scale)`, so the centre
+ * must live in `[half, 1-half]`. When the scale is so high the window is
+ * larger than the frame on one axis (half > 0.5), we fall back to dead
+ * center on that axis.
+ */
+function clampCenterToFrame(
+  cx: number,
+  cy: number,
+  scale: number
+): { cx: number; cy: number } {
+  const half = 1 / (2 * Math.max(1, scale));
+  const clampAxis = (v: number) =>
+    half >= 0.5 ? 0.5 : Math.max(half, Math.min(1 - half, v));
+  return { cx: clampAxis(cx), cy: clampAxis(cy) };
+}
+
+/**
  * The camera state for a moment at a given local progress (0..1).
  *
  * - With keyframes: interpolate centre + intensity through them.
  * - Without: hold the static `focusRegion` at the blended intensity.
+ *
+ * In both paths the focus centre is clamped so the zoomed window can't drift
+ * off the source frame — preview and export rely on this invariant to avoid
+ * black edges when a moment targets the corners.
  */
 export function cameraForMoment(
   m: DetectedMoment,
@@ -109,14 +132,15 @@ export function cameraForMoment(
   const kfs = m.keyframes;
   if (kfs && kfs.length > 0) {
     const { a, b, f } = bracket(kfs, clamp01(localProgressValue));
-    const cx = a.x + (b.x - a.x) * f;
-    const cy = a.y + (b.y - a.y) * f;
+    const cxRaw = a.x + (b.x - a.x) * f;
+    const cyRaw = a.y + (b.y - a.y) * f;
     const intensity = a.scale + (b.scale - a.scale) * f;
     const scale = scaleFromFocus(
       m.focusRegion.width,
       m.focusRegion.height,
       intensity
     );
+    const { cx, cy } = clampCenterToFrame(cxRaw, cyRaw, scale);
     return {
       scale,
       panXPct: (0.5 - cx) * 100,
@@ -124,13 +148,14 @@ export function cameraForMoment(
     };
   }
 
-  const cx = m.focusRegion.x + m.focusRegion.width / 2;
-  const cy = m.focusRegion.y + m.focusRegion.height / 2;
+  const cxRaw = m.focusRegion.x + m.focusRegion.width / 2;
+  const cyRaw = m.focusRegion.y + m.focusRegion.height / 2;
   const scale = scaleFromFocus(
     m.focusRegion.width,
     m.focusRegion.height,
     blendedIntensity
   );
+  const { cx, cy } = clampCenterToFrame(cxRaw, cyRaw, scale);
   return {
     scale,
     panXPct: (0.5 - cx) * 100,

@@ -248,11 +248,6 @@ function SettingsList({
           value={e.clickHighlightStyle}
         />
         <SettingRow
-          icon={<Sparkles size={11} className="text-violet-300" />}
-          label="Captions"
-          value={prettyCaptionStyle(e.captionStyle)}
-        />
-        <SettingRow
           icon={<Zap size={11} className="text-violet-300" />}
           label="Pacing"
           value={e.pacing}
@@ -321,23 +316,6 @@ function delta(current: number | undefined, next: number, suffix: string): strin
   if (Math.abs(d) < 1) return null;
   const sign = d > 0 ? "+" : "";
   return `${sign}${d}${suffix}`;
-}
-
-function prettyCaptionStyle(s: string): string {
-  switch (s) {
-    case "none":
-      return "Off";
-    case "minimal":
-      return "Minimal";
-    case "bold-pop":
-      return "Bold pop";
-    case "tutorial-tooltip":
-      return "Tooltip";
-    case "subtitle":
-      return "Subtitle";
-    default:
-      return s;
-  }
 }
 
 function prettyPlatform(p: string): string {

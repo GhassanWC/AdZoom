@@ -12,6 +12,7 @@ import {
   CreditCard,
   Settings,
   Sparkles,
+  Video,
   X,
   type LucideIcon,
 } from "lucide-react";
@@ -19,6 +20,8 @@ import { motion, AnimatePresence } from "framer-motion";
 import { cn } from "@/lib/cn";
 import { Logo } from "@/components/landing/Logo";
 import { sidebarItems } from "@/lib/mockData";
+import { useStoragePlan } from "@/lib/usage/useStoragePlan";
+import { fmtBytes, storageBand } from "@/lib/usage/plan";
 
 const icons: Record<string, LucideIcon> = {
   LayoutDashboard,
@@ -28,6 +31,7 @@ const icons: Record<string, LucideIcon> = {
   Download,
   CreditCard,
   Settings,
+  Video,
 };
 
 export function Sidebar({
@@ -38,6 +42,15 @@ export function Sidebar({
   onClose: () => void;
 }) {
   const pathname = usePathname();
+  const storage = useStoragePlan();
+  const band = storageBand(storage.usedBytes, storage.limitBytes);
+  const barClass =
+    band === "danger"
+      ? "bg-gradient-to-r from-rose-500 to-rose-400"
+      : band === "warn"
+        ? "bg-gradient-to-r from-amber-400 to-amber-300"
+        : "bg-gradient-to-r from-violet-500 to-cyan-400";
+  const usagePct = Math.max(1, Math.round(storage.fraction * 100));
 
   const nav = (
     <nav className="flex h-full flex-col">
@@ -79,10 +92,25 @@ export function Sidebar({
       <div className="m-3 space-y-3 rounded-xl border border-white/[0.06] bg-white/[0.02] p-4">
         <div className="flex items-center justify-between">
           <span className="text-xs font-medium text-white">Storage</span>
-          <span className="font-mono text-[10px] text-fog">4.2 / 10 GB</span>
+          <span
+            className={cn(
+              "font-mono text-[10px] tabular-nums",
+              band === "danger"
+                ? "text-rose-300"
+                : band === "warn"
+                  ? "text-amber-200"
+                  : "text-fog"
+            )}
+            title={`${storage.projectCount} project${storage.projectCount === 1 ? "" : "s"}`}
+          >
+            {fmtBytes(storage.usedBytes)} / {fmtBytes(storage.limitBytes)}
+          </span>
         </div>
         <div className="h-1 overflow-hidden rounded-full bg-white/[0.06]">
-          <div className="h-full w-[42%] rounded-full bg-gradient-to-r from-violet-500 to-cyan-400" />
+          <div
+            className={cn("h-full rounded-full transition-[width] duration-300", barClass)}
+            style={{ width: `${usagePct}%` }}
+          />
         </div>
 
         <div className="flex items-center justify-between pt-2">
@@ -90,13 +118,13 @@ export function Sidebar({
             <span className="inline-flex size-6 items-center justify-center rounded-md bg-violet-500/15 text-violet-300">
               <Sparkles size={11} />
             </span>
-            <span className="text-xs font-medium text-white">Pro plan</span>
+            <span className="text-xs font-medium text-white">{storage.plan.name}</span>
           </div>
           <Link
             href="/dashboard/billing"
             className="text-[11px] text-fog underline-offset-4 hover:text-white hover:underline"
           >
-            Upgrade
+            {storage.plan.ctaLabel}
           </Link>
         </div>
       </div>

@@ -1,25 +1,33 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { FieldValue, type DocumentReference } from "firebase-admin/firestore";
 import { getAdmin } from "@/lib/firebase/admin";
+import { stripUndefined } from "@/lib/firebase/sanitize";
 import {
-  analyzeInline,
-  analyzeWithGeminiFile,
+  classifyVideoSections,
+  labelMoments,
+  proposeGapFills,
   uploadVideoToGemini,
   waitForGeminiFileActive,
   GeminiCancelled,
+  type GeminiVideoRef,
 } from "@/lib/gemini";
 import {
   classifyError,
   estimateAnalysisSeconds,
 } from "@/lib/analysis-stages";
 import { balanceTimeline, distributionScore } from "@/lib/timeline-balancer";
-import type {
-  AnalysisActivityEvent,
-  AnalysisErrorKind,
-  DetectedMoment,
-  Pacing,
-  ProjectStatus,
-  VisualAnalysis,
+import { momentsFromEvents } from "@/lib/attention/events";
+import { attentionCurve } from "@/lib/attention/score";
+import type { Interaction } from "@/lib/recording/types";
+import {
+  AI_MOMENT_QUOTA,
+  type AnalysisActivityEvent,
+  type AnalysisErrorKind,
+  type DetectedMoment,
+  type MomentProvenance,
+  type Pacing,
+  type ProjectStatus,
+  type VisualAnalysis,
 } from "@/lib/firebase/schema";
 
 export const runtime = "nodejs";
@@ -151,6 +159,11 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     const mimeType = (project.mimeType as string | undefined) || "video/mp4";
     const duration = project.duration as number | undefined;
     const fileSize = project.fileSize as number | undefined;
+    const interactionScope = project.interactionScope as
+      | "tab"
+      | "external"
+      | undefined;
+    const interactionsPath = project.interactionsPath as string | undefined;
 
     if (!storagePath) {
       return NextResponse.json({ error: "Project has no video uploaded" }, { status: 400 });
@@ -172,7 +185,6 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
           status: "analyzing",
           stage: "Preparing analysis",
           detectedMoments: [],
-          suggestedCaptions: [],
           boringSections: [],
           recommendedPresetIds: [],
           activity: [],
@@ -201,28 +213,55 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     const sizeMB = (buffer.length / (1024 * 1024)).toFixed(1);
     await emitActivity(ref, "ok", `Downloaded video (${sizeMB} MB)`);
 
+    // Load real interaction events if the recording carried them. Best-effort:
+    // a missing/corrupt manifest just falls back to CV-only analysis.
+    let interactions: Interaction[] = [];
+    if (interactionsPath && interactionScope === "tab") {
+      try {
+        const [iBuf] = await bucket.file(interactionsPath).download();
+        const parsed = JSON.parse(iBuf.toString("utf8")) as {
+          version: number;
+          scope: string;
+          events: Interaction[];
+        };
+        interactions = Array.isArray(parsed?.events) ? parsed.events : [];
+        await emitActivity(
+          ref,
+          "ok",
+          `Loaded ${interactions.length} real interaction event${interactions.length === 1 ? "" : "s"}`
+        );
+      } catch (err) {
+        console.warn("[analyze] interactions load failed", err);
+        await emitActivity(
+          ref,
+          "warn",
+          "Interaction manifest unreadable — falling back to CV-only"
+        );
+      }
+    } else if (interactionScope === "external") {
+      await emitActivity(
+        ref,
+        "info",
+        "External-surface recording — relying on CV signals only"
+      );
+    }
+
     await ensureNotCancelled(ref);
 
-    // 5. Inline vs Files API
+    // 5. Prepare a Gemini video reference. The new refinement-only pipeline
+    // calls Gemini up to three times (sections → gap-fill → labels), so we
+    // upload once via the Files API for non-inline videos and reuse the URI.
     const useInline = buffer.length <= INLINE_BYTE_LIMIT;
-    let analysisJson;
-
+    let geminiVideo: GeminiVideoRef;
     if (useInline) {
-      await setStage(ref, "analyzing", "Analyzing UI interactions");
-      await emitActivity(ref, "info", `Sending video to Gemini (inline, ${sizeMB} MB)`);
-      analysisJson = await analyzeInline({
-        videoBuffer: buffer,
-        mimeType,
-        hintedDuration: duration,
-      });
+      geminiVideo = { kind: "inline", buffer, mimeType };
+      await emitActivity(ref, "info", `Using inline video (${sizeMB} MB)`);
     } else {
       await setStage(ref, "uploading_to_gemini", "Uploading to Gemini");
       await emitActivity(ref, "info", "Uploading video to Gemini Files API");
       const uploaded = await uploadVideoToGemini(buffer, mimeType);
       await emitActivity(ref, "ok", `Uploaded — file id ${uploaded.name.split("/").pop()}`);
-
       await ensureNotCancelled(ref);
-
       await setStage(ref, "extracting_frames", "Extracting frames");
       await waitForGeminiFileActive(uploaded.name, {
         timeoutMs: 180_000,
@@ -234,65 +273,240 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
         },
       });
       await emitActivity(ref, "ok", "Gemini finished extracting frames");
-
-      await ensureNotCancelled(ref);
-
-      await setStage(ref, "analyzing", "Analyzing UI interactions");
-      await emitActivity(ref, "info", "Asking Gemini for the cinematic plan");
-      analysisJson = await analyzeWithGeminiFile(uploaded, duration);
+      geminiVideo = { kind: "file", uri: uploaded.uri, mimeType: uploaded.mimeType };
     }
 
     await ensureNotCancelled(ref);
 
-    // 6. Build timeline — balancer redistributes Gemini's output across the
-    // full duration, respects min-spacing, and rescues empty quartiles.
-    await setStage(ref, "generating_timeline", "Building zoom timeline");
+    // 6. Phase A — Section classification (videoType, narrative, summary,
+    // preset recommendations). NO moments proposed here.
+    await setStage(ref, "analyzing", "Classifying recording");
+    await emitActivity(ref, "info", "Asking Gemini for structure (sections + classification)");
+    const sections = await classifyVideoSections({
+      video: geminiVideo,
+      hintedDuration: duration,
+    });
     await emitActivity(
       ref,
       "ok",
-      `Detected ${analysisJson.detectedMoments.length} moments, ${analysisJson.suggestedCaptions.length} captions`
+      `Classified as ${sections.videoType.replace(/-/g, " ")}${
+        sections.narrativeStructure.length > 0
+          ? ` · ${sections.narrativeStructure.length} narrative segments`
+          : ""
+      }`
     );
 
-    const rawMoments = analysisJson.detectedMoments as DetectedMoment[];
-    // Default pacing from the project's preset (Gemini-recommended or user's prior choice)
+    await ensureNotCancelled(ref);
+
+    // 7. Phase B — Build the deterministic candidate pool. Real events first,
+    // CV candidates as a backstop. Gemini contributes ZERO moments at this
+    // stage (invariant 1).
+    await setStage(ref, "generating_timeline", "Building zoom timeline");
+
     const existingPacing = (project.effectsSettings as { pacing?: Pacing } | undefined)?.pacing;
     const pacing: Pacing = existingPacing ?? "moderate";
-
-    // The client-side CV pass wrote this top-level before calling the route.
-    // Absent when the video wasn't readable on-device — analysis still proceeds.
     const visualAnalysis = project.visualAnalysis as VisualAnalysis | undefined;
 
-    const balanced = balanceTimeline({
-      raw: rawMoments,
-      duration: duration ?? 0,
-      pacing,
-      videoType: analysisJson.videoType,
-      visualAnalysis,
-    });
-
-    if (balanced.stats.fusedCount > 0) {
-      const bits = [
-        `Fused ${balanced.stats.fusedCount} moment${
-          balanced.stats.fusedCount === 1 ? "" : "s"
-        } with on-device CV signals`,
-      ];
-      if (balanced.stats.clickRefinedCount > 0) {
-        bits.push(`refined ${balanced.stats.clickRefinedCount} click timing${
-          balanced.stats.clickRefinedCount === 1 ? "" : "s"
-        }`);
-      }
-      await emitActivity(ref, "ok", bits.join(" · "));
-    } else if (!visualAnalysis) {
-      await emitActivity(ref, "info", "No on-device CV data — using Gemini scores only");
+    const eventMoments =
+      interactions.length > 0
+        ? momentsFromEvents(interactions, { duration: duration ?? 0 })
+        : [];
+    if (eventMoments.length > 0) {
+      await emitActivity(
+        ref,
+        "ok",
+        `Derived ${eventMoments.length} moment${
+          eventMoments.length === 1 ? "" : "s"
+        } from real interaction events`
+      );
     }
 
-    if (analysisJson.videoType) {
+    // Canonical attention curve — single importance signal across the product.
+    const attention = attentionCurve({
+      duration: duration ?? 0,
+      interactions,
+      interactionScope,
+      visualAnalysis,
+      uiRegions: visualAnalysis?.uiRegions,
+    });
+
+    // First selection pass: events + CV only. No `raw` AI input. This gives
+    // us the deterministic-only timeline before we even consider gap-fill.
+    // boringSections + interactions are passed so the reject pass can drop
+    // CV candidates that landed in quiet/idle stretches.
+    const firstPass = balanceTimeline({
+      raw: [],
+      duration: duration ?? 0,
+      pacing,
+      videoType: sections.videoType,
+      visualAnalysis,
+      eventMoments,
+      useCvCandidates: true,
+      boringSections: sections.boringSections,
+      interactions,
+    });
+
+    await ensureNotCancelled(ref);
+
+    // 8. Phase C — Detect coverage gaps and call Gemini for limited gap-fill
+    // ONLY. Gemini sees the empty windows and the maxMoments budget; it
+    // cannot exceed either. Quota math: even if every gap-fill survives,
+    // they make up ≤ AI_MOMENT_QUOTA of the final timeline.
+    const GAP_MIN_SECONDS = 15;
+    const dur = duration ?? 0;
+    const sortedFirst = [...firstPass.moments].sort((a, b) => a.startTime - b.startTime);
+    const rawGaps: Array<{ startTime: number; endTime: number }> = [];
+    let cursor = 0;
+    for (const m of sortedFirst) {
+      if (m.startTime - cursor >= GAP_MIN_SECONDS) {
+        rawGaps.push({ startTime: cursor, endTime: m.startTime });
+      }
+      cursor = Math.max(cursor, m.endTime);
+    }
+    if (dur - cursor >= GAP_MIN_SECONDS) {
+      rawGaps.push({ startTime: cursor, endTime: dur });
+    }
+
+    // Pre-filter: drop any gap that sits entirely inside a boring section —
+    // no point asking Gemini to fill a window we already classified as quiet.
+    const isFullyInsideBoring = (
+      g: { startTime: number; endTime: number }
+    ): boolean =>
+      (sections.boringSections ?? []).some(
+        (b) => g.startTime >= b.startTime - 0.1 && g.endTime <= b.endTime + 0.1
+      );
+    const gaps = rawGaps.filter((g) => !isFullyInsideBoring(g));
+    const skippedBoringGaps = rawGaps.length - gaps.length;
+    if (skippedBoringGaps > 0) {
       await emitActivity(
         ref,
         "info",
-        `Classified as ${analysisJson.videoType.replace(/-/g, " ")}`
+        `Skipped ${skippedBoringGaps} gap${skippedBoringGaps === 1 ? "" : "s"} inside boring sections`
       );
     }
+
+    // Quota-aware budget: gap-fills count as AI moments. Project the final
+    // size as max(firstPass + maxFills, MIN_MOMENTS) and back-solve. We're
+    // conservative — pick the floor.
+    const projectedTotal = firstPass.moments.length + gaps.length;
+    const aiBudget = Math.max(
+      0,
+      Math.min(gaps.length, Math.floor(projectedTotal * AI_MOMENT_QUOTA) + 1)
+    );
+
+    let aiGapMoments: DetectedMoment[] = [];
+    if (gaps.length > 0 && aiBudget > 0) {
+      await emitActivity(
+        ref,
+        "info",
+        `Asking Gemini to fill ${gaps.length} coverage gap${
+          gaps.length === 1 ? "" : "s"
+        } (budget ${aiBudget})`
+      );
+      try {
+        const proposals = await proposeGapFills({
+          video: geminiVideo,
+          gaps,
+          maxMoments: aiBudget,
+          boringSections: sections.boringSections,
+        });
+        aiGapMoments = proposals.map((p, i) => ({
+          id: `mom_ai_${i + 1}`,
+          startTime: p.startTime,
+          endTime: p.endTime,
+          label: p.label || "AI suggestion",
+          reason: p.reason || "",
+          focusRegion: p.focusRegion,
+          effectType: p.effectType,
+          uiContext: p.uiContext,
+          attentionScore: p.attentionScore,
+          recommendedIntensity: p.recommendedIntensity,
+          source: "ai",
+          provenance: "ai" as MomentProvenance,
+          confidenceScore: Math.max(0.3, Math.min(0.6, p.attentionScore)),
+          confidenceSource: "ai-gap-fill" as const,
+          confidenceReason: `${Math.max(0.3, Math.min(0.6, p.attentionScore)).toFixed(2)} — AI gap-fill in ${p.startTime.toFixed(1)}–${p.endTime.toFixed(1)}s coverage gap`,
+          // Explainability — Gemini chose this effect for this window.
+          whyEffectType: `Gemini gap-fill → ${p.effectType}${p.uiContext ? ` (${p.uiContext} context)` : ""}`,
+          targetRegionSource: "ai-proposal" as const,
+          sourceSignals: ["ai-gap-fill", `gap@${p.startTime.toFixed(1)}-${p.endTime.toFixed(1)}`],
+        }));
+        await emitActivity(
+          ref,
+          "ok",
+          `Gemini proposed ${aiGapMoments.length} gap-fill moment${
+            aiGapMoments.length === 1 ? "" : "s"
+          }`
+        );
+      } catch (err) {
+        console.warn("[analyze] gap-fill failed", err);
+        await emitActivity(ref, "warn", "Gap-fill call failed — proceeding with deterministic timeline only");
+      }
+    } else if (gaps.length === 0) {
+      await emitActivity(ref, "info", "No coverage gaps ≥15s — skipping AI gap-fill");
+    }
+
+    await ensureNotCancelled(ref);
+
+    // 9. Phase D — Final balance pass with the unified pool. Priority +
+    // quota enforcement is applied here. Old `rawMoments` from previous runs
+    // (if any) are NOT used — we keep the new candidate pool as `rawMoments`
+    // for the rebalance endpoint. boringSections + interactions feed the
+    // reject pass so AI gap-fills in idle / quiet stretches are dropped.
+    const balanced = balanceTimeline({
+      raw: aiGapMoments,
+      duration: dur,
+      pacing,
+      videoType: sections.videoType,
+      visualAnalysis,
+      eventMoments,
+      useCvCandidates: true,
+      boringSections: sections.boringSections,
+      interactions,
+    });
+
+    await ensureNotCancelled(ref);
+
+    // 10. Phase E — Label the FINAL moments. Gemini sees the chosen moments
+    // and returns label + reason per id. It cannot add or remove moments
+    // here — labeling is display-only.
+    const needsLabeling = balanced.moments
+      .filter((m) => m.provenance !== "user")
+      .map((m) => ({
+        id: m.id,
+        startTime: m.startTime,
+        endTime: m.endTime,
+        hint:
+          m.provenance === "event"
+            ? `derived from real interaction (${m.confidenceSource ?? "event"})`
+            : m.provenance === "cv"
+              ? `inferred from CV signals (${m.confidenceSource ?? "motion"})`
+              : `AI gap-fill`,
+        uiContext: m.uiContext,
+      }));
+
+    if (needsLabeling.length > 0) {
+      await emitActivity(ref, "info", `Asking Gemini to label ${needsLabeling.length} moment${needsLabeling.length === 1 ? "" : "s"}`);
+      try {
+        const labels = await labelMoments({ video: geminiVideo, moments: needsLabeling });
+        const byId = new Map(labels.map((l) => [l.id, l]));
+        for (const m of balanced.moments) {
+          const l = byId.get(m.id);
+          if (l) {
+            m.label = l.label;
+            // Keep our confidenceReason as the structured one; surface
+            // Gemini's reason on the editorial `reason` field.
+            m.reason = l.reason || m.reason;
+          }
+        }
+        await emitActivity(ref, "ok", `Labelled ${labels.length} moment${labels.length === 1 ? "" : "s"}`);
+      } catch (err) {
+        console.warn("[analyze] labeling failed", err);
+        await emitActivity(ref, "warn", "Labeling call failed — using deterministic labels");
+      }
+    }
+
+    // Stats reporting (now driven by the new pipeline's balancer output).
     if (balanced.stats.rewrittenEffects > 0) {
       await emitActivity(
         ref,
@@ -320,8 +534,72 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
         }`
       );
     }
+    if (balanced.stats.quotaDropped > 0) {
+      await emitActivity(
+        ref,
+        "info",
+        `Dropped ${balanced.stats.quotaDropped} AI moment${
+          balanced.stats.quotaDropped === 1 ? "" : "s"
+        } to honor the ${Math.round(AI_MOMENT_QUOTA * 100)}% quota`
+      );
+    }
+    if (balanced.stats.eventOverlapsResolved > 0) {
+      await emitActivity(
+        ref,
+        "info",
+        `Resolved ${balanced.stats.eventOverlapsResolved} candidate overlap${
+          balanced.stats.eventOverlapsResolved === 1 ? "" : "s"
+        } by priority`
+      );
+    }
+    // New: surface what the reject pass dropped — the user wants to see
+    // *why* the timeline ends up smaller now.
+    if (balanced.stats.aiRejectedBoring > 0) {
+      await emitActivity(
+        ref,
+        "info",
+        `Rejected ${balanced.stats.aiRejectedBoring} AI moment${
+          balanced.stats.aiRejectedBoring === 1 ? "" : "s"
+        } in boring sections`
+      );
+    }
+    if (balanced.stats.aiRejectedIdle > 0) {
+      await emitActivity(
+        ref,
+        "info",
+        `Rejected ${balanced.stats.aiRejectedIdle} AI moment${
+          balanced.stats.aiRejectedIdle === 1 ? "" : "s"
+        } inside long idle stretches`
+      );
+    }
+    if (balanced.stats.aiRejectedNoTarget > 0) {
+      await emitActivity(
+        ref,
+        "info",
+        `Rejected ${balanced.stats.aiRejectedNoTarget} AI moment${
+          balanced.stats.aiRejectedNoTarget === 1 ? "" : "s"
+        } with no meaningful target`
+      );
+    }
+    if (balanced.stats.sceneChangeNudged > 0) {
+      await emitActivity(
+        ref,
+        "info",
+        `Nudged ${balanced.stats.sceneChangeNudged} moment${
+          balanced.stats.sceneChangeNudged === 1 ? "" : "s"
+        } to start after a scene change`
+      );
+    }
     const emptyQuartiles = balanced.stats.quartileCoverage.filter((c) => !c).length;
-    if (emptyQuartiles > 0) {
+    if (balanced.stats.quartileLeftEmpty > 0) {
+      await emitActivity(
+        ref,
+        "info",
+        `${balanced.stats.quartileLeftEmpty} quartile${
+          balanced.stats.quartileLeftEmpty === 1 ? "" : "s"
+        } silent — candidates rejected as boring/idle (honouring rejection)`
+      );
+    } else if (emptyQuartiles > 0) {
       await emitActivity(
         ref,
         "warn",
@@ -337,41 +615,55 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       `Distribution score ${(distScore * 100).toFixed(0)}/100 · avg attention ${(balanced.stats.avgAttention * 100).toFixed(0)}/100`
     );
 
-    await new Promise((r) => setTimeout(r, 350));
-
-    // 7. Preset recommendations
+    // Preset recommendations come from the section classifier.
     await setStage(ref, "generating_presets", "Generating presets");
-    if (analysisJson.recommendedPresetIds.length > 0) {
+    if (sections.recommendedPresetIds.length > 0) {
       await emitActivity(
         ref,
         "ok",
-        `Recommended ${analysisJson.recommendedPresetIds.length} preset${
-          analysisJson.recommendedPresetIds.length === 1 ? "" : "s"
+        `Recommended ${sections.recommendedPresetIds.length} preset${
+          sections.recommendedPresetIds.length === 1 ? "" : "s"
         }`
       );
     } else {
       await emitActivity(ref, "warn", "No preset matched strongly — defaults will be used");
     }
-    await new Promise((r) => setTimeout(r, 250));
 
     await ensureNotCancelled(ref);
 
-    // 8. Finalize — write BOTH the balanced view and the raw Gemini output.
-    //    rawMoments lets us re-balance on preset change without re-calling Gemini.
+    // 11. Finalize. `rawMoments` is the full candidate pool (event + cv +
+    // ai-gap-fill + rejected) so the rebalance endpoint can re-pick without
+    // re-calling Gemini — and so denser presets can un-reject the rejected
+    // pool. User-edited moments live in `detectedMoments` and are preserved
+    // across rebalance.
+    const rawPool: DetectedMoment[] = [
+      ...eventMoments,
+      ...aiGapMoments,
+      ...balanced.rejectedPool,
+    ];
+    // Firestore rejects writes containing `undefined` anywhere in the
+    // document. Optional fields like `whyEffectType` or `targetRegionSource`
+    // are absent on legacy / CV / preserved moments — strip them out before
+    // persisting so the write doesn't blow up.
+    const cleanMoments = stripUndefined(balanced.moments);
+    const cleanRawPool = stripUndefined(rawPool);
+    const cleanRejectedPool = stripUndefined(balanced.rejectedPool);
     await ref.set(
       {
         status: "analyzed" as ProjectStatus,
         analysis: {
           status: "complete",
           stage: "Complete",
-          summary: analysisJson.summary,
-          detectedMoments: balanced.moments,
-          rawMoments,
-          suggestedCaptions: analysisJson.suggestedCaptions,
-          boringSections: analysisJson.boringSections,
-          recommendedPresetIds: analysisJson.recommendedPresetIds,
-          videoType: analysisJson.videoType,
-          narrativeStructure: analysisJson.narrativeStructure,
+          summary: sections.summary,
+          detectedMoments: cleanMoments,
+          rawMoments: cleanRawPool,
+          rejectedPool: cleanRejectedPool,
+          boringSections: sections.boringSections,
+          recommendedPresetIds: sections.recommendedPresetIds,
+          videoType: sections.videoType,
+          narrativeStructure: sections.narrativeStructure,
+          attentionCurve: attention.curveQ8,
+          attentionSampleRate: attention.sampleRate,
           completedAt: Date.now(),
           cancelRequested: false,
         },
@@ -379,19 +671,32 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       },
       { merge: true }
     );
+
+    // User-facing provenance summary — invariant 6 (trust).
+    const pc = balanced.stats.provenanceCounts;
+    const provenanceBits: string[] = [];
+    if (pc.event > 0) provenanceBits.push(`${pc.event} from your clicks`);
+    if (pc.cv > 0) provenanceBits.push(`${pc.cv} from motion`);
+    if (pc.ai > 0 || pc["ai-override"] > 0) {
+      const aiTotal = pc.ai + pc["ai-override"];
+      const aiPct = balanced.moments.length > 0 ? (aiTotal / balanced.moments.length) * 100 : 0;
+      provenanceBits.push(`${aiTotal} AI suggestion${aiTotal === 1 ? "" : "s"} (${aiPct.toFixed(0)}%)`);
+    }
+    if (pc.user > 0) provenanceBits.push(`${pc.user} from you`);
     await emitActivity(
       ref,
       "ok",
-      `Analysis complete — ${balanced.moments.length} balanced moment${
+      `Analysis complete — ${balanced.moments.length} moment${
         balanced.moments.length === 1 ? "" : "s"
-      }`
+      }${provenanceBits.length > 0 ? ` (${provenanceBits.join(", ")})` : ""}`
     );
 
     return NextResponse.json({
       ok: true,
       momentCount: balanced.moments.length,
-      summary: analysisJson.summary,
-      recommendedPresetIds: analysisJson.recommendedPresetIds,
+      summary: sections.summary,
+      recommendedPresetIds: sections.recommendedPresetIds,
+      provenanceCounts: pc,
     });
   } catch (err) {
     if (err instanceof CancelledError || err instanceof GeminiCancelled) {
