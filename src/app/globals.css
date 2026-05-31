@@ -18,6 +18,21 @@
   --color-surface: #0E1014;
   --color-hairline: rgba(255, 255, 255, 0.06);
 
+  /* ── Semantic design tokens ───────────────────────────────────────────────
+     New surface-agnostic names. Use these in new code instead of reaching
+     for `text-white` / `text-fog`. They resolve to readable values in BOTH
+     themes via the `html.light` overrides below, which means consumers
+     don't need light-specific styling at the component level. */
+  --color-text-primary: #FFFFFF;
+  --color-text-secondary: #C2C7D0;
+  --color-text-muted: #9BA1AD;
+  --color-text-disabled: rgba(255, 255, 255, 0.42);
+  --color-border-soft: rgba(255, 255, 255, 0.06);
+  --color-border-strong: rgba(255, 255, 255, 0.14);
+  --color-button-bg-soft: rgba(255, 255, 255, 0.04);
+  --color-button-bg-soft-hover: rgba(255, 255, 255, 0.08);
+  --color-disabled-bg: rgba(255, 255, 255, 0.03);
+
   /* Typography */
   --font-sans: var(--font-inter), ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --font-display: var(--font-sora), var(--font-inter), ui-sans-serif, system-ui;
@@ -29,15 +44,35 @@
 /* Light theme — flips the design tokens. Tailwind utilities that reference
    these tokens (`bg-ink`, `bg-surface`, `text-fog`, `bg-panel`, etc.) update
    automatically. Literal white-tint utilities (`text-white`, `bg-white/*`,
-   `border-white/*`) are overridden below. */
+   `border-white/*`) are overridden below.
+
+   On `--color-fog`: dark-mode value (#9BA1AD) was a comfortable muted-gray
+   on near-black. The naive light-mode flip (#64748B = slate-500) only
+   reaches 4.59:1 against white — passing AA but feeling washed out on the
+   secondary descriptions / step labels / sidebar text that lean on this
+   token everywhere. Slate-600 (#475569 = 7.62:1) is the readable
+   "secondary text" weight that pairs cleanly with the slate-900 primary
+   and makes the whole light theme feel intentional rather than faded. */
 html.light {
   --color-ink: #FFFFFF;
   --color-panel: #F8FAFC;
   --color-edge: #E2E8F0;
-  --color-fog: #64748B;
+  --color-fog: #475569;
   --color-app: #FFFFFF;
   --color-surface: #F8FAFC;
   --color-hairline: rgba(15, 23, 42, 0.08);
+
+  /* Semantic tokens — light counterparts. Same names, theme-appropriate
+     values. New code: prefer these over `text-fog` / `text-white`. */
+  --color-text-primary: #0F172A;
+  --color-text-secondary: #475569;
+  --color-text-muted: #64748B;
+  --color-text-disabled: #94A3B8;
+  --color-border-soft: rgba(15, 23, 42, 0.08);
+  --color-border-strong: rgba(15, 23, 42, 0.16);
+  --color-button-bg-soft: rgba(15, 23, 42, 0.04);
+  --color-button-bg-soft-hover: rgba(15, 23, 42, 0.08);
+  --color-disabled-bg: rgba(15, 23, 42, 0.04);
 }
 
 /* Custom utilities + bases */
@@ -285,11 +320,17 @@ html.light ::-webkit-scrollbar-thumb:hover {
 
 /* Text — white → near-ink */
 html.light .text-white { color: #0F172A; }
+html.light .text-white\/95 { color: rgba(15, 23, 42, 0.95); }
 html.light .text-white\/90 { color: rgba(15, 23, 42, 0.9); }
 html.light .text-white\/85 { color: rgba(15, 23, 42, 0.85); }
 html.light .text-white\/80 { color: rgba(15, 23, 42, 0.8); }
+html.light .text-white\/75 { color: rgba(15, 23, 42, 0.75); }
 html.light .text-white\/70 { color: rgba(15, 23, 42, 0.7); }
+html.light .text-white\/65 { color: rgba(15, 23, 42, 0.65); }
 html.light .text-white\/60 { color: rgba(15, 23, 42, 0.6); }
+html.light .text-white\/55 { color: rgba(15, 23, 42, 0.55); }
+html.light .text-white\/50 { color: rgba(15, 23, 42, 0.5); }
+html.light .text-white\/40 { color: rgba(15, 23, 42, 0.4); }
 html.light .hover\:text-white:hover { color: #0F172A; }
 html.light .focus\:text-white:focus { color: #0F172A; }
 html.light .group:hover .group-hover\:text-white { color: #0F172A; }
@@ -372,4 +413,245 @@ html.light .text-gradient {
   background: linear-gradient(180deg, #0F172A 0%, #1F2937 50%, #64748B 100%);
   -webkit-background-clip: text;
   background-clip: text;
+}
+
+/* ----------------------------------------------------------------------------
+   Solid white surfaces — used for "primary white-pill" controls (play button,
+   project-card hover overlay). The icons on top use `text-ink`/`fill-ink`,
+   which in light mode resolves to white via the token swap above — so white
+   icons land on a white surface and disappear. Flip the surface to dark navy
+   in light mode so the white icon stays legible.
+---------------------------------------------------------------------------- */
+html.light .bg-white { background-color: #0F172A; }
+html.light .bg-white\/95 { background-color: rgba(15, 23, 42, 0.92); }
+html.light .bg-white\/12 { background-color: rgba(15, 23, 42, 0.1); }
+html.light .bg-white\/15 { background-color: rgba(15, 23, 42, 0.12); }
+
+/* ----------------------------------------------------------------------------
+   Status banners — amber (warn) and rose (danger).
+   Dark theme uses ultra-light text (amber-50/100/200, rose-50/100/200) on
+   near-transparent fills (bg-amber-500/[0.06], etc.) for a soft glassy look.
+   On a white page those become illegible — pale yellow on white, pale pink on
+   white. Darken the text to the 700/800 range, and slightly strengthen the
+   fill and border so the banner still reads as a tinted surface.
+---------------------------------------------------------------------------- */
+
+/* Amber — warn tones */
+html.light .text-amber-50 { color: #78350F; }
+html.light .text-amber-100 { color: #78350F; }
+html.light .text-amber-100\/80 { color: rgba(120, 53, 15, 0.88); }
+html.light .text-amber-100\/85 { color: rgba(120, 53, 15, 0.9); }
+html.light .text-amber-200 { color: #92400E; }
+html.light .text-amber-200\/70 { color: rgba(146, 64, 14, 0.78); }
+html.light .text-amber-300 { color: #B45309; }
+
+html.light .bg-amber-500\/\[0\.04\] { background-color: rgba(245, 158, 11, 0.1); }
+html.light .bg-amber-500\/\[0\.06\] { background-color: rgba(245, 158, 11, 0.14); }
+html.light .bg-amber-500\/\[0\.08\] { background-color: rgba(245, 158, 11, 0.16); }
+html.light .bg-amber-400\/\[0\.08\] { background-color: rgba(245, 158, 11, 0.14); }
+html.light .bg-amber-500\/10 { background-color: rgba(245, 158, 11, 0.16); }
+html.light .bg-amber-500\/15 { background-color: rgba(245, 158, 11, 0.2); }
+html.light .bg-amber-500\/20 { background-color: rgba(245, 158, 11, 0.24); }
+html.light .bg-amber-400\/10 { background-color: rgba(245, 158, 11, 0.16); }
+html.light .bg-amber-400\/15 { background-color: rgba(245, 158, 11, 0.18); }
+html.light .bg-amber-400\/20 { background-color: rgba(245, 158, 11, 0.22); }
+html.light .bg-amber-400\/25 { background-color: rgba(245, 158, 11, 0.26); }
+html.light .bg-amber-100\/5 { background-color: rgba(245, 158, 11, 0.08); }
+
+html.light .border-amber-300\/40 { border-color: rgba(217, 119, 6, 0.5); }
+html.light .border-amber-300\/50 { border-color: rgba(217, 119, 6, 0.55); }
+html.light .border-amber-400\/30 { border-color: rgba(217, 119, 6, 0.5); }
+html.light .border-amber-400\/35 { border-color: rgba(217, 119, 6, 0.55); }
+html.light .border-amber-400\/40 { border-color: rgba(217, 119, 6, 0.6); }
+html.light .border-amber-200\/60 { border-color: rgba(217, 119, 6, 0.55); }
+
+/* Rose — danger tones */
+html.light .text-rose-50 { color: #881337; }
+html.light .text-rose-100 { color: #9F1239; }
+html.light .text-rose-200 { color: #BE123C; }
+html.light .text-rose-200\/70 { color: rgba(190, 18, 60, 0.78); }
+html.light .text-rose-300 { color: #BE123C; }
+html.light .text-rose-300\/80 { color: rgba(190, 18, 60, 0.85); }
+html.light .text-rose-400 { color: #E11D48; }
+
+html.light .bg-rose-500\/\[0\.06\] { background-color: rgba(244, 63, 94, 0.14); }
+html.light .bg-rose-500\/\[0\.08\] { background-color: rgba(244, 63, 94, 0.16); }
+html.light .bg-rose-500\/\[0\.12\] { background-color: rgba(244, 63, 94, 0.2); }
+html.light .bg-rose-500\/10 { background-color: rgba(244, 63, 94, 0.16); }
+html.light .bg-rose-500\/15 { background-color: rgba(244, 63, 94, 0.2); }
+html.light .bg-rose-500\/20 { background-color: rgba(244, 63, 94, 0.24); }
+html.light .bg-rose-500\/30 { background-color: rgba(244, 63, 94, 0.3); }
+html.light .bg-rose-400\/10 { background-color: rgba(244, 63, 94, 0.16); }
+html.light .bg-rose-400\/15 { background-color: rgba(244, 63, 94, 0.2); }
+html.light .bg-rose-400\/40 { background-color: rgba(244, 63, 94, 0.42); }
+html.light .bg-rose-400\/60 { background-color: rgba(244, 63, 94, 0.62); }
+html.light .bg-rose-400\/80 { background-color: rgba(244, 63, 94, 0.85); }
+html.light .bg-rose-400\/85 { background-color: rgba(244, 63, 94, 0.88); }
+
+html.light .border-rose-400\/25 { border-color: rgba(225, 29, 72, 0.5); }
+html.light .border-rose-400\/30 { border-color: rgba(225, 29, 72, 0.5); }
+html.light .border-rose-400\/40 { border-color: rgba(225, 29, 72, 0.55); }
+html.light .border-rose-400\/45 { border-color: rgba(225, 29, 72, 0.6); }
+html.light .border-rose-400\/70 { border-color: rgba(225, 29, 72, 0.75); }
+
+/* ----------------------------------------------------------------------------
+   Brand accent palettes — violet / emerald / cyan
+   Dark theme uses the ultra-light end of each ramp (`text-violet-200`,
+   `text-emerald-300`, `text-cyan-200` …) for badge / chip / step / sidebar
+   accent text. Those values are #C4B5FD / #6EE7B7 / #67E8F9 — fine glow on
+   ink, but they collapse to 1.5–2.1:1 contrast on white. Mirror the
+   amber/rose pattern below: darken text down the ramp, strengthen border
+   alpha so the chip outline still reads, and bump the bg tint alpha so the
+   chip surface still feels like a colored tint instead of a wash.
+
+   Values picked for AA (≥ 4.5:1) on white at the most common pairing
+   ("text on tinted bg of the same hue at ≤ 20% alpha"). The dark-mode
+   tokens at the top of this file are untouched.
+---------------------------------------------------------------------------- */
+
+/* Violet — primary brand accent. The 50/100 row is used for prominent
+   labels (workflow stepper current step, suggestion-bar headings); we drop
+   it to violet-800 so it carries weight. The 200/300/400 rows are used in
+   chips, sidebar accents, and timeline controls — violet-700/600 keep
+   them readable while staying recognisably "the brand color." */
+html.light .text-violet-50 { color: #5B21B6; }
+html.light .text-violet-100 { color: #5B21B6; }
+html.light .text-violet-100\/90 { color: rgba(91, 33, 182, 0.95); }
+html.light .text-violet-200 { color: #6D28D9; }
+html.light .text-violet-200\/90 { color: rgba(109, 40, 217, 0.92); }
+html.light .text-violet-300 { color: #7C3AED; }
+html.light .text-violet-300\/70 { color: rgba(124, 58, 237, 0.82); }
+html.light .text-violet-300\/80 { color: rgba(124, 58, 237, 0.88); }
+html.light .text-violet-400 { color: #7C3AED; }
+html.light .text-violet-400\/60 { color: rgba(124, 58, 237, 0.7); }
+
+/* Violet bg tints — bump alpha so the tinted surface is visible on white
+   without going opaque (chips would stop reading as chips). Each row maps
+   one-to-one to a class actually used in src/ (audited Nov 2025). */
+html.light .bg-violet-400\/\[0\.06\] { background-color: rgba(139, 92, 246, 0.09); }
+html.light .bg-violet-400\/\[0\.08\] { background-color: rgba(139, 92, 246, 0.11); }
+html.light .bg-violet-400\/10 { background-color: rgba(139, 92, 246, 0.13); }
+html.light .bg-violet-500\/\[0\.03\] { background-color: rgba(139, 92, 246, 0.05); }
+html.light .bg-violet-500\/\[0\.05\] { background-color: rgba(139, 92, 246, 0.07); }
+html.light .bg-violet-500\/\[0\.06\] { background-color: rgba(139, 92, 246, 0.08); }
+html.light .bg-violet-500\/\[0\.08\] { background-color: rgba(139, 92, 246, 0.11); }
+html.light .bg-violet-500\/10 { background-color: rgba(139, 92, 246, 0.13); }
+html.light .bg-violet-500\/15 { background-color: rgba(139, 92, 246, 0.17); }
+html.light .bg-violet-500\/20 { background-color: rgba(139, 92, 246, 0.22); }
+html.light .bg-violet-500\/25 { background-color: rgba(139, 92, 246, 0.28); }
+html.light .bg-violet-500\/30 { background-color: rgba(139, 92, 246, 0.32); }
+
+/* Violet borders — switch base to the violet-600 hue (rgb(124, 58, 237))
+   and bump alpha. Same outline strength on white that the dark variants
+   give on ink. */
+html.light .border-violet-300\/40 { border-color: rgba(124, 58, 237, 0.42); }
+html.light .border-violet-300\/45 { border-color: rgba(124, 58, 237, 0.48); }
+html.light .border-violet-300\/50 { border-color: rgba(124, 58, 237, 0.5); }
+html.light .border-violet-300\/80 { border-color: rgba(124, 58, 237, 0.7); }
+html.light .border-violet-400\/20 { border-color: rgba(124, 58, 237, 0.25); }
+html.light .border-violet-400\/30 { border-color: rgba(124, 58, 237, 0.35); }
+html.light .border-violet-400\/35 { border-color: rgba(124, 58, 237, 0.4); }
+html.light .border-violet-400\/40 { border-color: rgba(124, 58, 237, 0.45); }
+html.light .border-violet-400\/45 { border-color: rgba(124, 58, 237, 0.5); }
+html.light .border-violet-400\/50 { border-color: rgba(124, 58, 237, 0.55); }
+html.light .border-violet-400\/60 { border-color: rgba(124, 58, 237, 0.6); }
+html.light .border-violet-400\/70 { border-color: rgba(124, 58, 237, 0.65); }
+html.light .border-violet-400\/80 { border-color: rgba(124, 58, 237, 0.72); }
+html.light .border-violet-500\/30 { border-color: rgba(124, 58, 237, 0.4); }
+html.light .border-violet-500\/50 { border-color: rgba(124, 58, 237, 0.55); }
+
+/* Ring helpers — selection chips, focused preset cards, "Recommended" marks.
+   Tailwind 4 emits `--tw-ring-color` to back the `ring-*` utility, so the
+   custom-property override is the right knob (not `border-color`). */
+html.light .ring-violet-300\/30 { --tw-ring-color: rgba(124, 58, 237, 0.4); }
+html.light .ring-violet-300\/40 { --tw-ring-color: rgba(124, 58, 237, 0.5); }
+html.light .ring-violet-400\/20 { --tw-ring-color: rgba(124, 58, 237, 0.3); }
+html.light .ring-violet-400\/25 { --tw-ring-color: rgba(124, 58, 237, 0.35); }
+html.light .ring-violet-400\/30 { --tw-ring-color: rgba(124, 58, 237, 0.45); }
+html.light .ring-violet-400\/40 { --tw-ring-color: rgba(124, 58, 237, 0.55); }
+html.light .ring-violet-400\/50 { --tw-ring-color: rgba(124, 58, 237, 0.6); }
+html.light .ring-violet-400\/60 { --tw-ring-color: rgba(124, 58, 237, 0.65); }
+html.light .ring-violet-400\/70 { --tw-ring-color: rgba(124, 58, 237, 0.7); }
+html.light .ring-violet-400\/90 { --tw-ring-color: rgba(124, 58, 237, 0.85); }
+html.light .ring-violet-500\/60 { --tw-ring-color: rgba(124, 58, 237, 0.65); }
+
+/* Emerald — success / status (recording "Ready", "Bottom bar cropped",
+   exported-project chips, AI confidence "high"). Same shape as violet. */
+html.light .text-emerald-50 { color: #064E3B; }
+html.light .text-emerald-100 { color: #047857; }
+html.light .text-emerald-100\/80 { color: rgba(4, 120, 87, 0.88); }
+html.light .text-emerald-200 { color: #047857; }
+html.light .text-emerald-300 { color: #059669; }
+html.light .text-emerald-300\/70 { color: rgba(5, 150, 105, 0.82); }
+html.light .text-emerald-300\/80 { color: rgba(5, 150, 105, 0.88); }
+html.light .text-emerald-400 { color: #059669; }
+
+html.light .bg-emerald-400\/\[0\.08\] { background-color: rgba(16, 185, 129, 0.12); }
+html.light .bg-emerald-400\/10 { background-color: rgba(16, 185, 129, 0.14); }
+html.light .bg-emerald-400\/15 { background-color: rgba(16, 185, 129, 0.18); }
+html.light .bg-emerald-400\/40 { background-color: rgba(16, 185, 129, 0.42); }
+html.light .bg-emerald-500\/15 { background-color: rgba(5, 150, 105, 0.18); }
+html.light .bg-emerald-500\/20 { background-color: rgba(5, 150, 105, 0.22); }
+html.light .bg-emerald-400\/80 { background-color: rgba(16, 185, 129, 0.82); }
+html.light .bg-emerald-400\/85 { background-color: rgba(16, 185, 129, 0.88); }
+
+html.light .border-emerald-400\/20 { border-color: rgba(5, 150, 105, 0.25); }
+html.light .border-emerald-400\/30 { border-color: rgba(5, 150, 105, 0.4); }
+html.light .border-emerald-400\/35 { border-color: rgba(5, 150, 105, 0.45); }
+html.light .border-emerald-400\/40 { border-color: rgba(5, 150, 105, 0.48); }
+html.light .ring-emerald-400\/30 { --tw-ring-color: rgba(5, 150, 105, 0.45); }
+
+/* Cyan — secondary brand accent (webcam toggle, AI-suggestion icons,
+   timeline keyframe markers, "auto-captions" chip). Cyan-700/800 keep
+   the cool tone but lift contrast above 5:1 on white. */
+html.light .text-cyan-100 { color: #155E75; }
+html.light .text-cyan-200 { color: #155E75; }
+html.light .text-cyan-300 { color: #0E7490; }
+html.light .text-cyan-400 { color: #0E7490; }
+html.light .text-cyan-400\/80 { color: rgba(14, 116, 144, 0.88); }
+
+html.light .bg-cyan-400\/\[0\.08\] { background-color: rgba(34, 211, 238, 0.12); }
+html.light .bg-cyan-400\/10 { background-color: rgba(34, 211, 238, 0.14); }
+html.light .bg-cyan-400\/15 { background-color: rgba(34, 211, 238, 0.18); }
+
+html.light .border-cyan-200\/50 { border-color: rgba(21, 94, 117, 0.5); }
+html.light .border-cyan-300\/40 { border-color: rgba(14, 116, 144, 0.42); }
+html.light .border-cyan-400\/30 { border-color: rgba(14, 116, 144, 0.4); }
+html.light .border-cyan-400\/40 { border-color: rgba(14, 116, 144, 0.45); }
+html.light .ring-cyan-200\/40 { --tw-ring-color: rgba(21, 94, 117, 0.5); }
+
+/* ----------------------------------------------------------------------------
+   text-fog/{alpha} variants
+   The bare `text-fog` token is strengthened to slate-600 via the @theme
+   override above. The alpha variants below ride on top of that for cases
+   where designers wanted a *softer* fog — but the original values produced
+   pale gray-on-white at 60–85% alpha. We re-base them on slate-600 with
+   tighter alpha values so "softer fog" still passes AA.
+---------------------------------------------------------------------------- */
+html.light .text-fog\/85 { color: rgba(71, 85, 105, 0.95); }
+html.light .text-fog\/80 { color: rgba(71, 85, 105, 0.92); }
+html.light .text-fog\/75 { color: rgba(71, 85, 105, 0.88); }
+html.light .text-fog\/70 { color: #64748B; }
+html.light .text-fog\/65 { color: rgba(71, 85, 105, 0.82); }
+html.light .text-fog\/60 { color: rgba(71, 85, 105, 0.78); }
+html.light .text-fog\/50 { color: rgba(71, 85, 105, 0.72); }
+html.light .hover\:text-fog:hover { color: #475569; }
+
+/* ----------------------------------------------------------------------------
+   Disabled state — surfaces using soft-tint backgrounds (bg-white/[0.02])
+   combined with the global `text-white` flip and a `disabled:opacity-50`
+   on top become very faint on white. We can't override the `opacity`
+   utility itself without breaking sibling animations, but we CAN make the
+   base text dark enough that 50–70% opacity still lands above 4.5:1 on
+   white. The `--color-fog` strengthening to slate-600 (above) does this
+   for `text-fog` chains; this block handles `disabled:opacity-*` on
+   buttons whose base color is `text-white`. With the existing
+   `text-white → #0F172A` flip, a 50%-opacity slate-900 on white is ≈ 4.6:1
+   — already AA. The additional rule below lifts the disabled BACKGROUND
+   a touch so the button still reads as a button (not a flat patch of
+   page) at rest. */
+html.light button:disabled.bg-white\/\[0\.02\],
+html.light button:disabled.bg-white\/\[0\.03\],
+html.light button:disabled.bg-white\/\[0\.04\] {
+  background-color: rgba(15, 23, 42, 0.06);
 }

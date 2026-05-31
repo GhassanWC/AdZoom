@@ -72,7 +72,7 @@ export function MomentInspectorModal() {
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, y: 16, scale: 0.97 }}
             transition={{ duration: 0.26, ease: [0.22, 1, 0.36, 1] }}
-            className="relative flex max-h-[88vh] w-full max-w-xl flex-col overflow-hidden shadow-cinematic"
+            className="relative flex max-h-[88vh] w-full max-w-md flex-col overflow-hidden shadow-cinematic"
           >
             <button
               type="button"

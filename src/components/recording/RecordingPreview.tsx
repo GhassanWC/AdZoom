@@ -2,12 +2,32 @@
 
 import * as React from "react";
 import { motion } from "framer-motion";
-import { RefreshCcw, Sparkles, Loader2, Clock, FileVideo } from "lucide-react";
+import {
+  RefreshCcw,
+  Sparkles,
+  Loader2,
+  Clock,
+  FileVideo,
+  AlertTriangle,
+  Scissors,
+  Check,
+} from "lucide-react";
+import {
+  detectGreenBottomBand,
+  cropBottomBand,
+  type GreenBandReport,
+} from "@/lib/recording";
 
 /**
  * Post-recording take review. Shows the recorded clip with two paths:
  *  - "Use this take" → uploads + creates project + redirects to editor.
  *  - "Discard & re-record" → throws away the blob and returns to setup.
+ *
+ * When the captured surface was a browser tab, we also run a heuristic
+ * green-bottom-band detector against the blob to catch Chrome's
+ * sharing-controls strip (the "green bar" bug). If detected, the user
+ * gets an opt-in "Crop bottom bar" button that re-encodes the take with
+ * the band sliced off — the original blob is never modified silently.
  *
  * No trimming or scrub-edits here — those belong in the editor proper.
  */
@@ -16,8 +36,10 @@ export function RecordingPreview({
   durationSeconds,
   width,
   height,
+  displaySurface,
   onDiscard,
   onUse,
+  onReplaceBlob,
   uploading,
   uploadPct,
   error,
@@ -26,8 +48,11 @@ export function RecordingPreview({
   durationSeconds: number;
   width: number;
   height: number;
+  displaySurface: "monitor" | "window" | "browser" | null;
   onDiscard: () => void;
   onUse: () => void;
+  /** Replace the live preview blob with a corrected version (e.g. after crop). */
+  onReplaceBlob: (next: Blob, info: { width: number; height: number }) => void;
   uploading: boolean;
   uploadPct: number | null;
   error: string | null;
@@ -39,6 +64,134 @@ export function RecordingPreview({
     setUrl(next);
     return () => URL.revokeObjectURL(next);
   }, [blob]);
+
+  // ── Green-bar health check ────────────────────────────────────────────────
+  // Only run on `displaySurface === "browser"` takes. Window/monitor captures
+  // can't include Chrome's sharing-controls strip, so the detector would be
+  // noise. The detector is heuristic — see `health-check.ts` for the rules.
+  // We also skip if the user has already accepted a crop (band detection on
+  // the cropped blob would just thrash).
+  const [bandReport, setBandReport] = React.useState<GreenBandReport | null>(null);
+  const [bandChecked, setBandChecked] = React.useState(false);
+  const [cropped, setCropped] = React.useState(false);
+  const [cropping, setCropping] = React.useState(false);
+  const [cropPct, setCropPct] = React.useState<number | null>(null);
+  const [cropError, setCropError] = React.useState<string | null>(null);
+  /** True if the user explicitly chose "Keep original" — silences the warning. */
+  const [keptOriginal, setKeptOriginal] = React.useState(false);
+  /** Did the cropped output retain an audio track? `null` until crop runs. */
+  const [audioPreserved, setAudioPreserved] = React.useState<boolean | null>(null);
+  /**
+   * Snapshot of the input blob + dims taken right before crop replaces them
+   * upstream. Used to power the "revert to original" affordance, which only
+   * appears if the cropped output lost its audio.
+   */
+  const [originalSnapshot, setOriginalSnapshot] = React.useState<
+    { blob: Blob; width: number; height: number } | null
+  >(null);
+
+  React.useEffect(() => {
+    // Reset health-check state whenever a new blob arrives. We deliberately
+    // do NOT reset `cropped`, `keptOriginal`, `audioPreserved`, or
+    // `originalSnapshot` here — those describe a *decision the user made*
+    // and need to persist across the blob swap that crop/revert triggers.
+    setBandReport(null);
+    setBandChecked(false);
+    setCropError(null);
+    if (displaySurface !== "browser") {
+      setBandChecked(true);
+      return;
+    }
+    let cancelled = false;
+    detectGreenBottomBand(blob)
+      .then((report) => {
+        if (cancelled) return;
+        setBandReport(report);
+      })
+      .catch(() => {
+        // Detection failure is non-fatal — the user can still use the take.
+      })
+      .finally(() => {
+        if (!cancelled) setBandChecked(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [blob, displaySurface]);
+
+  const showBandWarning =
+    bandChecked && bandReport?.detected === true && !cropped && !keptOriginal;
+
+  /**
+   * Best-effort guess at whether the source recording even had audio. We use
+   * it to decide whether "no audio in the cropped output" is worth warning
+   * about — if the user disabled mic + system audio, a muted crop is fine.
+   * The crop function reports `audioPreserved` directly; this is just the
+   * pre-flight sanity for *expected* audio.
+   */
+  const sourceProbablyHadAudio = (() => {
+    const type = blob.type.toLowerCase();
+    // Heuristic: every MIME we record into has an audio codec stub
+    // ("...,mp4a..." or "...,opus") when audio was wired up. If neither
+    // appears, the source is video-only and we shouldn't fearmonger.
+    return /opus|mp4a|aac/.test(type);
+  })();
+
+  const handleKeepOriginal = React.useCallback(() => {
+    setKeptOriginal(true);
+  }, []);
+
+  const handleCrop = React.useCallback(async () => {
+    if (!bandReport || !bandReport.detected) return;
+    setCropping(true);
+    setCropPct(0);
+    setCropError(null);
+    // Snapshot the current (uncropped) blob *before* we hand the crop off,
+    // so a later "Revert to original" can put it back. The provider's
+    // replaceResultBlob is one-way from its side — we hold the source-of-
+    // truth for revert here in the preview.
+    const snapshot = { blob, width: bandReport.videoWidth, height: bandReport.videoHeight };
+    try {
+      const result = await cropBottomBand(
+        blob,
+        bandReport.bandHeightPx,
+        (p) => setCropPct(p.pct)
+      );
+      setOriginalSnapshot(snapshot);
+      setAudioPreserved(result.audioPreserved);
+      onReplaceBlob(result.blob, {
+        width: bandReport.videoWidth,
+        height: bandReport.videoHeight - bandReport.bandHeightPx,
+      });
+      setCropped(true);
+    } catch (err) {
+      setCropError(
+        err instanceof Error
+          ? err.message
+          : "Couldn't crop the bottom bar. You can still use the take as-is."
+      );
+    } finally {
+      setCropping(false);
+      setCropPct(null);
+    }
+  }, [bandReport, blob, onReplaceBlob]);
+
+  const handleRevert = React.useCallback(() => {
+    if (!originalSnapshot) return;
+    onReplaceBlob(originalSnapshot.blob, {
+      width: originalSnapshot.width,
+      height: originalSnapshot.height,
+    });
+    setCropped(false);
+    setAudioPreserved(null);
+    setOriginalSnapshot(null);
+    // Suppress the warning banner so the user isn't re-prompted to crop
+    // immediately after they consciously chose to back out.
+    setKeptOriginal(true);
+  }, [originalSnapshot, onReplaceBlob]);
+
+  const showAudioDroppedWarning =
+    cropped && audioPreserved === false && sourceProbablyHadAudio;
 
   const sizeMB = (blob.size / (1024 * 1024)).toFixed(1);
 
@@ -116,11 +269,121 @@ export function RecordingPreview({
         </div>
       </div>
 
+      {/* Sharing-bar health warning. Heuristic: a strong solid green band
+          along the bottom of the captured frame is Chrome's tab-share strip
+          (or, occasionally, a green footer on the captured page). We never
+          modify the recorded blob silently — the user opts in via the crop
+          button below. Detection only runs when displaySurface === "browser",
+          so window / monitor takes never see this banner. */}
+      {showBandWarning && (
+        <div className="mx-auto flex max-w-2xl items-start gap-3 rounded-2xl border border-amber-300/40 bg-amber-400/[0.08] px-4 py-3 text-left text-sm text-amber-100">
+          <AlertTriangle size={16} className="mt-0.5 shrink-0 text-amber-300" />
+          <div className="min-w-0 flex-1">
+            <div className="font-semibold text-amber-50">
+              A green browser sharing bar may have been captured.
+            </div>
+            <p className="mt-1 text-[12.5px] leading-relaxed text-amber-100/85">
+              Detected a {bandReport?.bandHeightPx}px solid-green band along the
+              bottom of your take. Try recording a window or full screen next
+              time for the cleanest result. We won&apos;t change this recording
+              unless you ask.
+            </p>
+            {/* Explicit duration disclosure — the crop is a real-time
+                re-encode, so on long takes this is a meaningful wait. We
+                put it up here, BEFORE the buttons, so the user is informed
+                before they choose, not after they've kicked it off. */}
+            <p className="mt-2 text-[11.5px] leading-relaxed text-amber-100/75">
+              Cropping re-processes the video and may take about as long as
+              the recording.
+            </p>
+            <div className="mt-2.5 flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={handleKeepOriginal}
+                disabled={cropping || uploading}
+                className="inline-flex h-9 items-center gap-1.5 rounded-full border border-white/15 bg-white/[0.04] px-3.5 text-[12px] font-semibold text-white/85 transition-colors duration-150 hover:border-white/30 hover:text-white disabled:opacity-60"
+              >
+                Keep original
+              </button>
+              <button
+                type="button"
+                onClick={handleCrop}
+                disabled={cropping || uploading}
+                className="inline-flex h-9 items-center gap-1.5 rounded-full border border-amber-300/50 bg-amber-400/15 px-3.5 text-[12px] font-semibold text-amber-50 transition-colors duration-150 hover:border-amber-300/70 hover:bg-amber-400/25 disabled:opacity-60"
+              >
+                {cropping ? (
+                  <Loader2 size={12} className="animate-spin" />
+                ) : (
+                  <Scissors size={12} />
+                )}
+                {cropping
+                  ? cropPct !== null
+                    ? `Cropping… ${Math.round(cropPct * 100)}%`
+                    : "Cropping…"
+                  : "Crop bottom bar"}
+              </button>
+            </div>
+            {cropError && (
+              <p className="mt-2 text-[12px] text-rose-200">{cropError}</p>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Success banner after a crop has landed. We elevate this from a
+          subtle chip to a full banner because it signals a real change to
+          what will be uploaded — not just an indicator. */}
+      {cropped && (
+        <div className="mx-auto flex max-w-2xl items-start gap-3 rounded-2xl border border-emerald-400/30 bg-emerald-400/[0.08] px-4 py-3 text-left text-sm text-emerald-100">
+          <Check size={16} className="mt-0.5 shrink-0 text-emerald-300" />
+          <div className="min-w-0 flex-1">
+            <div className="font-semibold text-emerald-50">
+              Cropped version is now being used for upload/editing.
+            </div>
+            <p className="mt-1 text-[12.5px] leading-relaxed text-emerald-100/80">
+              The bottom band has been removed from the take you&apos;re about
+              to send. The original recording on this page has been replaced.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Audio-loss warning, only when (a) the crop completed, (b) the
+          re-encoded output has no audio track, and (c) the source plausibly
+          had audio in the first place (so we don't nag on muted captures).
+          The "Revert to original" button is the explicit out the user is
+          promised by the copy. */}
+      {showAudioDroppedWarning && (
+        <div className="mx-auto flex max-w-2xl items-start gap-3 rounded-2xl border border-rose-400/30 bg-rose-500/[0.08] px-4 py-3 text-left text-sm text-rose-100">
+          <AlertTriangle size={16} className="mt-0.5 shrink-0 text-rose-300" />
+          <div className="min-w-0 flex-1">
+            <div className="font-semibold text-rose-50">
+              Cropped video may not include audio.
+            </div>
+            <p className="mt-1 text-[12.5px] leading-relaxed text-rose-100/85">
+              This browser couldn&apos;t carry the audio track through the crop.
+              You can keep the original recording instead.
+            </p>
+            <div className="mt-2.5">
+              <button
+                type="button"
+                onClick={handleRevert}
+                disabled={uploading || cropping}
+                className="inline-flex h-9 items-center gap-1.5 rounded-full border border-rose-300/50 bg-rose-400/15 px-3.5 text-[12px] font-semibold text-rose-50 transition-colors duration-150 hover:border-rose-300/70 hover:bg-rose-400/25 disabled:opacity-60"
+              >
+                <RefreshCcw size={12} />
+                Revert to original
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="flex flex-wrap items-center justify-center gap-3">
         <button
           type="button"
           onClick={onDiscard}
-          disabled={uploading}
+          disabled={uploading || cropping}
           className="inline-flex h-12 items-center gap-2 rounded-full border border-white/10 bg-white/[0.02] px-6 text-sm text-fog transition-colors duration-200 hover:border-white/25 hover:text-white disabled:opacity-50"
         >
           <RefreshCcw size={14} />
@@ -129,7 +392,7 @@ export function RecordingPreview({
         <button
           type="button"
           onClick={onUse}
-          disabled={uploading}
+          disabled={uploading || cropping}
           className="inline-flex h-12 items-center gap-2 rounded-full bg-gradient-to-r from-violet-500 to-violet-600 px-7 text-sm font-semibold text-white shadow-[0_18px_40px_-16px_rgba(139,92,246,0.65)] transition-all duration-200 hover:from-violet-500 hover:to-violet-500 disabled:opacity-70"
         >
           {uploading ? (

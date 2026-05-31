@@ -5,14 +5,14 @@ export function BeforeAfterSection() {
   return (
     <Section
       id="product"
-      eyebrow="Before / After"
+      eyebrow="Raw vs guided"
       title={
         <>
-          See the AI transformation —{" "}
-          <span className="text-gradient-violet">drag to compare.</span>
+          Same recording.{" "}
+          <span className="text-gradient-violet">Two stories.</span>
         </>
       }
-      subtitle="Same recording, zero edits. AdZoom analyzes cursor movement, clicks, and focus regions in real time, then composes a cinematic cut you can ship."
+      subtitle="The raw capture leaves the viewer to find what matters. AdZoom directs their attention — click by click, beat by beat — without changing what you said."
     >
       <div className="mx-auto max-w-5xl">
         <BeforeAfter />

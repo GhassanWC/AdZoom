@@ -27,6 +27,7 @@ export function RecordingChrome() {
     cancel,
     discardResult,
     useResult,
+    replaceResultBlob,
     uploading,
     uploadPct,
     error,
@@ -88,8 +89,10 @@ export function RecordingChrome() {
                     durationSeconds={result.durationSeconds}
                     width={result.width}
                     height={result.height}
+                    displaySurface={result.displaySurface}
                     onDiscard={discardResult}
                     onUse={useResult}
+                    onReplaceBlob={replaceResultBlob}
                     uploading={uploading}
                     uploadPct={uploadPct}
                     error={error}

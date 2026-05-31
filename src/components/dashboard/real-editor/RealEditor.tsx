@@ -10,7 +10,9 @@ import {
   RefreshCcw,
   Download,
   SlidersHorizontal,
+  Crosshair,
 } from "lucide-react";
+import { useToast } from "@/components/ui/Toast";
 import { useAuth } from "@/lib/firebase/AuthProvider";
 import { subscribeProject } from "@/lib/firebase/projects";
 import type { ProjectDoc } from "@/lib/firebase/schema";
@@ -28,6 +30,7 @@ import { ProcessingMiniPill } from "./ProcessingMiniPill";
 import { WorkflowStepper, type WorkflowStep } from "./WorkflowStepper";
 import { EditorToolbar } from "./EditorToolbar";
 import { DebugOverlay } from "./DebugOverlay";
+import { ClickPipelinePanel } from "./ClickPipelinePanel";
 import { disposeThumbnails } from "./timeline/thumbnails";
 
 export function RealEditorPage({ projectId }: { projectId: string }) {
@@ -107,7 +110,15 @@ export function RealEditorPage({ projectId }: { projectId: string }) {
 }
 
 function Body() {
-  const { project, startAnalyze, analyzing, analyzeError } = useEditorReal();
+  const {
+    project,
+    startAnalyze,
+    analyzing,
+    analyzeError,
+    refineFraming,
+    refiningFraming,
+  } = useEditorReal();
+  const toast = useToast();
   const hasAnalysis = (project.analysis?.detectedMoments?.length ?? 0) > 0;
   const isFailed = project.analysis?.status === "failed";
   // A draft is "missing" whenever there's nothing to edit — fresh upload,
@@ -206,6 +217,44 @@ function Body() {
               Re-analyze
             </Button>
           )}
+          {hasAnalysis && (
+            <Button
+              onClick={async () => {
+                try {
+                  const { changedCount, totalCount } = await refineFraming();
+                  if (changedCount === 0) {
+                    toast.success(
+                      "Framing already optimal",
+                      `Checked ${totalCount} moment${totalCount === 1 ? "" : "s"} — every focus point matches a real signal (or was set by you).`
+                    );
+                  } else {
+                    toast.success(
+                      "Framing refined",
+                      `${changedCount} moment${changedCount === 1 ? "" : "s"} now follow cursor / click / motion signals.`
+                    );
+                  }
+                } catch (err) {
+                  toast.error(
+                    "Couldn't refine framing",
+                    err instanceof Error ? err.message : "Unknown error"
+                  );
+                }
+              }}
+              variant="ghost"
+              size="md"
+              leftIcon={
+                refiningFraming ? (
+                  <Loader2 size={14} className="animate-spin" />
+                ) : (
+                  <Crosshair size={13} />
+                )
+              }
+              disabled={refiningFraming || isAnalyzingNow}
+              title="Re-derive zoom framing from real cursor / click / motion signals. Doesn't call AI."
+            >
+              {refiningFraming ? "Refining…" : "Refine framing"}
+            </Button>
+          )}
           <Button
             onClick={() => setEffectsOpen(true)}
             variant="ghost"
@@ -251,6 +300,9 @@ function Body() {
 
       {/* ── 4. Full-width timeline ───────────────────────────────────────── */}
       <RealTimeline />
+
+      {/* ── 4b. Click pipeline diagnostics — visible debug surface. ─────── */}
+      <ClickPipelinePanel />
 
       {/* ── 5. Presets — recommended hero + full rail ─────────────────────── */}
       <RecommendedPresets />

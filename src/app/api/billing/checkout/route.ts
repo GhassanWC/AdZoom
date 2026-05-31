@@ -1,6 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { getAdmin } from "@/lib/firebase/admin";
 import { createCheckout, planToVariantId } from "@/lib/lemonsqueezy/client";
+import { assertBillingEnv } from "@/lib/lemonsqueezy/env";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -20,6 +21,10 @@ export const dynamic = "force-dynamic";
  */
 export async function POST(req: NextRequest) {
   try {
+    // Fail fast with one consistent message if any LS env var is missing —
+    // avoids a half-configured deploy returning a confusing variant-id error.
+    assertBillingEnv();
+
     const authHeader = req.headers.get("authorization") || "";
     const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
     if (!idToken) {

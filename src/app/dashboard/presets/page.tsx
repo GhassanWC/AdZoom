@@ -28,6 +28,9 @@ import { PresetCard } from "@/components/dashboard/PresetCard";
 import { PresetDetailModal } from "@/components/dashboard/PresetDetailModal";
 import { useToast } from "@/components/ui/Toast";
 import { Button } from "@/components/ui/Button";
+import { useStoragePlan } from "@/lib/usage/useStoragePlan";
+import { planMeetsMinimum } from "@/lib/usage/plan";
+import { useRouter } from "next/navigation";
 import { cn } from "@/lib/cn";
 
 type CategoryFilter = "All" | PresetCategory | "My Presets";
@@ -35,6 +38,8 @@ const TABS: CategoryFilter[] = ["All", ...PRESET_CATEGORIES, "My Presets"];
 
 export default function PresetsPage() {
   const { user } = useAuth();
+  const { plan } = useStoragePlan();
+  const router = useRouter();
   const toast = useToast();
   const [custom, setCustom] = React.useState<Preset[]>([]);
   const [projects, setProjects] = React.useState<ProjectDoc[]>([]);
@@ -165,13 +170,24 @@ export default function PresetsPage() {
         </div>
       ) : (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-          {filtered.map((p) => (
-            <PresetCard
-              key={p.id}
-              preset={p}
-              onOpen={() => setOpen(p)}
-            />
-          ))}
+          {filtered.map((p) => {
+            const locked =
+              !!p.requiredPlan && !planMeetsMinimum(plan.tier, p.requiredPlan);
+            return (
+              <PresetCard
+                key={p.id}
+                preset={p}
+                locked={locked}
+                onOpen={() => {
+                  if (locked) {
+                    router.push("/pricing");
+                    return;
+                  }
+                  setOpen(p);
+                }}
+              />
+            );
+          })}
         </div>
       )}
 

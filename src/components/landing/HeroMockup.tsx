@@ -20,7 +20,7 @@ const cursorPath = [
 
 export function HeroMockup() {
   return (
-    <div className="relative mx-auto w-full max-w-[640px]">
+    <div className="relative mx-auto w-full">
       {/* soft outer glow */}
       <div
         aria-hidden

@@ -5,6 +5,7 @@ import { NoiseOverlay } from "@/components/ui/NoiseOverlay";
 import { AuthProvider } from "@/lib/firebase/AuthProvider";
 import { ToastProvider } from "@/components/ui/Toast";
 import { ThemeProvider, themeInitScript } from "@/lib/theme";
+import { ChatWidget } from "@/components/chat/ChatWidget";
 
 const inter = Inter({
   variable: "--font-inter",
@@ -56,7 +57,10 @@ export default function RootLayout({
         </a>
         <ThemeProvider>
           <AuthProvider>
-            <ToastProvider>{children}</ToastProvider>
+            <ToastProvider>
+              {children}
+              <ChatWidget />
+            </ToastProvider>
           </AuthProvider>
         </ThemeProvider>
       </body>

@@ -33,21 +33,9 @@ export function DebugOverlay() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  if (process.env.NODE_ENV === "production" && !open) return null;
-  if (!open) {
-    // Minimal floating toggle button — always available in dev.
-    if (process.env.NODE_ENV === "production") return null;
-    return (
-      <button
-        type="button"
-        onClick={() => setOpen(true)}
-        title="Toggle debug overlay (Ctrl+Shift+D)"
-        className="fixed bottom-4 right-4 z-50 inline-flex size-9 items-center justify-center rounded-full border border-white/15 bg-ink/80 text-white/70 shadow-cinematic backdrop-blur transition-colors hover:text-white"
-      >
-        <Bug size={14} />
-      </button>
-    );
-  }
+  // The overlay is opened via Ctrl+Shift+D or ?debug=1. No floating
+  // button — it cluttered the editor chrome.
+  if (!open) return null;
 
   const analysis = project.analysis;
   const moments = analysis?.detectedMoments ?? [];

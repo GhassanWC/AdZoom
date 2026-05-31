@@ -7,21 +7,20 @@ import {
   MousePointer2,
   Target,
   FastForward,
-  Diamond,
   Plus,
   Crosshair,
   X,
   ChevronDown,
-  Clock,
-  Camera,
   Brain,
   Crop,
   Zap,
-  MousePointerClick,
+  MoreHorizontal,
+  Copy,
 } from "lucide-react";
 import { useEditorReal } from "./context";
+import { useInteractions } from "./useInteractions";
+import { DirectionalPresetRow } from "./DirectionalPresetRow";
 import { Slider } from "@/components/ui/Slider";
-import { Toggle } from "@/components/ui/Toggle";
 import { cn } from "@/lib/cn";
 import { seedKeyframes } from "@/lib/timeline/camera";
 import type {
@@ -31,6 +30,32 @@ import type {
   MomentKeyframe,
   MomentProvenance,
 } from "@/lib/firebase/schema";
+
+/**
+ * Moment inspector — premium creative-tool layout.
+ *
+ * Hierarchy (top to bottom):
+ *   1. Compact header — small effect glyph, editable title, provenance dot,
+ *      overflow menu. The modal owns the close button so it doesn't render
+ *      twice. No subtitle, no badges, no auroras.
+ *   2. Effect — segmented control + inline intensity slider. The two
+ *      controls a user almost always wants to touch, in one tight block.
+ *   3. Timing — single compact row of two inline-edited time chips and a
+ *      duration readout. No card, no boxes, no "Seek" sub-button (clicking
+ *      the chip seeks).
+ *   4. Advanced — collapsed sections that are filtered by relevance to the
+ *      selected effect, so a Zoom moment doesn't surface Cursor controls
+ *      and a Speed-up moment doesn't surface Camera keyframes.
+ *   5. AI reasoning — single collapsed section that absorbs the old
+ *      "Source / confidence" block plus the AI's reason text. Most users
+ *      don't want CV signal peaks while editing.
+ *
+ * What was removed: section icon-circle gutters, per-section card borders,
+ * the "Inspector / MOTION" caption row, the redundant in-panel close button,
+ * the bottom "Clear selection" footer, the gradient auroras, the always-
+ * expanded Source confidence bar, and the always-expanded Cursor & focus
+ * section. All editing capability remains — just less visible by default.
+ */
 
 const PROVENANCE_PRESENTATION: Record<
   MomentProvenance,
@@ -74,18 +99,46 @@ function provenanceOf(m: DetectedMoment): MomentProvenance {
   return "ai";
 }
 
-const EFFECTS: { id: EffectType; label: string; Icon: typeof Sparkles }[] = [
-  { id: "zoom", label: "Zoom", Icon: Zap },
-  { id: "click-highlight", label: "Click", Icon: Target },
-  { id: "cursor-focus", label: "Focus", Icon: MousePointer2 },
-  { id: "speed-up", label: "Speed-up", Icon: FastForward },
+interface EffectSpec {
+  id: EffectType;
+  label: string;
+  Icon: typeof Sparkles;
+  /** Accent color used by the header glyph. */
+  accent: string;
+}
+
+const EFFECTS: EffectSpec[] = [
+  { id: "zoom", label: "Zoom", Icon: Zap, accent: "text-violet-300" },
+  { id: "click-highlight", label: "Click", Icon: Target, accent: "text-fuchsia-300" },
+  { id: "cursor-focus", label: "Focus", Icon: MousePointer2, accent: "text-indigo-300" },
+  { id: "speed-up", label: "Speed", Icon: FastForward, accent: "text-amber-300" },
 ];
+
+const EFFECT_BY_ID: Record<EffectType, EffectSpec> = Object.fromEntries(
+  EFFECTS.map((e) => [e.id, e])
+) as Record<EffectType, EffectSpec>;
+
+/**
+ * Which advanced sections matter for which effects. Anything not listed is
+ * hidden by default (still reachable via "Show all advanced" footer link
+ * — see `AdvancedFooter`). Keeps the inspector calm for the common case:
+ * Speed-up moments don't need Camera keyframes; Zoom moments don't need
+ * cursor coordinates.
+ */
+const ADVANCED_RELEVANCE: Record<
+  EffectType,
+  { keyframes: boolean; cursor: boolean }
+> = {
+  zoom: { keyframes: true, cursor: false },
+  "click-highlight": { keyframes: false, cursor: true },
+  "cursor-focus": { keyframes: true, cursor: true },
+  "speed-up": { keyframes: false, cursor: false },
+};
 
 export function MomentInspector() {
   const {
     project,
     selectedMomentId,
-    setSelectedMomentId,
     activeMoment,
     updateMoment,
     deleteMoment,
@@ -98,231 +151,513 @@ export function MomentInspector() {
   const moment =
     moments.find((m) => m.id === selectedMomentId) || activeMoment || null;
 
+  // Lazy-load the recording's interactions stream so the "Follow cursor"
+  // chip can compute a real path. Cheap when absent (external recording);
+  // a one-time GCS fetch the first time the inspector opens otherwise.
+  const interactionsState = useInteractions({
+    interactionsPath: project.interactionsPath,
+    scope: project.interactionScope,
+  });
+
+  // Show all advanced sections — opt-in escape hatch so power users can
+  // still reach Cursor controls on a Zoom moment without changing effect.
+  const [showAllAdvanced, setShowAllAdvanced] = React.useState(false);
+
   if (!moment) {
     return <EmptyInspector hasMoments={moments.length > 0} status={project.status} />;
   }
 
+  const effectSpec = EFFECT_BY_ID[moment.effectType];
+  const relevance = ADVANCED_RELEVANCE[moment.effectType];
+  const showKeyframes = showAllAdvanced || relevance.keyframes;
+  const showCursor = showAllAdvanced || relevance.cursor;
+  // Directional presets are only meaningful for effects whose framing the
+  // user controls — Speed-up and Click highlights frame themselves (the
+  // click coords) and don't need a manual camera nudge.
+  const showCameraPresets =
+    moment.effectType === "zoom" || moment.effectType === "cursor-focus";
+  const duration = moment.endTime - moment.startTime;
+
   return (
     <div className="glass overflow-hidden rounded-2xl">
-      {/* Header */}
-      <div className="relative border-b border-white/[0.06] px-5 pb-4 pt-5">
-        <div
-          aria-hidden
-          className="pointer-events-none absolute -top-12 right-0 h-32 w-48 bg-[radial-gradient(ellipse_at_top_right,rgba(139,92,246,0.18),transparent_60%)] blur-2xl"
-        />
-        <div className="relative flex items-start justify-between gap-3">
-          <div className="min-w-0 flex-1">
-            <div className="flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.18em] text-fog">
-              Inspector
-              <ProvenanceChip moment={moment} />
-            </div>
-            <input
-              value={moment.label}
-              onChange={(e) => updateMoment(moment.id, { label: e.target.value })}
-              className="-ml-1 mt-1 w-full rounded-lg px-1 font-display text-lg font-semibold text-white outline-none transition-colors duration-150 focus:bg-white/[0.04]"
-            />
-          </div>
-          <div className="flex shrink-0 items-center gap-1.5">
-            <IconButton
-              label="Duplicate (⌘D)"
-              onClick={() => duplicateMoment(moment.id)}
-            >
-              <Plus size={14} />
-            </IconButton>
-            <IconButton
-              label="Delete (Del)"
-              tone="danger"
-              onClick={() => deleteMoment(moment.id)}
-            >
-              <Trash2 size={14} />
-            </IconButton>
-          </div>
-        </div>
-      </div>
+      {/* ── Compact header ─────────────────────────────────────────────── */}
+      <Header
+        moment={moment}
+        effectSpec={effectSpec}
+        onTitleChange={(label) => updateMoment(moment.id, { label })}
+        onDuplicate={() => duplicateMoment(moment.id)}
+        onDelete={() => deleteMoment(moment.id)}
+      />
 
-      {/* Grouped collapsible sections */}
-      <div className="divide-y divide-white/[0.05]">
-        <CollapsibleGroup
-          icon={<Camera size={14} />}
-          title="Motion"
-          subtitle="Effect type & intensity"
-          defaultOpen
-        >
-          <div className="grid grid-cols-4 gap-2">
-            {EFFECTS.map((e) => {
-              const active = moment.effectType === e.id;
-              return (
-                <button
-                  key={e.id}
-                  onClick={() => updateMoment(moment.id, { effectType: e.id })}
-                  className={cn(
-                    "group/eff flex flex-col items-center gap-1.5 rounded-xl border p-2.5 text-center transition-all duration-200",
-                    active
-                      ? "border-violet-400/40 bg-violet-500/15 text-violet-100 shadow-[0_0_24px_-8px_rgba(139,92,246,0.5)]"
-                      : "border-white/10 bg-white/[0.02] text-fog hover:-translate-y-px hover:border-white/25 hover:text-white"
-                  )}
-                >
-                  <e.Icon size={15} className="opacity-90" />
-                  <span className="text-[11px] font-medium">{e.label}</span>
-                </button>
-              );
-            })}
-          </div>
-          <div className="mt-5">
-            <Slider
-              label="Zoom intensity"
-              value={Math.round((moment.intensity ?? 1) * 100)}
-              min={20}
-              max={150}
-              onChange={(v) => updateMoment(moment.id, { intensity: v / 100 })}
-            />
-          </div>
-        </CollapsibleGroup>
-
-        <CollapsibleGroup
-          icon={<Clock size={14} />}
-          title="Timing"
-          subtitle={`${fmt(moment.startTime)} → ${fmt(moment.endTime)} · ${(
-            moment.endTime - moment.startTime
-          ).toFixed(1)}s`}
-          defaultOpen
-        >
-          <div className="grid grid-cols-2 gap-3">
-            <TimeField
-              label="Start"
-              value={moment.startTime}
-              onChange={(v) => updateMoment(moment.id, { startTime: Math.max(0, v) })}
-              onSeek={() => seek(moment.startTime)}
-            />
-            <TimeField
-              label="End"
-              value={moment.endTime}
-              onChange={(v) =>
-                updateMoment(moment.id, {
-                  endTime: Math.max(moment.startTime + 0.1, v),
-                })
-              }
-              onSeek={() => seek(moment.endTime)}
-            />
-          </div>
-        </CollapsibleGroup>
-
-        <CollapsibleGroup
-          icon={<Diamond size={14} className="text-violet-300" />}
-          title="Camera keyframes"
-          subtitle={
-            (moment.keyframes?.length ?? 0) > 0
-              ? `${moment.keyframes!.length} keyframes`
-              : "Static focus"
-          }
-        >
-          <KeyframeEditor
-            moment={moment}
-            currentTime={currentTime}
-            onChange={(keyframes) => updateMoment(moment.id, { keyframes })}
-            onSeek={seek}
+      {/* ── Body ───────────────────────────────────────────────────────── */}
+      <div className="space-y-5 px-5 pb-5 pt-4">
+        {/* Effect + intensity — primary editing controls live here. */}
+        <section className="space-y-3">
+          <SegmentedEffect
+            value={moment.effectType}
+            onChange={(effectType) => updateMoment(moment.id, { effectType })}
           />
-        </CollapsibleGroup>
+          {showCameraPresets && (
+            <DirectionalPresetRow
+              moment={moment}
+              interactions={interactionsState.interactions}
+              interactionsLoading={interactionsState.loading}
+              onUpdate={(patch) => updateMoment(moment.id, patch)}
+            />
+          )}
+          <Slider
+            label={`${effectSpec.label} intensity`}
+            value={Math.round((moment.intensity ?? 1) * 100)}
+            min={20}
+            max={150}
+            onChange={(v) => updateMoment(moment.id, { intensity: v / 100 })}
+          />
+        </section>
 
-        <CollapsibleGroup
-          icon={<MousePointerClick size={14} />}
-          title="Cursor & focus"
-          subtitle="Where the camera looks"
-        >
-          <FocusRegionEditor moment={moment} onChange={(fr) => updateMoment(moment.id, { focusRegion: fr })} />
-        </CollapsibleGroup>
+        {/* Timing — single row, no boxes, click-to-seek chips. */}
+        <TimingRow
+          moment={moment}
+          duration={duration}
+          onStartChange={(v) => updateMoment(moment.id, { startTime: Math.max(0, v) })}
+          onEndChange={(v) =>
+            updateMoment(moment.id, {
+              endTime: Math.max(moment.startTime + 0.1, v),
+            })
+          }
+          onSeek={seek}
+        />
 
-        <CollapsibleGroup
-          icon={<Sparkles size={14} className="text-emerald-300" />}
-          title="Source"
-          subtitle={`${PROVENANCE_PRESENTATION[provenanceOf(moment)].label} · confidence ${(
-            (moment.confidenceScore ?? moment.attentionScore ?? 0.5) * 100
-          ).toFixed(0)}`}
-          defaultOpen
-        >
-          <SourceSection moment={moment} />
-        </CollapsibleGroup>
+        {/* ── Advanced ───────────────────────────────────────────────────
+            Soft separator instead of a hard divider. Sections are
+            individually collapsible and only the ones relevant to the
+            selected effect render by default. */}
+        <div className="space-y-1 pt-1">
+          {showKeyframes && (
+            <CompactSection
+              title="Camera keyframes"
+              meta={
+                (moment.keyframes?.length ?? 0) > 0
+                  ? `${moment.keyframes!.length} keyframes`
+                  : "Static focus"
+              }
+            >
+              <KeyframeEditor
+                moment={moment}
+                currentTime={currentTime}
+                onChange={(keyframes) => updateMoment(moment.id, { keyframes })}
+                onSeek={seek}
+              />
+            </CompactSection>
+          )}
 
-        {moment.reason && (
-          <CollapsibleGroup
-            icon={<Brain size={14} className="text-violet-300" />}
+          {showCursor && (
+            <CompactSection title="Cursor & focus" meta="Where the camera looks">
+              <FocusRegionEditor
+                moment={moment}
+                onChange={(fr) =>
+                  // Numeric edits in the inspector are an explicit user
+                  // choice — stamp the source so the balancer's refinement
+                  // pass leaves this region alone on subsequent re-analyze.
+                  updateMoment(moment.id, {
+                    focusRegion: fr,
+                    targetRegionSource: "user",
+                  })
+                }
+              />
+            </CompactSection>
+          )}
+
+          <CompactSection
             title="AI reasoning"
-            subtitle="Why this beat made the cut"
+            meta={
+              <span className="inline-flex items-center gap-1.5">
+                <span
+                  className={cn(
+                    "size-1.5 rounded-full",
+                    PROVENANCE_PRESENTATION[provenanceOf(moment)].dot
+                  )}
+                />
+                {PROVENANCE_PRESENTATION[provenanceOf(moment)].label}
+                <span className="font-mono tabular-nums text-fog/70">
+                  {Math.round(
+                    (moment.confidenceScore ?? moment.attentionScore ?? 0.5) * 100
+                  )}
+                </span>
+              </span>
+            }
           >
-            <p className="rounded-xl border border-violet-400/20 bg-violet-500/[0.05] px-3.5 py-3 text-[13px] leading-relaxed text-white/85">
-              {moment.reason}
-            </p>
-          </CollapsibleGroup>
-        )}
-      </div>
+            <AiReasoningSection moment={moment} />
+          </CompactSection>
 
-      <div className="border-t border-white/[0.06] px-5 py-3">
-        <button
-          onClick={() => setSelectedMomentId(null)}
-          className="w-full text-center text-[11px] text-fog transition-colors duration-200 hover:text-white"
-        >
-          Clear selection
-        </button>
+          {/* Power-user escape hatch — show all advanced sections regardless
+              of effect relevance. Tiny footer link, intentionally quiet. */}
+          {!(showKeyframes && showCursor) && (
+            <button
+              type="button"
+              onClick={() => setShowAllAdvanced((v) => !v)}
+              className="block w-full pt-1.5 text-left text-[11px] text-fog/80 transition-colors duration-150 hover:text-white"
+            >
+              {showAllAdvanced ? "Hide" : "Show all advanced controls"}
+            </button>
+          )}
+        </div>
       </div>
     </div>
   );
 }
 
-function ProvenanceChip({ moment }: { moment: DetectedMoment }) {
-  const p = provenanceOf(moment);
-  const pres = PROVENANCE_PRESENTATION[p];
+// ─── Header ──────────────────────────────────────────────────────────────
+
+function Header({
+  moment,
+  effectSpec,
+  onTitleChange,
+  onDuplicate,
+  onDelete,
+}: {
+  moment: DetectedMoment;
+  effectSpec: EffectSpec;
+  onTitleChange: (s: string) => void;
+  onDuplicate: () => void;
+  onDelete: () => void;
+}) {
+  const prov = PROVENANCE_PRESENTATION[provenanceOf(moment)];
   return (
-    <span
-      className={cn(
-        "inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[9px] font-semibold",
-        pres.chip
-      )}
-      title={pres.text}
-    >
-      <span className={cn("inline-block size-1.5 rounded-full", pres.dot)} />
-      {pres.label}
-    </span>
+    <div className="flex items-center gap-3 px-5 py-3.5">
+      <span
+        className={cn(
+          "inline-flex size-8 shrink-0 items-center justify-center rounded-lg bg-white/[0.03] ring-1 ring-white/10",
+          effectSpec.accent
+        )}
+        aria-label={`${effectSpec.label} moment`}
+      >
+        <effectSpec.Icon size={14} />
+      </span>
+      <input
+        value={moment.label}
+        onChange={(e) => onTitleChange(e.target.value)}
+        placeholder="Untitled moment"
+        className="-mx-1.5 min-w-0 flex-1 truncate rounded-md px-1.5 py-0.5 font-display text-[15px] font-semibold leading-tight text-white outline-none transition-colors duration-150 placeholder:text-fog/60 focus:bg-white/[0.04]"
+      />
+      <span
+        title={prov.text}
+        className="inline-flex shrink-0 items-center gap-1.5 text-[10.5px] text-fog"
+      >
+        <span className={cn("size-1.5 rounded-full", prov.dot)} />
+        {prov.label}
+      </span>
+      <OverflowMenu onDuplicate={onDuplicate} onDelete={onDelete} />
+    </div>
   );
 }
 
-function SourceSection({ moment }: { moment: DetectedMoment }) {
+function OverflowMenu({
+  onDuplicate,
+  onDelete,
+}: {
+  onDuplicate: () => void;
+  onDelete: () => void;
+}) {
+  const [open, setOpen] = React.useState(false);
+  const ref = React.useRef<HTMLDivElement | null>(null);
+  React.useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (!ref.current || ref.current.contains(e.target as Node)) return;
+      setOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [open]);
+
+  return (
+    <div ref={ref} className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-label="Moment actions"
+        aria-expanded={open}
+        className={cn(
+          "inline-flex size-8 items-center justify-center rounded-lg text-fog transition-colors duration-150",
+          open
+            ? "bg-white/[0.06] text-white"
+            : "hover:bg-white/[0.04] hover:text-white"
+        )}
+      >
+        <MoreHorizontal size={14} />
+      </button>
+      {open && (
+        <div className="absolute right-0 top-9 z-30 w-44 overflow-hidden rounded-lg border border-white/10 bg-ink/95 py-1 shadow-cinematic backdrop-blur-xl">
+          <MenuItem
+            onClick={() => {
+              setOpen(false);
+              onDuplicate();
+            }}
+            Icon={Copy}
+            label="Duplicate"
+            hint="⌘D"
+          />
+          <MenuItem
+            onClick={() => {
+              setOpen(false);
+              onDelete();
+            }}
+            Icon={Trash2}
+            label="Delete"
+            hint="Del"
+            tone="danger"
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MenuItem({
+  Icon,
+  label,
+  hint,
+  tone,
+  onClick,
+}: {
+  Icon: typeof Sparkles;
+  label: string;
+  hint?: string;
+  tone?: "danger";
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        "flex w-full items-center gap-2.5 px-3 py-1.5 text-left text-[12.5px] text-white/85 transition-colors duration-150 hover:bg-white/[0.06] hover:text-white",
+        tone === "danger" && "hover:bg-rose-500/10 hover:text-rose-200"
+      )}
+    >
+      <Icon size={12} className="shrink-0 opacity-80" />
+      <span className="flex-1">{label}</span>
+      {hint && (
+        <span className="font-mono text-[10px] text-fog/70">{hint}</span>
+      )}
+    </button>
+  );
+}
+
+// ─── Segmented effect ────────────────────────────────────────────────────
+
+function SegmentedEffect({
+  value,
+  onChange,
+}: {
+  value: EffectType;
+  onChange: (e: EffectType) => void;
+}) {
+  return (
+    <div
+      role="radiogroup"
+      aria-label="Effect type"
+      className="inline-flex w-full items-center rounded-lg border border-white/[0.08] bg-white/[0.02] p-1"
+    >
+      {EFFECTS.map((e) => {
+        const active = value === e.id;
+        return (
+          <button
+            key={e.id}
+            type="button"
+            role="radio"
+            aria-checked={active}
+            onClick={() => onChange(e.id)}
+            className={cn(
+              "inline-flex flex-1 items-center justify-center gap-1.5 rounded-md px-2.5 py-1.5 text-[12px] font-medium transition-colors duration-150",
+              active
+                ? "bg-white/[0.06] text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]"
+                : "text-fog hover:text-white"
+            )}
+          >
+            <e.Icon size={12} className={cn(active && e.accent)} />
+            <span>{e.label}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+// ─── Timing ──────────────────────────────────────────────────────────────
+
+/**
+ * Compact timing row. Replaces the two boxed number inputs with a single
+ * line: click-to-seek time chips with inline editing on focus, plus a
+ * duration readout on the right. No headers, no "Seek" sub-buttons — the
+ * chip is the seek affordance.
+ */
+function TimingRow({
+  moment,
+  duration,
+  onStartChange,
+  onEndChange,
+  onSeek,
+}: {
+  moment: DetectedMoment;
+  duration: number;
+  onStartChange: (v: number) => void;
+  onEndChange: (v: number) => void;
+  onSeek: (t: number) => void;
+}) {
+  return (
+    <section>
+      <div className="mb-1.5 flex items-baseline justify-between">
+        <span className="text-[10.5px] font-medium uppercase tracking-[0.14em] text-fog">
+          Timing
+        </span>
+        <span className="font-mono text-[10.5px] tabular-nums text-fog">
+          {duration.toFixed(1)}s
+        </span>
+      </div>
+      <div className="flex items-center gap-1.5 text-[12.5px]">
+        <TimeChip
+          value={moment.startTime}
+          onChange={onStartChange}
+          onSeek={() => onSeek(moment.startTime)}
+          label="Start"
+        />
+        <span className="text-fog/60">→</span>
+        <TimeChip
+          value={moment.endTime}
+          onChange={onEndChange}
+          onSeek={() => onSeek(moment.endTime)}
+          label="End"
+        />
+      </div>
+    </section>
+  );
+}
+
+/**
+ * Inline-edited time chip. Renders as a clickable mm:ss.t button by default
+ * (clicking seeks to that time). Double-click promotes it to a focused
+ * number input so the user can type a precise second value.
+ */
+function TimeChip({
+  value,
+  onChange,
+  onSeek,
+  label,
+}: {
+  value: number;
+  onChange: (v: number) => void;
+  onSeek: () => void;
+  label: string;
+}) {
+  const [editing, setEditing] = React.useState(false);
+  const inputRef = React.useRef<HTMLInputElement | null>(null);
+
+  React.useEffect(() => {
+    if (editing) {
+      inputRef.current?.focus();
+      inputRef.current?.select();
+    }
+  }, [editing]);
+
+  if (editing) {
+    return (
+      <input
+        ref={inputRef}
+        type="number"
+        step={0.1}
+        min={0}
+        defaultValue={value.toFixed(2)}
+        aria-label={`${label} (seconds)`}
+        onBlur={(e) => {
+          const v = Number(e.target.value);
+          if (Number.isFinite(v)) onChange(v);
+          setEditing(false);
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            const v = Number((e.target as HTMLInputElement).value);
+            if (Number.isFinite(v)) onChange(v);
+            setEditing(false);
+          } else if (e.key === "Escape") {
+            setEditing(false);
+          }
+        }}
+        className="h-7 w-20 rounded-md border border-violet-400/40 bg-white/[0.04] px-2 font-mono text-[12px] text-white outline-none"
+      />
+    );
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={onSeek}
+      onDoubleClick={() => setEditing(true)}
+      title={`Click to seek · double-click to edit · ${label}`}
+      className="inline-flex h-7 items-center gap-1.5 rounded-md border border-transparent bg-white/[0.025] px-2 font-mono text-[12px] tabular-nums text-white/90 transition-colors duration-150 hover:border-white/15 hover:bg-white/[0.05]"
+    >
+      {fmt(value)}
+    </button>
+  );
+}
+
+// ─── AI reasoning (replaces old SourceSection block) ────────────────────
+
+function AiReasoningSection({ moment }: { moment: DetectedMoment }) {
   const p = provenanceOf(moment);
   const pres = PROVENANCE_PRESENTATION[p];
   const conf = moment.confidenceScore ?? moment.attentionScore ?? 0.5;
   return (
     <div className="space-y-3">
-      <div className="rounded-xl border border-white/10 bg-white/[0.02] px-3.5 py-3">
-        <div className="flex items-center gap-2">
-          <span className={cn("inline-block size-2.5 rounded-full", pres.dot)} />
-          <span className="text-[12px] font-semibold text-white">{pres.label}</span>
-          <span className="ml-auto font-mono text-[10px] tabular-nums text-fog">
-            {(conf * 100).toFixed(0)} / 100
+      {/* Confidence bar — slim, no card border. */}
+      <div>
+        <div className="mb-1 flex items-center gap-2 text-[11px] text-fog">
+          <Brain size={11} className="text-violet-300" />
+          <span className="text-white/85">{pres.label}</span>
+          <span className="ml-auto font-mono tabular-nums text-fog/85">
+            {(conf * 100).toFixed(0)}/100
           </span>
         </div>
-        {/* Confidence bar */}
-        <div className="mt-2 h-1 w-full overflow-hidden rounded-full bg-white/5">
+        <div className="h-1 w-full overflow-hidden rounded-full bg-white/[0.05]">
           <div
             className={cn("h-full rounded-full", pres.dot)}
             style={{ width: `${Math.round(conf * 100)}%` }}
           />
         </div>
-        <p className="mt-2 text-[12px] leading-relaxed text-fog">
-          {moment.confidenceReason || pres.text}
-        </p>
-        {moment.confidenceSource && (
-          <p className="mt-1 font-mono text-[10px] uppercase tracking-wider text-white/40">
-            {moment.confidenceSource}
-          </p>
-        )}
-        {moment.eventIds && moment.eventIds.length > 0 && (
-          <p className="mt-1 font-mono text-[10px] tabular-nums text-white/40">
-            {moment.eventIds.length} event{moment.eventIds.length === 1 ? "" : "s"}
-          </p>
-        )}
       </div>
+
+      {/* Why the AI picked this beat. */}
+      {moment.reason && (
+        <p className="text-[12.5px] leading-relaxed text-white/80">
+          {moment.reason}
+        </p>
+      )}
+
+      {/* Confidence reason / source / event count — tiny mono lines so they
+          don't compete with the main reason text. */}
+      {(moment.confidenceReason ||
+        moment.confidenceSource ||
+        (moment.eventIds && moment.eventIds.length > 0)) && (
+        <div className="space-y-0.5 text-[11px] text-fog">
+          {moment.confidenceReason && <p>{moment.confidenceReason}</p>}
+          {moment.confidenceSource && (
+            <p className="font-mono uppercase tracking-wider text-white/40">
+              {moment.confidenceSource}
+            </p>
+          )}
+          {moment.eventIds && moment.eventIds.length > 0 && (
+            <p className="font-mono tabular-nums text-white/40">
+              {moment.eventIds.length} event
+              {moment.eventIds.length === 1 ? "" : "s"}
+            </p>
+          )}
+        </div>
+      )}
     </div>
   );
 }
+
+// ─── Empty state ─────────────────────────────────────────────────────────
 
 function EmptyInspector({
   hasMoments,
@@ -332,86 +667,78 @@ function EmptyInspector({
   status: string;
 }) {
   return (
-    <div className="glass relative overflow-hidden rounded-2xl p-6">
-      <div
-        aria-hidden
-        className="pointer-events-none absolute -top-16 right-0 h-40 w-56 bg-[radial-gradient(ellipse_at_top_right,rgba(139,92,246,0.18),transparent_65%)] blur-2xl"
-      />
-      <div className="relative">
-        <div className="inline-flex size-11 items-center justify-center rounded-2xl bg-violet-500/15 text-violet-300 ring-1 ring-violet-400/20">
-          <Crop size={18} />
-        </div>
-        <h3 className="mt-4 font-display text-base font-semibold text-white">
-          Inspector
-        </h3>
-        {hasMoments ? (
-          <p className="mt-1.5 text-[13px] leading-relaxed text-fog">
-            Select a moment or create one manually. The AI's plan is fully editable —
-            rename, retime, switch effect, or delete.
-          </p>
-        ) : status !== "analyzed" && status !== "completed" ? (
-          <p className="mt-1.5 text-[13px] leading-relaxed text-fog">
-            Run <strong className="text-white">Analyze with AI</strong> to generate a
-            first-draft edit.
-          </p>
-        ) : (
-          <p className="mt-1.5 text-[13px] leading-relaxed text-fog">
-            No moments yet — use the toolbar above to add your first zoom, focus, or
-            click highlight.
-          </p>
-        )}
+    <div className="glass overflow-hidden rounded-2xl p-6">
+      <div className="inline-flex size-9 items-center justify-center rounded-lg bg-violet-500/12 text-violet-300 ring-1 ring-violet-400/20">
+        <Crop size={16} />
       </div>
+      <h3 className="mt-3 font-display text-[15px] font-semibold text-white">
+        Inspector
+      </h3>
+      {hasMoments ? (
+        <p className="mt-1 text-[12.5px] leading-relaxed text-fog">
+          Select a moment to edit its effect, timing, and reasoning.
+        </p>
+      ) : status !== "analyzed" && status !== "completed" ? (
+        <p className="mt-1 text-[12.5px] leading-relaxed text-fog">
+          Run <strong className="text-white">Analyze with AI</strong> to
+          generate a first-draft edit.
+        </p>
+      ) : (
+        <p className="mt-1 text-[12.5px] leading-relaxed text-fog">
+          No moments yet — use the toolbar above to add one.
+        </p>
+      )}
     </div>
   );
 }
 
-// ─── Collapsible group ──────────────────────────────────────────────────────
+// ─── Compact section ─────────────────────────────────────────────────────
 
-function CollapsibleGroup({
-  icon,
+/**
+ * A flat, borderless disclosure row used for advanced sections. No icon
+ * gutter, no nested card — just a small clickable line. When expanded the
+ * content sits flush against the parent's padding rather than getting its
+ * own box. This is the visual difference between "inspector" and
+ * "settings dashboard."
+ */
+function CompactSection({
   title,
-  subtitle,
-  defaultOpen = false,
+  meta,
   children,
 }: {
-  icon: React.ReactNode;
   title: string;
-  subtitle?: string;
-  defaultOpen?: boolean;
+  meta?: React.ReactNode;
   children: React.ReactNode;
 }) {
-  const [open, setOpen] = React.useState(defaultOpen);
+  const [open, setOpen] = React.useState(false);
   return (
     <div>
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
         aria-expanded={open}
-        className="group flex w-full items-center gap-3 px-5 py-3.5 text-left transition-colors duration-150 hover:bg-white/[0.02]"
+        className="group flex w-full items-center gap-2 rounded-md py-1.5 text-left transition-colors duration-150 hover:bg-white/[0.025]"
       >
-        <span className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg bg-white/[0.03] text-fog ring-1 ring-white/[0.05] transition-colors duration-150 group-hover:text-white">
-          {icon}
-        </span>
-        <div className="min-w-0 flex-1">
-          <div className="text-[13px] font-semibold text-white">{title}</div>
-          {subtitle && (
-            <div className="truncate text-[11px] text-fog">{subtitle}</div>
-          )}
-        </div>
         <ChevronDown
-          size={14}
+          size={12}
           className={cn(
             "shrink-0 text-fog transition-transform duration-200",
-            open && "rotate-180"
+            !open && "-rotate-90"
           )}
         />
+        <span className="text-[12px] font-medium text-white/90">{title}</span>
+        {meta && (
+          <span className="ml-auto inline-flex items-center gap-1.5 truncate text-[11px] text-fog">
+            {meta}
+          </span>
+        )}
       </button>
-      {open && <div className="px-5 pb-5 pt-1">{children}</div>}
+      {open && <div className="mt-2 pb-2 pl-5">{children}</div>}
     </div>
   );
 }
 
-// ─── Keyframe editor ────────────────────────────────────────────────────────
+// ─── Keyframe editor ────────────────────────────────────────────────────
 
 const EASES: EaseKind[] = ["linear", "ease-in", "ease-out", "ease-in-out"];
 
@@ -473,23 +800,22 @@ function KeyframeEditor({
 
   if (!hasKfs) {
     return (
-      <div className="space-y-3">
-        <p className="text-[12px] leading-relaxed text-fog">
-          Animate the camera across this moment — drop keyframes and the preview
-          will play them live. Exports render identically.
+      <div className="space-y-2">
+        <p className="text-[11.5px] leading-relaxed text-fog">
+          Animate the camera across this moment.
         </p>
         <div className="grid grid-cols-2 gap-2">
           <button
             type="button"
             onClick={() => onChange(seedKeyframes(moment))}
-            className="rounded-xl border border-violet-400/30 bg-violet-500/10 py-2 text-[12px] font-medium text-violet-100 transition-colors duration-150 hover:bg-violet-500/20"
+            className="rounded-md border border-violet-400/30 bg-violet-500/10 py-1.5 text-[11.5px] font-medium text-violet-100 transition-colors duration-150 hover:bg-violet-500/20"
           >
             Add punch-in
           </button>
           <button
             type="button"
             onClick={addAtPlayhead}
-            className="rounded-xl border border-white/10 bg-white/[0.02] py-2 text-[12px] font-medium text-fog transition-colors duration-150 hover:border-white/25 hover:text-white"
+            className="rounded-md border border-white/10 bg-white/[0.02] py-1.5 text-[11.5px] font-medium text-fog transition-colors duration-150 hover:border-white/25 hover:text-white"
           >
             At playhead
           </button>
@@ -499,14 +825,17 @@ function KeyframeEditor({
   }
 
   return (
-    <div className="space-y-2">
+    <div className="space-y-1.5">
       {kfs.map((k, i) => (
-        <div key={i} className="flex items-center gap-2 rounded-xl border border-white/[0.06] bg-white/[0.02] p-2">
+        <div
+          key={i}
+          className="flex items-center gap-2 rounded-md bg-white/[0.02] p-1.5"
+        >
           <button
             type="button"
             onClick={() => onSeek(toAbs(k.t))}
             title="Jump to this keyframe"
-            className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-white/10 bg-white/[0.03] px-2 py-1.5 font-mono text-[10px] text-fog transition-colors duration-150 hover:text-white"
+            className="inline-flex shrink-0 items-center gap-1 rounded border border-white/10 bg-white/[0.03] px-1.5 py-1 font-mono text-[10px] text-fog transition-colors duration-150 hover:text-white"
           >
             <Crosshair size={10} />
             {Math.round(k.t * 100)}%
@@ -525,7 +854,7 @@ function KeyframeEditor({
             value={k.ease ?? "ease-in-out"}
             onChange={(e) => patchKf(i, { ease: e.target.value as EaseKind })}
             aria-label="Keyframe easing"
-            className="h-8 rounded-lg border border-white/10 bg-white/[0.03] px-1 text-[10px] text-white outline-none focus:border-white/20"
+            className="h-7 rounded border border-white/10 bg-white/[0.03] px-1 text-[10px] text-white outline-none focus:border-white/20"
           >
             {EASES.map((ez) => (
               <option key={ez} value={ez} className="bg-ink">
@@ -537,9 +866,9 @@ function KeyframeEditor({
             type="button"
             onClick={() => removeKf(i)}
             aria-label="Remove keyframe"
-            className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg text-fog transition-colors duration-150 hover:bg-rose-500/10 hover:text-rose-300"
+            className="inline-flex size-6 shrink-0 items-center justify-center rounded text-fog transition-colors duration-150 hover:bg-rose-500/10 hover:text-rose-300"
           >
-            <X size={12} />
+            <X size={11} />
           </button>
         </div>
       ))}
@@ -547,15 +876,15 @@ function KeyframeEditor({
         <button
           type="button"
           onClick={addAtPlayhead}
-          className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-violet-400/30 bg-violet-500/10 py-2 text-[12px] font-medium text-violet-100 transition-colors duration-150 hover:bg-violet-500/20"
+          className="inline-flex items-center justify-center gap-1.5 rounded-md border border-violet-400/30 bg-violet-500/10 py-1.5 text-[11.5px] font-medium text-violet-100 transition-colors duration-150 hover:bg-violet-500/20"
         >
-          <Plus size={12} />
+          <Plus size={11} />
           At playhead
         </button>
         <button
           type="button"
           onClick={() => onChange(undefined)}
-          className="rounded-xl border border-white/10 bg-white/[0.02] py-2 text-[12px] font-medium text-fog transition-colors duration-150 hover:border-rose-400/30 hover:text-rose-300"
+          className="rounded-md border border-white/10 bg-white/[0.02] py-1.5 text-[11.5px] font-medium text-fog transition-colors duration-150 hover:border-rose-400/30 hover:text-rose-300"
         >
           Clear all
         </button>
@@ -564,7 +893,7 @@ function KeyframeEditor({
   );
 }
 
-// ─── Focus region editor ────────────────────────────────────────────────────
+// ─── Focus region editor ────────────────────────────────────────────────
 
 function FocusRegionEditor({
   moment,
@@ -574,15 +903,15 @@ function FocusRegionEditor({
   onChange: (fr: DetectedMoment["focusRegion"]) => void;
 }) {
   return (
-    <div className="space-y-3">
-      <p className="text-[12px] leading-relaxed text-fog">
+    <div className="space-y-2">
+      <p className="text-[11.5px] leading-relaxed text-fog">
         Drag the violet box on the preview to retarget the camera. Fine-tune
-        below if you need exact coordinates.
+        coordinates below if needed.
       </p>
-      <div className="grid grid-cols-4 gap-2">
+      <div className="grid grid-cols-4 gap-1.5">
         {(["x", "y", "width", "height"] as const).map((k) => (
           <label key={k} className="block">
-            <span className="text-[10px] font-semibold uppercase tracking-[0.12em] text-fog">
+            <span className="text-[9.5px] font-medium uppercase tracking-[0.12em] text-fog">
               {k}
             </span>
             <input
@@ -597,7 +926,7 @@ function FocusRegionEditor({
                   [k]: Math.max(0, Math.min(1, Number(e.target.value))),
                 })
               }
-              className="mt-1 h-9 w-full rounded-lg border border-white/10 bg-white/[0.02] px-2 font-mono text-[12px] text-white outline-none focus:border-white/25"
+              className="mt-1 h-7 w-full rounded-md border border-white/10 bg-white/[0.02] px-1.5 font-mono text-[11.5px] text-white outline-none focus:border-white/25"
             />
           </label>
         ))}
@@ -606,80 +935,12 @@ function FocusRegionEditor({
   );
 }
 
-// ─── Misc atoms ─────────────────────────────────────────────────────────────
-
-function IconButton({
-  label,
-  tone,
-  onClick,
-  children,
-}: {
-  label: string;
-  tone?: "danger";
-  onClick: () => void;
-  children: React.ReactNode;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      aria-label={label}
-      title={label}
-      className={cn(
-        "inline-flex size-9 items-center justify-center rounded-xl border border-white/10 bg-white/[0.02] text-fog transition-all duration-200 hover:-translate-y-px hover:border-white/25 hover:text-white",
-        tone === "danger" &&
-          "hover:border-rose-400/40 hover:bg-rose-500/10 hover:text-rose-300"
-      )}
-    >
-      {children}
-    </button>
-  );
-}
-
-function TimeField({
-  label,
-  value,
-  onChange,
-  onSeek,
-}: {
-  label: string;
-  value: number;
-  onChange: (v: number) => void;
-  onSeek: () => void;
-}) {
-  return (
-    <label className="block">
-      <div className="mb-1 flex items-baseline justify-between">
-        <span className="text-[10px] font-semibold uppercase tracking-[0.14em] text-fog">
-          {label}
-        </span>
-        <button
-          type="button"
-          onClick={onSeek}
-          className="text-[10px] text-fog transition-colors duration-150 hover:text-white"
-        >
-          Seek
-        </button>
-      </div>
-      <div className="relative">
-        <input
-          type="number"
-          step={0.1}
-          min={0}
-          value={Number(value.toFixed(2))}
-          onChange={(e) => onChange(Number(e.target.value))}
-          className="h-10 w-full rounded-xl border border-white/10 bg-white/[0.02] px-3 pr-8 font-mono text-[13px] text-white outline-none focus:border-white/25"
-        />
-        <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-[10px] text-fog">
-          s
-        </span>
-      </div>
-    </label>
-  );
-}
-
 function fmt(s: number): string {
   if (!Number.isFinite(s) || s < 0) return "0:00";
   const m = Math.floor(s / 60);
   const r = Math.floor(s % 60);
-  return `${m}:${String(r).padStart(2, "0")}`;
+  const tenths = Math.floor((s - Math.floor(s)) * 10);
+  return tenths > 0
+    ? `${m}:${String(r).padStart(2, "0")}.${tenths}`
+    : `${m}:${String(r).padStart(2, "0")}`;
 }

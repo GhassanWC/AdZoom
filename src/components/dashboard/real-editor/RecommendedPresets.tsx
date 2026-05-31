@@ -1,13 +1,16 @@
 "use client";
 
 import * as React from "react";
-import { Sparkles, Wand2, Check, ArrowRight } from "lucide-react";
+import { useRouter } from "next/navigation";
+import { Sparkles, Wand2, Check, ArrowRight, Lock } from "lucide-react";
 import type { Preset } from "@/lib/firebase/schema";
 import { BUILTIN_PRESETS_BY_ID } from "@/lib/presets";
 import { useToast } from "@/components/ui/Toast";
 import { PresetThumb } from "@/components/landing/PresetThumb";
 import { PresetDetailModal } from "@/components/dashboard/PresetDetailModal";
 import { useEditorReal } from "./context";
+import { useStoragePlan } from "@/lib/usage/useStoragePlan";
+import { planMeetsMinimum } from "@/lib/usage/plan";
 import { cn } from "@/lib/cn";
 
 /**
@@ -16,6 +19,8 @@ import { cn } from "@/lib/cn";
  */
 export function RecommendedPresets() {
   const { project, applyPreset } = useEditorReal();
+  const { plan } = useStoragePlan();
+  const router = useRouter();
   const toast = useToast();
   const ids = project.analysis?.recommendedPresetIds ?? [];
   const [openPreset, setOpenPreset] = React.useState<Preset | null>(null);
@@ -30,10 +35,20 @@ export function RecommendedPresets() {
   const [hero, ...rest] = recommended;
   const activeId = project.selectedPresetId;
 
+  const isLocked = (p: Preset): boolean =>
+    !!p.requiredPlan && !planMeetsMinimum(plan.tier, p.requiredPlan);
+
   const onApply = async (preset: Preset) => {
+    if (isLocked(preset)) {
+      router.push("/pricing");
+      return;
+    }
     try {
       await applyPreset(preset);
-      toast.success("Preset applied", `${preset.name} — settings updated`);
+      toast.success(
+        "Preset applied to your current edit.",
+        `${preset.name} — your AI moments and timeline are unchanged.`
+      );
       setOpenPreset(null);
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Failed to apply preset";
@@ -73,8 +88,9 @@ export function RecommendedPresets() {
         <HeroPresetCard
           preset={hero}
           active={activeId === hero.id}
+          locked={isLocked(hero)}
           onApply={() => onApply(hero)}
-          onOpen={() => setOpenPreset(hero)}
+          onOpen={() => (isLocked(hero) ? router.push("/pricing") : setOpenPreset(hero))}
         />
 
         {/* Supporting recommendations */}
@@ -85,8 +101,9 @@ export function RecommendedPresets() {
               preset={p}
               rank={i + 2}
               active={activeId === p.id}
+              locked={isLocked(p)}
               onApply={() => onApply(p)}
-              onOpen={() => setOpenPreset(p)}
+              onOpen={() => (isLocked(p) ? router.push("/pricing") : setOpenPreset(p))}
             />
           ))}
         </div>
@@ -109,11 +126,13 @@ export function RecommendedPresets() {
 function HeroPresetCard({
   preset,
   active,
+  locked,
   onApply,
   onOpen,
 }: {
   preset: Preset;
   active: boolean;
+  locked?: boolean;
   onApply: () => void;
   onOpen: () => void;
 }) {
@@ -134,11 +153,18 @@ function HeroPresetCard({
           aria-hidden
           className="absolute inset-0 bg-gradient-to-t from-black/85 via-black/20 to-transparent"
         />
-        <span className="absolute left-4 top-4 inline-flex items-center gap-1.5 rounded-full border border-violet-400/50 bg-violet-500/30 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.18em] text-violet-100 backdrop-blur-md">
-          <Sparkles size={11} />
-          Top pick for you
-        </span>
-        {active && (
+        {locked ? (
+          <span className="absolute left-4 top-4 inline-flex items-center gap-1.5 rounded-full border border-amber-300/50 bg-amber-400/25 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.18em] text-amber-50 backdrop-blur-md">
+            <Lock size={11} />
+            {preset.requiredPlan === "pro" ? "Pro" : "Creator"} plan
+          </span>
+        ) : (
+          <span className="absolute left-4 top-4 inline-flex items-center gap-1.5 rounded-full border border-violet-400/50 bg-violet-500/30 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.18em] text-violet-100 backdrop-blur-md">
+            <Sparkles size={11} />
+            Top pick for you
+          </span>
+        )}
+        {active && !locked && (
           <span className="absolute right-4 top-4 inline-flex items-center gap-1.5 rounded-full bg-violet-500 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.18em] text-white shadow-violet-glow">
             <Check size={11} />
             Applied
@@ -166,8 +192,8 @@ function HeroPresetCard({
             onClick={onApply}
             className="group/btn inline-flex flex-1 items-center justify-center gap-2 rounded-xl bg-violet-500 px-4 py-2.5 text-[13px] font-semibold text-white shadow-[0_8px_24px_-8px_rgba(139,92,246,0.6)] transition-all duration-200 hover:bg-violet-500/90 active:scale-[0.98]"
           >
-            <Wand2 size={14} />
-            Apply this preset
+            {locked ? <Lock size={14} /> : <Wand2 size={14} />}
+            {locked ? "Upgrade to use" : "Apply this preset"}
             <ArrowRight
               size={13}
               className="transition-transform duration-200 group-hover/btn:translate-x-0.5"
@@ -189,12 +215,14 @@ function SupportingPresetCard({
   preset,
   rank,
   active,
+  locked,
   onApply,
   onOpen,
 }: {
   preset: Preset;
   rank: number;
   active: boolean;
+  locked?: boolean;
   onApply: () => void;
   onOpen: () => void;
 }) {
@@ -235,8 +263,8 @@ function SupportingPresetCard({
               onClick={onApply}
               className="inline-flex items-center gap-1 rounded-lg bg-violet-500/15 px-2.5 py-1 text-[11px] font-semibold text-violet-100 ring-1 ring-violet-400/30 transition-colors duration-200 hover:bg-violet-500/25"
             >
-              <Wand2 size={10} />
-              Apply
+              {locked ? <Lock size={10} /> : <Wand2 size={10} />}
+              {locked ? "Upgrade" : "Apply"}
             </button>
             <button
               onClick={onOpen}

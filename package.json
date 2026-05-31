@@ -5,7 +5,17 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "typecheck": "tsc --noEmit",
+    "fb:whoami": "node scripts/firebase-active.mjs",
+    "fb:use:dev": "firebase use dev",
+    "fb:use:prod": "firebase use prod",
+    "deploy:rules:dev": "node scripts/deploy-rules.mjs --project=dev",
+    "deploy:rules:prod": "node scripts/deploy-rules.mjs --project=prod",
+    "deploy:indexes:dev": "firebase deploy --only firestore:indexes --project=dev",
+    "deploy:indexes:prod": "firebase deploy --only firestore:indexes --project=prod",
+    "deploy:dev": "npm run deploy:rules:dev && npm run deploy:indexes:dev",
+    "deploy:prod": "npm run deploy:rules:prod && npm run deploy:indexes:prod"
   },
   "dependencies": {
     "@google/genai": "^2.2.0",

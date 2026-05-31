@@ -19,12 +19,14 @@ import type {
   ProjectDoc,
 } from "@/lib/firebase/schema";
 import { applyPresetToSettings } from "@/lib/presets";
-import { balanceTimeline } from "@/lib/timeline-balancer";
+import { getDoc } from "firebase/firestore";
+import { normalizePlan, planMeetsMinimum } from "@/lib/usage/plan";
 import {
   runVisualAnalysis,
   CvAbortError,
   CvTaintedError,
 } from "@/lib/cv/pipeline";
+import { useNotifications } from "@/lib/notifications/store";
 
 interface EditorRealContextValue {
   project: ProjectDoc;
@@ -74,6 +76,15 @@ interface EditorRealContextValue {
   clearSelectedPreset: () => Promise<void>;
   startAnalyze: () => Promise<void>;
   cancelAnalyze: () => Promise<void>;
+  /**
+   * Re-derive `focusRegion` for every non-user-positioned moment from the
+   * project's stored interactions + visual analysis. Cheap (no Gemini call,
+   * no balancer selection) — meant for users with projects analyzed before
+   * directional framing existed. Returns the number of moments updated.
+   */
+  refineFraming: () => Promise<{ changedCount: number; totalCount: number }>;
+  /** True while `refineFraming` is in flight. */
+  refiningFraming: boolean;
   analyzing: boolean;
   analyzeError: string | null;
   /** 0..1 progress of the client-side CV pass, or null when not scanning. */
@@ -143,6 +154,48 @@ export function EditorRealProvider({
   const [cvProgress, setCvProgress] = React.useState<number | null>(null);
   const cvAbortRef = React.useRef<AbortController | null>(null);
 
+  // ── Analysis completion → notification ─────────────────────────────────
+  // `startAnalyze` kicks off the server route and returns immediately;
+  // the completion arrives later via the Firestore snapshot updating
+  // `project.analysis.status`. Watch for the transition into "complete"
+  // / "failed" here and push the navbar notification at the transition
+  // edge so a re-render of the same status doesn't re-notify.
+  const notifications = useNotifications();
+  const lastAnalysisStatusRef = React.useRef<string | undefined>(
+    project.analysis?.status
+  );
+  React.useEffect(() => {
+    const prev = lastAnalysisStatusRef.current;
+    const curr = project.analysis?.status;
+    if (prev === curr) return;
+    lastAnalysisStatusRef.current = curr;
+    if (curr === "complete" && prev !== "complete") {
+      const momentCount = project.analysis?.detectedMoments?.length ?? 0;
+      notifications.push({
+        id: `analysis-completed:${project.id}:${project.analysis?.completedAt ?? "current"}`,
+        kind: "analysis-completed",
+        title: "AI analysis ready",
+        body: `${project.title || "Untitled"} — ${momentCount} moment${momentCount === 1 ? "" : "s"} detected`,
+        href: `/dashboard/projects/${project.id}`,
+      });
+    } else if (curr === "failed" && prev !== "failed") {
+      notifications.push({
+        id: `analysis-failed:${project.id}:${project.analysis?.completedAt ?? Date.now()}`,
+        kind: "analysis-failed",
+        title: "AI analysis failed",
+        body: `${project.title || "Untitled"} — open the project to retry`,
+        href: `/dashboard/projects/${project.id}`,
+      });
+    }
+  }, [
+    project.id,
+    project.title,
+    project.analysis?.status,
+    project.analysis?.completedAt,
+    project.analysis?.detectedMoments?.length,
+    notifications,
+  ]);
+
   // Compute the currently-active moment based on currentTime.
   const activeMoment = React.useMemo<DetectedMoment | null>(() => {
     const moments = project.analysis?.detectedMoments ?? [];
@@ -179,10 +232,21 @@ export function EditorRealProvider({
       const next = moments.map((m) =>
         m.id === id ? ({ ...m, ...patch, edited: true } as DetectedMoment) : m
       );
+      // Firestore rejects writes that carry `undefined` values anywhere in
+      // the document. Two ways those slip in here:
+      //   1. Callers pass `{ keyframes: undefined }` to clear a field —
+      //      e.g. the directional preset chips that reset a moment back to
+      //      static framing. The spread above preserves the `undefined`.
+      //   2. The moment we spread was previously read from Firestore and
+      //      still carries explicit-`undefined` optional fields (legacy).
+      // Strip both with the same recursive helper duplicateMoment uses.
       await setDoc(
         projectRef,
         {
-          analysis: { ...(project.analysis ?? {}), detectedMoments: next },
+          analysis: stripUndefined({
+            ...(project.analysis ?? {}),
+            detectedMoments: next,
+          }),
           updatedAt: serverTimestamp(),
         },
         { merge: true }
@@ -317,6 +381,11 @@ export function EditorRealProvider({
           intensity: 0.7,
           attentionScore: 0.6,
           source: "user",
+          // Stamp as user-positioned so the focal-region refinement pass in
+          // `fuseMomentsWithCv` doesn't later overwrite this with a derived
+          // region. The user explicitly added this moment; their initial
+          // centered framing is intentional until they drag the focus box.
+          targetRegionSource: "user",
           edited: true,
         };
         const next = [...moments, m].sort((a, b) => a.startTime - b.startTime);
@@ -411,45 +480,50 @@ export function EditorRealProvider({
 
   const applyPreset: EditorRealContextValue["applyPreset"] = React.useCallback(
     async (preset) => {
-      const nextSettings = applyPresetToSettings(project.effectsSettings, preset);
-
-      // Re-balance the timeline if we have the raw Gemini output stored.
-      // User-edited moments (label/time changes or manually added) are preserved.
-      const raw = project.analysis?.rawMoments ?? [];
-      const current = project.analysis?.detectedMoments ?? [];
-      const userEdited = current.filter((m) => m.edited);
-
-      const patch: Record<string, unknown> = {
-        effectsSettings: nextSettings,
-        selectedPresetId: preset.id,
-        updatedAt: serverTimestamp(),
-      };
-
-      if (raw.length > 0 && project.duration && project.duration > 0) {
-        const rebalanced = balanceTimeline({
-          raw,
-          duration: project.duration,
-          pacing: nextSettings.pacing,
-          videoType: project.analysis?.videoType,
-          preserved: userEdited,
-          // Re-fuse with the stored CV pass so fused scores survive preset changes.
-          visualAnalysis: project.visualAnalysis,
-        });
-        patch.analysis = {
-          ...(project.analysis ?? {}),
-          detectedMoments: rebalanced.moments,
-        };
+      // Defensive plan gate — the calling UI (PresetsRail / RecommendedPresets
+      // / standalone page) already hides locked presets, but this catches
+      // direct programmatic calls and surface bugs. Reads the live plan from
+      // Firestore so a recent webhook upgrade is honoured.
+      if (preset.requiredPlan) {
+        const { db } = getFirebase();
+        const userSnap = await getDoc(doc(db, "users", uid));
+        const plan = normalizePlan(
+          (userSnap.data() as { plan?: unknown } | undefined)?.plan
+        );
+        if (!planMeetsMinimum(plan, preset.requiredPlan)) {
+          throw new Error(
+            `${preset.name} requires the ${preset.requiredPlan} plan. Upgrade in /pricing.`
+          );
+        }
       }
 
-      await setDoc(projectRef, patch, { merge: true });
+      const nextSettings = applyPresetToSettings(project.effectsSettings, preset);
+
+      // A preset is a STYLE layer (zoom defaults, cursor glow, callout
+      // style, pacing target, export theme). It must NOT touch the AI's
+      // `detectedMoments`. The previous implementation called
+      // `balanceTimeline` here with the new preset's pacing — in the worst
+      // case that produced a stricter selection that dropped every moment,
+      // which then collapsed `hasAnalysis` in RealEditor and bounced the
+      // workflow stepper back to "analyze" (= "redo your analysis"). In
+      // the not-worst case it silently rewrote any non-`edited` moment,
+      // throwing away tuning the user had done by dragging the timeline
+      // even when no inspector-edit flag was set.
+      //
+      // Pacing is still captured in `effectsSettings.pacing`. A future
+      // explicit "Re-balance timeline" action can consume it; that path
+      // must be a deliberate user choice, not a side-effect of style apply.
+      await setDoc(
+        projectRef,
+        {
+          effectsSettings: nextSettings,
+          selectedPresetId: preset.id,
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
     },
-    [
-      project.effectsSettings,
-      project.analysis,
-      project.duration,
-      project.visualAnalysis,
-      projectRef,
-    ]
+    [project.effectsSettings, projectRef, uid]
   );
 
   const clearSelectedPreset: EditorRealContextValue["clearSelectedPreset"] =
@@ -621,6 +695,42 @@ export function EditorRealProvider({
     );
   }, [projectRef]);
 
+  const [refiningFraming, setRefiningFraming] = React.useState(false);
+
+  /**
+   * Re-derive `focusRegion` for every non-user-positioned moment using the
+   * project's stored interactions + visual analysis. Calls the lightweight
+   * `/api/projects/[id]/reframe` route (no Gemini, no balancer selection).
+   * The Firestore snapshot subscription in `RealEditorPage` will pick up
+   * the patched moments and re-render.
+   */
+  const refineFraming: EditorRealContextValue["refineFraming"] =
+    React.useCallback(async () => {
+      const token = await idTokenGetter();
+      if (!token) throw new Error("Not signed in.");
+      setRefiningFraming(true);
+      try {
+        const res = await fetch(`/api/projects/${project.id}/reframe`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${token}` },
+        });
+        if (!res.ok) {
+          const j = await res.json().catch(() => ({ error: "Reframe failed" }));
+          throw new Error(j.error || `HTTP ${res.status}`);
+        }
+        const body = (await res.json()) as {
+          changedCount?: number;
+          totalCount?: number;
+        };
+        return {
+          changedCount: body.changedCount ?? 0,
+          totalCount: body.totalCount ?? 0,
+        };
+      } finally {
+        setRefiningFraming(false);
+      }
+    }, [idTokenGetter, project.id]);
+
   // unused helpers exposed for callers that bulk-edit
   void arrayUnion;
   void arrayRemove;
@@ -662,6 +772,8 @@ export function EditorRealProvider({
     clearSelectedPreset,
     startAnalyze,
     cancelAnalyze,
+    refineFraming,
+    refiningFraming,
     analyzing,
     analyzeError,
     cvProgress,

@@ -69,6 +69,12 @@ interface InternalState {
    * downstream marks them as not-the-recorded-surface.
    */
   interactionScope: "tab" | "external";
+  /**
+   * Raw `displaySurface` from the captured video track — "monitor", "window",
+   * "browser", or null if the browser doesn't expose it. Forwarded into the
+   * RecordingResult so the preview can warn about likely sharing-bar capture.
+   */
+  displaySurface: "monitor" | "window" | "browser" | null;
 }
 
 export interface CreateRecordingEngineOptions {
@@ -131,6 +137,7 @@ export function createRecordingEngine(
     tickInterval: null,
     micLevel: 0,
     interactionScope: "tab",
+    displaySurface: null,
   };
 
   const listeners = new Set<(e: RecordingEvent) => void>();
@@ -221,6 +228,7 @@ export function createRecordingEngine(
     s.startedAt = 0;
     s.pausedAt = 0;
     s.totalPausedMs = 0;
+    s.displaySurface = null;
   };
 
   const prepare: RecordingEngine["prepare"] = async (opts) => {
@@ -268,18 +276,19 @@ export function createRecordingEngine(
     // indicator" and "recorder is actually capturing" collapses to a few
     // synchronous lines (mixer setup + MediaRecorder ctor).
     //
-    // `selfBrowserSurface: "include"` is what makes the current Chrome tab
-    // show up in the picker; without it the user can't capture the tab
-    // they're running AdZoom in. `surfaceSwitching` and `monitorTypeSurfaces`
-    // are belt-and-suspenders: tell Chrome to surface every source type it
-    // can. `systemAudio` mirrors the user's toggle.
+    // `selfBrowserSurface: "exclude"` hides the AdZoom tab from the picker.
+    // Capturing our own tab is the path that bakes Chrome's "is sharing your
+    // screen" controls strip into the recorded video (the green bar bug). The
+    // user can still capture any other tab, any window, or the full screen —
+    // which is what we recommend in the setup UI. Older browsers that don't
+    // recognise this key ignore it (it's not in lib.dom.d.ts; harmless).
     const constraints: ExtendedDisplayMediaOptions = {
       video: {
         frameRate: { ideal: 30, max: 60 },
       },
       // Browsers only honor this on certain source types; harmless otherwise.
       audio: opts.systemAudio,
-      selfBrowserSurface: "include",
+      selfBrowserSurface: "exclude",
       surfaceSwitching: "include",
       systemAudio: opts.systemAudio ? "include" : "exclude",
       monitorTypeSurfaces: "include",
@@ -303,6 +312,26 @@ export function createRecordingEngine(
     };
     s.width = settings.width ?? 1920;
     s.height = settings.height ?? 1080;
+    s.displaySurface = settings.displaySurface ?? null;
+
+    // Dev-mode insight into what the user actually picked. Useful when
+    // diagnosing the "green bar" / sharing-controls capture: a `browser`
+    // surface paired with a viewport-matching size is almost certainly the
+    // AdZoom tab itself, which we already discourage in the picker but can
+    // still happen via Chrome's "Other tab" route.
+    if (process.env.NODE_ENV !== "production") {
+      console.info("[recording] picked surface", {
+        displaySurface: settings.displaySurface,
+        width: settings.width,
+        height: settings.height,
+        frameRate: settings.frameRate,
+      });
+      if (settings.displaySurface === "browser") {
+        console.warn(
+          "[recording] Tab capture selected. Chrome may bake a sharing controls strip into the recorded video. Prefer Window or Entire Screen."
+        );
+      }
+    }
 
     // Decide whether real input events are authoritative for this take.
     // displaySurface === "browser" means the user picked a tab. We can't tell
@@ -464,6 +493,7 @@ export function createRecordingEngine(
         const height = s.height;
         const mimeType = s.mime;
         const interactionScope = s.interactionScope;
+        const displaySurface = s.displaySurface;
         const blob = new Blob(s.chunks, { type: mimeType });
         // Drain the interaction provider before tearing down. If the surface
         // was external we still keep the events around (they describe what
@@ -483,6 +513,7 @@ export function createRecordingEngine(
           height,
           interactions,
           interactionScope,
+          displaySurface,
         };
         teardown();
         setState("stopped");

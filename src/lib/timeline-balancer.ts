@@ -34,6 +34,7 @@ import { AI_MOMENT_QUOTA, PROVENANCE_RANK } from "./firebase/schema";
 import { sampleCvForMoment, fuseAttention, nearestClickEvent } from "./cv/fusion";
 import { cvCandidateMoments } from "./cv/peaks";
 import type { Interaction } from "./recording/types";
+import { refineMomentFocalRegion } from "./timeline/focal-region";
 
 export interface PacingProfile {
   /** Target moments per minute. */
@@ -169,6 +170,8 @@ export interface BalancerResult {
     fusedCount: number;
     /** Moments whose start time was nudged onto a detected click event. */
     clickRefinedCount: number;
+    /** Moments whose focusRegion was refined onto a directional signal. */
+    focusRefinedCount: number;
     /** CV attention-curve peaks added to the candidate pool. */
     cvCandidatesAdded: number;
     /** Provenance histogram of kept moments. */
@@ -187,6 +190,29 @@ export interface BalancerResult {
     sceneChangeNudged: number;
     /** Quartiles left empty after honouring rejection (no rescue performed). */
     quartileLeftEmpty: number;
+    /**
+     * Per-provenance accounting for event-derived (real click / typing /
+     * scroll-pause) candidates. Surfaced so the editor's Analysis Debug
+     * panel can show exactly where a user's clicks were lost between
+     * `momentsFromEvents` output and the final timeline.
+     *
+     *   eventCandidatesIn       = how many event moments entered balanceTimeline()
+     *   eventDroppedByOverlap   = collapsed in resolveOverlaps (same-target)
+     *   eventDroppedTooClose    = greedy-selection EVENT_MIN_SPACING (0.8s) rule
+     *   eventDroppedTooManyZooms= greedy-selection zoomCooldown rule (now bypassed
+     *                             for events — should always be 0; surfaces a
+     *                             regression if it isn't)
+     *   eventDroppedTooDense    = quartile-cap or target-count cap
+     *   eventKept               = events present in the final timeline
+     */
+    eventStats: {
+      eventCandidatesIn: number;
+      eventDroppedByOverlap: number;
+      eventDroppedTooClose: number;
+      eventDroppedTooManyZooms: number;
+      eventDroppedTooDense: number;
+      eventKept: number;
+    };
   };
 }
 
@@ -635,21 +661,25 @@ interface FusionResult {
   moments: DetectedMoment[];
   fusedCount: number;
   clickRefinedCount: number;
+  /** How many moments had their focusRegion refined onto a real signal. */
+  focusRefinedCount: number;
 }
 
 function fuseMomentsWithCv(
   raw: DetectedMoment[],
   va: VisualAnalysis,
-  duration: number
+  duration: number,
+  interactions?: Interaction[]
 ): FusionResult {
   const sorted = [...raw].sort((a, b) => a.startTime - b.startTime);
   let clickRefinedCount = 0;
+  let focusRefinedCount = 0;
 
   const moments = sorted.map((m, i) => {
     const cv = sampleCvForMoment(va, m.startTime, m.endTime);
     const geminiScore = m.attentionScore ?? m.importance ?? 0.5;
 
-    const next: DetectedMoment = {
+    let next: DetectedMoment = {
       ...m,
       attentionScore: fuseAttention(geminiScore, cv),
       attentionFactors: {
@@ -679,37 +709,22 @@ function fuseMomentsWithCv(
       }
     }
 
-    // Focus-region refinement — a stable hotspot far from Gemini's box pulls
-    // the focus centre 40 % of the way toward the measured centroid.
-    if (cv.centroid && cv.centroid.variance < 0.02) {
-      const gx = next.focusRegion.x + next.focusRegion.width / 2;
-      const gy = next.focusRegion.y + next.focusRegion.height / 2;
-      const dist = Math.hypot(cv.centroid.x - gx, cv.centroid.y - gy);
-      if (dist > 0.25) {
-        const w = next.focusRegion.width;
-        const h = next.focusRegion.height;
-        const nx = gx + (cv.centroid.x - gx) * 0.4;
-        const ny = gy + (cv.centroid.y - gy) * 0.4;
-        next.focusRegion = {
-          x: clamp(nx - w / 2, 0, Math.max(0, 1 - w)),
-          y: clamp(ny - h / 2, 0, Math.max(0, 1 - h)),
-          width: w,
-          height: h,
-        };
-        // Upgrade the targetRegionSource — the focus box is no longer a
-        // generic AI proposal but grounded in a measured motion hotspot.
-        next.targetRegionSource = "motion-centroid";
-        next.sourceSignals = [
-          ...(next.sourceSignals ?? []),
-          `cv-centroid@${cv.centroid.x.toFixed(2)},${cv.centroid.y.toFixed(2)}`,
-        ];
-      }
+    // Focus-region refinement — multi-signal cascade replaces the old
+    // CV-centroid-only block. The helper consults real clicks first, then
+    // cursor dwell, then CV centroid, then form heuristics, and ONLY
+    // overwrites the region when the new centre is materially different.
+    // User-positioned regions (`targetRegionSource === "user"` or
+    // `source === "user"`) are passed through untouched.
+    const refined = refineMomentFocalRegion(next, interactions, va);
+    if (refined !== next) {
+      next = refined;
+      focusRefinedCount++;
     }
 
     return next;
   });
 
-  return { moments, fusedCount: moments.length, clickRefinedCount };
+  return { moments, fusedCount: moments.length, clickRefinedCount, focusRefinedCount };
 }
 
 /** Legacy floor — events with confidence below this can always be overridden. */
@@ -806,8 +821,26 @@ function ensureConfidence(m: DetectedMoment): DetectedMoment {
 function resolveOverlaps(
   candidates: DetectedMoment[],
   interactions: Interaction[] | undefined
-): { kept: DetectedMoment[]; eventOverlapsResolved: number } {
-  const EPS_FOCUS = 0.18;
+): { kept: DetectedMoment[]; eventOverlapsResolved: number; eventsDropped: number } {
+  /**
+   * Focus-distance threshold for "this candidate is on the same UI
+   * target as one we already kept." AI-vs-AI uses the historical
+   * loose 0.18 (lets the balancer collapse overlapping AI proposals
+   * on the same region into one). Event-vs-event uses a much
+   * tighter 0.08 — separate user clicks usually land on separate
+   * elements, and the loose threshold was collapsing legitimate
+   * multi-click sequences (sidebar nav, button row) into one zoom.
+   */
+  const EPS_FOCUS_AI = 0.18;
+  const EPS_FOCUS_EVENT = 0.08;
+  /**
+   * Temporal collapse window for event-vs-event. Two clicks within
+   * this many seconds of each other count as "the same click" and
+   * collapse to one moment; further apart, they each become their
+   * own moment. Matches the user's spec: clicks < 0.8s apart merge,
+   * otherwise stay separate.
+   */
+  const EVENT_COLLAPSE_S = 0.8;
   const sorted = [...candidates].sort((a, b) => {
     const ra = PROVENANCE_RANK[provenanceOf(a)];
     const rb = PROVENANCE_RANK[provenanceOf(b)];
@@ -816,15 +849,30 @@ function resolveOverlaps(
   });
   const kept: DetectedMoment[] = [];
   let eventOverlapsResolved = 0;
+  // Distinct from `eventOverlapsResolved`: counts EVENT candidates that
+  // failed to enter `kept` here (the AI-vs-event override drops the kept
+  // event AFTER counting it as resolved, so we'd over-count if we used
+  // the same counter for diagnostics).
+  let eventsDropped = 0;
   for (const cand of sorted) {
     const cCx = cand.focusRegion.x + cand.focusRegion.width / 2;
     const cCy = cand.focusRegion.y + cand.focusRegion.height / 2;
+    const candProv = provenanceOf(cand);
     let overlapsExisting: DetectedMoment | null = null;
     for (const k of kept) {
-      const overlapsTime = !(k.endTime <= cand.startTime || k.startTime >= cand.endTime);
+      const kProv = provenanceOf(k);
+      const bothEvent = candProv === "event" && kProv === "event";
+      // For event-vs-event, the overlap test is much tighter — only
+      // collapse clicks within EVENT_COLLAPSE_S of each other AND on
+      // essentially the same target. Letting separate user clicks on
+      // separate targets survive is the whole point of this loop fix.
+      const overlapsTime = bothEvent
+        ? Math.abs(k.startTime - cand.startTime) < EVENT_COLLAPSE_S
+        : !(k.endTime <= cand.startTime || k.startTime >= cand.endTime);
+      const epsFocus = bothEvent ? EPS_FOCUS_EVENT : EPS_FOCUS_AI;
       const kCx = k.focusRegion.x + k.focusRegion.width / 2;
       const kCy = k.focusRegion.y + k.focusRegion.height / 2;
-      const closeFocus = Math.hypot(kCx - cCx, kCy - cCy) < EPS_FOCUS;
+      const closeFocus = Math.hypot(kCx - cCx, kCy - cCy) < epsFocus;
       if (overlapsTime && closeFocus) {
         overlapsExisting = k;
         break;
@@ -835,8 +883,8 @@ function resolveOverlaps(
       continue;
     }
     // Resolve: cand's rank ≤ existing's by sort order. Special case AI override.
+    // `candProv` is already in scope from the overlap-detection block above.
     const existingProv = provenanceOf(overlapsExisting);
-    const candProv = provenanceOf(cand);
     if (existingProv === "event" && candProv === "ai") {
       const eventConf = overlapsExisting.confidenceScore ?? 1;
       const aiConf = cand.confidenceScore ?? 0;
@@ -868,15 +916,17 @@ function resolveOverlaps(
           whySelected: appendWhy(cand.whySelected, reason),
         };
         eventOverlapsResolved++;
+        eventsDropped++; // the kept event was replaced by ai-override
         continue;
       }
       eventOverlapsResolved++;
     } else if (existingProv === "event") {
       eventOverlapsResolved++;
     }
-    // Otherwise drop the candidate.
+    // Candidate dropped (either lost to higher-rank existing, or AI vs AI overlap).
+    if (candProv === "event") eventsDropped++;
   }
-  return { kept, eventOverlapsResolved };
+  return { kept, eventOverlapsResolved, eventsDropped };
 }
 
 /**
@@ -963,6 +1013,7 @@ export function balanceTimeline(input: BalancerInput): BalancerResult {
   // dense pacing to bring them back into consideration.
   let fusedCount = 0;
   let clickRefinedCount = 0;
+  let focusRefinedCount = 0;
   let cvCandidatesAdded = 0;
 
   const rawIn = unrejectRebalance
@@ -986,9 +1037,10 @@ export function balanceTimeline(input: BalancerInput): BalancerResult {
     // CV fusion still adjusts the AI/Gemini moments — keep events untouched.
     const aiOnly = effectiveRaw.filter((m) => provenanceOf(m) !== "event");
     const evOnly = effectiveRaw.filter((m) => provenanceOf(m) === "event");
-    const fusion = fuseMomentsWithCv(aiOnly, visualAnalysis, duration);
+    const fusion = fuseMomentsWithCv(aiOnly, visualAnalysis, duration, input.interactions);
     fusedCount = fusion.fusedCount;
     clickRefinedCount = fusion.clickRefinedCount;
+    focusRefinedCount = fusion.focusRefinedCount;
     effectiveRaw = [...evOnly, ...fusion.moments];
 
     if (input.useCvCandidates) {
@@ -1030,6 +1082,12 @@ export function balanceTimeline(input: BalancerInput): BalancerResult {
   // relaxed rule also lets a strongly-disagreeing AI candidate override a
   // healthy event when no real click sits within ±1s — see resolveOverlaps.
   effectiveRaw = effectiveRaw.map(ensureConfidence);
+  // Count events entering the overlap/greedy stages. Events that the reject
+  // pass might have skipped don't count here — only the pool the balancer
+  // actively considers.
+  const eventCandidatesIn = effectiveRaw.filter(
+    (m) => provenanceOf(m) === "event"
+  ).length;
   const overlapResolved = resolveOverlaps(effectiveRaw, interactions);
   effectiveRaw = overlapResolved.kept;
 
@@ -1068,12 +1126,26 @@ export function balanceTimeline(input: BalancerInput): BalancerResult {
       return { ...m, effectType, intensity, whyEffectType };
     });
 
-  // Target count: bounded by pacing rate and duration.
+  // Target count: bounded by pacing rate, duration, AND duration-aware
+  // caps so a short clip can't claim 20 moments and a 5-minute clip can
+  // claim more than the global `MAX_MOMENTS` floor of 24. The bucket
+  // caps were explicitly specified for the click-zoom redesign:
+  //   short  (≤30s)   → 3..6
+  //   medium (30..120s) → 6..12
+  //   long   (>120s)  → 12..20
+  // The pacing-rate calculation still wins inside the bucket window;
+  // these brackets only tighten the floor + ceiling.
   const minutes = Math.max(duration / 60, 0.5);
+  const durationBucket: { min: number; max: number } =
+    duration <= 30
+      ? { min: 3, max: 6 }
+      : duration <= 120
+        ? { min: 6, max: 12 }
+        : { min: 12, max: 20 };
   const targetCount = clamp(
     Math.round(minutes * ratePerMin),
-    Math.max(MIN_MOMENTS, Math.ceil(minutes * minPerMin)),
-    Math.min(MAX_MOMENTS, Math.ceil(minutes * maxPerMin))
+    Math.max(MIN_MOMENTS, durationBucket.min, Math.ceil(minutes * minPerMin)),
+    Math.min(MAX_MOMENTS, durationBucket.max, Math.ceil(minutes * maxPerMin))
   );
 
   // 4 quartile buckets
@@ -1091,6 +1163,23 @@ export function balanceTimeline(input: BalancerInput): BalancerResult {
   // Score = attentionScore - rhythmPenalty(against kept set so far).
   // We greedily pick the top-scoring candidate each round, re-scoring after
   // each pick so rhythm memory updates dynamically. O(n^2) but n is tiny.
+  //
+  // Spacing has TWO regimes:
+  //
+  //   - AI / CV candidates use the pacing-profile `minSpacing` (7s at
+  //     moderate) + `zoomCooldown` (10s for zoom-vs-zoom). These rules
+  //     keep AI-derived moments from feeling spam-y.
+  //
+  //   - EVENT candidates (real clicks / typing / scroll pauses) use
+  //     `EVENT_MIN_SPACING` (0.8s) and are exempt from `zoomCooldown`.
+  //     The user explicitly clicked through their app and wants the
+  //     camera to follow each meaningful action. Collapsing multi-
+  //     click sequences (sidebar nav, button row) into one zoom was
+  //     the "only 1 moment for 6 clicks" bug. 0.8s matches the
+  //     event-vs-event collapse threshold in `resolveOverlaps`, so
+  //     clicks too close to be distinct were already merged upstream
+  //     before they reach this loop.
+  const EVENT_MIN_SPACING = 0.8;
   const remaining = [...annotated];
   while (kept.length < targetCount && remaining.length > 0) {
     let bestIdx = -1;
@@ -1098,14 +1187,21 @@ export function balanceTimeline(input: BalancerInput): BalancerResult {
     let bestPenalty = 0;
     for (let i = 0; i < remaining.length; i++) {
       const c = remaining[i];
+      const cProv = provenanceOf(c);
+      const isEvent = cProv === "event";
+      const cMinSpacing = isEvent ? EVENT_MIN_SPACING : minSpacing;
       const q = whichQuartile(c.startTime, quartileLen, QUARTILES);
       if (q < 0) continue;
       if (quartileCounts[q] >= Math.ceil(maxPerMin * (quartileLen / 60)) + 1) continue;
-      if (kept.some((k) => Math.abs(k.startTime - c.startTime) < minSpacing)) continue;
-      if (c.effectType === "zoom") {
+      if (kept.some((k) => Math.abs(k.startTime - c.startTime) < cMinSpacing)) continue;
+      // Zoom cooldown — only applies to AI/CV-derived zooms. Real user
+      // clicks aren't rate-limited; if the user clicked five times in
+      // ten seconds, the camera follows all five.
+      if (c.effectType === "zoom" && !isEvent) {
         const recentZoom = kept.some(
           (k) =>
             k.effectType === "zoom" &&
+            provenanceOf(k) !== "event" &&
             Math.abs(k.startTime - c.startTime) < zoomCooldown
         );
         if (recentZoom) continue;
@@ -1113,8 +1209,7 @@ export function balanceTimeline(input: BalancerInput): BalancerResult {
 
       const intensity = c.intensity ?? 0.5;
       const penalty = rhythmPenalty(c, kept, c.effectType, intensity);
-      const p = provenanceOf(c);
-      const provBoost = p === "event" ? 0.3 : p === "cv" ? 0.1 : 0;
+      const provBoost = cProv === "event" ? 0.3 : cProv === "cv" ? 0.1 : 0;
       const conf = c.confidenceScore ?? 0.5;
       const score = (c.attentionScore ?? 0.5) + provBoost * (0.5 + conf / 2) - penalty;
       if (score > bestScore) {
@@ -1150,21 +1245,48 @@ export function balanceTimeline(input: BalancerInput): BalancerResult {
     quartileCounts[q]++;
   }
 
-  // Diagnostics for what didn't make it.
+  // Diagnostics for what didn't make it. Per-provenance spacing so
+  // event candidates aren't mis-blamed for "too close" when the AI
+  // rule (7s) wouldn't have applied to them. Track event drops
+  // separately so the Analysis Debug panel can show exactly how many
+  // user clicks were lost to each rule.
+  let eventDroppedTooClose = 0;
+  let eventDroppedTooManyZooms = 0;
+  let eventDroppedTooDense = 0;
   for (const c of remaining) {
-    if (kept.some((k) => Math.abs(k.startTime - c.startTime) < minSpacing)) {
+    const isEvent = provenanceOf(c) === "event";
+    const cMinSpacing = isEvent ? EVENT_MIN_SPACING : minSpacing;
+    if (kept.some((k) => Math.abs(k.startTime - c.startTime) < cMinSpacing)) {
       droppedTooClose++;
+      if (isEvent) eventDroppedTooClose++;
     } else if (
       c.effectType === "zoom" &&
+      !isEvent &&
       kept.some(
         (k) =>
           k.effectType === "zoom" &&
+          provenanceOf(k) !== "event" &&
           Math.abs(k.startTime - c.startTime) < zoomCooldown
       )
     ) {
       droppedTooManyZooms++;
+    } else if (
+      isEvent &&
+      c.effectType === "zoom" &&
+      kept.some(
+        (k) =>
+          k.effectType === "zoom" &&
+          provenanceOf(k) !== "event" &&
+          Math.abs(k.startTime - c.startTime) < zoomCooldown
+      )
+    ) {
+      // Should never happen — event zooms bypass cooldown in the greedy
+      // loop. Surface it if it does (regression alarm).
+      droppedTooManyZooms++;
+      eventDroppedTooManyZooms++;
     } else {
       droppedTooDense++;
+      if (isEvent) eventDroppedTooDense++;
     }
   }
 
@@ -1265,6 +1387,7 @@ export function balanceTimeline(input: BalancerInput): BalancerResult {
       avgAttention,
       fusedCount,
       clickRefinedCount,
+      focusRefinedCount,
       cvCandidatesAdded,
       provenanceCounts,
       quotaDropped,
@@ -1274,6 +1397,14 @@ export function balanceTimeline(input: BalancerInput): BalancerResult {
       aiRejectedNoTarget: rejectPass.stats.aiRejectedNoTarget,
       sceneChangeNudged,
       quartileLeftEmpty,
+      eventStats: {
+        eventCandidatesIn,
+        eventDroppedByOverlap: overlapResolved.eventsDropped,
+        eventDroppedTooClose,
+        eventDroppedTooManyZooms,
+        eventDroppedTooDense,
+        eventKept: provenanceCounts.event,
+      },
     },
   };
 }

@@ -6,7 +6,6 @@ import {
   Download,
   Smartphone,
   Monitor,
-  Settings2,
   AlertCircle,
   Loader2,
   ExternalLink,
@@ -15,6 +14,7 @@ import {
   ZoomIn,
   Clock,
   Lock,
+  Sparkles,
 } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { cn } from "@/lib/cn";
@@ -30,6 +30,9 @@ import {
 import type { ExportFormat } from "@/lib/firebase/schema";
 import { useStoragePlan } from "@/lib/usage/useStoragePlan";
 import { planMeetsMinimum } from "@/lib/usage/plan";
+import { useMonthlyUsage } from "@/lib/usage/useMonthlyUsage";
+import { useAuth } from "@/lib/firebase/AuthProvider";
+import { useNotifications } from "@/lib/notifications/store";
 
 const resolutions = ["1080p", "4K"] as const;
 const fpsOptions = [30, 60] as const;
@@ -39,8 +42,11 @@ const formats: { id: ExportFormat; label: string; desc: string; Icon: typeof Sma
 ];
 
 export function RealExportPanel() {
-  const { project, uid, videoRef, duration } = useEditorReal();
+  const { project, uid, videoRef, duration, updateEffects } = useEditorReal();
+  const notifications = useNotifications();
   const { plan } = useStoragePlan();
+  const usage = useMonthlyUsage();
+  const { getIdToken } = useAuth();
 
   // 4K is Pro-only. Free + Creator are capped at 1080p.
   const canExport4k = planMeetsMinimum(plan.tier, "pro");
@@ -99,6 +105,54 @@ export function RealExportPanel() {
     setProgress({ stage: "preparing", pct: 0 });
 
     try {
+      // ── 1. Server-side permit ────────────────────────────────────────
+      // Validates plan + monthly cap + locks resolution/format/watermark
+      // server-side BEFORE we burn cycles rendering. Any failure here
+      // saves the user a 60s+ render they couldn't have uploaded anyway.
+      const token = await getIdToken();
+      if (!token) throw new Error("Sign in to export.");
+      const permitRes = await fetch("/api/billing/export-permit", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          projectId: project.id,
+          projectTitle: project.title,
+          resolution,
+          format,
+          fps,
+        }),
+      });
+      const permitJson = (await permitRes.json()) as {
+        ok?: boolean;
+        exportId?: string;
+        uploadPath?: string;
+        applyWatermark?: boolean;
+        error?: string;
+        kind?: "plan_required" | "limit_reached";
+        used?: number;
+        limit?: number;
+      };
+      if (!permitRes.ok || !permitJson.ok) {
+        // Surface the server's clear message; the user knows what to do
+        // (upgrade) without guessing.
+        const friendly =
+          permitJson.kind === "plan_required"
+            ? "Pro plan required for 4K export. Upgrade in /pricing."
+            : permitJson.kind === "limit_reached"
+              ? `Export limit reached (${permitJson.used}/${permitJson.limit}). Upgrade to keep exporting.`
+              : permitJson.error || `Export blocked (${permitRes.status})`;
+        throw new Error(friendly);
+      }
+
+      const { exportId, uploadPath, applyWatermark } = permitJson;
+      if (!exportId || !uploadPath) {
+        throw new Error("Permit was missing exportId or uploadPath.");
+      }
+
+      // ── 2. Render ────────────────────────────────────────────────────
       const blob = await renderProjectClientSide({
         uid,
         projectId: project.id,
@@ -110,24 +164,34 @@ export function RealExportPanel() {
         resolution,
         fps,
         format,
+        applyWatermark: !!applyWatermark,
         onProgress: (p) => setProgress(p),
         signal: controller.signal,
       });
 
+      // ── 3. Upload to the path the permit blessed ─────────────────────
       setProgress({ stage: "uploading", pct: 0 });
       const ext = pickedMimeExt();
       const { downloadURL } = await uploadExport({
         uid,
         projectId: project.id,
-        projectTitle: project.title,
+        exportId,
+        uploadPath,
         blob,
-        format,
-        resolution,
-        fps,
-        ext,
       });
       setProgress({ stage: "complete", pct: 1, downloadURL });
       setDownloadURL(downloadURL);
+
+      // Persistent notification — the user may have walked away from
+      // the export panel by the time it finishes. Dedupe id ties to
+      // the export id so a stray re-render can't queue it twice.
+      notifications.push({
+        id: `export-completed:${exportId}`,
+        kind: "export-completed",
+        title: "Export ready",
+        body: `${project.title || "Untitled"} · ${format} · ${resolution}`,
+        href: "/dashboard/exports",
+      });
 
       // Trigger local download too
       const a = document.createElement("a");
@@ -139,6 +203,13 @@ export function RealExportPanel() {
       const msg = err instanceof Error ? err.message : "Export failed.";
       setProgress({ stage: "failed", pct: 0, message: msg });
       setError(msg);
+      notifications.push({
+        id: `export-failed:${project.id}:${Date.now()}`,
+        kind: "export-failed",
+        title: "Export failed",
+        body: `${project.title || "Untitled"} — ${msg}`,
+        href: `/dashboard/projects/${project.id}`,
+      });
     } finally {
       cancelRef.current = null;
     }
@@ -193,30 +264,108 @@ export function RealExportPanel() {
           <div className="mb-2 text-[10px] font-semibold uppercase tracking-[0.18em] text-fog">
             Format
           </div>
-          <div className="grid grid-cols-3 gap-1.5">
-            {[...formats, { id: "Custom" as const, label: "Custom", desc: "—", Icon: Settings2 }].map(
-              (f) => {
-                const active = format === f.id;
-                return (
-                  <button
-                    key={f.id}
-                    onClick={() => setFormat(f.id)}
-                    className={cn(
-                      "flex flex-col items-center gap-1 rounded-xl border p-4 text-center transition-colors duration-150",
-                      active
-                        ? "border-violet-400/40 bg-violet-500/15 text-violet-200"
-                        : "border-white/10 bg-white/[0.02] text-fog hover:border-white/20 hover:text-white"
-                    )}
-                  >
-                    <f.Icon size={16} />
-                    <span className="text-[12px] font-medium">{f.label}</span>
-                    <span className="text-[10px] opacity-70">{f.desc}</span>
-                  </button>
-                );
-              }
-            )}
+          {/* "Custom" was a third option here. It surfaced as a button but
+              the renderer in `export.ts` only branches on TikTok 9:16 vs
+              the default — there's no width/height/aspect/bitrate UI
+              wired up, so selecting it silently exported at YouTube 16:9
+              dimensions. Hidden until the Custom configuration panel
+              ships (per user direction). The `"Custom"` literal stays in
+              the `ExportFormat` union so any persisted defaults still
+              type-check; the renderer's defensive fallback maps it to a
+              safe horizontal output. */}
+          <div className="grid grid-cols-2 gap-1.5">
+            {formats.map((f) => {
+              const active = format === f.id;
+              return (
+                <button
+                  key={f.id}
+                  onClick={() => setFormat(f.id)}
+                  className={cn(
+                    "flex flex-col items-center gap-1 rounded-xl border p-4 text-center transition-colors duration-150",
+                    active
+                      ? "border-violet-400/40 bg-violet-500/15 text-violet-200"
+                      : "border-white/10 bg-white/[0.02] text-fog hover:border-white/20 hover:text-white"
+                  )}
+                >
+                  <f.Icon size={16} />
+                  <span className="text-[12px] font-medium">{f.label}</span>
+                  <span className="text-[10px] opacity-70">{f.desc}</span>
+                </button>
+              );
+            })}
           </div>
         </div>
+
+        {/* Cinematic vignette — opt-in. When on, BOTH preview and
+            export render the same radial darkening at the frame edges
+            so what you see is what you get. Persisted on the project's
+            effectsSettings so re-opening the editor remembers the
+            choice. */}
+        <div className="flex items-start justify-between gap-3 rounded-xl border border-white/10 bg-white/[0.02] px-4 py-3">
+          <div className="min-w-0">
+            <div className="text-[12px] font-medium text-white">
+              Cinematic vignette
+            </div>
+            <p className="mt-0.5 text-[11px] leading-relaxed text-fog">
+              Soft radial darkening at the frame edges. Off by default —
+              the preview matches, so it&apos;s safe to flip on / off and
+              see the result before exporting.
+            </p>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={!!project.effectsSettings.vignette}
+            onClick={() =>
+              updateEffects("vignette", !project.effectsSettings.vignette)
+            }
+            className={cn(
+              "relative mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors duration-150",
+              project.effectsSettings.vignette
+                ? "bg-violet-500"
+                : "bg-white/[0.08] hover:bg-white/[0.14]"
+            )}
+          >
+            <span
+              className={cn(
+                "inline-block size-4 rounded-full bg-white shadow-sm transition-transform duration-150",
+                project.effectsSettings.vignette
+                  ? "translate-x-[18px]"
+                  : "translate-x-[2px]"
+              )}
+            />
+          </button>
+        </div>
+
+        {/* Monthly usage strip — live counter from users/{uid}/usage/{YYYY-MM} */}
+        {Number.isFinite(usage.limit) && (
+          <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-white/10 bg-white/[0.02] px-4 py-3 text-[12px]">
+            <span className="inline-flex items-center gap-2 text-fog">
+              <span className="text-[10px] font-semibold uppercase tracking-[0.18em] text-fog/80">
+                This month
+              </span>
+              <span className="font-mono tabular-nums text-white/85">
+                {usage.used} / {usage.limit}
+              </span>
+              <span className="text-fog/70">exports</span>
+            </span>
+            {usage.remaining <= 0 ? (
+              <Link
+                href="/pricing"
+                className="inline-flex items-center gap-1 rounded-full border border-rose-400/40 bg-rose-500/10 px-2 py-0.5 text-[10.5px] font-semibold text-rose-200 hover:bg-rose-500/20"
+              >
+                Limit reached — upgrade
+              </Link>
+            ) : usage.remaining <= 2 ? (
+              <Link
+                href="/pricing"
+                className="inline-flex items-center gap-1 rounded-full border border-amber-400/35 bg-amber-500/10 px-2 py-0.5 text-[10.5px] font-semibold text-amber-200 hover:bg-amber-500/20"
+              >
+                {usage.remaining} left — upgrade
+              </Link>
+            ) : null}
+          </div>
+        )}
 
         {/* Pre-flight summary — build trust before the user commits to a render */}
         <div className="rounded-xl border border-white/10 bg-white/[0.02] px-4 py-4">
@@ -246,6 +395,21 @@ export function RealExportPanel() {
               label="Est. render time"
               value={
                 estRenderSeconds > 0 ? `~${fmtDuration(estRenderSeconds)}` : "—"
+              }
+            />
+            {/* Render manifest summary — mirrors the dev-mode
+                `[export] render manifest` console table. Surfaces the
+                conditional layers (vignette, click highlights) so the
+                user can't accidentally export with vignette on without
+                realising. "Clean" = no opt-in visual effects baked in. */}
+            <PreFlightRow
+              icon={<Sparkles size={11} className="text-violet-300" />}
+              label="Visual effects"
+              value={
+                describeExportEffects(
+                  project.effectsSettings.vignette === true,
+                  project.effectsSettings.clickHighlights === true
+                ) || "Clean — no extra effects baked in"
               }
             />
           </div>
@@ -342,6 +506,22 @@ function PreFlightRow({
       </span>
     </div>
   );
+}
+
+/**
+ * Compose the "Visual effects" pre-flight value. Returns an empty
+ * string when no conditional effect is on (caller prints "Clean — …"
+ * instead). Mirrors the dev console's render manifest so the user can
+ * cross-check what's about to bake in.
+ */
+function describeExportEffects(
+  vignette: boolean,
+  clickHighlights: boolean
+): string {
+  const on: string[] = [];
+  if (vignette) on.push("vignette");
+  if (clickHighlights) on.push("click highlights");
+  return on.length === 0 ? "" : `${on.join(" · ")}`;
 }
 
 function fmtDuration(seconds: number): string {

@@ -50,6 +50,27 @@ export interface RecordingResult {
    * is empty (or noise from our own UI) and downstream must rely on CV only.
    */
   interactionScope: "tab" | "external";
+  /**
+   * Raw `displaySurface` from the captured video track, when the browser
+   * exposes it. "browser" means the user picked a tab — which is the path
+   * most likely to bake Chrome's sharing-controls strip into the video.
+   * The preview uses this to decide whether to run the green-band detector.
+   */
+  displaySurface: "monitor" | "window" | "browser" | null;
+}
+
+/**
+ * Bounding rect of a clicked element, normalised to the captured
+ * display surface (0..1 each axis). Shared by `click`, `dblclick`,
+ * `rightclick` variants below. Same coordinate space as the click's
+ * own `x` / `y` so the classifier can derive "did the click land near
+ * the centre of the element, or near an edge?".
+ */
+export interface ElementRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
 }
 
 /**
@@ -77,6 +98,15 @@ export type Interaction =
       x: number;
       y: number;
       button: "left" | "middle" | "right";
+      /**
+       * Element bounding rect at click time, normalised to the captured
+       * display surface (0..1 each). Present only for tab-self captures
+       * where `event.target` is meaningful; undefined for external
+       * (window/monitor) captures because the AdZoom tab and the
+       * captured surface are different windows. Drives click-tier
+       * classification in `src/lib/attention/click-classifier.ts`.
+       */
+      targetRect?: ElementRect;
     }
   | {
       type: "dblclick";
@@ -84,6 +114,7 @@ export type Interaction =
       t: number;
       x: number;
       y: number;
+      targetRect?: ElementRect;
     }
   | {
       type: "rightclick";
@@ -91,6 +122,7 @@ export type Interaction =
       t: number;
       x: number;
       y: number;
+      targetRect?: ElementRect;
     }
   | {
       type: "scroll";

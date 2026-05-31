@@ -202,10 +202,10 @@ export const exportsHistory: ExportRow[] = [
 ];
 
 export const navLinks = [
-  { label: "Product", href: "#product" },
-  { label: "Features", href: "#features" },
-  { label: "Pricing", href: "#pricing" },
-  { label: "Changelog", href: "#changelog" },
+  { label: "Product", href: "/#product" },
+  { label: "Features", href: "/#features" },
+  { label: "Pricing", href: "/pricing" },
+  { label: "Changelog", href: "/changelog" },
 ];
 
 export const sidebarItems = [

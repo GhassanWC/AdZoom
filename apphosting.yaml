@@ -54,3 +54,27 @@ env:
     secret: FIREBASE_SERVICE_ACCOUNT_B64
     availability:
       - RUNTIME
+
+  # Lemon Squeezy — billing. The webhook signature secret needs RUNTIME
+  # access on /api/billing/webhook. The other four are read by the
+  # checkout route and the plan-resolver.
+  - variable: LEMONSQUEEZY_API_KEY
+    secret: LEMONSQUEEZY_API_KEY
+    availability:
+      - RUNTIME
+  - variable: LEMONSQUEEZY_STORE_ID
+    secret: LEMONSQUEEZY_STORE_ID
+    availability:
+      - RUNTIME
+  - variable: LEMONSQUEEZY_WEBHOOK_SECRET
+    secret: LEMONSQUEEZY_WEBHOOK_SECRET
+    availability:
+      - RUNTIME
+  - variable: LEMONSQUEEZY_PRO_VARIANT_ID
+    secret: LEMONSQUEEZY_PRO_VARIANT_ID
+    availability:
+      - RUNTIME
+  - variable: LEMONSQUEEZY_CREATOR_VARIANT_ID
+    secret: LEMONSQUEEZY_CREATOR_VARIANT_ID
+    availability:
+      - RUNTIME

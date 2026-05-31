@@ -21,16 +21,34 @@ import { useToast } from "@/components/ui/Toast";
 import { PresetCard } from "@/components/dashboard/PresetCard";
 import { PresetDetailModal } from "@/components/dashboard/PresetDetailModal";
 import { useEditorReal } from "./context";
+import { useStoragePlan } from "@/lib/usage/useStoragePlan";
+import { planMeetsMinimum } from "@/lib/usage/plan";
+import { useRouter } from "next/navigation";
 import { cn } from "@/lib/cn";
 
 export function PresetsRail() {
   const { user } = useAuth();
   const { project, applyPreset, clearSelectedPreset } = useEditorReal();
+  const { plan } = useStoragePlan();
+  const router = useRouter();
   const toast = useToast();
   const [custom, setCustom] = React.useState<Preset[]>([]);
   const [openPreset, setOpenPreset] = React.useState<Preset | null>(null);
   const [saveOpen, setSaveOpen] = React.useState(false);
   const scrollRef = React.useRef<HTMLDivElement | null>(null);
+
+  /**
+   * A preset is "locked" when its requiredPlan exceeds the viewer's tier.
+   * Custom presets never carry requiredPlan (their owner authored them, so
+   * they're free to use even after a downgrade).
+   */
+  const isLocked = React.useCallback(
+    (p: Preset): boolean => {
+      if (!p.requiredPlan) return false;
+      return !planMeetsMinimum(plan.tier, p.requiredPlan);
+    },
+    [plan.tier]
+  );
 
   React.useEffect(() => {
     if (!user) return;
@@ -61,7 +79,10 @@ export function PresetsRail() {
   const onApply = async (preset: Preset) => {
     try {
       await applyPreset(preset);
-      toast.success("Preset applied", `${preset.name} — settings updated`);
+      toast.success(
+        "Preset applied to your current edit.",
+        `${preset.name} — your AI moments and timeline are unchanged.`
+      );
       setOpenPreset(null);
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Failed to apply preset";
@@ -160,16 +181,26 @@ export function PresetsRail() {
           ref={scrollRef}
           className="flex gap-4 overflow-x-auto px-6 py-5 [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
         >
-          {allPresets.map((p) => (
-            <div key={p.id} className="w-56 shrink-0">
-              <PresetCard
-                preset={p}
-                active={activePresetId === p.id}
-                recommended={recommendedSet.has(p.id)}
-                onOpen={() => setOpenPreset(p)}
-              />
-            </div>
-          ))}
+          {allPresets.map((p) => {
+            const locked = isLocked(p);
+            return (
+              <div key={p.id} className="w-56 shrink-0">
+                <PresetCard
+                  preset={p}
+                  active={activePresetId === p.id}
+                  recommended={recommendedSet.has(p.id)}
+                  locked={locked}
+                  onOpen={() => {
+                    if (locked) {
+                      router.push("/pricing");
+                      return;
+                    }
+                    setOpenPreset(p);
+                  }}
+                />
+              </div>
+            );
+          })}
           {allPresets.length === 0 && (
             <div className="grid h-32 w-full place-items-center text-xs text-fog">
               No presets available.

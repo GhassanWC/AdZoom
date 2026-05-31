@@ -783,11 +783,17 @@ export async function proposeGapFills(opts: {
     .map<GapFillCandidate>((m) => ({
       startTime: Math.max(0, Number(m.startTime) || 0),
       endTime: Math.max(0, Number(m.endTime) || 0),
+      // 35% box centred — tightened from the legacy 50% default so
+      // Gemini gap-fills that omit focusRegion don't render as
+      // "barely zoomed full-frame pans". Downstream
+      // `refineMomentFocalRegion` still tries to derive a better
+      // region from clicks / cursor / CV; this is only the fallback
+      // when no signal is available.
       focusRegion: {
-        x: clamp01((m.focusRegion as Record<string, number>)?.x ?? 0.25),
-        y: clamp01((m.focusRegion as Record<string, number>)?.y ?? 0.25),
-        width: clamp01((m.focusRegion as Record<string, number>)?.width ?? 0.5),
-        height: clamp01((m.focusRegion as Record<string, number>)?.height ?? 0.5),
+        x: clamp01((m.focusRegion as Record<string, number>)?.x ?? 0.325),
+        y: clamp01((m.focusRegion as Record<string, number>)?.y ?? 0.325),
+        width: clamp01((m.focusRegion as Record<string, number>)?.width ?? 0.35),
+        height: clamp01((m.focusRegion as Record<string, number>)?.height ?? 0.35),
       },
       effectType:
         (["zoom", "click-highlight", "cursor-focus", "speed-up"] as const).includes(
@@ -1099,11 +1105,20 @@ function sanitizeAnalysis(a: AnalysisJSON): AnalysisJSON {
         endTime: Math.max(0, Number(m.endTime) || 0),
         label: (m.label || "Moment").slice(0, 80),
         reason: (m.reason || "").slice(0, 240),
+        // 35% box centred when Gemini's region is missing/invalid.
+        // Tightened from the legacy 50% default — at 50%, scale at
+        // intensity 0.5 was ≈ 1.4 ("barely zoomed full-frame pan").
+        // At 35% it's ≈ 1.7, which reads as an actual zoom. The
+        // balancer still calls `refineMomentFocalRegion` on every AI
+        // moment, which replaces this region with one derived from
+        // real clicks / cursor dwell / CV motion centroid whenever
+        // such signals exist. This default only survives when there
+        // is no signal — and 35% beats 50% for that worst case.
         focusRegion: {
-          x: clamp01(m.focusRegion?.x ?? 0.25),
-          y: clamp01(m.focusRegion?.y ?? 0.25),
-          width: clamp01(m.focusRegion?.width ?? 0.5),
-          height: clamp01(m.focusRegion?.height ?? 0.5),
+          x: clamp01(m.focusRegion?.x ?? 0.325),
+          y: clamp01(m.focusRegion?.y ?? 0.325),
+          width: clamp01(m.focusRegion?.width ?? 0.35),
+          height: clamp01(m.focusRegion?.height ?? 0.35),
         },
         effectType:
           (["zoom", "click-highlight", "cursor-focus", "speed-up"] as const).includes(

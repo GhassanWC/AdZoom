@@ -16,7 +16,15 @@ import {
 import { cn } from "@/lib/cn";
 import { useEditorReal } from "./context";
 import { dequantize } from "@/lib/cv/resample";
-import { cameraForMoment, localProgress, IDENTITY_CAMERA } from "@/lib/timeline/camera";
+import {
+  resolveCameraFrame,
+  IDENTITY_CAMERA,
+  cameraDiagnostic,
+  type CameraState,
+} from "@/lib/timeline/camera";
+import { clickHighlightGeometry } from "@/lib/timeline/click-highlight";
+import { coverFitDims } from "@/lib/timeline/cover";
+import { FocalPathOverlay } from "./FocalPathOverlay";
 import type {
   DetectedMoment,
   FocusRegion,
@@ -46,7 +54,7 @@ function fmt(s: number): string {
 }
 
 interface CameraDriverState {
-  activeMoment: DetectedMoment | null;
+  moments: DetectedMoment[];
   previewMode: boolean;
   autoZoom: number;
   zoomSpeed: number;
@@ -54,13 +62,18 @@ interface CameraDriverState {
 }
 
 /**
- * Continuous cinematic camera. A rAF loop recomputes the *target* every frame
- * from the live `video.currentTime` (so keyframed moments animate through
- * their keyframes), then eases the *current* transform toward it with
- * time-based exponential smoothing — inertia, natural deceleration, never a
- * robotic straight CSS line. A very low amplitude drift keeps the frame alive
- * while zoomed in. The shared `cameraForMoment` model is the same one the
- * export renderer uses, so preview === export.
+ * Continuous cinematic camera. A rAF loop recomputes the *target* every
+ * frame from the live `video.currentTime`, then eases the *current*
+ * transform toward it with time-based exponential smoothing — inertia,
+ * natural deceleration, never a robotic straight CSS line. A very low
+ * amplitude drift keeps the frame alive while zoomed in.
+ *
+ * The target comes from `resolveCameraFrame` — the SAME function the
+ * exporter calls. The moment's edge envelope (auto ease-in/out for
+ * non-keyframed moments) is baked into the resolver, so preview and
+ * export ramp in and out identically. Any difference the user sees
+ * between the two surfaces is a real bug, not a smoothing-vs-no-smoothing
+ * artifact.
  */
 function useCinematicCamera(
   wrapRef: React.RefObject<HTMLDivElement | null>,
@@ -70,6 +83,8 @@ function useCinematicCamera(
   const currentRef = React.useRef({ scale: 1, tx: 0, ty: 0 });
   const stateRef = React.useRef(state);
   stateRef.current = state;
+  /** Last moment id we logged a snapshot for — one log per activation. */
+  const loggedMomentRef = React.useRef<string | null>(null);
 
   React.useEffect(() => {
     let raf = 0;
@@ -81,18 +96,77 @@ function useCinematicCamera(
       const s = stateRef.current;
 
       // Recompute the target from the live playhead each frame.
-      let tgt = IDENTITY_CAMERA;
-      if (s.previewMode && s.activeMoment) {
-        const m = s.activeMoment;
-        const t = videoRef.current?.currentTime ?? m.startTime;
-        const perMoment =
-          m.intensity ??
-          m.recommendedIntensity ??
-          m.attentionScore ??
-          m.importance ??
-          0.5;
-        const blended = perMoment * 0.6 + (s.autoZoom / 100) * 0.4;
-        tgt = cameraForMoment(m, blended, localProgress(m, t));
+      let tgt: CameraState = IDENTITY_CAMERA;
+      if (s.previewMode && s.moments.length > 0) {
+        const t = videoRef.current?.currentTime ?? 0;
+        const { camera, moment } = resolveCameraFrame(s.moments, t, {
+          autoZoom: s.autoZoom,
+        });
+        tgt = camera;
+
+        // Dev-mode camera diagnostic: log the moment's three checkpoints
+        // (start, middle, end) the first time it becomes active. Pair
+        // with the `[export] camera snapshots` table the renderer logs
+        // and the rows MUST match — that's how we verify preview/export
+        // share the same camera resolver.
+        if (
+          process.env.NODE_ENV !== "production" &&
+          moment &&
+          loggedMomentRef.current !== moment.id
+        ) {
+          loggedMomentRef.current = moment.id;
+          const v = videoRef.current;
+          const wrap = wrapRef.current;
+          // Use the cover-fit dims the export will use, computed
+          // against the preview wrapper's actual rendered size. Logging
+          // raw videoWidth/Height would make the preview table
+          // mismatched against the export table whenever source aspect
+          // differs from output aspect — the resolver is identical, but
+          // the tx/ty pixel projections wouldn't be apples-to-apples
+          // without the same cover-fit step. The export snapshot
+          // already uses canvasW/canvasH; here we use the wrapper's
+          // client size as the equivalent target.
+          const targetW = wrap?.clientWidth || v?.videoWidth || 1920;
+          const targetH = wrap?.clientHeight || v?.videoHeight || 1080;
+          const { drawW, drawH } = coverFitDims(
+            v?.videoWidth ?? targetW,
+            v?.videoHeight ?? targetH,
+            targetW,
+            targetH
+          );
+          const samples = [
+            moment.startTime + 0.05,
+            (moment.startTime + moment.endTime) / 2,
+            moment.endTime - 0.05,
+          ];
+          console.groupCollapsed(
+            `[preview] camera snapshots for moment ${moment.id}`
+          );
+          console.table(
+            samples
+              .map((tt) =>
+                cameraDiagnostic(s.moments, tt, {
+                  autoZoom: s.autoZoom,
+                  drawW,
+                  drawH,
+                })
+              )
+              .map((r) => ({
+                t: r.t.toFixed(2),
+                moment: r.momentId,
+                scale: r.scale.toFixed(3),
+                cx: r.cx.toFixed(3),
+                cy: r.cy.toFixed(3),
+                panXPct: r.panXPct.toFixed(2),
+                panYPct: r.panYPct.toFixed(2),
+                tx: r.canvasTranslate.tx.toFixed(1),
+                ty: r.canvasTranslate.ty.toFixed(1),
+              }))
+          );
+          console.groupEnd();
+        } else if (!moment) {
+          loggedMomentRef.current = null;
+        }
       }
 
       // Responsiveness `k` — higher = snappier. Driven by Zoom Speed + pacing.
@@ -107,20 +181,13 @@ function useCinematicCamera(
       cur.tx += (tgt.panXPct - cur.tx) * f;
       cur.ty += (tgt.panYPct - cur.ty) * f;
 
-      // Subtle inertial drift — only when meaningfully zoomed in.
-      let dx = 0;
-      let dy = 0;
-      if (cur.scale > 1.03) {
-        const amp = Math.min(0.5, (cur.scale - 1) * 0.6);
-        dx = Math.sin(now * 0.00045) * amp * 0.7;
-        dy = Math.cos(now * 0.00032) * amp * 0.55;
-      }
-
+      // Inertial drift removed — the preview's CSS transform now mirrors
+      // the resolver target exactly (after the smoothing pass). The
+      // exporter is per-frame deterministic, so the sinusoidal sway
+      // here would have made preview ≠ export at every zoomed frame.
       const el = wrapRef.current;
       if (el) {
-        el.style.transform = `translate(${(cur.tx + dx).toFixed(3)}%, ${(
-          cur.ty + dy
-        ).toFixed(3)}%) scale(${cur.scale.toFixed(4)})`;
+        el.style.transform = `translate(${cur.tx.toFixed(3)}%, ${cur.ty.toFixed(3)}%) scale(${cur.scale.toFixed(4)})`;
       }
       raf = requestAnimationFrame(tick);
     };
@@ -229,10 +296,14 @@ export function RealVideoPlayer() {
     }
   };
 
-  // Cinematic camera — the rAF loop recomputes the target each frame from the
-  // live playhead (so keyframed moments animate live).
+  // Cinematic camera — the rAF loop recomputes the target each frame
+  // from the live playhead by calling the SAME shared resolver the
+  // exporter uses. Passing the full moments array (not just
+  // `activeMoment`) means moment selection happens in one place and
+  // preview never drifts from export on overlap edge cases.
+  const allMoments = project.analysis?.detectedMoments ?? [];
   useCinematicCamera(transformWrapRef, videoRef, {
-    activeMoment,
+    moments: allMoments,
     previewMode,
     autoZoom: project.effectsSettings.autoZoom,
     zoomSpeed: project.effectsSettings.zoomSpeed,
@@ -278,7 +349,7 @@ export function RealVideoPlayer() {
           <video
             ref={videoRef}
             src={project.originalVideoUrl || undefined}
-            className="h-full w-full object-contain"
+            className="h-full w-full object-cover"
             playsInline
             crossOrigin="anonymous"
             preload="metadata"
@@ -310,24 +381,33 @@ export function RealVideoPlayer() {
           />
         )}
 
-        {/* Editable focus region — drag/resize the zoom target directly on the
-            frame. Shown with preview OFF so the box maps 1:1 to the source. */}
-        {activeMoment && !previewMode && (
+        {/* Camera path — thin polyline through the active moment's
+            keyframes. Lives between the focus box and the video so it
+            reads as the camera's trajectory. Only renders when there are
+            ≥ 2 keyframes (a single point isn't a path). */}
+        {activeMoment && <FocalPathOverlay moment={activeMoment} />}
+
+        {/* Editable focus region — drag/resize the zoom target directly on
+            the frame. Always rendered when a moment is selected; during
+            preview mode the box drops to ghost opacity so the cinematic
+            framing isn't visually obstructed but the user can still drag
+            (hover to bring it back to full opacity). */}
+        {activeMoment && (
           <EditableFocusBox
             key={activeMoment.id}
             moment={activeMoment}
             aspectRef={aspectRef}
+            ghost={previewMode}
             onCommit={(focusRegion) =>
-              updateMoment(activeMoment.id, { focusRegion })
+              // Stamp `targetRegionSource: "user"` so the balancer's
+              // `refineMomentFocalRegion` pass leaves this region alone on
+              // any subsequent re-analyze / reframe — user intent wins.
+              updateMoment(activeMoment.id, {
+                focusRegion,
+                targetRegionSource: "user",
+              })
             }
           />
-        )}
-
-        {/* Hint: reposition focus needs preview OFF */}
-        {activeMoment && previewMode && (
-          <div className="pointer-events-none absolute bottom-20 left-1/2 -translate-x-1/2 rounded-full border border-white/15 bg-black/55 px-2.5 py-1 text-[10px] text-white/80 backdrop-blur-md">
-            Turn Preview OFF to reposition the focus box
-          </div>
         )}
 
         {/* AI tracking chip */}
@@ -350,11 +430,17 @@ export function RealVideoPlayer() {
           {previewMode ? "Preview ON" : "Preview OFF"}
         </button>
 
-        {/* Vignette */}
-        <div
-          aria-hidden
-          className="pointer-events-none absolute inset-0 bg-[radial-gradient(ellipse_at_center,transparent_60%,rgba(0,0,0,0.25)_100%)]"
-        />
+        {/* Vignette — opt-in via the "Cinematic vignette" toggle in the
+            export panel. Preview honors the same flag so what you see is
+            what you get; if it's off here it'll be off in the exported
+            file. The CSS gradient mirrors the exporter's
+            `drawVignette` radial gradient byte-for-byte. */}
+        {project.effectsSettings.vignette && (
+          <div
+            aria-hidden
+            className="pointer-events-none absolute inset-0 bg-[radial-gradient(ellipse_at_center,transparent_60%,rgba(0,0,0,0.25)_100%)]"
+          />
+        )}
 
         {/* Controls */}
         <div className="absolute inset-x-0 bottom-0 z-40 bg-gradient-to-t from-black/85 via-black/40 to-transparent px-4 pb-3 pt-10">
@@ -458,10 +544,17 @@ function EditableFocusBox({
   moment,
   aspectRef,
   onCommit,
+  ghost = false,
 }: {
   moment: DetectedMoment;
   aspectRef: React.RefObject<HTMLDivElement | null>;
   onCommit: (fr: FocusRegion) => void;
+  /**
+   * Render at reduced opacity, with handles only visible on hover. Used
+   * during preview-mode playback so the user can still drag the focus box
+   * without it competing with the cinematic camera animation.
+   */
+  ghost?: boolean;
 }) {
   const [draft, setDraft] = React.useState<FocusRegion>(moment.focusRegion);
   const dragRef = React.useRef<{
@@ -558,7 +651,12 @@ function EditableFocusBox({
   return (
     <div
       onPointerDown={(e) => begin(e, "move")}
-      className="absolute z-30 cursor-move rounded-md ring-2 ring-violet-400/90 shadow-[0_0_0_4px_rgba(139,92,246,0.18)] transition-shadow"
+      className={cn(
+        "group absolute z-30 cursor-move rounded-md ring-2 ring-violet-400/90 shadow-[0_0_0_4px_rgba(139,92,246,0.18)] transition-opacity duration-150",
+        ghost
+          ? "opacity-25 hover:opacity-90 focus-within:opacity-90"
+          : "opacity-100"
+      )}
       style={{
         left: `${draft.x * 100}%`,
         top: `${draft.y * 100}%`,
@@ -568,7 +666,12 @@ function EditableFocusBox({
       }}
     >
       <span className="pointer-events-none absolute inset-0 bg-violet-400/[0.06]" />
-      <span className="pointer-events-none absolute -top-6 left-0 inline-flex items-center gap-1 rounded-md bg-violet-500 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-white shadow-violet-glow">
+      <span
+        className={cn(
+          "pointer-events-none absolute -top-6 left-0 inline-flex items-center gap-1 rounded-md bg-violet-500 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-white shadow-violet-glow transition-opacity duration-150",
+          ghost && "opacity-0 group-hover:opacity-100"
+        )}
+      >
         <Move3D size={9} />
         {moment.label}
       </span>
@@ -580,8 +683,9 @@ function EditableFocusBox({
           key={h.id}
           onPointerDown={(e) => begin(e, h.id)}
           className={cn(
-            "absolute size-2.5 rounded-[2px] border border-violet-200 bg-violet-500",
-            h.cls
+            "absolute size-2.5 rounded-[2px] border border-violet-200 bg-violet-500 transition-opacity duration-150",
+            h.cls,
+            ghost && "opacity-0 group-hover:opacity-100"
           )}
           style={{ cursor: h.cursor, touchAction: "none" }}
         />
@@ -696,6 +800,18 @@ function OverlayLayer({
   );
 }
 
+/**
+ * Click-highlight overlay for the preview. Sizes + opacities all come
+ * from the shared `clickHighlightGeometry` helper so the canvas
+ * exporter (`drawClickHighlight`) and this DOM renderer can't drift
+ * apart. Each style — ring / pulse / burst — maps the same geometry
+ * tuple to its own DOM shape.
+ *
+ * `outer.radius` is a "reference px" value at the editor's typical
+ * 1280-wide preview surface, which is what the original CSS used. The
+ * exporter scales it for higher-resolution canvases; preview keeps the
+ * native px since it's already running at that surface.
+ */
 function ClickHighlight({
   x,
   y,
@@ -709,86 +825,96 @@ function ClickHighlight({
   style: "ring" | "pulse" | "burst";
   sizePct: number;
 }) {
-  const p = Math.max(0, Math.min(1, progress));
-  const base = 24 + (sizePct / 100) * 72;
+  const geom = clickHighlightGeometry(progress, sizePct, style);
+  const left = `${x * 100}%`;
+  const top = `${y * 100}%`;
 
   if (style === "pulse") {
+    const outerSize = geom.outer.radius * 2;
+    const innerSize = (geom.innerRing?.radius ?? 0) * 2;
     return (
       <>
         <span
           className="pointer-events-none absolute z-30 -translate-x-1/2 -translate-y-1/2 rounded-full bg-violet-400/40 blur-[1px]"
           style={{
-            left: `${x * 100}%`,
-            top: `${y * 100}%`,
-            width: `${base + p * 80}px`,
-            height: `${base + p * 80}px`,
-            opacity: 0.8 - p * 0.6,
+            left,
+            top,
+            width: `${outerSize}px`,
+            height: `${outerSize}px`,
+            opacity: geom.outer.opacity,
           }}
         />
-        <span
-          className="pointer-events-none absolute z-30 -translate-x-1/2 -translate-y-1/2 rounded-full border border-violet-200"
-          style={{
-            left: `${x * 100}%`,
-            top: `${y * 100}%`,
-            width: `${base * 0.55}px`,
-            height: `${base * 0.55}px`,
-            opacity: 0.9,
-          }}
-        />
+        {geom.innerRing && (
+          <span
+            className="pointer-events-none absolute z-30 -translate-x-1/2 -translate-y-1/2 rounded-full border border-violet-200"
+            style={{
+              left,
+              top,
+              width: `${innerSize}px`,
+              height: `${innerSize}px`,
+              opacity: geom.innerRing.opacity,
+            }}
+          />
+        )}
       </>
     );
   }
 
   if (style === "burst") {
+    const size = geom.outer.radius * 2;
+    const spokes = geom.spokes;
     return (
       <span
         aria-hidden
         className="pointer-events-none absolute z-30 -translate-x-1/2 -translate-y-1/2"
         style={{
-          left: `${x * 100}%`,
-          top: `${y * 100}%`,
-          width: `${base + p * 120}px`,
-          height: `${base + p * 120}px`,
-          opacity: 1 - p * 0.85,
+          left,
+          top,
+          width: `${size}px`,
+          height: `${size}px`,
+          opacity: geom.outer.opacity,
         }}
       >
-        <svg viewBox="0 0 100 100" className="h-full w-full">
-          {Array.from({ length: 10 }).map((_, i) => {
-            const a = (i / 10) * Math.PI * 2;
-            const r1 = 30;
-            const r2 = 48;
-            const x1 = 50 + Math.cos(a) * r1;
-            const y1 = 50 + Math.sin(a) * r1;
-            const x2 = 50 + Math.cos(a) * r2;
-            const y2 = 50 + Math.sin(a) * r2;
-            return (
-              <line
-                key={i}
-                x1={x1}
-                y1={y1}
-                x2={x2}
-                y2={y2}
-                stroke="rgba(196,181,253,0.95)"
-                strokeWidth="3"
-                strokeLinecap="round"
-              />
-            );
-          })}
-        </svg>
+        {spokes && (
+          <svg viewBox="0 0 100 100" className="h-full w-full">
+            {Array.from({ length: spokes.count }).map((_, i) => {
+              const a = (i / spokes.count) * Math.PI * 2;
+              const r1 = spokes.innerRatio * 100;
+              const r2 = spokes.outerRatio * 100;
+              const x1 = 50 + Math.cos(a) * r1;
+              const y1 = 50 + Math.sin(a) * r1;
+              const x2 = 50 + Math.cos(a) * r2;
+              const y2 = 50 + Math.sin(a) * r2;
+              return (
+                <line
+                  key={i}
+                  x1={x1}
+                  y1={y1}
+                  x2={x2}
+                  y2={y2}
+                  stroke="rgba(196,181,253,0.95)"
+                  strokeWidth="3"
+                  strokeLinecap="round"
+                />
+              );
+            })}
+          </svg>
+        )}
       </span>
     );
   }
 
   // "ring" — default
+  const ringSize = geom.outer.radius * 2;
   return (
     <span
       className="pointer-events-none absolute z-30 -translate-x-1/2 -translate-y-1/2 rounded-full border border-violet-400/80"
       style={{
-        left: `${x * 100}%`,
-        top: `${y * 100}%`,
-        width: `${base + p * 64}px`,
-        height: `${base + p * 64}px`,
-        opacity: 1 - p * 0.7,
+        left,
+        top,
+        width: `${ringSize}px`,
+        height: `${ringSize}px`,
+        opacity: geom.outer.opacity,
       }}
     />
   );

@@ -87,6 +87,38 @@ function clamp01(v: number): number {
   return v;
 }
 
+/**
+ * Read `event.target.getBoundingClientRect()` and normalise to the
+ * viewport (0..1 each axis) so downstream click-tier classification
+ * can see the size + position of the clicked element. Returns
+ * `undefined` when there's no useful rect (target not an Element,
+ * zero-size element, or detached node).
+ *
+ * Captured unconditionally here — the gate on "is this a tab-self
+ * capture?" lives in `momentsFromEvents` (the consumer). For external
+ * (window/monitor) captures the rect is meaningless (it would be
+ * AdZoom's own DOM) and the consumer zeroes it.
+ */
+function targetRect(target: EventTarget | null): {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+} | undefined {
+  if (!(target instanceof Element)) return undefined;
+  const rect = target.getBoundingClientRect();
+  if (!Number.isFinite(rect.width) || !Number.isFinite(rect.height)) return undefined;
+  if (rect.width <= 0 || rect.height <= 0) return undefined;
+  const w = Math.max(1, window.innerWidth || 1);
+  const h = Math.max(1, window.innerHeight || 1);
+  return {
+    x: clamp01(rect.left / w),
+    y: clamp01(rect.top / h),
+    width: clamp01(rect.width / w),
+    height: clamp01(rect.height / h),
+  };
+}
+
 const CAPABILITIES: InteractionProviderCapabilities = {
   mousePath: true,
   keyEvents: true,
@@ -230,6 +262,7 @@ export function createBrowserInteractionProvider(): InteractionProvider {
       x: n.x,
       y: n.y,
       button: e.button === 1 ? "middle" : "left",
+      targetRect: targetRect(e.target),
     });
   }
 
@@ -237,14 +270,28 @@ export function createBrowserInteractionProvider(): InteractionProvider {
     if (state.paused) return;
     bumpActivity();
     const n = viewportNorm(e.clientX, e.clientY);
-    state.events.push({ type: "dblclick", id: nextId(), t: tNow(), x: n.x, y: n.y });
+    state.events.push({
+      type: "dblclick",
+      id: nextId(),
+      t: tNow(),
+      x: n.x,
+      y: n.y,
+      targetRect: targetRect(e.target),
+    });
   }
 
   function onContextMenu(e: MouseEvent) {
     if (state.paused) return;
     bumpActivity();
     const n = viewportNorm(e.clientX, e.clientY);
-    state.events.push({ type: "rightclick", id: nextId(), t: tNow(), x: n.x, y: n.y });
+    state.events.push({
+      type: "rightclick",
+      id: nextId(),
+      t: tNow(),
+      x: n.x,
+      y: n.y,
+      targetRect: targetRect(e.target),
+    });
   }
 
   // ── Scroll / wheel ──

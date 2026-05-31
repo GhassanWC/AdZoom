@@ -1,6 +1,6 @@
 "use client";
 
-import { Check, MoreHorizontal, Sparkles, User } from "lucide-react";
+import { Check, Lock, MoreHorizontal, Sparkles, User } from "lucide-react";
 import type { Preset } from "@/lib/firebase/schema";
 import { PresetThumb } from "@/components/landing/PresetThumb";
 import { cn } from "@/lib/cn";
@@ -9,6 +9,12 @@ interface PresetCardProps {
   preset: Preset;
   active?: boolean;
   recommended?: boolean;
+  /**
+   * True when the preset's `requiredPlan` exceeds the viewer's current
+   * plan. The card desaturates, shows a lock chip, and the parent should
+   * route the click to `/pricing` instead of applying.
+   */
+  locked?: boolean;
   onOpen: () => void;
   onMenu?: () => void;
 }
@@ -17,6 +23,7 @@ export function PresetCard({
   preset,
   active,
   recommended,
+  locked,
   onOpen,
   onMenu,
 }: PresetCardProps) {
@@ -28,16 +35,29 @@ export function PresetCard({
         "group glass relative w-full overflow-hidden rounded-xl text-left transition-all duration-200",
         active
           ? "border-violet-400/50 ring-2 ring-violet-400/30 shadow-[0_0_24px_-8px_rgba(139,92,246,0.55)]"
-          : "hover:border-white/[0.12]"
+          : "hover:border-white/[0.12]",
+        locked && "opacity-90"
       )}
+      aria-disabled={locked || undefined}
     >
       <div className="relative aspect-[16/10] overflow-hidden border-b border-white/[0.06]">
         <PresetThumb vibe={preset.vibe} />
 
-        {recommended && (
+        {locked && (
+          <div className="pointer-events-none absolute inset-0 bg-gradient-to-b from-black/40 via-black/20 to-black/55" />
+        )}
+
+        {recommended && !locked && (
           <span className="absolute left-2 top-2 inline-flex items-center gap-1 rounded-full border border-violet-400/50 bg-violet-500/25 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.16em] text-violet-100 backdrop-blur-md">
             <Sparkles size={10} />
             For this video
+          </span>
+        )}
+
+        {locked && preset.requiredPlan && (
+          <span className="absolute left-2 top-2 inline-flex items-center gap-1 rounded-full border border-amber-300/50 bg-amber-400/20 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.16em] text-amber-100 backdrop-blur-md">
+            <Lock size={9} />
+            {preset.requiredPlan === "pro" ? "Pro" : "Creator"}
           </span>
         )}
 
@@ -48,7 +68,7 @@ export function PresetCard({
           </span>
         )}
 
-        {active && (
+        {active && !locked && (
           <span className="absolute bottom-2 left-2 inline-flex items-center gap-1.5 rounded-full bg-violet-500 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.16em] text-white shadow-violet-glow">
             <Check size={10} />
             Applied

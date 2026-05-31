@@ -5,16 +5,13 @@ import { AlertTriangle, Check, CreditCard, Sparkles } from "lucide-react";
 import { PageHeader } from "@/components/dashboard/PageHeader";
 import { useAuth } from "@/lib/firebase/AuthProvider";
 import { useStoragePlan } from "@/lib/usage/useStoragePlan";
+import { useMonthlyUsage } from "@/lib/usage/useMonthlyUsage";
 import { fmtBytes, storageBand, type PlanTier } from "@/lib/usage/plan";
 import { subscribeSubscription } from "@/lib/firebase/subscriptions";
 import { CheckoutButton } from "@/components/billing/CheckoutButton";
 import { ManageSubscriptionButton } from "@/components/billing/ManageSubscriptionButton";
 import { cn } from "@/lib/cn";
 import type { Subscription } from "@/lib/firebase/schema";
-
-// Exports-this-month is still TODO — no usage tracking on the server yet.
-// Keep it mocked but visually muted so it doesn't read as authoritative.
-const mockExports = { value: 0, max: 100, unit: "" };
 
 interface PlanCopy {
   price: string;
@@ -72,6 +69,7 @@ function fmtDate(epochMs?: number): string | null {
 export default function BillingPage() {
   const { user } = useAuth();
   const storage = useStoragePlan();
+  const usage = useMonthlyUsage();
   const tier = storage.plan.tier;
   const copy = PLAN_COPY[tier];
 
@@ -242,21 +240,32 @@ export default function BillingPage() {
             </div>
           </div>
 
-          {/* Exports — still mock; flagged in code */}
-          <div className="glass rounded-2xl p-6 opacity-80">
+          {/* Exports — live, read from users/{uid}/usage/{YYYY-MM} */}
+          <div className="glass rounded-2xl p-6">
             <div className="flex items-center justify-between">
               <span className="text-sm font-medium text-white">Exports this month</span>
               <span className="font-mono text-xs text-fog">
-                {mockExports.value} / {mockExports.max}
+                {usage.used} /{" "}
+                {Number.isFinite(usage.limit) ? usage.limit : "∞"}
               </span>
             </div>
             <div className="mt-4 h-1.5 overflow-hidden rounded-full bg-white/[0.06]">
               <div
-                className="h-full rounded-full bg-gradient-to-r from-cyan-400 to-violet-500"
-                style={{ width: `${(mockExports.value / mockExports.max) * 100}%` }}
+                className="h-full rounded-full bg-gradient-to-r from-cyan-400 to-violet-500 transition-[width] duration-300"
+                style={{
+                  width: Number.isFinite(usage.limit)
+                    ? `${Math.min(100, Math.round((usage.used / Math.max(1, usage.limit)) * 100))}%`
+                    : "100%",
+                }}
               />
             </div>
-            <div className="mt-2 text-[11px] text-fog">Export tracking coming soon</div>
+            <div className="mt-2 text-[11px] text-fog">
+              {Number.isFinite(usage.limit)
+                ? usage.remaining > 0
+                  ? `${usage.remaining} remaining`
+                  : "Cap reached — upgrade to keep exporting"
+                : "Unlimited"}
+            </div>
           </div>
 
           {/* Payment method — driven by live subscription state */}

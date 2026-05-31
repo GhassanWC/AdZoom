@@ -9,3 +9,10 @@ export {
   type RecordingState,
   type RecordingTick,
 } from "./types";
+export {
+  detectGreenBottomBand,
+  cropBottomBand,
+  type GreenBandReport,
+  type CropProgress,
+  type CropResult,
+} from "./health-check";

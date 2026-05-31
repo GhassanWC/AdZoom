@@ -90,9 +90,26 @@ const LS_STATUS_MAP: Record<string, SubscriptionStatus> = {
   expired: "expired",
 };
 
+/**
+ * Map an LS `attributes.status` string to our enum.
+ *
+ * Defaults are *conservative*: an undefined or unknown status flags as
+ * `"past_due"` rather than `"active"`. The previous default of `"active"`
+ * would silently promote a malformed payload — that's the wrong direction
+ * for a billing surface. Genuine "still paying" deliveries always carry a
+ * known status, so this default only fires on garbled input where
+ * pessimism is safer.
+ */
 export function mapStatus(lsStatus: string | undefined): SubscriptionStatus {
-  if (!lsStatus) return "active";
-  return LS_STATUS_MAP[lsStatus] ?? "active";
+  if (!lsStatus) return "past_due";
+  const mapped = LS_STATUS_MAP[lsStatus];
+  if (!mapped) {
+    console.warn(
+      `[ls/webhook] unknown LS status "${lsStatus}" — defaulting to past_due`
+    );
+    return "past_due";
+  }
+  return mapped;
 }
 
 /** Parse an ISO timestamp into epoch ms, returning undefined for null/garbage. */
@@ -125,13 +142,16 @@ export interface ReducedSubscription {
  * Pure state reducer: take an LS event + payload, return the patch we
  * should write to `subscriptions/{uid}` and the current effective plan.
  *
- * Plan downgrade policy:
- *   • `cancelled` keeps the paid plan until `endsAt` passes — LS keeps the
- *     subscription active until then. Most webhook deliveries for cancel
- *     happen with `endsAt` in the future, so we don't downgrade here.
- *   • `expired` downgrades immediately to `"free"`.
- *   • `paused` keeps the plan (status flips, but they paid for the period).
- *   • All other transitions keep the variant-derived plan.
+ * Plan downgrade policy (conservative — when in doubt, downgrade):
+ *   • `subscription_expired` event OR `expired` status     → free
+ *   • `unpaid` status (LS dunning exhausted)               → free
+ *   • `paused` status (customer paused, not paying)        → free
+ *   • `cancelled` event with `endsAt` already in the past  → free
+ *   • `cancelled` with future `endsAt`                     → keep paid plan
+ *   • `past_due` (grace period — LS still retrying)        → keep paid plan
+ *   • `active` / `on_trial`                                → variant plan
+ *   • Any unmapped state                                   → keep PREVIOUS
+ *     plan (return `effectivePlan` from the variant lookup but log a warn).
  */
 export function reduceSubscription(
   event: LsEvent,
@@ -144,16 +164,18 @@ export function reduceSubscription(
   const status = mapStatus(attrs.status);
   const endsAt = toEpochMs(attrs.ends_at);
 
-  // Determine the access-effective plan. Defaults to the variant's plan;
-  // collapses to "free" only when the subscription truly has no time left.
+  // Determine the access-effective plan.
   let effectivePlan: "free" | "creator" | "pro" = planFromVariant;
-  if (event === "subscription_expired") {
+  const downgradeStatuses: SubscriptionStatus[] = ["expired", "unpaid", "paused"];
+  if (event === "subscription_expired" || downgradeStatuses.includes(status)) {
     effectivePlan = "free";
   } else if (event === "subscription_cancelled") {
-    // Keep the paid plan until endsAt; if endsAt is already in the past
-    // (shouldn't happen on cancel, but defensive), downgrade now.
+    // Cancel keeps the paid plan until endsAt; defensive downgrade if endsAt
+    // is already in the past.
     if (endsAt && endsAt <= now) effectivePlan = "free";
   }
+  // active / on_trial / past_due / cancelled-with-future-endsAt all keep
+  // `planFromVariant` set above.
 
   const patch: Partial<Subscription> = {
     plan: effectivePlan,

@@ -18,6 +18,9 @@ import { getAdmin } from "@/lib/firebase/admin";
 import { balanceTimeline } from "@/lib/timeline-balancer";
 import { momentsFromEvents } from "@/lib/attention/events";
 import { attentionCurve } from "@/lib/attention/score";
+import { cursorIntent } from "@/lib/attention/cursor-intent";
+import { canUseAiFeature } from "@/lib/usage/ai-features";
+import { canUsePreset } from "@/lib/usage/gating";
 import { stripUndefined } from "@/lib/firebase/sanitize";
 import type { Interaction } from "@/lib/recording/types";
 import type {
@@ -66,6 +69,30 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
   const existingPacing = (project.effectsSettings as { pacing?: Pacing } | undefined)?.pacing;
   const pacing: Pacing = body.pacing ?? existingPacing ?? "moderate";
 
+  // ── Plan gates ──────────────────────────────────────────────────────
+  // Refuse to rebalance if the project carries a premium preset this user
+  // can't use, OR if they're asking for "fast" pacing (the AI-rebalance
+  // feature, gated to Creator+).
+  const selectedPresetId = project.selectedPresetId as string | undefined;
+  if (selectedPresetId && !(await canUsePreset(uid, selectedPresetId))) {
+    return NextResponse.json(
+      {
+        error: "The preset on this project requires a higher plan.",
+        kind: "plan_required",
+      },
+      { status: 402 }
+    );
+  }
+  if (pacing === "fast" && !(await canUseAiFeature(uid, "ai-rebalance"))) {
+    return NextResponse.json(
+      {
+        error: "Dense pacing requires the Creator plan.",
+        kind: "plan_required",
+      },
+      { status: 402 }
+    );
+  }
+
   const analysis = project.analysis as Analysis | undefined;
   if (!analysis || !analysis.rawMoments) {
     return NextResponse.json(
@@ -103,8 +130,24 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
   }
 
   // 4. Re-run phases C → E.
+  const cursorIntentSeries =
+    interactions.length > 0
+      ? cursorIntent(
+          interactions,
+          duration,
+          visualAnalysis?.sampleRate ?? 10
+        )
+      : undefined;
+
   const eventMoments =
-    interactions.length > 0 ? momentsFromEvents(interactions, { duration }) : [];
+    interactions.length > 0
+      ? momentsFromEvents(interactions, {
+          duration,
+          cursorIntent: cursorIntentSeries,
+          visualAnalysis,
+          scope: interactionScope,
+        })
+      : [];
 
   const attention = attentionCurve({
     duration,

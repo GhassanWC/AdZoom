@@ -18,11 +18,16 @@ import {
 import { balanceTimeline, distributionScore } from "@/lib/timeline-balancer";
 import { momentsFromEvents } from "@/lib/attention/events";
 import { attentionCurve } from "@/lib/attention/score";
+import { cursorIntent } from "@/lib/attention/cursor-intent";
+import { classifyClick, type ClickTier } from "@/lib/attention/click-classifier";
+import { canUseAiFeature } from "@/lib/usage/ai-features";
+import { canUsePreset } from "@/lib/usage/gating";
 import type { Interaction } from "@/lib/recording/types";
 import {
   AI_MOMENT_QUOTA,
   type AnalysisActivityEvent,
   type AnalysisErrorKind,
+  type ClickPipelineDiagnostics,
   type DetectedMoment,
   type MomentProvenance,
   type Pacing,
@@ -164,10 +169,28 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       | "external"
       | undefined;
     const interactionsPath = project.interactionsPath as string | undefined;
+    const selectedPresetId = project.selectedPresetId as string | undefined;
 
     if (!storagePath) {
       return NextResponse.json({ error: "Project has no video uploaded" }, { status: 400 });
     }
+
+    // ── Plan gate: refuse to analyze if the project has a premium preset
+    // selected that this user can't use. Catches the case where someone
+    // tampered `selectedPresetId` directly on their project doc.
+    if (selectedPresetId && !(await canUsePreset(uid, selectedPresetId))) {
+      return NextResponse.json(
+        {
+          error: "The preset on this project requires a higher plan. Upgrade or pick a different preset.",
+          kind: "plan_required",
+        },
+        { status: 402 }
+      );
+    }
+
+    // Pre-compute AI feature flags once so the gates below stay readable.
+    const allowGapFill = await canUseAiFeature(uid, "advanced-balancing");
+    const allowLabeling = await canUseAiFeature(uid, "ai-labeling");
     if (!process.env.GEMINI_API_KEY) {
       await bail(ref, "unknown", "GEMINI_API_KEY is not configured on the server.");
       return NextResponse.json(
@@ -215,8 +238,26 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
 
     // Load real interaction events if the recording carried them. Best-effort:
     // a missing/corrupt manifest just falls back to CV-only analysis.
+    // `loadDiag` records exactly what happened in this stage so the Analysis
+    // Debug panel can show whether the JSON sidecar was even reached.
     let interactions: Interaction[] = [];
+    const loadDiag: {
+      attemptedLoad: boolean;
+      interactionsLoaded: boolean;
+      loadReason?: string;
+    } = { attemptedLoad: false, interactionsLoaded: false };
     if (interactionsPath && interactionScope === "tab") {
+      loadDiag.attemptedLoad = true;
+      console.info("[analyze] loading interactions", {
+        projectId,
+        interactionsPath,
+        scope: interactionScope,
+      });
+      await emitActivity(
+        ref,
+        "info",
+        `Loading interactions from ${interactionsPath}`
+      );
       try {
         const [iBuf] = await bucket.file(interactionsPath).download();
         const parsed = JSON.parse(iBuf.toString("utf8")) as {
@@ -225,6 +266,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
           events: Interaction[];
         };
         interactions = Array.isArray(parsed?.events) ? parsed.events : [];
+        loadDiag.interactionsLoaded = true;
         await emitActivity(
           ref,
           "ok",
@@ -232,6 +274,10 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
         );
       } catch (err) {
         console.warn("[analyze] interactions load failed", err);
+        loadDiag.loadReason =
+          err instanceof Error
+            ? `load-failed: ${err.message}`
+            : "load-failed";
         await emitActivity(
           ref,
           "warn",
@@ -239,11 +285,16 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
         );
       }
     } else if (interactionScope === "external") {
+      loadDiag.loadReason = "scope=external";
       await emitActivity(
         ref,
         "info",
         "External-surface recording — relying on CV signals only"
       );
+    } else if (!interactionsPath) {
+      loadDiag.loadReason = "no-interactionsPath";
+    } else {
+      loadDiag.loadReason = `scope=${interactionScope ?? "undefined"}`;
     }
 
     await ensureNotCancelled(ref);
@@ -307,18 +358,87 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     const pacing: Pacing = existingPacing ?? "moderate";
     const visualAnalysis = project.visualAnalysis as VisualAnalysis | undefined;
 
+    // Cursor intent (hesitation / velocity per bucket) feeds the click
+    // classifier's "deliberate approach" signal — small bump per click
+    // when the user slowed before pressing. Cheap; skip when there's
+    // no interaction stream.
+    const cursorIntentSeries =
+      interactions.length > 0
+        ? cursorIntent(
+            interactions,
+            duration ?? 0,
+            visualAnalysis?.sampleRate ?? 10
+          )
+        : undefined;
+
     const eventMoments =
       interactions.length > 0
-        ? momentsFromEvents(interactions, { duration: duration ?? 0 })
+        ? momentsFromEvents(interactions, {
+            duration: duration ?? 0,
+            cursorIntent: cursorIntentSeries,
+            visualAnalysis,
+            scope: interactionScope,
+          })
         : [];
-    if (eventMoments.length > 0) {
+
+    // Click → moment conversion summary. Counts the raw clicks
+    // (left + double + right) against the moments they produced so the
+    // analyze log surfaces when many clicks collapsed into few moments
+    // (resolveOverlaps merge) vs many clicks got their own moment.
+    // The downstream balancer still applies its own selection rules;
+    // this is "what events.ts emitted before selection."
+    const totalClicks = interactions.filter(
+      (e) => e.type === "click" || e.type === "dblclick" || e.type === "rightclick"
+    ).length;
+    const clickMoments = eventMoments.filter(
+      (m) => m.provenance === "event" &&
+        (m.eventIds ?? []).some((id) => id.startsWith("ev_"))
+    ).length;
+
+    // Per-tier breakdown — re-run classifyClick to tally tiers. Cheap
+    // (pure function, no I/O) and decoupled from events.ts emit logic.
+    // We classify single-clicks AND dblclicks as primary-cta (events.ts
+    // does the same); right-clicks are always primary-cta by spec.
+    const clickMomentsByTier: ClickPipelineDiagnostics["clickMomentsByTier"] = {
+      "primary-cta": 0,
+      icon: 0,
+      nav: 0,
+      form: 0,
+      background: 0,
+    };
+    for (const e of interactions) {
+      if (e.type === "click") {
+        const cls = classifyClick({
+          click: { x: e.x, y: e.y, t: e.t, targetRect: e.targetRect },
+          cursorIntent: cursorIntentSeries,
+          visualAnalysis,
+          scope: interactionScope ?? "tab",
+        });
+        clickMomentsByTier[cls.tier as ClickTier] += 1;
+      } else if (e.type === "dblclick" || e.type === "rightclick") {
+        clickMomentsByTier["primary-cta"] += 1;
+      }
+    }
+    if (interactions.length > 0) {
       await emitActivity(
         ref,
         "ok",
         `Derived ${eventMoments.length} moment${
           eventMoments.length === 1 ? "" : "s"
-        } from real interaction events`
+        } from ${interactions.length} interaction event${
+          interactions.length === 1 ? "" : "s"
+        } (${totalClicks} click${totalClicks === 1 ? "" : "s"} → ${clickMoments} click moment${
+          clickMoments === 1 ? "" : "s"
+        })`
       );
+      console.info("[analyze] click→moment summary", {
+        projectId,
+        totalInteractions: interactions.length,
+        totalClicks,
+        clickMomentsEmitted: clickMoments,
+        totalEventMoments: eventMoments.length,
+        scope: interactionScope,
+      });
     }
 
     // Canonical attention curve — single importance signal across the product.
@@ -395,7 +515,13 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     );
 
     let aiGapMoments: DetectedMoment[] = [];
-    if (gaps.length > 0 && aiBudget > 0) {
+    if (gaps.length > 0 && aiBudget > 0 && !allowGapFill) {
+      await emitActivity(
+        ref,
+        "info",
+        "AI gap-fill skipped — Creator plan required for advanced AI balancing"
+      );
+    } else if (gaps.length > 0 && aiBudget > 0) {
       await emitActivity(
         ref,
         "info",
@@ -485,7 +611,13 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
         uiContext: m.uiContext,
       }));
 
-    if (needsLabeling.length > 0) {
+    if (needsLabeling.length > 0 && !allowLabeling) {
+      await emitActivity(
+        ref,
+        "info",
+        "AI labeling skipped — Creator plan required for cinematic AI labels"
+      );
+    } else if (needsLabeling.length > 0) {
       await emitActivity(ref, "info", `Asking Gemini to label ${needsLabeling.length} moment${needsLabeling.length === 1 ? "" : "s"}`);
       try {
         const labels = await labelMoments({ video: geminiVideo, moments: needsLabeling });
@@ -648,6 +780,33 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     const cleanMoments = stripUndefined(balanced.moments);
     const cleanRawPool = stripUndefined(rawPool);
     const cleanRejectedPool = stripUndefined(balanced.rejectedPool);
+
+    // Build stage-by-stage click-pipeline diagnostics. Persisted so the
+    // editor's Analysis Debug panel can show *exactly* which stage
+    // dropped a click. Numbers are gathered from `loadDiag` (capture →
+    // load), the local `totalClicks` / `clickMoments` / per-tier tally
+    // (momentsFromEvents), and `balanced.stats.eventStats` (balancer).
+    const clickPipeline: ClickPipelineDiagnostics = {
+      interactionsPath,
+      attemptedLoad: loadDiag.attemptedLoad,
+      interactionsLoaded: loadDiag.interactionsLoaded,
+      scope: interactionScope,
+      loadReason: loadDiag.loadReason,
+      totalInteractions: interactions.length,
+      totalClicks,
+      eventMomentsEmitted: eventMoments.length,
+      clickMomentsEmitted: clickMoments,
+      clickMomentsByTier,
+      eventCandidatesIn: balanced.stats.eventStats.eventCandidatesIn,
+      eventDroppedByOverlap: balanced.stats.eventStats.eventDroppedByOverlap,
+      eventDroppedTooClose: balanced.stats.eventStats.eventDroppedTooClose,
+      eventDroppedTooManyZooms:
+        balanced.stats.eventStats.eventDroppedTooManyZooms,
+      eventDroppedTooDense: balanced.stats.eventStats.eventDroppedTooDense,
+      eventKept: balanced.stats.eventStats.eventKept,
+    };
+    console.info("[analyze] clickPipeline", { projectId, ...clickPipeline });
+
     await ref.set(
       {
         status: "analyzed" as ProjectStatus,
@@ -664,6 +823,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
           narrativeStructure: sections.narrativeStructure,
           attentionCurve: attention.curveQ8,
           attentionSampleRate: attention.sampleRate,
+          clickPipeline: stripUndefined(clickPipeline),
           completedAt: Date.now(),
           cancelRequested: false,
         },

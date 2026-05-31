@@ -35,6 +35,7 @@ export const BUILTIN_PRESETS: Preset[] = [
       "Punchy, high-contrast cuts. Aggressive zoom rhythm, oversized click bursts.",
     useCase: "Vlogs, challenges, retention-driven YouTube content.",
     vibe: "mrbeast",
+    requiredPlan: "creator",
     effects: settings({
       autoZoom: 92,
       cursorSize: 70,
@@ -55,6 +56,7 @@ export const BUILTIN_PRESETS: Preset[] = [
     description:
       "Slow, deliberate zooms. Soft cursor, ring highlights. Feels filmic.",
     useCase: "Trailers, product reveals, founder updates.",
+    requiredPlan: "creator",
     vibe: "cinematic",
     effects: settings({
       autoZoom: 68,
@@ -137,6 +139,7 @@ export const BUILTIN_PRESETS: Preset[] = [
     id: "preset-product-demo",
     name: "Product Demo",
     category: "Product Demo",
+    requiredPlan: "creator",
     description:
       "Polished SaaS walkthrough. Moderate zoom, soft cursor glow, minimal callouts.",
     useCase: "Investor decks, demo days, landing-page hero loops.",
@@ -158,6 +161,7 @@ export const BUILTIN_PRESETS: Preset[] = [
     id: "preset-saas-pitch",
     name: "SaaS Pitch",
     category: "SaaS",
+    requiredPlan: "creator",
     description:
       "Sales-grade demo: clean cursor, deliberate pacing.",
     useCase: "Outbound sales clips, pitch decks, partner demos.",
@@ -222,6 +226,7 @@ export const BUILTIN_PRESETS: Preset[] = [
     id: "preset-live-demo",
     name: "Live Demo",
     category: "Product Demo",
+    requiredPlan: "pro",
     description:
       "Real-time pacing for live calls. Minimal post-production feel.",
     useCase: "Customer demos, sales calls, real-time walkthroughs.",

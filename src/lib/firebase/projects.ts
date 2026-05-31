@@ -29,6 +29,7 @@ import {
   type ProjectDoc,
   type ProjectStatus,
 } from "./schema";
+import { BUILTIN_PRESETS_BY_ID } from "@/lib/presets";
 
 const ACCEPTED_MIME = ["video/mp4", "video/quicktime", "video/webm", "video/x-matroska"];
 
@@ -62,6 +63,48 @@ interface CreateProjectInput {
   interactionScope?: "tab" | "external";
 }
 
+/**
+ * Read the user's workspace defaults (preset id + export format) and
+ * fold them into the standard `DEFAULT_EFFECTS_SETTINGS` so the new
+ * project starts already configured the way the user wants. Failure
+ * to read settings is non-fatal — the project simply gets the
+ * built-in defaults.
+ *
+ * Applied to NEW projects only — existing projects are untouched, as
+ * documented in the Settings UI.
+ */
+async function loadWorkspaceDefaults(
+  uid: string
+): Promise<{ effectsSettings: typeof DEFAULT_EFFECTS_SETTINGS; selectedPresetId?: string }> {
+  try {
+    const { db } = getFirebase();
+    const snap = await getDoc(doc(db, "users", uid, "settings", "workspace"));
+    if (!snap.exists()) return { effectsSettings: DEFAULT_EFFECTS_SETTINGS };
+    const data = snap.data() as {
+      defaultPresetId?: string;
+      defaultExportFormat?: typeof DEFAULT_EFFECTS_SETTINGS.defaultExportFormat;
+    };
+    // Resolve the preset id to its EffectsSettings via the static
+    // built-in table — saves a round trip and means custom presets
+    // (not in the built-in table) safely fall through.
+    const preset = data.defaultPresetId
+      ? BUILTIN_PRESETS_BY_ID[data.defaultPresetId]
+      : undefined;
+    return {
+      effectsSettings: {
+        ...DEFAULT_EFFECTS_SETTINGS,
+        ...(preset?.effects ?? {}),
+        ...(data.defaultExportFormat
+          ? { defaultExportFormat: data.defaultExportFormat }
+          : {}),
+      },
+      selectedPresetId: data.defaultPresetId,
+    };
+  } catch {
+    return { effectsSettings: DEFAULT_EFFECTS_SETTINGS };
+  }
+}
+
 export async function createProjectFromFile({
   uid,
   file,
@@ -77,6 +120,7 @@ export async function createProjectFromFile({
     throw new Error(`Unsupported file type: ${file.type || file.name}`);
   }
   const { db, storage } = getFirebase();
+  const { effectsSettings, selectedPresetId } = await loadWorkspaceDefaults(uid);
 
   // 1. Pre-create the Firestore doc to get an ID.
   const projectsCol = collection(db, "users", uid, "projects");
@@ -91,7 +135,8 @@ export async function createProjectFromFile({
     height: height ?? null,
     fileSize: file.size,
     mimeType: file.type || "video/mp4",
-    effectsSettings: DEFAULT_EFFECTS_SETTINGS,
+    effectsSettings,
+    ...(selectedPresetId ? { selectedPresetId } : {}),
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
   });

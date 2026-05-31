@@ -8,6 +8,7 @@ import {
   verifyLemonSqueezySignature,
   type LsWebhookPayload,
 } from "@/lib/lemonsqueezy/webhook";
+import { assertBillingEnv } from "@/lib/lemonsqueezy/env";
 import { stripUndefined } from "@/lib/firebase/sanitize";
 
 export const runtime = "nodejs";
@@ -34,6 +35,18 @@ export const dynamic = "force-dynamic";
  * In dev, expose it with ngrok. In prod, no auth header is expected.
  */
 export async function POST(req: NextRequest) {
+  // Surface env mis-configuration as a 500 with a clear message; LS will
+  // retry, giving ops a chance to fix it.
+  try {
+    assertBillingEnv();
+  } catch (err) {
+    console.error("[billing/webhook]", err);
+    return NextResponse.json(
+      { error: err instanceof Error ? err.message : "Billing env not configured" },
+      { status: 500 }
+    );
+  }
+
   let rawBody: string;
   try {
     rawBody = await req.text();
@@ -92,39 +105,56 @@ export async function POST(req: NextRequest) {
   }
 
   try {
-    const { patch, effectivePlan } = reduceSubscription(eventName, payload);
     const now = Date.now();
-
     const subRef = db.doc(`subscriptions/${uid}`);
     const userRef = db.doc(`users/${uid}`);
 
-    // Order matters: write subscription + user-plan mirror FIRST so a
-    // Firestore failure means LS will retry the whole event. Only after
-    // both succeed do we record the idempotency marker.
-    await db.runTransaction(async (tx) => {
-      const subSnap = await tx.get(subRef);
-      const existing = subSnap.exists ? subSnap.data() : null;
-      const createdAt = (existing?.createdAt as number | undefined) ?? now;
+    // `subscription_payment_success` carries a `subscription-invoice`
+    // resource — NOT a subscription. Its attributes have no `variant_id`
+    // and the `status` field is the invoice status ("paid"), not the
+    // subscription status. Running it through `reduceSubscription` would
+    // clobber the real state (set plan→"free", status→"past_due") because
+    // the reducer defaults missing/unknown fields conservatively.
+    //
+    // The subscription_* state events (created/updated/cancelled/...) are
+    // authoritative for status + plan. Payment-success only writes a
+    // receipt timestamp, so it can't overwrite known-good state.
+    if (eventName === "subscription_payment_success") {
+      await subRef.set(
+        { lastPaymentAt: now, updatedAt: now },
+        { merge: true }
+      );
+    } else {
+      const { patch, effectivePlan } = reduceSubscription(eventName, payload);
 
-      tx.set(
-        subRef,
-        stripUndefined({
-          ...patch,
-          userId: uid,
-          createdAt,
-          updatedAt: now,
-        }),
-        { merge: true }
-      );
-      tx.set(
-        userRef,
-        {
-          plan: effectivePlan,
-          updatedAt: FieldValue.serverTimestamp(),
-        },
-        { merge: true }
-      );
-    });
+      // Order matters: write subscription + user-plan mirror FIRST so a
+      // Firestore failure means LS will retry the whole event. Only after
+      // both succeed do we record the idempotency marker.
+      await db.runTransaction(async (tx) => {
+        const subSnap = await tx.get(subRef);
+        const existing = subSnap.exists ? subSnap.data() : null;
+        const createdAt = (existing?.createdAt as number | undefined) ?? now;
+
+        tx.set(
+          subRef,
+          stripUndefined({
+            ...patch,
+            userId: uid,
+            createdAt,
+            updatedAt: now,
+          }),
+          { merge: true }
+        );
+        tx.set(
+          userRef,
+          {
+            plan: effectivePlan,
+            updatedAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+      });
+    }
 
     // Idempotency marker — `create` throws if it already exists, which we
     // swallow (means a concurrent delivery beat us; the state is the same).

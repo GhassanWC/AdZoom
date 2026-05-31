@@ -13,6 +13,7 @@ import {
   type RecordingResult,
   type RecordingState,
 } from "@/lib/recording";
+import { useNotifications } from "@/lib/notifications/store";
 
 /**
  * Provider that owns the recording engine for the entire dashboard session.
@@ -51,6 +52,12 @@ interface RecordingContextValue {
   cancel: () => void;
   discardResult: () => void;
   useResult: () => Promise<void>;
+  /**
+   * Replace the current result blob (e.g. after the user accepts a crop fix
+   * in the preview). The original interactions / scope / mimeType stay; we
+   * only swap the blob + width/height so the upload uses the corrected file.
+   */
+  replaceResultBlob: (next: Blob, info: { width: number; height: number }) => void;
 }
 
 const Ctx = React.createContext<RecordingContextValue | null>(null);
@@ -58,6 +65,7 @@ const Ctx = React.createContext<RecordingContextValue | null>(null);
 export function RecordingProvider({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const { user } = useAuth();
+  const notifications = useNotifications();
 
   const engineRef = React.useRef<RecordingEngine | null>(null);
   if (!engineRef.current && typeof window !== "undefined") {
@@ -167,6 +175,23 @@ export function RecordingProvider({ children }: { children: React.ReactNode }) {
     setUploadPct(null);
   };
 
+  const replaceResultBlob: RecordingContextValue["replaceResultBlob"] = (
+    next,
+    info
+  ) => {
+    setResult((prev) =>
+      prev
+        ? {
+            ...prev,
+            blob: next,
+            mimeType: next.type || prev.mimeType,
+            width: info.width,
+            height: info.height,
+          }
+        : prev
+    );
+  };
+
   const useResult: RecordingContextValue["useResult"] = async () => {
     if (!result || !user) return;
     setUploading(true);
@@ -188,6 +213,16 @@ export function RecordingProvider({ children }: { children: React.ReactNode }) {
         onProgress: (pct) => setUploadPct(pct),
         interactions: result.interactions,
         interactionScope: result.interactionScope,
+      });
+      // Persistent notification — the navbar bell carries the take
+      // forward even if the user navigates away mid-upload. The id is
+      // keyed on the freshly minted projectId so retries can't dupe.
+      notifications.push({
+        id: `upload-completed:${projectId}`,
+        kind: "upload-completed",
+        title: "Recording uploaded",
+        body: `${filename} ready for analysis`,
+        href: `/dashboard/projects/${projectId}`,
       });
       setResult(null);
       setUploading(false);
@@ -221,6 +256,7 @@ export function RecordingProvider({ children }: { children: React.ReactNode }) {
     cancel,
     discardResult,
     useResult,
+    replaceResultBlob,
   };
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

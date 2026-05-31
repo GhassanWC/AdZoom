@@ -1,11 +1,9 @@
 import { Navbar } from "@/components/landing/Navbar";
 import { Hero } from "@/components/landing/Hero";
-import { SocialProof } from "@/components/landing/SocialProof";
-import { BeforeAfterSection } from "@/components/landing/BeforeAfterSection";
-import { Features } from "@/components/landing/Features";
-import { HowItWorks } from "@/components/landing/HowItWorks";
+import { AIWorkflow } from "@/components/landing/AIWorkflow";
+import { ShowcaseGallery } from "@/components/landing/ShowcaseGallery";
+import { MidCTA } from "@/components/landing/MidCTA";
 import { Presets } from "@/components/landing/Presets";
-import { Testimonials } from "@/components/landing/Testimonials";
 import { Pricing } from "@/components/landing/Pricing";
 import { FinalCTA } from "@/components/landing/FinalCTA";
 import { Footer } from "@/components/landing/Footer";
@@ -16,12 +14,10 @@ export default function HomePage() {
       <Navbar />
       <main className="relative">
         <Hero />
-        <SocialProof />
-        <BeforeAfterSection />
-        <Features />
-        <HowItWorks />
+        <AIWorkflow />
+        <ShowcaseGallery />
+        <MidCTA />
         <Presets />
-        <Testimonials />
         <Pricing />
         <FinalCTA />
       </main>

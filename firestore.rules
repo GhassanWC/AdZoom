@@ -1,5 +1,24 @@
 rules_version = '2';
 
+// AdZoom Firestore Security Rules — billing-hardened revision.
+//
+// Security model
+// ──────────────
+// Anything that affects whether a user can access paid features is OWNED BY
+// THE SERVER and read-only to the client:
+//   • users/{uid}.plan              ← mirrored from the Lemon Squeezy webhook
+//   • subscriptions/{uid}.*         ← written by the LS webhook only
+//   • users/{uid}/usage/{period}.*  ← written by the export-permit endpoint
+//   • users/{uid}/exports/*         ← created by the export-permit endpoint
+//                                     (clients do ONE narrow completion patch)
+//   • processedEvents/{eventId}     ← webhook idempotency markers
+//
+// The user profile + projects + custom presets remain client-owned.
+//
+// Deploy: `firebase deploy --only firestore:rules` from the repo root. These
+// rules MUST be deployed before the billing-hardening code paths are
+// trustworthy — until they are, the client can still flip plan = "pro".
+
 service cloud.firestore {
   match /databases/{database}/documents {
 
@@ -11,27 +30,124 @@ service cloud.firestore {
       return isSignedIn() && request.auth.uid == uid;
     }
 
-    // User profile document
-    match /users/{uid} {
-      allow read, write: if isOwner(uid);
+    /**
+     * True when the incoming update doesn't change any of `forbidden`'s
+     * fields. Used for field-level lockdown on docs that mix client-owned
+     * and server-owned data (e.g. users/{uid} where `plan` is server-only).
+     */
+    function notTouchingKeys(forbidden) {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(forbidden);
+    }
 
-      // Projects subcollection
+    // ── User profile doc ─────────────────────────────────────────────────
+    // Holds displayName/email/photoURL/createdAt/updatedAt (client-writable)
+    // AND `plan` (server-only, mirrored from the webhook). Future server-
+    // owned fields go in this list:
+    //   const SERVER_OWNED_USER_KEYS = ['plan'];
+    match /users/{uid} {
+      allow read: if isOwner(uid);
+
+      // On create, the client must NOT set `plan` — it's set by the webhook
+      // later. ensureUserDoc() in AuthProvider.tsx already never sets it.
+      allow create: if isOwner(uid)
+        && !request.resource.data.keys().hasAny(['plan']);
+
+      // On update, the client may change anything EXCEPT `plan`. Lets the
+      // existing profile-merge flow keep working without opening a door for
+      // self-upgrade.
+      allow update: if isOwner(uid) && notTouchingKeys(['plan']);
+
+      allow delete: if false;
+
+      // ── Projects (fully client-owned) ─────────────────────────────────
       match /projects/{projectId} {
         allow read, create, update, delete: if isOwner(uid);
       }
 
-      // Exports subcollection
-      match /exports/{exportId} {
-        allow read, create, update, delete: if isOwner(uid);
-      }
-
-      // Custom presets created by this user
+      // ── Custom presets (fully client-owned) ───────────────────────────
       match /presets/{presetId} {
         allow read, create, update, delete: if isOwner(uid);
       }
+
+      // ── Exports ───────────────────────────────────────────────────────
+      // Server creates the export doc via /api/billing/export-permit with
+      // `status: "permitted"`. After uploading the bytes to Storage, the
+      // client patches a NARROW whitelist of fields to mark it ready.
+      // resolution / format / applyWatermark / fps are immutable from the
+      // moment the permit was issued.
+      match /exports/{exportId} {
+        allow read: if isOwner(uid);
+        // No client-side creation; everything goes through the permit endpoint.
+        allow create: if false;
+        // One-shot completion patch: permitted → ready, plus upload-result
+        // fields. Anything else is denied.
+        allow update: if isOwner(uid)
+          && resource.data.status == 'permitted'
+          && request.resource.data.status == 'ready'
+          && request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(['status', 'storagePath', 'exportUrl', 'fileSize', 'completedAt']);
+        allow delete: if false;
+      }
+
+      // ── Monthly usage counters ────────────────────────────────────────
+      // Read-only to the owner so the billing page can show "X / Y exports
+      // this month". All mutations go through the export-permit endpoint.
+      match /usage/{periodId} {
+        allow read: if isOwner(uid);
+        allow write: if false;
+      }
+
+      // ── Workspace settings (client-owned) ─────────────────────────────
+      // Single-doc parent for the user's preferences: workspace defaults
+      // (default preset id + default export format) + notification
+      // preferences. Read by the Settings page, the notifications store,
+      // and the new-project creation flow. The user owns these — flipping
+      // their own notification preference can't affect billing or grant
+      // any premium access, so client-owned is fine.
+      match /settings/{settingsDocId} {
+        allow read, write: if isOwner(uid);
+      }
+
+      // ── API key metadata (server-issued, owner-readable) ──────────────
+      // Per-user metadata for issued API keys: name, prefix, SHA-256
+      // hash, type, timestamps, revoked flag. The HASH is the secret
+      // material — even a leaked metadata read can't authenticate as the
+      // user because the validation path also requires `apiKeyIndex/{hash}`
+      // (server-locked, below). All writes go through the
+      // `/api/settings/api-keys` routes which use the admin SDK; clients
+      // never write directly. List + read are owner-only.
+      match /apiKeys/{keyId} {
+        allow read: if isOwner(uid);
+        allow write: if false;
+      }
     }
 
-    // Everything else is denied
+    // ── Subscription state (server only) ───────────────────────────────
+    // Lemon Squeezy webhook is the only writer; the owner can read their own.
+    match /subscriptions/{uid} {
+      allow read: if isOwner(uid);
+      allow write: if false;
+    }
+
+    // ── Webhook idempotency markers (server only — opaque to clients) ──
+    match /processedEvents/{eventId} {
+      allow read, write: if false;
+    }
+
+    // ── API key reverse-lookup index (server only — opaque to clients) ──
+    // Maps `sha256(plaintext_api_key)` → { uid, keyId, type, createdAt }.
+    // This collection is the secret material for bearer-token resolution
+    // in `validateApiKey` (src/lib/firebase/api-keys-server.ts). It MUST
+    // NOT be readable by any client — a successful read would let an
+    // attacker enumerate valid hashes and brute-force forward to the
+    // plaintext. The default-deny rule below would also block this, but
+    // we add an EXPLICIT deny so a future overly-permissive
+    // `match /{document=**}` change can't silently expose it.
+    match /apiKeyIndex/{hash} {
+      allow read, write: if false;
+    }
+
+    // ── Default deny ───────────────────────────────────────────────────
     match /{document=**} {
       allow read, write: if false;
     }

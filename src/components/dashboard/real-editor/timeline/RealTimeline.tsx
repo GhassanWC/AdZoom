@@ -11,6 +11,8 @@ import {
   Film,
   Diamond,
   Layers,
+  Bug,
+  Activity,
 } from "lucide-react";
 import { useEditorReal } from "../context";
 import { cn } from "@/lib/cn";
@@ -26,14 +28,14 @@ import {
   TRACK_HEIGHTS,
   PROVENANCE_PRESENTATION,
 } from "./constants";
+import { readPersistedBool, writePersistedBool } from "./utils";
 import type { DragState, DragMode } from "./utils";
 import { MomentPill } from "./MomentPill";
 import { TimelineTrack, TrackLabel } from "./TimelineTrack";
 import { TimelineRuler, GridLines } from "./TimelineRuler";
 import { Playhead } from "./Playhead";
 import { GapIndicator, emptyQuartileRanges } from "./GapIndicator";
-import { TimelineHeader } from "./TimelineHeader";
-import { CollapsibleSection } from "./CollapsibleSection";
+import { TimelineHeader, type TimelineHealth } from "./TimelineHeader";
 import { NarrativeBand } from "./NarrativeBand";
 import { DensityBar } from "./DensityBar";
 import { AttentionWaveform } from "./AttentionWaveform";
@@ -300,14 +302,62 @@ export function RealTimeline() {
       ? { ...m, startTime: draft.startTime, endTime: draft.endTime }
       : m;
 
+  // ── Insights state ───────────────────────────────────────────────────
+  // The whole analytics block — attention waveform, balance/density/quiet
+  // pills, distribution histogram, sources/effects legend, CV debug toggle,
+  // and the AI/User track split — lives behind a single "Insights" toggle
+  // in the header. Default closed: most users don't need it constantly
+  // visible, and the editing surface stays calm.
+  //
+  // These hooks live ABOVE the empty-timeline early return so React's
+  // call order stays stable across renders. The first render of an
+  // empty project would otherwise skip these four hooks; once a moment
+  // arrived the hook count would jump and React would throw "change in
+  // the order of Hooks" (Rules of Hooks).
+  const [insightsOpen, setInsightsOpen] = React.useState(false);
+  React.useEffect(() => {
+    setInsightsOpen(readPersistedBool("adzoom.timeline.insights.open", false));
+  }, []);
+  const toggleInsights = () => {
+    const next = !insightsOpen;
+    setInsightsOpen(next);
+    writePersistedBool("adzoom.timeline.insights.open", next);
+  };
+  // Show-separate-lanes is opt-in inside Insights so we don't surprise users
+  // with two stacked tracks before they ask for the split.
+  const [separateLanes, setSeparateLanes] = React.useState(false);
+  React.useEffect(() => {
+    setSeparateLanes(readPersistedBool("adzoom.timeline.separateLanes", false));
+  }, []);
+  const toggleSeparateLanes = () => {
+    const next = !separateLanes;
+    setSeparateLanes(next);
+    writePersistedBool("adzoom.timeline.separateLanes", next);
+  };
+
   if (total > 0 && moments.length === 0) {
     return <EmptyTimeline analyzed={project.analysis?.status === "complete"} />;
   }
 
-  const showUserRow = userCount > 0;
   const showNarrative = narrativeSegments.length > 0;
+
+  const showUserRow = separateLanes && userCount > 0;
   const aiHeight = TRACK_HEIGHTS.ai;
   const userHeight = TRACK_HEIGHTS.user;
+  // Single merged track when not split — slightly taller than the old AI
+  // track so the pills breathe with the extra spacing the brief calls for.
+  const mergedHeight = TRACK_HEIGHTS.ai;
+
+  // Single-signal AI health for the header dot. Priority:
+  // empty → quiet (any empty quartile) → clustered → balanced.
+  const health: TimelineHealth =
+    moments.length === 0
+      ? "empty"
+      : emptyQuartiles > 0
+        ? "quiet"
+        : isClustered
+          ? "clustered"
+          : "balanced";
 
   const onLaneClick = (e: React.PointerEvent) => {
     if (total <= 0 || dragRef.current) return;
@@ -316,29 +366,65 @@ export function RealTimeline() {
     seek(Math.max(0, Math.min(total, pct * total)));
   };
 
+  // Direct read of the click-pipeline diagnostics so the timeline can
+  // surface a warning bar when the recording detected clicks but the
+  // pipeline failed to turn them into edits. This is the user's
+  // primary signal that something is wrong before the Analysis Debug
+  // panel below the timeline gets a chance to explain why.
+  const clickPipeline = project.analysis?.clickPipeline;
+  const showClickLossWarning =
+    !!clickPipeline &&
+    clickPipeline.totalClicks > 0 &&
+    clickPipeline.eventKept === 0;
+  const showClickPartialWarning =
+    !!clickPipeline &&
+    clickPipeline.totalClicks >= 4 &&
+    clickPipeline.eventKept > 0 &&
+    clickPipeline.eventKept < clickPipeline.totalClicks * 0.4;
+
   return (
     <div className="glass relative overflow-hidden rounded-3xl">
       <TimelineHeader
-        aiCount={provenanceCounts.ai}
-        userCount={provenanceCounts.user}
-        eventCount={provenanceCounts.event}
-        cvCount={provenanceCounts.cv}
-        distScore={distScore}
-        isClustered={isClustered}
-        densityPerMin={densityPerMin}
-        emptyQuartiles={emptyQuartiles}
-        showBalanceBadge={moments.length >= 2 && total > 0}
-        showDensityBadge={total > 0}
+        health={health}
         zoom={zoom}
         onZoomOut={() => setZoom((z) => Math.max(1, Math.round((z - 0.5) * 2) / 2))}
         onZoomIn={() => setZoom((z) => Math.min(8, Math.round((z + 0.5) * 2) / 2))}
-        showCvDebugToggle={!!va && va.sampleCount > 0}
-        cvDebug={cvDebug}
-        onToggleCvDebug={() => setCvDebug(!cvDebug)}
         currentTime={currentTime}
         total={total}
-        attentionCurve={attentionCurve}
+        insightsOpen={insightsOpen}
+        onToggleInsights={toggleInsights}
       />
+
+      {showClickLossWarning && (
+        <div className="flex items-start gap-2 border-b border-rose-400/25 bg-rose-500/[0.08] px-6 py-2.5 text-[12.5px] text-rose-100">
+          <AlertTriangle size={13} className="mt-0.5 shrink-0 text-rose-300" />
+          <div>
+            <strong className="text-white">
+              Clicks detected but not turned into zooms.
+            </strong>{" "}
+            <span className="text-rose-100/85">
+              {clickPipeline!.totalClicks} click
+              {clickPipeline!.totalClicks === 1 ? "" : "s"} in the recording,
+              0 on the timeline. See <em>Analysis Debug</em> below the
+              timeline to see which stage dropped them.
+            </span>
+          </div>
+        </div>
+      )}
+      {!showClickLossWarning && showClickPartialWarning && (
+        <div className="flex items-start gap-2 border-b border-amber-400/25 bg-amber-500/[0.08] px-6 py-2.5 text-[12.5px] text-amber-100">
+          <AlertTriangle size={13} className="mt-0.5 shrink-0 text-amber-300" />
+          <div>
+            <strong className="text-white">
+              Only {clickPipeline!.eventKept} of{" "}
+              {clickPipeline!.totalClicks} clicks became zooms.
+            </strong>{" "}
+            <span className="text-amber-100/85">
+              Check Analysis Debug for the drop reason.
+            </span>
+          </div>
+        </div>
+      )}
 
       {multiSelectIds.length > 0 && (
         <div className="flex flex-wrap items-center justify-between gap-2 border-b border-rose-400/25 bg-rose-500/[0.08] px-6 py-2.5 text-[12px] text-rose-100">
@@ -373,21 +459,13 @@ export function RealTimeline() {
         </div>
       )}
 
-      {/* ── Cinematic chapters strip ─────────────────────────────────── */}
+      {/* ── Chapters strip ────────────────────────────────────────────
+          Simplified: no heading row, no count chip, no "AI-classified"
+          caption — the band itself is self-explanatory. Slimmer top
+          padding so chapters feel like a soft section divider rather
+          than a primary panel. */}
       {showNarrative && (
-        <div className="border-b border-white/[0.06] px-6 pb-4 pt-5">
-          <div className="mb-2.5 flex items-center justify-between">
-            <div className="inline-flex items-center gap-2 text-[10.5px] font-semibold uppercase tracking-[0.2em] text-fog">
-              <Layers size={11} className="text-violet-300" />
-              Chapters
-              <span className="rounded-full bg-white/[0.04] px-2 py-[1px] font-mono text-[9.5px] tabular-nums tracking-wider text-fog/80">
-                {narrativeSegments.length}
-              </span>
-            </div>
-            <span className="hidden text-[10.5px] uppercase tracking-[0.16em] text-fog/60 md:inline">
-              AI-classified narrative beats
-            </span>
-          </div>
+        <div className="border-b border-white/[0.04] px-6 pb-3.5 pt-3.5">
           <NarrativeBand
             segments={narrativeSegments}
             duration={total}
@@ -405,24 +483,37 @@ export function RealTimeline() {
             gridTemplateColumns: `clamp(40px, 12vw, ${GUTTER_WIDTH}px) minmax(0, 1fr)`,
           }}
         >
-          {/* Left gutter */}
+          {/* Left gutter — labels only appear when separate lanes are on.
+              In the merged default, the track speaks for itself. */}
           <div className="flex flex-col pr-3">
             <div style={{ height: TRACK_HEIGHTS.ruler }} />
             <div style={{ height: TRACK_HEIGHTS.gap }} />
-            <TrackLabel
-              Icon={Sparkles}
-              label="AI edits"
-              count={aiCount}
-              height={aiHeight}
-              tone="violet"
-            />
-            {showUserRow && (
+            {separateLanes ? (
+              <>
+                <TrackLabel
+                  Icon={Sparkles}
+                  label="AI edits"
+                  count={aiCount}
+                  height={aiHeight}
+                  tone="violet"
+                />
+                {showUserRow && (
+                  <TrackLabel
+                    Icon={User}
+                    label="Your edits"
+                    count={userCount}
+                    height={userHeight}
+                    tone="cyan"
+                  />
+                )}
+              </>
+            ) : (
               <TrackLabel
-                Icon={User}
-                label="Your edits"
-                count={userCount}
-                height={userHeight}
-                tone="cyan"
+                Icon={Film}
+                label="Edits"
+                count={moments.length}
+                height={mergedHeight}
+                tone="fog"
               />
             )}
           </div>
@@ -442,76 +533,128 @@ export function RealTimeline() {
               >
                 <GridLines total={total} />
 
-                <GapIndicator ranges={emptyRanges} />
+                {/* Quiet-region markers live behind Insights — when the
+                    panel is closed we keep the surface clean. */}
+                {insightsOpen && <GapIndicator ranges={emptyRanges} />}
 
-                {/* AI track — attention waveform sits behind the pills as a
-                    cinematic backdrop. */}
-                <TimelineTrack
-                  ariaLabel="AI edits track"
-                  height={aiHeight}
-                  className="bg-gradient-to-b from-violet-500/[0.04] via-violet-500/[0.02] to-transparent"
-                >
-                  {attentionCurve && attentionCurve.length > 0 && (
-                    <div className="pointer-events-none absolute inset-x-0 inset-y-0 z-0">
-                      <AttentionWaveform
-                        curve={attentionCurve}
-                        duration={total}
-                        height={aiHeight}
-                        variant="full"
-                        className="opacity-90"
-                      />
-                    </div>
-                  )}
-                  <div className="absolute inset-0 z-10">
-                    {aiMoments.map((m0) => {
-                      const m = withDraft(m0);
-                      return (
-                        <MomentPill
-                          key={m0.id}
-                          moment={m}
-                          total={total}
-                          selected={selectedMomentId === m0.id}
-                          multiSelected={multiSelectIds.includes(m0.id)}
-                          dragging={draft?.id === m0.id}
-                          onBeginDrag={beginDrag}
-                          onDuplicate={() => duplicateMoment(m0.id)}
-                          onDelete={() => deleteMoment(m0.id)}
-                          onEdit={() => {
-                            setSelectedMomentId(m0.id);
-                            openInspector();
-                          }}
-                        />
-                      );
-                    })}
-                  </div>
-                </TimelineTrack>
+                {separateLanes ? (
+                  <>
+                    {/* AI lane — attention waveform only renders here when
+                        Insights is open, so the default surface is flat. */}
+                    <TimelineTrack
+                      ariaLabel="AI edits track"
+                      height={aiHeight}
+                    >
+                      {insightsOpen &&
+                        attentionCurve &&
+                        attentionCurve.length > 0 && (
+                          <div className="pointer-events-none absolute inset-x-0 inset-y-0 z-0">
+                            <AttentionWaveform
+                              curve={attentionCurve}
+                              duration={total}
+                              height={aiHeight}
+                              variant="full"
+                              className="opacity-70"
+                            />
+                          </div>
+                        )}
+                      <div className="absolute inset-0 z-10">
+                        {aiMoments.map((m0) => {
+                          const m = withDraft(m0);
+                          return (
+                            <MomentPill
+                              key={m0.id}
+                              moment={m}
+                              total={total}
+                              selected={selectedMomentId === m0.id}
+                              multiSelected={multiSelectIds.includes(m0.id)}
+                              dragging={draft?.id === m0.id}
+                              onBeginDrag={beginDrag}
+                              onDuplicate={() => duplicateMoment(m0.id)}
+                              onDelete={() => deleteMoment(m0.id)}
+                              onEdit={() => {
+                                setSelectedMomentId(m0.id);
+                                openInspector();
+                              }}
+                            />
+                          );
+                        })}
+                      </div>
+                    </TimelineTrack>
 
-                {showUserRow && (
+                    {showUserRow && (
+                      <TimelineTrack
+                        ariaLabel="Your edits track"
+                        height={userHeight}
+                      >
+                        {userMoments.map((m0) => {
+                          const m = withDraft(m0);
+                          return (
+                            <MomentPill
+                              key={m0.id}
+                              moment={m}
+                              total={total}
+                              selected={selectedMomentId === m0.id}
+                              multiSelected={multiSelectIds.includes(m0.id)}
+                              dragging={draft?.id === m0.id}
+                              onBeginDrag={beginDrag}
+                              onDuplicate={() => duplicateMoment(m0.id)}
+                              onDelete={() => deleteMoment(m0.id)}
+                              onEdit={() => {
+                                setSelectedMomentId(m0.id);
+                                openInspector();
+                              }}
+                            />
+                          );
+                        })}
+                      </TimelineTrack>
+                    )}
+                  </>
+                ) : (
+                  // ── Merged "Edits" track ─────────────────────────────
+                  // Single calm lane that holds AI + user moments together.
+                  // MomentPill already differentiates source via tone (violet
+                  // accent for AI, cyan for user) so the visual signal is
+                  // preserved without two lanes competing for attention.
                   <TimelineTrack
-                    ariaLabel="Your edits track"
-                    height={userHeight}
-                    className="bg-gradient-to-b from-cyan-400/[0.04] via-cyan-400/[0.02] to-transparent"
+                    ariaLabel="Edits track"
+                    height={mergedHeight}
                   >
-                    {userMoments.map((m0) => {
-                      const m = withDraft(m0);
-                      return (
-                        <MomentPill
-                          key={m0.id}
-                          moment={m}
-                          total={total}
-                          selected={selectedMomentId === m0.id}
-                          multiSelected={multiSelectIds.includes(m0.id)}
-                          dragging={draft?.id === m0.id}
-                          onBeginDrag={beginDrag}
-                          onDuplicate={() => duplicateMoment(m0.id)}
-                          onDelete={() => deleteMoment(m0.id)}
-                          onEdit={() => {
-                            setSelectedMomentId(m0.id);
-                            openInspector();
-                          }}
-                        />
-                      );
-                    })}
+                    {insightsOpen &&
+                      attentionCurve &&
+                      attentionCurve.length > 0 && (
+                        <div className="pointer-events-none absolute inset-x-0 inset-y-0 z-0">
+                          <AttentionWaveform
+                            curve={attentionCurve}
+                            duration={total}
+                            height={mergedHeight}
+                            variant="full"
+                            className="opacity-60"
+                          />
+                        </div>
+                      )}
+                    <div className="absolute inset-0 z-10">
+                      {moments.map((m0) => {
+                        const m = withDraft(m0);
+                        return (
+                          <MomentPill
+                            key={m0.id}
+                            moment={m}
+                            total={total}
+                            selected={selectedMomentId === m0.id}
+                            multiSelected={multiSelectIds.includes(m0.id)}
+                            dragging={draft?.id === m0.id}
+                            onBeginDrag={beginDrag}
+                            onDuplicate={() => duplicateMoment(m0.id)}
+                            onDelete={() => deleteMoment(m0.id)}
+                            onEdit={() => {
+                              setSelectedMomentId(m0.id);
+                              openInspector();
+                            }}
+                          />
+                        );
+                      })}
+                    </div>
                   </TimelineTrack>
                 )}
 
@@ -533,21 +676,39 @@ export function RealTimeline() {
         </div>
       </div>
 
-      {/* ── Secondary band: distribution (collapsed by default) ─────────── */}
-      {moments.length > 0 && total > 0 && (
-        <div className="space-y-2 px-6 pb-5 pt-3">
-          <CollapsibleSection
-            title="Distribution"
-            storageKey="adzoom.timeline.distribution.open"
-            meta={<span>{moments.length}-moment histogram</span>}
-          >
-            <DensityBar moments={moments} duration={total} />
-          </CollapsibleSection>
+      {/* ── Cluster nudge ────────────────────────────────────────────────
+          Kept actionable but with neutral styling so it doesn't compete
+          with the editing surface. Only shows when there's a real issue. */}
+      {isClustered && (
+        <div className="mx-6 mt-4 mb-4 flex items-start gap-2 rounded-xl border border-amber-300/35 bg-amber-400/[0.06] px-3.5 py-2.5 text-[12px] text-amber-100">
+          <AlertTriangle size={13} className="mt-0.5 shrink-0 text-amber-300" />
+          <p className="leading-relaxed">
+            Some moments look clustered. Drag them apart, or try a different
+            preset.
+          </p>
         </div>
       )}
 
-      {/* CV debug signals */}
-      {cvDebug && va && va.sampleCount > 0 && (
+      {/* ── Insights panel (analytics, legends, advanced toggles) ──────── */}
+      {insightsOpen && (
+        <InsightsPanel
+          moments={moments}
+          total={total}
+          distScore={distScore}
+          densityPerMin={densityPerMin}
+          emptyQuartiles={emptyQuartiles}
+          isClustered={isClustered}
+          provenanceCounts={provenanceCounts}
+          separateLanes={separateLanes}
+          onToggleSeparateLanes={toggleSeparateLanes}
+          showCvDebugToggle={!!va && va.sampleCount > 0}
+          cvDebug={cvDebug}
+          onToggleCvDebug={() => setCvDebug(!cvDebug)}
+        />
+      )}
+
+      {/* CV debug signals — only when Insights is open AND user opted in. */}
+      {insightsOpen && cvDebug && va && va.sampleCount > 0 && (
         <div className="border-t border-white/[0.06] px-6 py-4">
           <CvSignalTracks
             visualAnalysis={va}
@@ -557,26 +718,84 @@ export function RealTimeline() {
           />
         </div>
       )}
+    </div>
+  );
+}
 
-      {/* Cluster warning */}
-      {isClustered && (
-        <div className="mx-6 mb-5 flex items-start gap-2 rounded-2xl border border-amber-400/30 bg-amber-500/[0.06] px-4 py-3 text-[12px] text-amber-100">
-          <AlertTriangle size={13} className="mt-0.5 shrink-0 text-amber-300" />
-          <div className="min-w-0">
-            <div className="font-semibold text-amber-200">
-              Moments look clustered.
-            </div>
-            <p className="mt-0.5 leading-relaxed text-amber-100/85">
-              Drag them apart, or try a different preset — the timeline
-              re-balances automatically.
-            </p>
+/**
+ * Progressive-disclosure panel for everything that used to crowd the header
+ * and the bottom strip: balance/density/quiet, distribution histogram,
+ * sources legend, effects legend, separate-lanes toggle, CV debug toggle.
+ *
+ * Lives at the bottom of the timeline so power users can pin it open and
+ * scroll past it; first-timers never see it unless they click "Insights".
+ */
+function InsightsPanel({
+  moments,
+  total,
+  distScore,
+  densityPerMin,
+  emptyQuartiles,
+  isClustered,
+  provenanceCounts,
+  separateLanes,
+  onToggleSeparateLanes,
+  showCvDebugToggle,
+  cvDebug,
+  onToggleCvDebug,
+}: {
+  moments: DetectedMoment[];
+  total: number;
+  distScore: number;
+  densityPerMin: number;
+  emptyQuartiles: number;
+  isClustered: boolean;
+  provenanceCounts: { event: number; cv: number; ai: number; user: number };
+  separateLanes: boolean;
+  onToggleSeparateLanes: () => void;
+  showCvDebugToggle: boolean;
+  cvDebug: boolean;
+  onToggleCvDebug: () => void;
+}) {
+  const showBalance = moments.length >= 2 && total > 0;
+  return (
+    <div className="border-t border-white/[0.06] bg-white/[0.012] px-6 py-5">
+      <div className="mb-4 inline-flex items-center gap-2 text-[10.5px] font-semibold uppercase tracking-[0.18em] text-fog">
+        <Activity size={11} className="text-violet-300" />
+        Analytics
+      </div>
+
+      {/* Key metrics row — replaces the old header chip cluster. */}
+      <div className="flex flex-wrap items-center gap-2">
+        {showBalance && (
+          <Metric
+            label={isClustered ? "Clustered" : "Balanced"}
+            value={(distScore * 100).toFixed(0)}
+            tone={isClustered ? "amber" : "emerald"}
+          />
+        )}
+        {total > 0 && (
+          <Metric label="Density" value={`${densityPerMin.toFixed(1)}/min`} tone="fog" />
+        )}
+        {emptyQuartiles > 0 && (
+          <Metric label="Quiet" value={`${emptyQuartiles}/4`} tone="amber" />
+        )}
+        <Metric label="Moments" value={String(moments.length)} tone="fog" />
+      </div>
+
+      {/* Distribution histogram. */}
+      {moments.length > 0 && total > 0 && (
+        <div className="mt-5">
+          <div className="mb-1.5 text-[10.5px] font-medium uppercase tracking-[0.14em] text-fog/85">
+            Distribution
           </div>
+          <DensityBar moments={moments} duration={total} />
         </div>
       )}
 
-      {/* ── Provenance + effect legend ──────────────────────────────── */}
-      <div className="flex flex-wrap items-center gap-x-5 gap-y-2.5 border-t border-white/[0.06] bg-white/[0.015] px-6 py-3.5 text-[11px] text-fog">
-        <span className="text-[10px] font-semibold uppercase tracking-[0.2em] text-fog/70">
+      {/* Sources + Effects legend. */}
+      <div className="mt-5 flex flex-wrap items-center gap-x-5 gap-y-2.5 text-[11px] text-fog">
+        <span className="text-[10px] font-semibold uppercase tracking-[0.18em] text-fog/85">
           Sources
         </span>
         {(["event", "cv", "ai", "ai-override", "user"] as const).map((k) => {
@@ -589,11 +808,17 @@ export function RealTimeline() {
             >
               <p.Icon size={11} className="text-white/80" />
               <span className="text-white/85">{p.label}</span>
+              {provenanceCounts[k as keyof typeof provenanceCounts] !==
+                undefined && (
+                <span className="font-mono text-[10px] tabular-nums text-fog/70">
+                  {provenanceCounts[k as keyof typeof provenanceCounts] ?? 0}
+                </span>
+              )}
             </span>
           );
         })}
         <span aria-hidden className="hidden h-4 w-px bg-white/10 md:inline-block" />
-        <span className="text-[10px] font-semibold uppercase tracking-[0.2em] text-fog/70">
+        <span className="text-[10px] font-semibold uppercase tracking-[0.18em] text-fog/85">
           Effects
         </span>
         {(Object.keys(EFFECT_TONES) as Array<keyof typeof EFFECT_TONES>).map(
@@ -614,7 +839,84 @@ export function RealTimeline() {
           Keyframed
         </span>
       </div>
+
+      {/* Advanced toggles — separate lanes + CV debug. */}
+      <div className="mt-5 flex flex-wrap items-center gap-2">
+        <ToggleChip
+          active={separateLanes}
+          onClick={onToggleSeparateLanes}
+          Icon={Layers}
+          label="Split AI / user lanes"
+        />
+        {showCvDebugToggle && (
+          <ToggleChip
+            active={cvDebug}
+            onClick={onToggleCvDebug}
+            Icon={Bug}
+            label="CV debug signals"
+          />
+        )}
+      </div>
     </div>
+  );
+}
+
+function Metric({
+  label,
+  value,
+  tone,
+}: {
+  label: string;
+  value: string;
+  tone: "emerald" | "amber" | "fog";
+}) {
+  const tint =
+    tone === "emerald"
+      ? "border-emerald-400/30 bg-emerald-400/[0.08] text-emerald-100"
+      : tone === "amber"
+        ? "border-amber-300/35 bg-amber-400/[0.08] text-amber-100"
+        : "border-white/10 bg-white/[0.025] text-white/85";
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center gap-2 rounded-lg border px-2.5 py-1.5 text-[11.5px] font-medium",
+        tint
+      )}
+    >
+      <span className="text-[10px] uppercase tracking-[0.14em] opacity-80">
+        {label}
+      </span>
+      <span className="font-mono tabular-nums">{value}</span>
+    </span>
+  );
+}
+
+function ToggleChip({
+  active,
+  onClick,
+  Icon,
+  label,
+}: {
+  active: boolean;
+  onClick: () => void;
+  Icon: React.ComponentType<{ size?: number; className?: string }>;
+  label: string;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={active}
+      className={cn(
+        "inline-flex h-8 items-center gap-1.5 rounded-lg border px-2.5 text-[11.5px] font-medium transition-colors duration-150",
+        active
+          ? "border-violet-400/40 bg-violet-500/12 text-violet-100"
+          : "border-white/10 bg-white/[0.025] text-fog hover:border-white/25 hover:text-white"
+      )}
+    >
+      <Icon size={12} />
+      {label}
+    </button>
   );
 }
 

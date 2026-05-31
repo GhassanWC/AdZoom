@@ -464,6 +464,58 @@ export interface Analysis {
    * `rejected: true` so rebalance can re-introduce them under denser presets.
    */
   rejectedPool?: DetectedMoment[];
+  /**
+   * Stage-by-stage diagnostics for the click → zoom pipeline. Populated
+   * by the analyze route on every run so the editor's Analysis Debug
+   * panel can show exactly where a user's clicks were lost between
+   * `interactions.json` and the final timeline.
+   *
+   * Layout: capture → load → momentsFromEvents → balancer (overlap +
+   * greedy) → final. Each stage records its in/out counts so a missing
+   * click is locatable to a specific stage.
+   */
+  clickPipeline?: ClickPipelineDiagnostics;
+}
+
+export interface ClickPipelineDiagnostics {
+  /** Storage path the route attempted to load (`users/<uid>/projects/<id>/interactions.json`). */
+  interactionsPath?: string;
+  /** Did the route try to load? False if the project has no `interactionsPath` or scope is external. */
+  attemptedLoad: boolean;
+  /** Did the JSON parse + decode succeed? */
+  interactionsLoaded: boolean;
+  /** Recording capture scope ("tab" enables real click targets; "external" forces heuristic). */
+  scope?: "tab" | "external";
+  /** Why the load was skipped or failed (e.g. "scope=external", "no interactionsPath", "404"). */
+  loadReason?: string;
+  /** Total interaction events parsed (clicks + hovers + idles + …). */
+  totalInteractions: number;
+  /** click + dblclick + rightclick events. */
+  totalClicks: number;
+  /** Moments emitted by `momentsFromEvents` (covers clicks, typing, scroll-pauses, …). */
+  eventMomentsEmitted: number;
+  /** Subset of `eventMomentsEmitted` derived from click / dblclick / rightclick. */
+  clickMomentsEmitted: number;
+  /** Per-tier histogram of how click-classifier sized each click moment. */
+  clickMomentsByTier: {
+    "primary-cta": number;
+    icon: number;
+    nav: number;
+    form: number;
+    background: number;
+  };
+  /** Balancer entrance count for events (after reject pass — events skip it, so == eventMomentsEmitted). */
+  eventCandidatesIn: number;
+  /** Events collapsed by `resolveOverlaps` (event-vs-event same-target). */
+  eventDroppedByOverlap: number;
+  /** Events dropped by greedy `EVENT_MIN_SPACING` (0.8s). */
+  eventDroppedTooClose: number;
+  /** Events dropped by zoomCooldown (should be 0 — regression alarm). */
+  eventDroppedTooManyZooms: number;
+  /** Events dropped by quartile cap or target-count cap. */
+  eventDroppedTooDense: number;
+  /** Event moments present in the final timeline. */
+  eventKept: number;
 }
 
 export type Pacing = "slow" | "moderate" | "fast";
@@ -481,6 +533,14 @@ export interface EffectsSettings {
   verticalExport: boolean;
   clickHighlights: boolean;
   motionTracking: boolean;
+  /**
+   * Cinematic vignette — a soft radial darkening at the frame edges,
+   * baked into the exported video when enabled. Preview honors this too
+   * so what you see is what you get. Optional + defaults to `false`
+   * (no migration needed for older docs — they decode as undefined and
+   * the consumer treats that as off).
+   */
+  vignette?: boolean;
   // ── preset-driven ──
   pacing: Pacing;
   targetPlatform: TargetPlatform;
@@ -543,6 +603,25 @@ export interface Preset {
   basedOn?: string;
   createdAt?: number;
   updatedAt?: number;
+  /**
+   * Minimum plan tier required to apply this preset. Absent = available on
+   * all tiers (including free). Custom presets never carry a `requiredPlan`
+   * — they're authored by the user and tied to their own tier.
+   */
+  requiredPlan?: "free" | "creator" | "pro";
+}
+
+/**
+ * Per-user, per-month export usage counter. Stored at
+ * `users/{uid}/usage/{YYYY-MM}`. Written only by the server via
+ * `incrementExportUsage()` in src/lib/usage/usage.ts; the client can read
+ * its own to render "X of Y exports this month".
+ */
+export interface MonthlyUsage {
+  exportCount: number;
+  /** Epoch ms of the most recent export permit. */
+  lastExportAt?: number;
+  updatedAt: number;
 }
 
 export interface ProjectDoc {
@@ -601,6 +680,100 @@ export interface UserDoc {
 }
 
 /**
+ * Per-user workspace settings — persisted at
+ * `users/{uid}/settings/workspace`. Lives in its own doc (not on `UserDoc`)
+ * so the user can write freely without auth coupling, and so reads from
+ * the settings page don't fetch the full user record.
+ *
+ * Fields are all optional so older accounts decode as defaults instead
+ * of failing the type-check. The settings page resolves missing fields
+ * to `DEFAULT_WORKSPACE_SETTINGS` below.
+ */
+export interface WorkspaceSettings {
+  /** Default preset id applied to new projects. */
+  defaultPresetId?: string;
+  /** Default export container/aspect applied to new projects. */
+  defaultExportFormat?: ExportFormat;
+  /** Per-channel notification preferences. */
+  notifications?: NotificationPreferences;
+  updatedAt?: number;
+}
+
+export interface NotificationPreferences {
+  /** Push a bell entry when an export finishes or fails. */
+  renderComplete?: boolean;
+  /** Stats / shareable highlights digest. Reserved — no producer yet. */
+  weeklyDigest?: boolean;
+  /** Product changelog. Reserved — no producer yet. */
+  productNews?: boolean;
+}
+
+export const DEFAULT_WORKSPACE_SETTINGS: Required<
+  Omit<WorkspaceSettings, "updatedAt">
+> & { updatedAt?: number } = {
+  defaultPresetId: "preset-cinematic",
+  defaultExportFormat: "YouTube 16:9",
+  notifications: {
+    renderComplete: true,
+    weeklyDigest: false,
+    productNews: true,
+  },
+};
+
+/**
+ * Public API key metadata — persisted at
+ * `users/{uid}/apiKeys/{keyId}`. The plaintext key is shown to the user
+ * ONCE at creation time and never stored. We persist a SHA-256 hash and
+ * a short prefix so the dashboard can preview which key is which without
+ * being able to authenticate as the user.
+ *
+ * For server-side validation, a parallel `apiKeyIndex/{sha256(key)}` doc
+ * stores `{ uid, keyId }` so a bearer token can be resolved without a
+ * collection-group query.
+ */
+export interface ApiKeyDoc {
+  id: string;
+  /** Human-friendly label set by the user. */
+  name: string;
+  /**
+   * First 12 chars of the plaintext key. Includes the `ak_test_` / `ak_live_`
+   * prefix so the dashboard can show e.g. `ak_live_8f6c…` without exposing
+   * anything secret.
+   */
+  keyPrefix: string;
+  /** SHA-256 hex of the full plaintext key. Server-only check material. */
+  keyHash: string;
+  type: "test" | "live";
+  createdAt: number;
+  /**
+   * Last time the validation helper resolved this key. Updated
+   * fire-and-forget on each validate call; may lag by a few seconds.
+   */
+  lastUsedAt?: number;
+  /**
+   * Soft-delete flag. When true, the validation helper rejects the
+   * key and the parallel index doc is removed. Kept on the user's
+   * record so the dashboard can still show "revoked on …" if desired.
+   */
+  revoked?: boolean;
+  revokedAt?: number;
+}
+
+/**
+ * Global index doc at `apiKeyIndex/{sha256(plaintext)}`. Read by the
+ * server-side `validateApiKey` helper to resolve a bearer token to a
+ * `{ uid, keyId }` pair without scanning every user's subcollection.
+ * Created at key issuance, deleted at revocation. Client never reads
+ * or writes — Firestore rules MUST restrict it to server (admin SDK).
+ */
+export interface ApiKeyIndexDoc {
+  uid: string;
+  keyId: string;
+  type: "test" | "live";
+  createdAt: number;
+}
+
+/**
  * Lifecycle status of a Lemon Squeezy subscription, normalised to our
  * internal vocabulary. Maps to LS `status` strings with a small switch in
  * `src/lib/lemonsqueezy/webhook.ts`.
@@ -636,11 +809,32 @@ export interface Subscription {
   customerPortalUrl?: string;
   /** LS-hosted payment update URL. */
   updateUrl?: string;
+  /**
+   * Epoch ms of the most recent successful payment, written by
+   * `subscription_payment_success`. Independent from `status`/`plan` so a
+   * payment receipt event can never clobber the authoritative subscription
+   * state (which only the subscription_* state events drive).
+   */
+  lastPaymentAt?: number;
   createdAt: number;
   updatedAt: number;
 }
 
-export type ExportStatus = "queued" | "exporting" | "ready" | "failed";
+/**
+ * Export lifecycle:
+ *   permitted → exporting → ready  (happy path)
+ *   permitted → failed              (render error after permit issued)
+ *
+ * `permitted` is set by /api/billing/export-permit BEFORE the client
+ * renders. Resolution / format / fps / applyWatermark are immutable from
+ * that moment onward — the Firestore rules forbid touching them.
+ */
+export type ExportStatus =
+  | "queued"
+  | "permitted"
+  | "exporting"
+  | "ready"
+  | "failed";
 
 export interface ExportDoc {
   id: string;
@@ -656,4 +850,18 @@ export interface ExportDoc {
   errorMessage?: string;
   createdAt: number;
   completedAt?: number;
+  /**
+   * Whether the client must render this export with a free-tier watermark.
+   * Set by the permit endpoint based on the user's plan at issue time —
+   * locked in until completion so a mid-render upgrade can't strip it.
+   */
+  applyWatermark?: boolean;
+  /**
+   * Exact Storage path the client must upload to. Returned by the permit
+   * endpoint so the client doesn't construct it. Storage rules separately
+   * enforce that the upload lands under the user's prefix.
+   */
+  expectedStoragePath?: string;
+  /** Month bucket ("YYYY-MM") this export counted against. */
+  monthlyBucket?: string;
 }

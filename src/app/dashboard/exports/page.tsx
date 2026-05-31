@@ -3,10 +3,9 @@
 import * as React from "react";
 import Link from "next/link";
 import { Download, ExternalLink, Loader2 } from "lucide-react";
-import { collection, onSnapshot, orderBy, query } from "firebase/firestore";
 import { PageHeader } from "@/components/dashboard/PageHeader";
 import { useAuth } from "@/lib/firebase/AuthProvider";
-import { getFirebase } from "@/lib/firebase/client";
+import { subscribeExports } from "@/lib/firebase/exports";
 import type { ExportDoc } from "@/lib/firebase/schema";
 import { cn } from "@/lib/cn";
 
@@ -41,32 +40,7 @@ export default function ExportsPage() {
 
   React.useEffect(() => {
     if (!user) return;
-    const { db } = getFirebase();
-    const q = query(
-      collection(db, "users", user.uid, "exports"),
-      orderBy("createdAt", "desc")
-    );
-    const unsub = onSnapshot(q, (snap) => {
-      const next: ExportDoc[] = snap.docs.map((d) => {
-        const data = d.data() as Record<string, unknown>;
-        const createdAt = data.createdAt as { toMillis?: () => number } | undefined;
-        const completedAt = data.completedAt as { toMillis?: () => number } | undefined;
-        return {
-          id: d.id,
-          projectId: (data.projectId as string) ?? "",
-          projectTitle: (data.projectTitle as string) ?? "Untitled",
-          format: (data.format as ExportDoc["format"]) ?? "1080p",
-          resolution: (data.resolution as ExportDoc["resolution"]) ?? "1080p",
-          fps: (data.fps as ExportDoc["fps"]) ?? 30,
-          exportUrl: data.exportUrl as string | undefined,
-          storagePath: data.storagePath as string | undefined,
-          fileSize: data.fileSize as number | undefined,
-          status: (data.status as ExportDoc["status"]) ?? "queued",
-          errorMessage: data.errorMessage as string | undefined,
-          createdAt: createdAt?.toMillis?.() ?? Date.now(),
-          completedAt: completedAt?.toMillis?.(),
-        };
-      });
+    const unsub = subscribeExports(user.uid, (next) => {
       setRows(next);
       setLoaded(true);
     });

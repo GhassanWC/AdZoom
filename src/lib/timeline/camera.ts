@@ -1,11 +1,26 @@
 /**
- * Shared camera model — the single source of truth for "where does the camera
- * sit for this moment at this instant".
+ * Shared camera model — the single source of truth for "where does the
+ * camera sit for this moment at this instant".
  *
- * Used by BOTH the live preview (`RealVideoPlayer`) and the export renderer
- * (`export.ts`) so what you preview is what you export. This is the
- * "Editable Timeline Model → render" boundary: moments (with optional
- * keyframes) go in, a concrete camera state comes out.
+ * Used by BOTH the live preview (`RealVideoPlayer`) and the export
+ * renderer (`export.ts`). The bug fixed here: preview and export both
+ * called `cameraForMoment(...)` and got the same target camera state, but
+ *
+ *   1. The preview's rAF loop layered exponential smoothing on top, so
+ *      the camera RAMPED into the target at moment start (cinematic).
+ *   2. The export jumped straight to the target target on the first frame
+ *      of the moment and back to identity on the first frame after — a
+ *      hard cut, "barely zoomed" feel.
+ *
+ * The fix is a moment-edge envelope baked into `cameraForMoment`: for
+ * moments without explicit keyframes, scale + pan ramp from identity to
+ * target over the first fraction of the moment and back to identity over
+ * the last fraction. Preview and export now share that envelope, so the
+ * exported video matches the in-editor preview.
+ *
+ * Keyframed moments DON'T get the envelope — the user/AI has expressly
+ * directed the camera path and any auto-easing would suppress their
+ * intent. The keyframe interpolation handles its own ease in/out.
  */
 
 import type {
@@ -17,19 +32,43 @@ import type {
 export interface CameraState {
   /** Final zoom scale applied to the frame (≥ 1). */
   scale: number;
-  /** Horizontal pan, percent of frame width. Preview: translateX%. Export: ×canvasW/100. */
+  /** Horizontal pan, percent of frame width. Preview: translateX%. */
   panXPct: number;
   /** Vertical pan, percent of frame height. */
   panYPct: number;
+  /**
+   * Focal centre in source-normalised coords (0..1). Canonical pan
+   * representation — `panXPct = 100 * (0.5 - cx)`. Surfaced so consumers
+   * (canvas exporter, debug overlay) that need to project into pixel
+   * space don't have to invert the percentage.
+   */
+  cx: number;
+  cy: number;
 }
 
-export const IDENTITY_CAMERA: CameraState = { scale: 1, panXPct: 0, panYPct: 0 };
+export const IDENTITY_CAMERA: CameraState = {
+  scale: 1,
+  panXPct: 0,
+  panYPct: 0,
+  cx: 0.5,
+  cy: 0.5,
+};
 
 const MAX_SCALE = 2.4;
+
+/** Edge-envelope: ramps scale + pan from identity → target → identity. */
+const EDGE_FRACTION = 0.18; // 18% of the moment on each edge
+const EDGE_MIN_S = 0.12; // never shorter than this (so flash-short moments still ease)
+const EDGE_MAX_S = 0.4; // never longer than this (so long moments don't waste runtime)
 
 function clamp01(v: number): number {
   if (!Number.isFinite(v)) return 0;
   return Math.max(0, Math.min(1, v));
+}
+
+function clampRange(v: number, lo: number, hi: number): number {
+  if (!Number.isFinite(v)) return lo;
+  return Math.max(lo, Math.min(hi, v));
 }
 
 /** Standard easing curves for keyframe interpolation. */
@@ -115,14 +154,43 @@ function clampCenterToFrame(
 }
 
 /**
+ * Moment edge envelope. Returns a 0..1 multiplier driving how much of the
+ * target camera (scale + pan) is active at this local progress:
+ *
+ *   - 0 → identity (no zoom, no pan) — at the very edges of the moment
+ *   - 1 → full target — in the middle hold region
+ *   - eased ramp between
+ *
+ * Ease-in-out cubic on each side. Edge width is `EDGE_FRACTION` of the
+ * moment duration, clamped to [`EDGE_MIN_S`, `EDGE_MAX_S`] so flash-short
+ * moments still ease and long moments don't waste half their runtime
+ * ramping. Symmetric in / out.
+ *
+ * For moments shorter than `2*EDGE_MIN_S`, the in and out ramps would
+ * overlap; we shorten them proportionally so the curve still peaks at 1
+ * in the middle.
+ */
+function edgeEnvelope(localProg: number, durSec: number): number {
+  if (durSec <= 0) return 1;
+  let edgeSec = clampRange(durSec * EDGE_FRACTION, EDGE_MIN_S, EDGE_MAX_S);
+  if (edgeSec * 2 > durSec) edgeSec = durSec / 2;
+  const edge = edgeSec / durSec; // 0..0.5
+  if (edge <= 0) return 1;
+  if (localProg < edge) return applyEase("ease-in-out", localProg / edge);
+  if (localProg > 1 - edge)
+    return applyEase("ease-in-out", (1 - localProg) / edge);
+  return 1;
+}
+
+/**
  * The camera state for a moment at a given local progress (0..1).
  *
- * - With keyframes: interpolate centre + intensity through them.
- * - Without: hold the static `focusRegion` at the blended intensity.
+ * Static moment (no keyframes): the focusRegion centre is the target, and
+ * an envelope ramps the camera in at the start and out at the end so the
+ * exporter doesn't hard-cut into/out of the zoom.
  *
- * In both paths the focus centre is clamped so the zoomed window can't drift
- * off the source frame — preview and export rely on this invariant to avoid
- * black edges when a moment targets the corners.
+ * Keyframed moment: interpolate centre + intensity through the keyframes.
+ * No envelope — the user's keyframes own the motion, including any edges.
  */
 export function cameraForMoment(
   m: DetectedMoment,
@@ -145,21 +213,36 @@ export function cameraForMoment(
       scale,
       panXPct: (0.5 - cx) * 100,
       panYPct: (0.5 - cy) * 100,
+      cx,
+      cy,
     };
   }
 
   const cxRaw = m.focusRegion.x + m.focusRegion.width / 2;
   const cyRaw = m.focusRegion.y + m.focusRegion.height / 2;
-  const scale = scaleFromFocus(
+  const targetScale = scaleFromFocus(
     m.focusRegion.width,
     m.focusRegion.height,
     blendedIntensity
   );
-  const { cx, cy } = clampCenterToFrame(cxRaw, cyRaw, scale);
+  const { cx, cy } = clampCenterToFrame(cxRaw, cyRaw, targetScale);
+
+  // Apply the edge envelope to scale + pan so preview and export both
+  // ramp in/out the same way. The clamp uses the FULL target scale so the
+  // visible window never leaks off the source frame mid-ramp.
+  const env = edgeEnvelope(
+    clamp01(localProgressValue),
+    Math.max(0, m.endTime - m.startTime)
+  );
+  const scale = 1 + (targetScale - 1) * env;
+  const targetPanXPct = (0.5 - cx) * 100;
+  const targetPanYPct = (0.5 - cy) * 100;
   return {
     scale,
-    panXPct: (0.5 - cx) * 100,
-    panYPct: (0.5 - cy) * 100,
+    panXPct: targetPanXPct * env,
+    panYPct: targetPanYPct * env,
+    cx: 0.5 + (cx - 0.5) * env,
+    cy: 0.5 + (cy - 0.5) * env,
   };
 }
 
@@ -176,4 +259,150 @@ export function seedKeyframes(m: DetectedMoment): MomentKeyframe[] {
     { t: 0, x: cx, y: cy, scale: Math.max(0.2, intensity * 0.7), ease: "ease-out" },
     { t: 1, x: cx, y: cy, scale: Math.min(1, intensity), ease: "ease-in-out" },
   ];
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// SHARED RESOLVER — single source of truth for preview + export.
+//
+// Use these in NEW callers instead of `cameraForMoment` directly. The
+// resolver does:
+//   1. Pick the moment containing `t` from a list (deterministic).
+//   2. Apply the same `perMoment * 0.6 + autoZoom * 0.4` blending the
+//      preview and export both used inline (now in one place — the
+//      fallback chain previously diverged: preview included
+//      `?? m.importance`, export did not, leaking 10–20% scale on
+//      legacy moments).
+//   3. Call `cameraForMoment` to get the CameraState.
+//
+// Consumers convert the CameraState into either CSS `%` translates
+// (preview) or canvas pixel translates (export) via the small adapter
+// helpers below. The math lives in ONE place; the adapters are pure
+// projections that can't drift from each other.
+// ─────────────────────────────────────────────────────────────────────────
+
+export interface ResolverOpts {
+  /**
+   * Project-level intensity floor (0..100). Mixed with the moment's own
+   * intensity to give the final blended value. From `effectsSettings.autoZoom`.
+   */
+  autoZoom: number;
+}
+
+/**
+ * Single source of truth for "what camera is active at time `t`?". Used by
+ * both preview and export. Returns `IDENTITY_CAMERA` when no moment overlaps.
+ */
+export function resolveCameraFrame(
+  moments: DetectedMoment[] | null | undefined,
+  t: number,
+  opts: ResolverOpts
+): { camera: CameraState; moment: DetectedMoment | null } {
+  if (!moments || moments.length === 0) {
+    return { camera: IDENTITY_CAMERA, moment: null };
+  }
+  const m = pickActiveMoment(moments, t);
+  if (!m) return { camera: IDENTITY_CAMERA, moment: null };
+  const blended = blendIntensity(m, opts.autoZoom);
+  const camera = cameraForMoment(m, blended, localProgress(m, t));
+  return { camera, moment: m };
+}
+
+/**
+ * Deterministic moment selection for a given playhead time. When moments
+ * overlap (rare but legal), prefer the one with the LATEST startTime —
+ * matches the editor's "last-authored wins" intuition. The export and
+ * preview both call this, so they always agree on which moment is active.
+ */
+function pickActiveMoment(
+  moments: DetectedMoment[],
+  t: number
+): DetectedMoment | null {
+  let pick: DetectedMoment | null = null;
+  for (const m of moments) {
+    if (t < m.startTime || t > m.endTime) continue;
+    if (!pick || m.startTime > pick.startTime) pick = m;
+  }
+  return pick;
+}
+
+/**
+ * Blend the moment's per-moment intensity with the project's autoZoom
+ * floor. Single, canonical formula — preview and export previously
+ * inlined this with slightly different fallback chains (export was
+ * missing `?? m.importance`, leaking zoom on legacy moments).
+ */
+export function blendIntensity(
+  m: DetectedMoment,
+  autoZoomPct: number
+): number {
+  const perMoment =
+    m.intensity ??
+    m.recommendedIntensity ??
+    m.attentionScore ??
+    m.importance ??
+    0.5;
+  return perMoment * 0.6 + clamp01(autoZoomPct / 100) * 0.4;
+}
+
+/**
+ * Convert a CameraState into the canvas pixel translates required by the
+ * export's `ctx.translate(canvasW/2,...); ctx.scale(s,s); ctx.translate(tx,ty)`
+ * chain. The previous export used `(panXPct/100) * canvasW`, which is only
+ * correct when the source aspect matches the canvas aspect — for vertical
+ * exports of a 16:9 recording, drawW differs from canvasW by a factor of
+ * ~3.16 and the focal point ended up off-canvas. Using `drawW`/`drawH`
+ * (the post-cover dimensions) places the focal point at the canvas centre
+ * regardless of source/canvas aspect mismatch.
+ */
+export function canvasTranslateFor(
+  camera: CameraState,
+  drawW: number,
+  drawH: number
+): { tx: number; ty: number } {
+  return {
+    tx: (0.5 - camera.cx) * drawW,
+    ty: (0.5 - camera.cy) * drawH,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// DEBUG / DIAGNOSTIC HELPERS
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * Capture both the preview-style and export-style camera values for a
+ * single timestamp. Used by the dev-only "Camera diagnostics" toggle in
+ * the editor — log this for a few timestamps and the two columns must be
+ * identical. If they're not, the bug is real and reproducible from one
+ * moment's data alone.
+ */
+export interface CameraSnapshot {
+  t: number;
+  momentId: string | null;
+  scale: number;
+  cx: number;
+  cy: number;
+  panXPct: number;
+  panYPct: number;
+  /** Pixel translate that WOULD be used by export at the given draw size. */
+  canvasTranslate: { tx: number; ty: number };
+}
+
+export function cameraDiagnostic(
+  moments: DetectedMoment[] | null | undefined,
+  t: number,
+  opts: ResolverOpts & { drawW: number; drawH: number }
+): CameraSnapshot {
+  const { camera, moment } = resolveCameraFrame(moments, t, opts);
+  const px = canvasTranslateFor(camera, opts.drawW, opts.drawH);
+  return {
+    t,
+    momentId: moment?.id ?? null,
+    scale: camera.scale,
+    cx: camera.cx,
+    cy: camera.cy,
+    panXPct: camera.panXPct,
+    panYPct: camera.panYPct,
+    canvasTranslate: px,
+  };
 }

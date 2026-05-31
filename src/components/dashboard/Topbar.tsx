@@ -2,10 +2,12 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { Bell, Menu, Search, LogOut, Video, Sun, Moon } from "lucide-react";
+import { Menu, LogOut, Video, Sun, Moon } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { useAuth } from "@/lib/firebase/AuthProvider";
 import { useTheme } from "@/lib/theme";
+import { NavbarSearch } from "./NavbarSearch";
+import { NavbarNotifications } from "./NavbarNotifications";
 
 interface TopbarProps {
   onOpenSidebar: () => void;
@@ -51,20 +53,7 @@ export function Topbar({ onOpenSidebar, className }: TopbarProps) {
         <Menu size={16} />
       </button>
 
-      <div className="relative max-w-md flex-1">
-        <Search
-          size={14}
-          className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-fog"
-        />
-        <input
-          type="text"
-          placeholder="Search projects, presets, exports…"
-          className="h-9 w-full rounded-lg border border-white/10 bg-white/[0.02] pl-9 pr-16 text-sm text-white placeholder:text-fog/70 outline-none transition-colors duration-200 focus:border-white/20 focus:bg-white/[0.04]"
-        />
-        <kbd className="pointer-events-none absolute right-2 top-1/2 hidden -translate-y-1/2 items-center gap-0.5 rounded border border-white/10 bg-white/[0.04] px-1.5 py-0.5 font-mono text-[10px] text-fog sm:inline-flex">
-          ⌘K
-        </kbd>
-      </div>
+      <NavbarSearch />
 
       <Link
         href="/dashboard/record"
@@ -89,13 +78,7 @@ export function Topbar({ onOpenSidebar, className }: TopbarProps) {
         {theme === "dark" ? <Sun size={15} /> : <Moon size={15} />}
       </button>
 
-      <button
-        aria-label="Notifications"
-        className="relative inline-flex size-9 items-center justify-center rounded-lg border border-white/10 bg-white/[0.02] text-fog transition-colors duration-200 hover:text-white"
-      >
-        <Bell size={15} />
-        <span className="absolute right-2 top-2 size-1.5 rounded-full bg-violet-400 shadow-[0_0_8px_rgba(139,92,246,0.6)]" />
-      </button>
+      <NavbarNotifications />
 
       <div ref={ref} className="relative">
         <button
