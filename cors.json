@@ -1,0 +1,11 @@
+[
+  {
+    "origin": [
+      "https://adzoom-prod--adzoom-prod.us-east4.hosted.app",
+      "http://localhost:3000"
+    ],
+    "method": ["GET", "HEAD", "OPTIONS"],
+    "responseHeader": ["Content-Type", "Range", "Accept-Ranges", "Content-Range"],
+    "maxAgeSeconds": 3600
+  }
+]
