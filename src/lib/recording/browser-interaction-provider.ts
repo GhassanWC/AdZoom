@@ -1,5 +1,5 @@
 /**
- * BrowserInteractionProvider — captures real input on the AdZoom tab itself.
+ * BrowserInteractionProvider — captures real input on the Framevo tab itself.
  *
  * Scope is strictly "tab": browsers cannot observe input on other windows or
  * the OS desktop. When the user picks an external surface in getDisplayMedia,
@@ -97,7 +97,7 @@ function clamp01(v: number): number {
  * Captured unconditionally here — the gate on "is this a tab-self
  * capture?" lives in `momentsFromEvents` (the consumer). For external
  * (window/monitor) captures the rect is meaningless (it would be
- * AdZoom's own DOM) and the consumer zeroes it.
+ * Framevo's own DOM) and the consumer zeroes it.
  */
 function targetRect(target: EventTarget | null): {
   x: number;

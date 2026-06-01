@@ -12,7 +12,7 @@ export function Testimonials() {
           <span className="text-gradient-violet">can feel.</span>
         </>
       }
-      subtitle="Creators, founders, and educators ship faster and more cinematic with AdZoom."
+      subtitle="Creators, founders, and educators ship faster and more cinematic with Framevo."
     >
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
         {testimonials.map((t, i) => (

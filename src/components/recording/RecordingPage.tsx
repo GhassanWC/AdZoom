@@ -91,7 +91,7 @@ function RecordingLive({
       </h2>
       <p className="mt-2 max-w-md text-sm text-fog">
         The HUD stays pinned at the bottom of every page — you can navigate
-        around AdZoom and the take will keep rolling until you stop it.
+        around Framevo and the take will keep rolling until you stop it.
       </p>
       <p className="mt-6 font-mono text-4xl font-semibold tabular-nums text-white">
         {fmt(elapsed)}

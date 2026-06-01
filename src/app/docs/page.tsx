@@ -14,8 +14,8 @@ import { Navbar } from "@/components/landing/Navbar";
 import { Footer } from "@/components/landing/Footer";
 
 export const metadata = {
-  title: "Docs — AdZoom",
-  description: "Documentation for recording, analysing, editing, and exporting with AdZoom.",
+  title: "Docs — Framevo",
+  description: "Documentation for recording, analysing, editing, and exporting with Framevo.",
 };
 
 const SECTIONS = [
@@ -47,7 +47,7 @@ const SECTIONS = [
     href: "/api-reference",
     Icon: Code,
     title: "API",
-    body: "REST endpoints for integrating AdZoom into your own workflow. Bearer-token auth with API keys.",
+    body: "REST endpoints for integrating Framevo into your own workflow. Bearer-token auth with API keys.",
   },
   {
     href: "#shortcuts",
@@ -82,7 +82,7 @@ export default function DocsPage() {
               Docs
             </span>
             <h1 className="mt-5 font-display text-4xl font-semibold leading-[1.05] tracking-tight text-white sm:text-5xl">
-              How AdZoom{" "}
+              How Framevo{" "}
               <span className="text-gradient-violet">actually works.</span>
             </h1>
             <p className="mt-6 max-w-2xl text-[16px] leading-relaxed text-fog">
@@ -122,7 +122,7 @@ export default function DocsPage() {
           {/* ── Recording section ─────────────────────────────── */}
           <Article id="recording" title="Recording">
             <p>
-              AdZoom records inside your browser using the standard{" "}
+              Framevo records inside your browser using the standard{" "}
               <code className="rounded bg-white/[0.05] px-1 font-mono text-[12.5px] text-violet-200">
                 getDisplayMedia
               </code>{" "}
@@ -130,7 +130,7 @@ export default function DocsPage() {
               whole screen — and the browser handles permission.
             </p>
             <p>
-              For tab captures, AdZoom additionally captures coarse
+              For tab captures, Framevo additionally captures coarse
               interaction events to a sidecar JSON file. Every click,
               scroll, hover, idle stretch, and typing burst is recorded,
               along with the bounding rectangle of the element you clicked
@@ -138,7 +138,7 @@ export default function DocsPage() {
             </p>
             <p>
               External (window or monitor) captures cannot see element
-              rectangles because the AdZoom tab and the captured surface
+              rectangles because the Framevo tab and the captured surface
               are different windows. The capture is still useful — the
               pipeline degrades to heuristic classification based on
               cursor signals and CV regions.

@@ -50,7 +50,7 @@ export function FakeRecording() {
           {/* code block */}
           <div className="rounded-lg border border-white/[0.06] bg-black/40 p-3 font-mono text-[10px] leading-relaxed">
             <div className="text-violet-300/80">
-              import <span className="text-white/80">{"{"} enhance {"}"}</span> from <span className="text-emerald-300/80">"adzoom"</span>;
+              import <span className="text-white/80">{"{"} enhance {"}"}</span> from <span className="text-emerald-300/80">"framevo"</span>;
             </div>
             <div className="mt-1 text-white/40">
               {/* */}

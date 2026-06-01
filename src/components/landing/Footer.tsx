@@ -45,7 +45,7 @@ export function Footer() {
 
         {/* Inline link row + copyright */}
         <div className="mt-10 flex flex-col-reverse items-start gap-5 border-t border-white/[0.06] pt-6 text-[12.5px] text-fog md:flex-row md:items-center md:justify-between">
-          <span>© {new Date().getFullYear()} AdZoom Labs, Inc.</span>
+          <span>© {new Date().getFullYear()} Framevo Labs, Inc.</span>
           <nav
             aria-label="Footer"
             className="flex flex-wrap items-center gap-x-5 gap-y-2"

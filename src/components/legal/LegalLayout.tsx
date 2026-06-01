@@ -9,7 +9,7 @@ import { Footer } from "@/components/landing/Footer";
  * three pages.
  *
  * The disclaimer is intentional: these pages are starter content, not
- * lawyer-reviewed. They name AdZoom's actual data flows (Firestore,
+ * lawyer-reviewed. They name Framevo's actual data flows (Firestore,
  * Gemini, Lemon Squeezy, browser recording) but the legal language
  * should be reviewed before going public.
  */
@@ -63,7 +63,7 @@ export function LegalLayout({
             <AlertTriangle size={14} className="mt-0.5 shrink-0 text-amber-300" />
             <p>
               <strong className="text-white">Starter language.</strong> This
-              page describes AdZoom&apos;s actual data flows but is not yet
+              page describes Framevo&apos;s actual data flows but is not yet
               lawyer-reviewed. Treat the wording as a template until a legal
               professional adapts it to your jurisdiction.
             </p>
@@ -75,10 +75,10 @@ export function LegalLayout({
             <p className="text-[13.5px] text-fog">
               Questions about this page?{" "}
               <a
-                href="mailto:hello@adzoom.app"
+                href="mailto:support@framevo.app"
                 className="text-violet-300 underline decoration-violet-300/40 underline-offset-4 transition-colors hover:text-violet-200"
               >
-                hello@adzoom.app
+                support@framevo.app
               </a>
             </p>
           </div>

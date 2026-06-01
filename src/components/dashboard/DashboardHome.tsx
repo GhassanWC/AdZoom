@@ -149,7 +149,7 @@ function EmptyState() {
         No projects yet
       </h3>
       <p className="mx-auto mt-2 max-w-md text-sm text-fog">
-        Upload your first screen recording and AdZoom's AI will plan a cinematic cut for you in seconds.
+        Upload your first screen recording and Framevo's AI will plan a cinematic cut for you in seconds.
       </p>
       <div className="mt-6">
         <Button href="/dashboard/upload" variant="primary" size="md" leftIcon={<Plus size={14} />}>

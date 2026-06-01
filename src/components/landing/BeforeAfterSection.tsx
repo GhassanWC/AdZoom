@@ -12,7 +12,7 @@ export function BeforeAfterSection() {
           <span className="text-gradient-violet">Two stories.</span>
         </>
       }
-      subtitle="The raw capture leaves the viewer to find what matters. AdZoom directs their attention — click by click, beat by beat — without changing what you said."
+      subtitle="The raw capture leaves the viewer to find what matters. Framevo directs their attention — click by click, beat by beat — without changing what you said."
     >
       <div className="mx-auto max-w-5xl">
         <BeforeAfter />

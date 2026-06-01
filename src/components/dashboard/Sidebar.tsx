@@ -55,7 +55,7 @@ export function Sidebar({
   const nav = (
     <nav className="flex h-full flex-col">
       <div className="flex h-16 items-center px-5">
-        <Link href="/" aria-label="AdZoom home">
+        <Link href="/" aria-label="Framevo home">
           <Logo />
         </Link>
       </div>

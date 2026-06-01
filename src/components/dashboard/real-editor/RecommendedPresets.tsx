@@ -77,7 +77,7 @@ export function RecommendedPresets() {
             One-click cinematic looks
           </h2>
           <p className="mt-1 text-[13px] text-fog">
-            Tuned to what AdZoom detected. Apply one as a starting point, then
+            Tuned to what Framevo detected. Apply one as a starting point, then
             refine on the timeline.
           </p>
         </div>

@@ -5,8 +5,8 @@ import { Footer } from "@/components/landing/Footer";
 import { Button } from "@/components/ui/Button";
 
 export const metadata = {
-  title: "Blog — AdZoom",
-  description: "Notes on building AdZoom, attention-aware editing, and shipped features.",
+  title: "Blog — Framevo",
+  description: "Notes on building Framevo, attention-aware editing, and shipped features.",
 };
 
 export default function BlogPage() {
@@ -60,7 +60,7 @@ export default function BlogPage() {
             </p>
             <div className="mt-7 flex flex-wrap items-center justify-center gap-3">
               <Button
-                href="mailto:hello@adzoom.app?subject=Subscribe%20me%20to%20the%20AdZoom%20blog"
+                href="mailto:support@framevo.app?subject=Subscribe%20me%20to%20the%20Framevo%20blog"
                 variant="primary"
                 size="md"
                 leftIcon={<Mail size={13} />}
@@ -85,7 +85,7 @@ export default function BlogPage() {
             <div className="mt-5 grid grid-cols-1 gap-4 sm:grid-cols-2">
               <Topic
                 title="Click tiers"
-                body="How AdZoom classifies a click as primary CTA, icon, nav, form, or background — and why that decides the camera move."
+                body="How Framevo classifies a click as primary CTA, icon, nav, form, or background — and why that decides the camera move."
               />
               <Topic
                 title="The balancer"

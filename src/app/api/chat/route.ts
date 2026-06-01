@@ -13,8 +13,9 @@
 
 import { NextResponse, type NextRequest } from "next/server";
 import { getGemini, ANALYSIS_MODEL } from "@/lib/gemini";
-import { ADZOOM_SYSTEM_PROMPT } from "@/lib/chat/system-prompt";
+import { FRAMEVO_SYSTEM_PROMPT } from "@/lib/chat/system-prompt";
 import { checkRateLimit, clientIp } from "@/lib/chat/rate-limit";
+import { BRAND_STRINGS } from "@/lib/branding";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -94,7 +95,7 @@ export async function POST(req: NextRequest) {
   // sees a clean JSON error rather than a half-empty SSE stream.
   if (!process.env.GEMINI_API_KEY) {
     return NextResponse.json(
-      { error: "AdZoom's assistant is offline right now — email hello@adzoom.app." },
+      { error: BRAND_STRINGS.brandAssistantOffline },
       { status: 503 }
     );
   }
@@ -124,7 +125,7 @@ export async function POST(req: NextRequest) {
           model: ANALYSIS_MODEL,
           contents,
           config: {
-            systemInstruction: ADZOOM_SYSTEM_PROMPT,
+            systemInstruction: FRAMEVO_SYSTEM_PROMPT,
             temperature: 0.4,
             maxOutputTokens: 400,
           },
@@ -137,7 +138,7 @@ export async function POST(req: NextRequest) {
       } catch (err) {
         console.error("[chat] gemini stream error", err);
         send(
-          "Sorry — AdZoom's assistant hit an error. Try again in a moment, or email hello@adzoom.app."
+          BRAND_STRINGS.brandAssistantError
         );
       } finally {
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));

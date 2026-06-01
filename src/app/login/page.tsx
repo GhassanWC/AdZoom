@@ -1,8 +1,9 @@
 import { Suspense } from "react";
 import { LoginCard } from "./LoginCard";
+import { PAGE_TITLE } from "@/lib/branding";
 
 export const metadata = {
-  title: "Sign in — AdZoom",
+  title: PAGE_TITLE.login,
 };
 
 export default function LoginPage() {

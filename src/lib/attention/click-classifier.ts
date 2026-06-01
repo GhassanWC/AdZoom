@@ -51,7 +51,7 @@ interface Inputs {
   visualAnalysis?: VisualAnalysis;
   /**
    * "tab" = in-tab capture, targetRect is meaningful. "external" =
-   * window/monitor capture, targetRect (if any) is AdZoom's own DOM
+   * window/monitor capture, targetRect (if any) is Framevo's own DOM
    * and MUST be ignored. Callers pass this so the classifier can
    * pick the right path.
    */

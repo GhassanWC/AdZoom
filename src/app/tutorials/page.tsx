@@ -11,7 +11,7 @@ import { Footer } from "@/components/landing/Footer";
 import { Button } from "@/components/ui/Button";
 
 export const metadata = {
-  title: "Tutorials — AdZoom",
+  title: "Tutorials — Framevo",
   description: "Step-by-step guides for getting cinematic results out of your recordings.",
 };
 
@@ -77,7 +77,7 @@ export default function TutorialsPage() {
               <span className="text-gradient-violet">doing.</span>
             </h1>
             <p className="mt-6 text-[16px] leading-relaxed text-fog">
-              Short, guided walkthroughs of the AdZoom workflow — from
+              Short, guided walkthroughs of the Framevo workflow — from
               your first recording to debugging an edit the AI got wrong.
               The first set of tutorials lands soon.
             </p>
@@ -105,7 +105,7 @@ export default function TutorialsPage() {
             </p>
             <div className="mt-7 flex flex-wrap items-center justify-center gap-3">
               <Button
-                href="mailto:hello@adzoom.app?subject=Notify%20me%20when%20AdZoom%20tutorials%20ship"
+                href="mailto:support@framevo.app?subject=Notify%20me%20when%20Framevo%20tutorials%20ship"
                 variant="primary"
                 size="md"
                 leftIcon={<Mail size={13} />}
@@ -130,10 +130,10 @@ export default function TutorialsPage() {
             <p className="mt-2 text-[13.5px] text-fog">
               The planned list, grouped by skill level. Tell us at{" "}
               <a
-                href="mailto:hello@adzoom.app"
+                href="mailto:support@framevo.app"
                 className="text-violet-300 underline decoration-violet-300/40 underline-offset-4 hover:text-violet-200"
               >
-                hello@adzoom.app
+                support@framevo.app
               </a>{" "}
               if you&apos;d like one written next.
             </p>

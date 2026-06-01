@@ -6,6 +6,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { ArrowLeft } from "lucide-react";
 import { useAuth } from "@/lib/firebase/AuthProvider";
 import { Logo } from "@/components/landing/Logo";
+import { BRAND_STRINGS } from "@/lib/branding";
 
 export function LoginCard() {
   const { user, loading, configured, signInWithGoogle } = useAuth();
@@ -49,7 +50,7 @@ export function LoginCard() {
         <div className="mb-7 text-center">
           <Logo className="mx-auto" />
           <h1 className="mt-5 font-display text-2xl font-semibold tracking-tight text-white">
-            Sign in to AdZoom
+            {BRAND_STRINGS.signInTo}
           </h1>
           <p className="mt-1.5 text-sm text-fog">
             One click to start enhancing recordings.

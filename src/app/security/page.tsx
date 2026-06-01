@@ -1,23 +1,23 @@
 import { LegalLayout, LegalSection } from "@/components/legal/LegalLayout";
 
 export const metadata = {
-  title: "Security — AdZoom",
+  title: "Security — Framevo",
   description:
-    "How AdZoom protects your account, your recordings, and your data.",
+    "How Framevo protects your account, your recordings, and your data.",
 };
 
 export default function SecurityPage() {
   return (
     <LegalLayout
       eyebrow="Security"
-      title="Security at AdZoom"
-      intro="This page covers the controls in place around your account, your data, and the infrastructure that runs AdZoom. If you spot something we haven't addressed, please report it."
+      title="Security at Framevo"
+      intro="This page covers the controls in place around your account, your data, and the infrastructure that runs Framevo. If you spot something we haven't addressed, please report it."
       lastUpdated="May 30, 2026"
     >
       <LegalSection n="01" title="Account security">
         <p>
           Authentication runs through Firebase Authentication. Passwords
-          are never stored by AdZoom; the auth provider handles hashing,
+          are never stored by Framevo; the auth provider handles hashing,
           rate-limiting, and session management. We support email +
           password, Google, and any other providers enabled on your
           workspace.
@@ -74,7 +74,7 @@ export default function SecurityPage() {
 
       <LegalSection n="03" title="Data in transit">
         <p>
-          All connections between your browser and AdZoom run over TLS.
+          All connections between your browser and Framevo run over TLS.
           Connections from our servers to Firebase, Google Gemini, and
           Lemon Squeezy run over their providers&apos; TLS endpoints.
         </p>
@@ -95,7 +95,7 @@ export default function SecurityPage() {
           permission, and only for the surface you select.
         </p>
         <p>
-          When you record a browser tab, AdZoom additionally captures
+          When you record a browser tab, Framevo additionally captures
           coarse interaction events (click positions, scroll, hover,
           idle stretches) and, where available, the bounding rectangle
           of the element you clicked. We do not capture the URL, the DOM,
@@ -105,7 +105,7 @@ export default function SecurityPage() {
         <p>
           For external (window or monitor) captures, the bounding-rect
           field is stripped before upload because it would otherwise
-          refer to AdZoom&apos;s own UI rather than the captured surface.
+          refer to Framevo&apos;s own UI rather than the captured surface.
         </p>
       </LegalSection>
 
@@ -125,7 +125,7 @@ export default function SecurityPage() {
       <LegalSection n="06" title="Payments">
         <p>
           Payment details — card numbers, billing addresses, tax data —
-          are handled entirely by Lemon Squeezy. AdZoom only receives
+          are handled entirely by Lemon Squeezy. Framevo only receives
           plan state, subscription identifiers, and webhook events. We
           never see or store card data.
         </p>
@@ -156,10 +156,10 @@ export default function SecurityPage() {
         <p>
           If you find a vulnerability, please email{" "}
           <a
-            href="mailto:hello@adzoom.app"
+            href="mailto:support@framevo.app"
             className="text-violet-300 underline decoration-violet-300/40 underline-offset-4 hover:text-violet-200"
           >
-            hello@adzoom.app
+            support@framevo.app
           </a>{" "}
           with reproduction steps. We will acknowledge within three
           business days and work with you on a remediation timeline.
@@ -174,17 +174,17 @@ export default function SecurityPage() {
 
       <LegalSection n="09" title="What we don't yet have">
         <p>
-          We&apos;re honest about the gaps. AdZoom does not yet offer
+          We&apos;re honest about the gaps. Framevo does not yet offer
           SOC 2, ISO 27001, HIPAA, or any other formal compliance
           certification. If you need any of these for your use case, talk
           to us at{" "}
           <a
-            href="mailto:hello@adzoom.app"
+            href="mailto:support@framevo.app"
             className="text-violet-300 underline decoration-violet-300/40 underline-offset-4 hover:text-violet-200"
           >
-            hello@adzoom.app
+            support@framevo.app
           </a>{" "}
-          before bringing AdZoom into a regulated workflow.
+          before bringing Framevo into a regulated workflow.
         </p>
       </LegalSection>
     </LegalLayout>

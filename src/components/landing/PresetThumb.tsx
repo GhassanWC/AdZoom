@@ -66,7 +66,7 @@ export function PresetThumb({ vibe }: { vibe: PresetVibe }) {
               POV: you ship
             </span>
             <span className="absolute bottom-3 left-1/2 -translate-x-1/2 text-[8px] font-medium text-white/80">
-              @adzoom
+              @framevo
             </span>
             <div className="absolute right-1.5 bottom-3 flex flex-col items-center gap-1.5">
               <span className="size-3 rounded-full bg-white/20" />

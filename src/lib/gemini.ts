@@ -64,7 +64,7 @@ export const ANALYSIS_SCHEMA = {
           focusRegion: {
             type: Type.OBJECT,
             description:
-              "Normalized rectangle (0..1) inside the video frame that AdZoom should zoom toward.",
+              "Normalized rectangle (0..1) inside the video frame that Framevo should zoom toward.",
             required: ["x", "y", "width", "height"],
             properties: {
               x: { type: Type.NUMBER },
@@ -231,13 +231,13 @@ const VALID_PRESET_IDS = new Set(BUILTIN_PRESETS.map((p) => p.id));
 /** Build the user-side prompt with explicit quartile bounds, when known. */
 function buildUserPrompt(hintedDuration?: number): string {
   if (!hintedDuration || hintedDuration <= 0) {
-    return "Analyze this screen recording for AdZoom. Return the structured plan, distributing moments across the FULL video duration with at least one moment per quartile.";
+    return "Analyze this screen recording for Framevo. Return the structured plan, distributing moments across the FULL video duration with at least one moment per quartile.";
   }
   const d = hintedDuration;
   const q = d / 4;
   const fmt = (s: number) => `${s.toFixed(1)}s`;
   return [
-    `Analyze this screen recording for AdZoom. The video is ${d.toFixed(1)} seconds long.`,
+    `Analyze this screen recording for Framevo. The video is ${d.toFixed(1)} seconds long.`,
     `Distribute moments across the FULL timeline. Specifically:`,
     `- Q1 (${fmt(0)}–${fmt(q)}): include at least 1 moment if the quartile has any visible action.`,
     `- Q2 (${fmt(q)}–${fmt(q * 2)}): include at least 1 moment.`,
@@ -247,7 +247,7 @@ function buildUserPrompt(hintedDuration?: number): string {
   ].join(" ");
 }
 
-const SYSTEM_INSTRUCTION = `You are AdZoom's senior video editor. You are not labeling moments — you are directing how a viewer's attention should flow through this recording. Think editorially, not mechanically.
+const SYSTEM_INSTRUCTION = `You are Framevo's senior video editor. You are not labeling moments — you are directing how a viewer's attention should flow through this recording. Think editorially, not mechanically.
 
 WHAT YOU ARE DECIDING
 1. videoType — classify the overall recording (coding-tutorial, saas-demo, talking-tutorial, presentation, vertical-short, onboarding-flow, or mixed).

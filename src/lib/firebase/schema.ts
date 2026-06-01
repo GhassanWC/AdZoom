@@ -316,7 +316,7 @@ export interface NarrativeSegment {
   label: string;
 }
 
-// NOTE (V1): caption generation was removed to refocus AdZoom on attention /
+// NOTE (V1): caption generation was removed to refocus Framevo on attention /
 // zoom direction. If/when captions return as an optional plugin they should
 // live in their own subcollection (e.g. `projects/{id}/captions/{id}`) rather
 // than being inlined into `Analysis`, so the core pipeline stays minimal.
@@ -649,7 +649,7 @@ export interface ProjectDoc {
   selectedPresetId?: string;
   exportUrl?: string;
   /**
-   * "tab" when the recording surface was the AdZoom tab itself (events are
+   * "tab" when the recording surface was the Framevo tab itself (events are
    * authoritative). "external" for any other surface (browser-captured events
    * are noise — pipeline relies on CV only). Absent on uploads, treated as
    * "external" by the analyzer.

@@ -7,7 +7,7 @@ import { Container } from "@/components/ui/Container";
  * vertical-stripe backdrop, large mixed serif/italic headline,
  * subhead, and a single chunky primary button.
  *
- * Honest copy note: no "Join thousands of builders" — AdZoom has no
+ * Honest copy note: no "Join thousands of builders" — Framevo has no
  * user-count to claim. The subhead leads with the value proposition
  * instead.
  */
@@ -50,7 +50,7 @@ export function FinalCTA() {
           </h2>
 
           <p className="mx-auto mt-7 max-w-xl text-[15.5px] leading-relaxed text-[rgba(255,255,255,0.78)] sm:text-[16.5px]">
-            Record in your browser. AdZoom reads every click, builds
+            Record in your browser. Framevo reads every click, builds
             the timeline, and hands you a first-draft cut you can ship.
           </p>
 

@@ -40,7 +40,7 @@ export interface RecordingResult {
   height: number;
   /**
    * Real user interactions captured during recording. Always tab-scoped in v1
-   * (browser can't see input outside the AdZoom tab). Empty when the user
+   * (browser can't see input outside the Framevo tab). Empty when the user
    * recorded an external surface — see `interactionScope`.
    */
   interactions: Interaction[];
@@ -102,7 +102,7 @@ export type Interaction =
        * Element bounding rect at click time, normalised to the captured
        * display surface (0..1 each). Present only for tab-self captures
        * where `event.target` is meaningful; undefined for external
-       * (window/monitor) captures because the AdZoom tab and the
+       * (window/monitor) captures because the Framevo tab and the
        * captured surface are different windows. Drives click-tier
        * classification in `src/lib/attention/click-classifier.ts`.
        */

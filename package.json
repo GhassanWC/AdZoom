@@ -14,6 +14,8 @@
     "deploy:rules:prod": "node scripts/deploy-rules.mjs --project=prod",
     "deploy:indexes:dev": "firebase deploy --only firestore:indexes --project=dev",
     "deploy:indexes:prod": "firebase deploy --only firestore:indexes --project=prod",
+    "deploy:cors:dev": "node scripts/deploy-cors.mjs --project=dev",
+    "deploy:cors:prod": "node scripts/deploy-cors.mjs --project=prod",
     "deploy:dev": "npm run deploy:rules:dev && npm run deploy:indexes:dev",
     "deploy:prod": "npm run deploy:rules:prod && npm run deploy:indexes:prod"
   },

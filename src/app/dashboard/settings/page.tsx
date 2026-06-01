@@ -302,7 +302,7 @@ function ApiKeysSection() {
   return (
     <Section
       title="API keys"
-      description="Use the AdZoom API to enhance recordings programmatically."
+      description="Use the Framevo API to enhance recordings programmatically."
       action={
         <Button
           variant="ghost"
@@ -503,7 +503,7 @@ function EmptyApiKeys({ onCreate }: { onCreate: () => void }) {
       </div>
       <p className="mt-3 text-[13px] font-medium text-white">No API keys yet</p>
       <p className="mt-1 text-[12px] text-fog">
-        Create a key to connect AdZoom to your own tools.
+        Create a key to connect Framevo to your own tools.
       </p>
       <div className="mt-4 inline-flex">
         <Button

@@ -117,7 +117,7 @@ export function ProcessingOverlay() {
 
             <div className="text-center">
               <div className="mb-2 text-[10px] font-semibold uppercase tracking-[0.22em] text-violet-300">
-                AdZoom AI
+                Framevo AI
               </div>
               <AnimatePresence mode="wait">
                 <motion.h3

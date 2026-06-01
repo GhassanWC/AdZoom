@@ -196,7 +196,7 @@ export function RealExportPanel() {
       // Trigger local download too
       const a = document.createElement("a");
       a.href = URL.createObjectURL(blob);
-      a.download = `${project.title || "adzoom-export"}.${ext}`;
+      a.download = `${project.title || "framevo-export"}.${ext}`;
       a.click();
       URL.revokeObjectURL(a.href);
     } catch (err) {

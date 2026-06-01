@@ -64,7 +64,7 @@ interface InternalState {
   tickInterval: ReturnType<typeof setInterval> | null;
   micLevel: number;
   /**
-   * "tab" when the picked source is the AdZoom tab itself (events here are
+   * "tab" when the picked source is the Framevo tab itself (events here are
    * authoritative). "external" for any other surface — events are kept but
    * downstream marks them as not-the-recorded-surface.
    */
@@ -276,7 +276,7 @@ export function createRecordingEngine(
     // indicator" and "recorder is actually capturing" collapses to a few
     // synchronous lines (mixer setup + MediaRecorder ctor).
     //
-    // `selfBrowserSurface: "exclude"` hides the AdZoom tab from the picker.
+    // `selfBrowserSurface: "exclude"` hides the Framevo tab from the picker.
     // Capturing our own tab is the path that bakes Chrome's "is sharing your
     // screen" controls strip into the recorded video (the green bar bug). The
     // user can still capture any other tab, any window, or the full screen —
@@ -317,7 +317,7 @@ export function createRecordingEngine(
     // Dev-mode insight into what the user actually picked. Useful when
     // diagnosing the "green bar" / sharing-controls capture: a `browser`
     // surface paired with a viewport-matching size is almost certainly the
-    // AdZoom tab itself, which we already discourage in the picker but can
+    // Framevo tab itself, which we already discourage in the picker but can
     // still happen via Chrome's "Other tab" route.
     if (process.env.NODE_ENV !== "production") {
       console.info("[recording] picked surface", {
@@ -497,7 +497,7 @@ export function createRecordingEngine(
         const blob = new Blob(s.chunks, { type: mimeType });
         // Drain the interaction provider before tearing down. If the surface
         // was external we still keep the events around (they describe what
-        // the user did *inside AdZoom* during recording) but mark the scope
+        // the user did *inside Framevo* during recording) but mark the scope
         // so the analyzer doesn't trust them as the recorded surface.
         let interactions: Interaction[] = [];
         try {

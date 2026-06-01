@@ -155,7 +155,7 @@ export function RecordingSetup({
 
       {/* Sharing-bar advisory: tab capture can bake Chrome's "is sharing your
           screen" controls into the recorded video (the "green bar"). We
-          already exclude AdZoom's own tab from the picker via
+          already exclude Framevo's own tab from the picker via
           `selfBrowserSurface: "exclude"`, but any *other* tab is still
           available — so this is the gentle steer toward Window / Screen. */}
       <div className="mx-auto flex max-w-xl items-start gap-2.5 rounded-xl border border-white/10 bg-white/[0.02] px-3.5 py-2.5 text-left text-[11.5px] leading-relaxed text-fog">

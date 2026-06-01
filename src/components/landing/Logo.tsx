@@ -1,14 +1,18 @@
 import { cn } from "@/lib/cn";
+import { BRAND } from "@/lib/branding";
 
 /**
- * Official AdZoom mark — a bold "A" letter framed by camera-viewfinder
+ * Official Framevo mark — a bold "F" letter framed by camera-viewfinder
  * corner brackets with a red record dot. Rendered as inline SVG so it
  * scales across every surface (footer, navbar, sidebar, login card)
  * without an asset round-trip.
  *
  * Each instance defines its own gradient with a unique id so multiple
- * Logos on the same page don't clash on the SVG fragment fragment
- * graph (`<defs>` ids are page-global).
+ * Logos on the same page don't clash on the SVG fragment graph
+ * (`<defs>` ids are page-global).
+ *
+ * Wordmark text reads `BRAND.name` from src/lib/branding.ts — never
+ * hard-code the product name here.
  */
 let logoIdCounter = 0;
 
@@ -23,7 +27,7 @@ export function Logo({
   size?: number;
 }) {
   const uid = (logoIdCounter += 1);
-  const gradId = `adzoom-violet-${uid}`;
+  const gradId = `framevo-violet-${uid}`;
   const wordmarkPx = Math.round(size * 0.6); // ~17px for size=28
 
   return (
@@ -36,13 +40,13 @@ export function Logo({
         height={size}
         viewBox="0 0 100 100"
         xmlns="http://www.w3.org/2000/svg"
-        aria-label="AdZoom"
+        aria-label={BRAND.name}
         role="img"
       >
         <defs>
           <linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor="#A78BFA" />
-            <stop offset="100%" stopColor="#7C3AED" />
+            <stop offset="0%" stopColor={BRAND.colors.primaryFrom} />
+            <stop offset="100%" stopColor={BRAND.colors.primaryTo} />
           </linearGradient>
         </defs>
 
@@ -60,16 +64,14 @@ export function Logo({
           <path d="M 88 73 V 89 H 72" />
         </g>
 
-        {/* "A" letter — filled, with inner triangle hole */}
+        {/* "F" letter — filled, bold uppercase */}
         <path
-          d="M 22 84 L 50 18 L 78 84 L 66 84 L 60 68 L 40 68 L 34 84 Z
-             M 50 36 L 57 60 L 43 60 Z"
+          d="M 26 18 H 79 V 30 H 42 V 44 H 66 V 56 H 42 V 84 H 26 Z"
           fill={`url(#${gradId})`}
-          fillRule="evenodd"
         />
 
         {/* Recording dot */}
-        <circle cx="76" cy="26" r="5" fill="#EF4444" />
+        <circle cx="76" cy="26" r="5" fill={BRAND.colors.recordingDot} />
       </svg>
 
       {withWordmark && (
@@ -77,7 +79,7 @@ export function Logo({
           className="font-display font-semibold tracking-tight text-white"
           style={{ fontSize: wordmarkPx, lineHeight: 1 }}
         >
-          AdZoom
+          {BRAND.name}
         </span>
       )}
     </span>

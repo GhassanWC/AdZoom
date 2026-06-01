@@ -19,7 +19,7 @@ export interface InteractionProviderCapabilities {
   keyEvents: boolean;
   /** True if focus changes are observable. */
   focusEvents: boolean;
-  /** True for OS-level providers that see input outside the AdZoom tab. */
+  /** True for OS-level providers that see input outside the Framevo tab. */
   crossWindow: boolean;
 }
 

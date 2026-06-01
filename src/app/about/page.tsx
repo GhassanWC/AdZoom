@@ -11,9 +11,9 @@ import { Footer } from "@/components/landing/Footer";
 import { Button } from "@/components/ui/Button";
 
 export const metadata = {
-  title: "About — AdZoom",
+  title: "About — Framevo",
   description:
-    "Why AdZoom exists and what we're trying to build.",
+    "Why Framevo exists and what we're trying to build.",
 };
 
 export default function AboutPage() {
@@ -47,7 +47,7 @@ export default function AboutPage() {
             <p className="mt-6 max-w-2xl text-[16.5px] leading-relaxed text-fog">
               Most screen recordings are flat. The camera holds the whole
               tab while the action happens in a 200-pixel corner. The
-              viewer drifts. The message gets lost. AdZoom exists to fix
+              viewer drifts. The message gets lost. Framevo exists to fix
               that — by reading what you actually did and directing the
               camera so the viewer follows.
             </p>
@@ -65,7 +65,7 @@ export default function AboutPage() {
               recording.
             </p>
             <p className="text-[15.5px] leading-relaxed text-fog">
-              Under the hood, AdZoom runs a four-pass pipeline: capture
+              Under the hood, Framevo runs a four-pass pipeline: capture
               every interaction alongside the pixels, ask Gemini to read
               the recording at a structural level, balance candidate
               moments against attention and pacing rules, then hand you a
@@ -118,10 +118,10 @@ export default function AboutPage() {
               For anything else — partnership ideas, press, security
               reports, or just a hello — email{" "}
               <a
-                href="mailto:hello@adzoom.app"
+                href="mailto:support@framevo.app"
                 className="text-violet-300 underline decoration-violet-300/40 underline-offset-4 hover:text-violet-200"
               >
-                hello@adzoom.app
+                support@framevo.app
               </a>
               .
             </p>
@@ -132,7 +132,7 @@ export default function AboutPage() {
               Try the editor.
             </h3>
             <p className="mx-auto mt-3 max-w-md text-[14px] text-fog">
-              Record any tab. Watch AdZoom turn it into a guided cut.
+              Record any tab. Watch Framevo turn it into a guided cut.
               Free to start, no card required.
             </p>
             <div className="mt-6 flex flex-wrap items-center justify-center gap-3">

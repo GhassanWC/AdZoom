@@ -115,7 +115,7 @@ export function RealProcessingOverlay() {
             <div className="flex items-center justify-between border-b border-white/[0.06] px-5 py-3">
               <div className="flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.22em] text-violet-300">
                 <Sparkles size={11} />
-                AdZoom AI
+                Framevo AI
               </div>
               <div className="flex items-center gap-1.5">
                 {currentlyProcessing && (
@@ -230,7 +230,7 @@ function ActiveBody({
           </AnimatePresence>
           <p className="mt-1.5 text-sm text-fog">
             {ANALYSIS_STAGES.find((s) => s.id === status)?.description ||
-              "AdZoom is processing your recording."}
+              "Framevo is processing your recording."}
           </p>
 
           <ul className="mt-5 space-y-2.5">

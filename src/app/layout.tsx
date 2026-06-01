@@ -6,6 +6,7 @@ import { AuthProvider } from "@/lib/firebase/AuthProvider";
 import { ToastProvider } from "@/components/ui/Toast";
 import { ThemeProvider, themeInitScript } from "@/lib/theme";
 import { ChatWidget } from "@/components/chat/ChatWidget";
+import { BRAND, PAGE_TITLE } from "@/lib/branding";
 
 const inter = Inter({
   variable: "--font-inter",
@@ -21,14 +22,12 @@ const sora = Sora({
 });
 
 export const metadata: Metadata = {
-  title: "AdZoom — Cinematic screen recordings, automatically",
-  description:
-    "AI-powered screen recording enhancer. Auto-zoom, cursor focus, click highlights, motion tracking, vertical reframing — instantly.",
-  metadataBase: new URL("https://adzoom.app"),
+  title: PAGE_TITLE.landing,
+  description: `${BRAND.longTagline} Auto-zoom, cursor focus, click highlights, motion tracking, vertical reframing — instantly.`,
+  metadataBase: new URL(BRAND.url),
   openGraph: {
-    title: "AdZoom — Cinematic screen recordings, automatically",
-    description:
-      "Turn boring screen recordings into cinematic videos with AI.",
+    title: PAGE_TITLE.landing,
+    description: "Turn boring screen recordings into cinematic videos with AI.",
     type: "website",
   },
 };

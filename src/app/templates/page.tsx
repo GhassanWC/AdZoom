@@ -7,7 +7,7 @@ import { presets } from "@/lib/mockData";
 import { PresetThumb } from "@/components/landing/PresetThumb";
 
 export const metadata = {
-  title: "Templates — AdZoom",
+  title: "Templates — Framevo",
   description: "Starter presets and project templates for every recording format.",
 };
 

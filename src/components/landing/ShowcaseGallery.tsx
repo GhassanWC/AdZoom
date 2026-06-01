@@ -6,7 +6,7 @@ import { PresetThumb } from "./PresetThumb";
 
 /**
  * The big "real output" showcase grid — adapted from Shipper's Airbnb
- * property card pattern. Each tile is an AdZoom preset visualised by
+ * property card pattern. Each tile is an Framevo preset visualised by
  * PresetThumb, with a caption that names the format + pacing the
  * preset is wired for.
  *
@@ -51,7 +51,7 @@ export function ShowcaseGallery() {
           <span className="text-gradient-violet">every recording.</span>
         </>
       }
-      subtitle="Twelve cinematic recipes shipped with AdZoom. Each tile previews the format, pacing, and camera rhythm the preset configures — apply one and refine from there."
+      subtitle="Twelve cinematic recipes shipped with Framevo. Each tile previews the format, pacing, and camera rhythm the preset configures — apply one and refine from there."
       size="wide"
     >
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">

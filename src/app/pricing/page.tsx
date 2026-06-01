@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/Button";
 import { CheckoutButton } from "@/components/billing/CheckoutButton";
 
 export const metadata = {
-  title: "Pricing — AdZoom",
+  title: "Pricing — Framevo",
   description: "Pick a plan to unlock cinematic AI editing, HD/4K exports, and premium presets.",
 };
 
@@ -62,7 +62,7 @@ export default function PricingPage() {
           <span className="text-violet-300">at every scale.</span>
         </h1>
         <p className="mx-auto mt-4 max-w-xl text-[15px] leading-relaxed text-fog">
-          AdZoom turns raw screen recordings into polished, attention-aware
+          Framevo turns raw screen recordings into polished, attention-aware
           edits. Start free; upgrade when you want premium exports, advanced
           AI, or to bring your team along.
         </p>

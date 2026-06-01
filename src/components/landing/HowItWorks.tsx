@@ -26,7 +26,7 @@ const steps: Step[] = [
     n: "02",
     Icon: BrainCircuit,
     title: "Analyze",
-    body: "Gemini reads the recording. AdZoom classifies the video, splits it into narrative chapters, and turns each meaningful click into a camera move.",
+    body: "Gemini reads the recording. Framevo classifies the video, splits it into narrative chapters, and turns each meaningful click into a camera move.",
   },
   {
     n: "03",

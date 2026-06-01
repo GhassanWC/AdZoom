@@ -66,7 +66,7 @@ interface RenderInput {
   onProgress: (p: ExportProgress) => void;
   signal?: AbortSignal;
   /**
-   * When true, draw a "Made with AdZoom" watermark on every frame. Set by
+   * When true, draw a "Made with Framevo" watermark on every frame. Set by
    * the server's /api/billing/export-permit response based on the user's
    * plan at permit-time. The client is expected to honour this flag; a
    * tampered client could ignore it (see plan notes: full tamper-proof
@@ -598,7 +598,7 @@ function drawWatermark(
   const fontSize = Math.max(18, Math.round(canvasH * 0.024));
   const padX = Math.round(fontSize * 0.9);
   const padY = Math.round(fontSize * 0.45);
-  const text = "Made with AdZoom";
+  const text = "Made with Framevo";
 
   ctx.save();
   ctx.font = `600 ${fontSize}px -apple-system, "Segoe UI", system-ui, sans-serif`;

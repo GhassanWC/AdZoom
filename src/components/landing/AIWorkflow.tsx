@@ -67,7 +67,7 @@ export function AIWorkflow() {
               </span>
             </h2>
             <p className="mt-5 max-w-xl text-[16px] leading-relaxed text-fog">
-              AdZoom isn&apos;t a filter. It&apos;s a four-pass pipeline
+              Framevo isn&apos;t a filter. It&apos;s a four-pass pipeline
               that reads your recording the way a video editor would —
               and frames the camera so the viewer can follow.
             </p>

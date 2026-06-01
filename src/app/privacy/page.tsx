@@ -1,9 +1,9 @@
 import { LegalLayout, LegalSection } from "@/components/legal/LegalLayout";
 
 export const metadata = {
-  title: "Privacy Policy — AdZoom",
+  title: "Privacy Policy — Framevo",
   description:
-    "How AdZoom collects, uses, stores, and shares your data.",
+    "How Framevo collects, uses, stores, and shares your data.",
 };
 
 export default function PrivacyPage() {
@@ -11,18 +11,18 @@ export default function PrivacyPage() {
     <LegalLayout
       eyebrow="Privacy"
       title="Privacy Policy"
-      intro="AdZoom is a recording, editing, and rendering tool. To do that work we process video, audio, interaction events, and account data. This page explains what we collect, why, where it lives, and the choices you have."
+      intro="Framevo is a recording, editing, and rendering tool. To do that work we process video, audio, interaction events, and account data. This page explains what we collect, why, where it lives, and the choices you have."
       lastUpdated="May 30, 2026"
     >
       <LegalSection n="01" title="Who we are">
         <p>
-          AdZoom (&quot;AdZoom&quot;, &quot;we&quot;, &quot;us&quot;) is
-          operated by AdZoom Labs, Inc. We can be reached at{" "}
+          Framevo (&quot;Framevo&quot;, &quot;we&quot;, &quot;us&quot;) is
+          operated by Framevo Labs, Inc. We can be reached at{" "}
           <a
-            href="mailto:hello@adzoom.app"
+            href="mailto:support@framevo.app"
             className="text-violet-300 underline decoration-violet-300/40 underline-offset-4 hover:text-violet-200"
           >
-            hello@adzoom.app
+            support@framevo.app
           </a>{" "}
           for any privacy-related question, request, or complaint.
         </p>
@@ -67,7 +67,7 @@ export default function PrivacyPage() {
 
       <LegalSection n="03" title="Where your data lives">
         <p>
-          AdZoom uses Google Firebase as its primary infrastructure. Your
+          Framevo uses Google Firebase as its primary infrastructure. Your
           account record, project documents, and analysis results live in
           Cloud Firestore. Video files, interaction sidecars, and rendered
           exports live in Cloud Storage. Both are scoped per-user and
@@ -123,7 +123,7 @@ export default function PrivacyPage() {
           <li>Debugging and improving the product.</li>
         </ul>
         <p>
-          Your recordings and edits are not used to train AdZoom&apos;s own
+          Your recordings and edits are not used to train Framevo&apos;s own
           models. Where third-party AI processors are involved (Gemini),
           their training behaviour is governed by their own terms.
         </p>
@@ -145,10 +145,10 @@ export default function PrivacyPage() {
           hold about you. You can do most of this directly from the
           dashboard. For anything else, email{" "}
           <a
-            href="mailto:hello@adzoom.app"
+            href="mailto:support@framevo.app"
             className="text-violet-300 underline decoration-violet-300/40 underline-offset-4 hover:text-violet-200"
           >
-            hello@adzoom.app
+            support@framevo.app
           </a>{" "}
           and we will respond within 30 days.
         </p>
@@ -156,7 +156,7 @@ export default function PrivacyPage() {
 
       <LegalSection n="08" title="Cookies and local storage">
         <p>
-          AdZoom uses browser local storage and first-party cookies to
+          Framevo uses browser local storage and first-party cookies to
           keep you signed in, remember UI preferences, and store
           per-account notifications. We do not run third-party analytics
           or advertising cookies.
@@ -165,7 +165,7 @@ export default function PrivacyPage() {
 
       <LegalSection n="09" title="Children">
         <p>
-          AdZoom is not directed at children under 13 (or 16 in
+          Framevo is not directed at children under 13 (or 16 in
           jurisdictions where the higher age applies). We do not knowingly
           collect data from anyone in that age range.
         </p>
@@ -175,7 +175,7 @@ export default function PrivacyPage() {
         <p>
           When this policy changes materially, we will update the
           &quot;last updated&quot; date at the top of the page and notify
-          signed-in users by email. Continuing to use AdZoom after a
+          signed-in users by email. Continuing to use Framevo after a
           change means you accept the updated policy.
         </p>
       </LegalSection>

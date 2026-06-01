@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { useChatStream, type ChatMessage } from "./useChatStream";
+import { BRAND, BRAND_STRINGS } from "@/lib/branding";
 
 /**
  * Floating chat widget. Bubble button bottom-right; panel opens on
@@ -40,7 +41,7 @@ export function ChatWidget() {
       {/* Floating bubble — bottom-right on every page */}
       <button
         type="button"
-        aria-label={open ? "Close chat" : "Open chat with AdZoom"}
+        aria-label={open ? "Close chat" : `Open chat with ${BRAND.name}`}
         onClick={() => setOpen((v) => !v)}
         className={cn(
           "fixed bottom-5 right-5 z-50 inline-flex size-14 items-center justify-center rounded-full text-white shadow-[0_18px_38px_-10px_rgba(139,92,246,0.7)] transition-transform duration-200 hover:scale-[1.04] active:scale-95",
@@ -119,7 +120,7 @@ function Header({
         </span>
         <div className="leading-tight">
           <div className="text-[13.5px] font-semibold text-[#fff]">
-            Ask AdZoom
+            {BRAND_STRINGS.askBrand}
           </div>
           <div className="text-[10.5px] text-[rgba(255,255,255,0.55)]">
             Powered by Gemini · usually under a minute
@@ -191,9 +192,9 @@ function MessageList({
 }
 
 const SUGGESTIONS = [
-  "How does AdZoom analyze a recording?",
+  `How does ${BRAND.name} analyze a recording?`,
   "What's in the Pro plan?",
-  "Does AdZoom work on Windows?",
+  `Does ${BRAND.name} work on Windows?`,
   "Can I record only one window?",
 ];
 
@@ -202,7 +203,7 @@ function Welcome() {
     <div className="flex h-full flex-col justify-end">
       <div className="rounded-2xl border border-white/10 bg-white/[0.04] p-4">
         <p className="text-[13px] leading-relaxed text-[rgba(255,255,255,0.85)]">
-          Hi — I&apos;m AdZoom&apos;s assistant. Ask me anything about
+          Hi — I&apos;m {BRAND.name}&apos;s assistant. Ask me anything about
           recording, the editor, presets, or pricing.
         </p>
       </div>
@@ -320,7 +321,7 @@ function Composer({
               submit();
             }
           }}
-          placeholder="Ask about AdZoom…"
+          placeholder="Ask about Framevo…"
           rows={1}
           disabled={disabled}
           className="max-h-24 min-h-[20px] flex-1 resize-none bg-transparent text-[13.5px] leading-snug text-[#fff] placeholder:text-[rgba(255,255,255,0.4)] focus:outline-none disabled:opacity-60"

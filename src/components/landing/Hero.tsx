@@ -5,6 +5,7 @@ import * as React from "react";
 import { Button } from "@/components/ui/Button";
 import { Container } from "@/components/ui/Container";
 import { HeroMockup } from "./HeroMockup";
+import { BRAND } from "@/lib/branding";
 
 type RecordingMode = "tab" | "window" | "monitor";
 
@@ -49,19 +50,16 @@ export function Hero() {
         <div className="mx-auto max-w-[960px] text-center">
           <div className="mb-7 inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-3.5 py-1.5 text-[11px] font-medium uppercase tracking-[0.2em] text-fog backdrop-blur-md">
             <Sparkles size={12} className="text-violet-300" />
-            Attention-aware video editor
+            {BRAND.name} · AI video editor
           </div>
 
           <h1 className="font-display text-[clamp(3rem,8.25vw,6.25rem)] font-semibold leading-[0.93] tracking-[-0.05em] text-white">
-            AdZoom understands what you did
-            <br className="hidden sm:block" />{" "}
-            <span className="text-gradient-violet">
-              and directs the viewer&apos;s attention.
-            </span>
+            AI video editing that{" "}
+            <span className="text-gradient-violet">follows the action.</span>
           </h1>
 
           <p className="mx-auto mt-7 max-w-[660px] text-[17.5px] leading-relaxed text-fog">
-            Record in your browser. AdZoom reads every click and navigation,
+            Record in your browser. Framevo reads every click and navigation,
             understands the workflow, and composes a first-draft edit with
             cinematic camera moves. You stay in control of the timeline.
           </p>
@@ -81,7 +79,7 @@ export function Hero() {
           </div>
 
           {/* Recording-mode segmented picker — Shipper-style tab row.
-              Maps to the three browser-capture modes AdZoom actually
+              Maps to the three browser-capture modes Framevo actually
               supports (Tab / Window / Monitor). */}
           <div className="mt-10 flex justify-center">
             <div

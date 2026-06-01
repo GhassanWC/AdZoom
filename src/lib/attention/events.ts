@@ -41,7 +41,7 @@ export interface EventMomentOptions {
   /**
    * The recording's interaction scope. "external" tells the classifier
    * to IGNORE any `targetRect` on click events because it would refer
-   * to AdZoom's own DOM, not the captured surface. Defaults to "tab"
+   * to Framevo's own DOM, not the captured surface. Defaults to "tab"
    * for backwards compatibility with older callers.
    */
   scope?: "tab" | "external";

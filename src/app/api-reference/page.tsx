@@ -5,8 +5,8 @@ import { Footer } from "@/components/landing/Footer";
 import { Button } from "@/components/ui/Button";
 
 export const metadata = {
-  title: "API Reference — AdZoom",
-  description: "REST endpoints for integrating AdZoom into your own workflow.",
+  title: "API Reference — Framevo",
+  description: "REST endpoints for integrating Framevo into your own workflow.",
 };
 
 export default function ApiReferencePage() {
@@ -38,7 +38,7 @@ export default function ApiReferencePage() {
               <span className="text-gradient-violet">bearer-token auth.</span>
             </h1>
             <p className="mt-6 max-w-2xl text-[16px] leading-relaxed text-fog">
-              The AdZoom API is small on purpose. Right now it covers
+              The Framevo API is small on purpose. Right now it covers
               authentication and key validation; project + analyze
               endpoints land next.
             </p>

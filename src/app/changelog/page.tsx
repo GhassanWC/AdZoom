@@ -5,8 +5,8 @@ import { Footer } from "@/components/landing/Footer";
 import { Button } from "@/components/ui/Button";
 
 export const metadata = {
-  title: "Changelog — AdZoom",
-  description: "What's new in AdZoom — features shipped, fixes landed, improvements rolled out.",
+  title: "Changelog — Framevo",
+  description: "What's new in Framevo — features shipped, fixes landed, improvements rolled out.",
 };
 
 type Tag = "feature" | "improvement" | "fix";
@@ -155,7 +155,7 @@ export default function ChangelogPage() {
             </span>
             <h1 className="mt-5 font-display text-4xl font-semibold leading-[1.05] tracking-tight text-white sm:text-5xl">
               What&apos;s new in{" "}
-              <span className="text-gradient-violet">AdZoom.</span>
+              <span className="text-gradient-violet">Framevo.</span>
             </h1>
             <p className="mt-6 text-[16px] leading-relaxed text-fog">
               Every meaningful change, dated, tagged, and grouped. We
@@ -203,7 +203,7 @@ export default function ChangelogPage() {
             </p>
             <div className="mt-4">
               <Button
-                href="mailto:hello@adzoom.app?subject=Subscribe%20me%20to%20the%20AdZoom%20changelog"
+                href="mailto:support@framevo.app?subject=Subscribe%20me%20to%20the%20Framevo%20changelog"
                 variant="ghost"
                 size="sm"
                 leftIcon={<Mail size={12} />}

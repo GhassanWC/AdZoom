@@ -5,7 +5,7 @@ import { Footer } from "@/components/landing/Footer";
 import { Button } from "@/components/ui/Button";
 
 export const metadata = {
-  title: "Careers — AdZoom",
+  title: "Careers — Framevo",
   description: "No open roles right now — but we'd love to hear from you.",
 };
 
@@ -56,7 +56,7 @@ export default function CareersPage() {
                 <p className="mt-2 text-[14px] leading-relaxed text-fog">
                   If you work on creator tools, video pipelines,
                   attention-aware editing, or pixel-perfect product UI — and
-                  AdZoom resonates with you — write to us. We keep a short
+                  Framevo resonates with you — write to us. We keep a short
                   list of people we&apos;d call first when we open a role.
                 </p>
                 <p className="mt-2 text-[14px] leading-relaxed text-fog">
@@ -66,12 +66,12 @@ export default function CareersPage() {
                 </p>
                 <div className="mt-5">
                   <Button
-                    href="mailto:hello@adzoom.app?subject=Future%20role%20at%20AdZoom"
+                    href="mailto:support@framevo.app?subject=Future%20role%20at%20Framevo"
                     variant="primary"
                     size="md"
                     leftIcon={<Mail size={13} />}
                   >
-                    hello@adzoom.app
+                    support@framevo.app
                   </Button>
                 </div>
               </div>

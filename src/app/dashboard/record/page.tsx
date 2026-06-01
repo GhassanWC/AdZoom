@@ -1,7 +1,8 @@
 import { RecordingPage } from "@/components/recording/RecordingPage";
+import { PAGE_TITLE } from "@/lib/branding";
 
 export const metadata = {
-  title: "AdZoom — Record",
+  title: PAGE_TITLE.record,
   description: "Capture a screen recording and let the AI draft the cut.",
 };
 

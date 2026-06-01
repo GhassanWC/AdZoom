@@ -117,7 +117,7 @@ export const ERROR_RECOVERY: Record<
   },
   network_interruption: {
     title: "Network interrupted",
-    reason: "The connection between AdZoom and Gemini dropped mid-analysis.",
+    reason: "The connection between Framevo and Gemini dropped mid-analysis.",
     suggestion: "Retry. If this keeps happening, check your network and try a different browser.",
   },
   unknown: {
