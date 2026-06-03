@@ -24,6 +24,7 @@ import {
 } from "@/lib/timeline/camera";
 import { clickHighlightGeometry } from "@/lib/timeline/click-highlight";
 import { coverFitDims } from "@/lib/timeline/cover";
+import { probeVideoBottomBand } from "@/lib/recording/health-check";
 import { FocalPathOverlay } from "./FocalPathOverlay";
 import type {
   DetectedMoment,
@@ -62,6 +63,20 @@ interface CameraDriverState {
 }
 
 /**
+ * Live snapshot of the cinematic camera, written by the rAF loop every
+ * frame and read by the (opt-in) camera debug overlay. `tx`/`ty` are in
+ * PERCENT — the same units fed to the CSS `translate(...)`. At rest, with
+ * no active moment, this MUST read scale=1, tx=0, ty=0; the overlay
+ * flags it red otherwise so a stuck transform is obvious at a glance.
+ */
+interface CameraDebugInfo {
+  scale: number;
+  tx: number;
+  ty: number;
+  momentId: string | null;
+}
+
+/**
  * Continuous cinematic camera. A rAF loop recomputes the *target* every
  * frame from the live `video.currentTime`, then eases the *current*
  * transform toward it with time-based exponential smoothing — inertia,
@@ -78,7 +93,8 @@ interface CameraDriverState {
 function useCinematicCamera(
   wrapRef: React.RefObject<HTMLDivElement | null>,
   videoRef: React.RefObject<HTMLVideoElement | null>,
-  state: CameraDriverState
+  state: CameraDriverState,
+  debugRef?: React.MutableRefObject<CameraDebugInfo>
 ) {
   const currentRef = React.useRef({ scale: 1, tx: 0, ty: 0 });
   const stateRef = React.useRef(state);
@@ -97,12 +113,14 @@ function useCinematicCamera(
 
       // Recompute the target from the live playhead each frame.
       let tgt: CameraState = IDENTITY_CAMERA;
+      let activeMomentId: string | null = null;
       if (s.previewMode && s.moments.length > 0) {
         const t = videoRef.current?.currentTime ?? 0;
         const { camera, moment } = resolveCameraFrame(s.moments, t, {
           autoZoom: s.autoZoom,
         });
         tgt = camera;
+        activeMomentId = moment?.id ?? null;
 
         // Dev-mode camera diagnostic: log the moment's three checkpoints
         // (start, middle, end) the first time it becomes active. Pair
@@ -189,6 +207,18 @@ function useCinematicCamera(
       if (el) {
         el.style.transform = `translate(${cur.tx.toFixed(3)}%, ${cur.ty.toFixed(3)}%) scale(${cur.scale.toFixed(4)})`;
       }
+
+      // Publish the live transform for the camera debug overlay. When no
+      // moment is active the smoothing target is identity, so this settles
+      // to {scale:1, tx:0, ty:0} — the invariant the overlay asserts.
+      if (debugRef) {
+        debugRef.current = {
+          scale: cur.scale,
+          tx: cur.tx,
+          ty: cur.ty,
+          momentId: activeMomentId,
+        };
+      }
       raf = requestAnimationFrame(tick);
     };
 
@@ -217,20 +247,70 @@ export function RealVideoPlayer() {
   const containerRef = React.useRef<HTMLDivElement | null>(null);
   const aspectRef = React.useRef<HTMLDivElement | null>(null);
   const transformWrapRef = React.useRef<HTMLDivElement | null>(null);
+  // Live camera transform, written each frame by the cinematic camera and
+  // read by the opt-in debug overlay (?debugCamera=1).
+  const cameraDebugRef = React.useRef<CameraDebugInfo>({
+    scale: 1,
+    tx: 0,
+    ty: 0,
+    momentId: null,
+  });
   const [muted, setMuted] = React.useState(false);
   const [volume, setVolume] = React.useState(1);
   const [isFullscreen, setIsFullscreen] = React.useState(false);
+  // Intrinsic aspect of the loaded recording. Drives the preview frame so
+  // the default ("Source") export — which keeps the full captured viewport
+  // — is shown WYSIWYG instead of being cropped into a fixed 16:9 box.
+  const [sourceAspect, setSourceAspect] = React.useState<number | null>(null);
 
   // Track fullscreen state so we can swap the layout from "aspect-locked
   // card centered in the page" to "fill the viewport, letterboxed by the
   // video itself via object-contain".
   React.useEffect(() => {
     const onChange = () => {
-      setIsFullscreen(document.fullscreenElement === containerRef.current);
+      const fs = document.fullscreenElement === containerRef.current;
+      setIsFullscreen(fs);
+
+      // Fullscreen dimension audit — the preview is a plain <video>, so
+      // displayed size vs intrinsic size + the resolved object-fit tells us
+      // immediately whether fullscreen is cropping (cover) or preserving
+      // the whole frame (contain). The camera scale/translate come from the
+      // live debug ref; at rest with no moment they must be 1 / 0 / 0.
+      if (process.env.NODE_ENV !== "production") {
+        const v = videoRef.current;
+        const box = aspectRef.current;
+        const cam = cameraDebugRef.current;
+        const fit = v ? getComputedStyle(v).objectFit : "—";
+        console.info(`[fullscreen] ${fs ? "entered" : "exited"}`, {
+          videoWidth: v?.videoWidth ?? 0,
+          videoHeight: v?.videoHeight ?? 0,
+          displayedWidth: v ? Math.round(v.getBoundingClientRect().width) : 0,
+          displayedHeight: v ? Math.round(v.getBoundingClientRect().height) : 0,
+          containerWidth: box ? Math.round(box.getBoundingClientRect().width) : 0,
+          containerHeight: box ? Math.round(box.getBoundingClientRect().height) : 0,
+          screenWidth: window.innerWidth,
+          screenHeight: window.innerHeight,
+          objectFit: fit,
+          cameraScale: +cam.scale.toFixed(4),
+          cameraTranslateX: +cam.tx.toFixed(3),
+          cameraTranslateY: +cam.ty.toFixed(3),
+          activeMomentId: cam.momentId,
+        });
+        if (fs && fit === "cover") {
+          console.warn(
+            "[fullscreen] object-fit is COVER — this crops the recording. Screen captures should use CONTAIN to preserve the full viewport."
+          );
+        }
+        if (cam.momentId === null && Math.abs(cam.scale - 1) > 0.01) {
+          console.warn(
+            `[fullscreen] no active moment but cameraScale=${cam.scale.toFixed(3)} (expected 1). A stuck camera transform is adding zoom.`
+          );
+        }
+      }
     };
     document.addEventListener("fullscreenchange", onChange);
     return () => document.removeEventListener("fullscreenchange", onChange);
-  }, []);
+  }, [videoRef]);
 
   // Wire video element events
   React.useEffect(() => {
@@ -239,16 +319,45 @@ export function RealVideoPlayer() {
     const onTime = () => setCurrentTime(v.currentTime);
     const onLoaded = () => {
       if (Number.isFinite(v.duration)) setDuration(v.duration);
+      if (v.videoWidth > 0 && v.videoHeight > 0) {
+        setSourceAspect(v.videoWidth / v.videoHeight);
+      }
     };
     const onPlay = () => setPlaying(true);
     const onPause = () => setPlaying(false);
+    // Dev-only: once a real frame is decoded, sample the SOURCE video's
+    // bottom rows. This proves whether the green strip the user sees in
+    // the preview is baked into the recorded pixels (capture-time, e.g.
+    // Chrome's tab-share toolbar) or introduced by our rendering. The
+    // preview is a plain <video> with no canvas compositing, so green
+    // here = source pixels — but we log the measurement so it's not a
+    // guess. Runs once per load.
+    const onData = () => {
+      if (process.env.NODE_ENV === "production") return;
+      const probe = probeVideoBottomBand(v);
+      if (!probe) {
+        console.info(
+          "[preview] source bottom-band probe: unreadable (CORS taint or no frame)"
+        );
+        return;
+      }
+      console.info("[preview] source bottom-band probe", {
+        ...probe,
+        verdict:
+          probe.bandHeightPx >= 3
+            ? `GREEN BAND IN SOURCE (${probe.bandHeightPx}px) — baked into the recording at capture, not added by the editor. The old 16:9 cover-crop hid it; "Source" framing now shows the full captured frame.`
+            : `source bottom is clean (${(probe.bottomRowGreenRatio * 100).toFixed(0)}% green) — no baked-in band.`,
+      });
+    };
     v.addEventListener("timeupdate", onTime);
     v.addEventListener("loadedmetadata", onLoaded);
+    v.addEventListener("loadeddata", onData);
     v.addEventListener("play", onPlay);
     v.addEventListener("pause", onPause);
     return () => {
       v.removeEventListener("timeupdate", onTime);
       v.removeEventListener("loadedmetadata", onLoaded);
+      v.removeEventListener("loadeddata", onData);
       v.removeEventListener("play", onPlay);
       v.removeEventListener("pause", onPause);
     };
@@ -302,17 +411,40 @@ export function RealVideoPlayer() {
   // `activeMoment`) means moment selection happens in one place and
   // preview never drifts from export on overlap edge cases.
   const allMoments = project.analysis?.detectedMoments ?? [];
-  useCinematicCamera(transformWrapRef, videoRef, {
-    moments: allMoments,
-    previewMode,
-    autoZoom: project.effectsSettings.autoZoom,
-    zoomSpeed: project.effectsSettings.zoomSpeed,
-    pacing: project.effectsSettings.pacing,
-  });
+  useCinematicCamera(
+    transformWrapRef,
+    videoRef,
+    {
+      moments: allMoments,
+      previewMode,
+      autoZoom: project.effectsSettings.autoZoom,
+      zoomSpeed: project.effectsSettings.zoomSpeed,
+      pacing: project.effectsSettings.pacing,
+    },
+    cameraDebugRef
+  );
 
   // Vertical reframe — when the preset asks for 9:16, mask the player.
   const verticalPreview = previewMode && project.effectsSettings.verticalExport;
   const va = project.visualAnalysis;
+
+  // Two independent decisions — keeping them separate is what fixes the
+  // fullscreen crop:
+  //
+  //   useContain      → object-fit. `contain` preserves the whole captured
+  //                     viewport (letterboxing as needed). True whenever we
+  //                     are NOT in the explicit 9:16 crop preset — and that
+  //                     INCLUDES fullscreen. (A previous version tied this
+  //                     to `!isFullscreen`, so fullscreen fell back to
+  //                     `object-cover` and zoom-cropped the recording.)
+  //   applySourceAspect → whether to size the *card* to the recording's
+  //                     aspect via an inline ratio. Only in WINDOWED source
+  //                     mode; in fullscreen the card fills the screen and
+  //                     the video `contain`s within it.
+  const verticalCropPreset = verticalPreview;
+  const useContain = !verticalCropPreset;
+  const applySourceAspect = useContain && !isFullscreen;
+  const previewAspect = sourceAspect ?? 16 / 9;
 
   return (
     <div
@@ -328,6 +460,7 @@ export function RealVideoPlayer() {
     >
       <div
         ref={aspectRef}
+        style={applySourceAspect ? { aspectRatio: String(previewAspect) } : undefined}
         className={cn(
           "relative overflow-hidden bg-black shadow-cinematic",
           isFullscreen
@@ -336,7 +469,9 @@ export function RealVideoPlayer() {
                 "w-full rounded-xl border border-white/[0.06]",
                 verticalPreview
                   ? "mx-auto aspect-[9/16] max-h-[72vh]"
-                  : "mx-auto aspect-video max-h-[56vh] max-w-[100vh]"
+                  // Source framing: aspect comes from the inline style above;
+                  // bound the height so a tall capture can't dominate the page.
+                  : "mx-auto max-h-[56vh] max-w-[100vh]"
               )
         )}
       >
@@ -349,7 +484,13 @@ export function RealVideoPlayer() {
           <video
             ref={videoRef}
             src={project.originalVideoUrl || undefined}
-            className="h-full w-full object-cover"
+            className={cn(
+              "h-full w-full",
+              // `contain` preserves the full captured viewport (windowed AND
+              // fullscreen). Only the explicit 9:16 crop preset uses `cover`
+              // to fill + center-crop.
+              useContain ? "object-contain" : "object-cover"
+            )}
             playsInline
             crossOrigin="anonymous"
             preload="metadata"
@@ -386,6 +527,16 @@ export function RealVideoPlayer() {
             reads as the camera's trajectory. Only renders when there are
             ≥ 2 keyframes (a single point isn't a path). */}
         {activeMoment && <FocalPathOverlay moment={activeMoment} />}
+
+        {/* Opt-in camera debug overlay — ?debugCamera=1 or
+            localStorage['framevo:debugCamera']='1'. Shows the live camera
+            transform so a fullscreen crop can be diagnosed at a glance. */}
+        <CameraDebugOverlay
+          debugRef={cameraDebugRef}
+          videoRef={videoRef}
+          aspectRef={aspectRef}
+          isFullscreen={isFullscreen}
+        />
 
         {/* Editable focus region — drag/resize the zoom target directly on
             the frame. Always rendered when a moment is selected; during
@@ -518,6 +669,159 @@ export function RealVideoPlayer() {
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+/**
+ * TEMPORARY camera debug overlay. Opt-in via `?debugCamera=1` or
+ * `localStorage['framevo:debugCamera'] = '1'`. Reads the live camera ref
+ * (written each frame by `useCinematicCamera`) plus the video's intrinsic
+ * vs displayed size, and renders a compact HUD:
+ *
+ *   Scale / Translate X / Translate Y / Active moment
+ *   + video, displayed, container dimensions and object-fit
+ *
+ * Scale turns RED when no moment is active but the transform isn't
+ * identity — the fingerprint of a camera-driven crop. Remove once the
+ * fullscreen-crop investigation is closed.
+ */
+function CameraDebugOverlay({
+  debugRef,
+  videoRef,
+  aspectRef,
+  isFullscreen,
+}: {
+  debugRef: React.MutableRefObject<CameraDebugInfo>;
+  videoRef: React.RefObject<HTMLVideoElement | null>;
+  aspectRef: React.RefObject<HTMLDivElement | null>;
+  isFullscreen: boolean;
+}) {
+  const [enabled, setEnabled] = React.useState(false);
+  const [snap, setSnap] = React.useState({
+    scale: 1,
+    tx: 0,
+    ty: 0,
+    momentId: null as string | null,
+    videoW: 0,
+    videoH: 0,
+    dispW: 0,
+    dispH: 0,
+    contW: 0,
+    contH: 0,
+    fit: "—",
+  });
+
+  React.useEffect(() => {
+    try {
+      const url = new URL(window.location.href);
+      setEnabled(
+        url.searchParams.get("debugCamera") === "1" ||
+          window.localStorage.getItem("framevo:debugCamera") === "1"
+      );
+    } catch {
+      setEnabled(false);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    if (!enabled) return;
+    let raf = 0;
+    let last = 0;
+    const loop = (now: number) => {
+      // Throttle to ~12fps — the values are for eyeballing, not animation.
+      if (now - last > 80) {
+        last = now;
+        const v = videoRef.current;
+        const box = aspectRef.current;
+        const cam = debugRef.current;
+        const vr = v?.getBoundingClientRect();
+        const br = box?.getBoundingClientRect();
+        setSnap({
+          scale: cam.scale,
+          tx: cam.tx,
+          ty: cam.ty,
+          momentId: cam.momentId,
+          videoW: v?.videoWidth ?? 0,
+          videoH: v?.videoHeight ?? 0,
+          dispW: vr ? Math.round(vr.width) : 0,
+          dispH: vr ? Math.round(vr.height) : 0,
+          contW: br ? Math.round(br.width) : 0,
+          contH: br ? Math.round(br.height) : 0,
+          fit: v ? getComputedStyle(v).objectFit : "—",
+        });
+      }
+      raf = requestAnimationFrame(loop);
+    };
+    raf = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(raf);
+  }, [enabled, debugRef, videoRef, aspectRef]);
+
+  if (!enabled) return null;
+
+  const identityViolated =
+    snap.momentId === null &&
+    (Math.abs(snap.scale - 1) > 0.01 ||
+      Math.abs(snap.tx) > 0.01 ||
+      Math.abs(snap.ty) > 0.01);
+  const fitIsCover = snap.fit === "cover";
+
+  return (
+    <div className="pointer-events-none absolute left-1/2 top-3 z-[60] -translate-x-1/2 rounded-lg border border-white/20 bg-black/85 px-3 py-2 font-mono text-[11px] leading-snug text-white shadow-cinematic backdrop-blur-md">
+      <div className="mb-1 text-[9px] font-semibold uppercase tracking-[0.2em] text-violet-300">
+        Camera debug {isFullscreen ? "· fullscreen" : ""}
+      </div>
+      <DebugLine
+        label="Scale"
+        value={snap.scale.toFixed(4)}
+        warn={identityViolated}
+      />
+      <DebugLine
+        label="Translate X"
+        value={`${snap.tx.toFixed(2)}%`}
+        warn={identityViolated}
+      />
+      <DebugLine
+        label="Translate Y"
+        value={`${snap.ty.toFixed(2)}%`}
+        warn={identityViolated}
+      />
+      <DebugLine label="Active moment" value={snap.momentId ?? "none"} />
+      <div className="my-1 border-t border-white/10" />
+      <DebugLine label="object-fit" value={snap.fit} warn={fitIsCover} />
+      <DebugLine
+        label="video"
+        value={snap.videoW ? `${snap.videoW}×${snap.videoH}` : "—"}
+      />
+      <DebugLine label="displayed" value={`${snap.dispW}×${snap.dispH}`} />
+      <DebugLine label="container" value={`${snap.contW}×${snap.contH}`} />
+      {identityViolated && (
+        <div className="mt-1 text-[10px] text-rose-300">
+          ⚠ transform ≠ identity with no moment
+        </div>
+      )}
+      {fitIsCover && (
+        <div className="mt-1 text-[10px] text-amber-300">
+          ⚠ object-fit: cover is cropping
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DebugLine({
+  label,
+  value,
+  warn,
+}: {
+  label: string;
+  value: string;
+  warn?: boolean;
+}) {
+  return (
+    <div className="flex items-center justify-between gap-4">
+      <span className="text-white/60">{label}:</span>
+      <span className={warn ? "text-rose-300" : "text-white"}>{value}</span>
     </div>
   );
 }

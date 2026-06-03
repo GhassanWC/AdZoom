@@ -320,11 +320,24 @@ export function createRecordingEngine(
     // Framevo tab itself, which we already discourage in the picker but can
     // still happen via Chrome's "Other tab" route.
     if (process.env.NODE_ENV !== "production") {
-      console.info("[recording] picked surface", {
-        displaySurface: settings.displaySurface,
-        width: settings.width,
-        height: settings.height,
+      // Capture-side half of the dimension audit. The export-side half
+      // (`[export] dimension audit`) logs videoWidth/videoHeight + canvas
+      // + export dims. Together they trace the full capture → file chain,
+      // so an "it's cropped" report can be diagnosed from the console.
+      // The recorder is fed this raw track verbatim (engine never re-canvases
+      // the screen), so the recorded file's intrinsic size === these dims —
+      // any cropping is introduced downstream at EXPORT, not here.
+      const aspect =
+        settings.width && settings.height
+          ? (settings.width / settings.height).toFixed(4)
+          : "unknown";
+      console.info("[recording] capture dimension audit", {
+        displaySurface: settings.displaySurface ?? "unknown",
+        trackWidth: settings.width,
+        trackHeight: settings.height,
+        captureAspect: aspect,
         frameRate: settings.frameRate,
+        recordedSize: `${settings.width ?? "?"}×${settings.height ?? "?"} (fed to MediaRecorder un-cropped)`,
       });
       if (settings.displaySurface === "browser") {
         console.warn(

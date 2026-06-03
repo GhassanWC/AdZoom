@@ -520,7 +520,19 @@ export interface ClickPipelineDiagnostics {
 
 export type Pacing = "slow" | "moderate" | "fast";
 export type TargetPlatform = "youtube" | "tiktok" | "reels" | "twitter" | "internal";
-export type ExportFormat = "1080p" | "4K" | "TikTok 9:16" | "YouTube 16:9" | "Custom";
+// "Source" preserves the captured viewport's aspect ratio exactly — no
+// crop, no letterbox. It is the safe default so an export never silently
+// drops content at the edges. "TikTok 9:16" and "YouTube 16:9" are
+// explicit CROP presets: they force a fixed container aspect and
+// center-crop the source (via object-fit: cover) to fill it. See
+// `resolveOutputDims` for the single source of truth on output sizing.
+export type ExportFormat =
+  | "Source"
+  | "1080p"
+  | "4K"
+  | "TikTok 9:16"
+  | "YouTube 16:9"
+  | "Custom";
 
 export interface EffectsSettings {
   autoZoom: number;

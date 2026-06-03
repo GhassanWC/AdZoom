@@ -258,6 +258,62 @@ export async function detectGreenBottomBand(blob: Blob): Promise<GreenBandReport
   }
 }
 
+/**
+ * Synchronous bottom-band probe against a LIVE `<video>` element (not a
+ * blob). Diagnostic-only: it answers the single question "are the bottom
+ * rows of the SOURCE video green?" so we can prove a green strip is baked
+ * into the captured pixels rather than added by our canvas rendering.
+ *
+ * Returns `null` when the frame can't be read (no metadata yet, or a
+ * tainted canvas). Requires the video to be seekable to a painted frame —
+ * call it after `loadeddata`/`seeked`. Reuses the same green heuristics as
+ * the on-demand detector so the two never disagree.
+ */
+export interface BottomBandProbe {
+  sourceW: number;
+  sourceH: number;
+  /** 0..1 — fraction of green pixels in the very bottom row of the frame. */
+  bottomRowGreenRatio: number;
+  /** Height (px) of the contiguous green band flush to the bottom edge. */
+  bandHeightPx: number;
+}
+
+export function probeVideoBottomBand(
+  video: HTMLVideoElement
+): BottomBandProbe | null {
+  const w = video.videoWidth;
+  const h = video.videoHeight;
+  if (!w || !h) return null;
+
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) return null;
+
+  try {
+    ctx.drawImage(video, 0, 0, w, h);
+  } catch {
+    return null; // cross-origin taint or not-yet-painted
+  }
+
+  const stripeH = Math.max(16, Math.floor(h * 0.15));
+  let data: Uint8ClampedArray;
+  try {
+    data = ctx.getImageData(0, h - stripeH, w, stripeH).data;
+  } catch {
+    return null; // tainted canvas (CORS) — can't read pixels
+  }
+
+  const step = Math.max(1, Math.floor(w / 80));
+  return {
+    sourceW: w,
+    sourceH: h,
+    bottomRowGreenRatio: rowGreenRatio(data, stripeH - 1, w, step),
+    bandHeightPx: measureBottomBand(data, w, stripeH),
+  };
+}
+
 export interface CropProgress {
   /** 0..1 — `currentTime / duration`. */
   pct: number;

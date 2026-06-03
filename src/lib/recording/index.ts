@@ -12,7 +12,9 @@ export {
 export {
   detectGreenBottomBand,
   cropBottomBand,
+  probeVideoBottomBand,
   type GreenBandReport,
+  type BottomBandProbe,
   type CropProgress,
   type CropResult,
 } from "./health-check";

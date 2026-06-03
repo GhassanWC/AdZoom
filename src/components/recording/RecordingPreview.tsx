@@ -19,15 +19,30 @@ import {
 } from "@/lib/recording";
 
 /**
+ * Confidence threshold at/above which a detected green sharing-bar is
+ * cropped AUTOMATICALLY (before the take is uploaded), rather than waiting
+ * for the user to click "Crop bottom bar". The detector's confidence is
+ * "how many probe frames agreed, scaled by how consistent the band height
+ * was" — a rock-stable strip across all three probes scores ~1.0, which is
+ * exactly the baked-in Chrome toolbar we want gone. Below this threshold
+ * the detection is too uncertain to act on silently, so we fall back to the
+ * opt-in button. Audio-loss is still surfaced with a Revert affordance, so
+ * "automatic" never means "irreversible".
+ */
+const AUTO_CROP_MIN_CONFIDENCE = 0.8;
+
+/**
  * Post-recording take review. Shows the recorded clip with two paths:
  *  - "Use this take" → uploads + creates project + redirects to editor.
  *  - "Discard & re-record" → throws away the blob and returns to setup.
  *
- * When the captured surface was a browser tab, we also run a heuristic
+ * When the captured surface was a browser tab, we run a heuristic
  * green-bottom-band detector against the blob to catch Chrome's
- * sharing-controls strip (the "green bar" bug). If detected, the user
- * gets an opt-in "Crop bottom bar" button that re-encodes the take with
- * the band sliced off — the original blob is never modified silently.
+ * sharing-controls strip (the "green bar" bug). A HIGH-confidence band is
+ * cropped automatically before upload (the stored recording is clean, so a
+ * full-frame "Source" export never shows the strip). A lower-confidence
+ * band falls back to an opt-in "Crop bottom bar" button. Either way the
+ * original is recoverable via Revert if the crop drops audio.
  *
  * No trimming or scrub-edits here — those belong in the editor proper.
  */
@@ -79,6 +94,12 @@ export function RecordingPreview({
   const [cropError, setCropError] = React.useState<string | null>(null);
   /** True if the user explicitly chose "Keep original" — silences the warning. */
   const [keptOriginal, setKeptOriginal] = React.useState(false);
+  /**
+   * One-shot latch so auto-crop fires at most once per blob. Without it, a
+   * FAILED auto-crop would toggle `cropping` false→true and re-trigger the
+   * effect forever. Reset per-blob in the detection effect below.
+   */
+  const [autoCropAttempted, setAutoCropAttempted] = React.useState(false);
   /** Did the cropped output retain an audio track? `null` until crop runs. */
   const [audioPreserved, setAudioPreserved] = React.useState<boolean | null>(null);
   /**
@@ -98,6 +119,9 @@ export function RecordingPreview({
     setBandReport(null);
     setBandChecked(false);
     setCropError(null);
+    // `autoCropAttempted` is per-blob: a fresh take (or the cropped output
+    // swapped in) is a new blob and deserves its own single auto-crop shot.
+    setAutoCropAttempted(false);
     if (displaySurface !== "browser") {
       setBandChecked(true);
       return;
@@ -119,8 +143,22 @@ export function RecordingPreview({
     };
   }, [blob, displaySurface]);
 
+  // High-confidence bands are cropped automatically; lower-confidence ones
+  // fall back to the manual opt-in warning below.
+  const autoCropEligible =
+    bandReport?.detected === true &&
+    bandReport.confidence >= AUTO_CROP_MIN_CONFIDENCE;
+
+  // Manual opt-in warning shows for lower-confidence bands, OR when a
+  // high-confidence auto-crop was attempted and failed (so the user still
+  // has a way to retry or knowingly keep the original).
+  const autoCropFailed = autoCropEligible && autoCropAttempted && !!cropError;
   const showBandWarning =
-    bandChecked && bandReport?.detected === true && !cropped && !keptOriginal;
+    bandChecked &&
+    bandReport?.detected === true &&
+    !cropped &&
+    !keptOriginal &&
+    (!autoCropEligible || autoCropFailed);
 
   /**
    * Best-effort guess at whether the source recording even had audio. We use
@@ -175,6 +213,26 @@ export function RecordingPreview({
       setCropPct(null);
     }
   }, [bandReport, blob, onReplaceBlob]);
+
+  // Auto-crop: when a high-confidence sharing-bar is detected, slice it off
+  // automatically before the take is uploaded. Guards mirror handleCrop's
+  // preconditions plus the user's decisions (cropped / keptOriginal) so a
+  // manual Revert isn't immediately undone by a re-trigger. Runs at most
+  // once per detected band — once `cropped` flips true the guard holds.
+  React.useEffect(() => {
+    if (!bandChecked || !autoCropEligible) return;
+    if (cropped || cropping || keptOriginal || autoCropAttempted) return;
+    setAutoCropAttempted(true);
+    void handleCrop();
+  }, [
+    bandChecked,
+    autoCropEligible,
+    cropped,
+    cropping,
+    keptOriginal,
+    autoCropAttempted,
+    handleCrop,
+  ]);
 
   const handleRevert = React.useCallback(() => {
     if (!originalSnapshot) return;
@@ -268,6 +326,27 @@ export function RecordingPreview({
           )}
         </div>
       </div>
+
+      {/* Auto-crop in progress — a high-confidence sharing-bar was found and
+          is being sliced off automatically before upload. Shown instead of
+          the opt-in warning so the user understands why the action buttons
+          are briefly disabled. */}
+      {autoCropEligible && cropping && !cropped && (
+        <div className="mx-auto flex max-w-2xl items-start gap-3 rounded-2xl border border-violet-400/30 bg-violet-500/[0.08] px-4 py-3 text-left text-sm text-violet-100">
+          <Loader2 size={16} className="mt-0.5 shrink-0 animate-spin text-violet-300" />
+          <div className="min-w-0 flex-1">
+            <div className="font-semibold text-violet-50">
+              Removing the captured browser sharing bar…
+            </div>
+            <p className="mt-1 text-[12.5px] leading-relaxed text-violet-100/85">
+              Detected a {bandReport?.bandHeightPx}px green strip along the
+              bottom of your take and we&apos;re cropping it out automatically
+              {cropPct !== null ? ` — ${Math.round(cropPct * 100)}%` : ""}. This
+              re-processes the video and may take about as long as the recording.
+            </p>
+          </div>
+        </div>
+      )}
 
       {/* Sharing-bar health warning. Heuristic: a strong solid green band
           along the bottom of the captured frame is Chrome's tab-share strip

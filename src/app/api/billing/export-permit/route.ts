@@ -76,7 +76,10 @@ export async function POST(req: NextRequest) {
       typeof projectId !== "string" ||
       typeof projectTitle !== "string" ||
       (resolution !== "1080p" && resolution !== "4K") ||
-      (format !== "TikTok 9:16" && format !== "YouTube 16:9" && format !== "Custom") ||
+      (format !== "Source" &&
+        format !== "TikTok 9:16" &&
+        format !== "YouTube 16:9" &&
+        format !== "Custom") ||
       (fps !== 30 && fps !== 60)
     ) {
       return NextResponse.json(

@@ -14,6 +14,8 @@ import {
   cameraDiagnostic,
 } from "@/lib/timeline/camera";
 import { coverFitDims } from "@/lib/timeline/cover";
+import { resolveOutputDims } from "@/lib/timeline/output-dims";
+import { probeVideoBottomBand } from "@/lib/recording/health-check";
 import { drawClickHighlight } from "@/lib/timeline/click-highlight";
 import type {
   DetectedMoment,
@@ -37,6 +39,27 @@ function pickMime(): { mime: string; ext: string } | null {
     }
   }
   return null;
+}
+
+/**
+ * TEMPORARY DEBUG MODE — draws a RED border at the video's on-canvas bounds
+ * and a BLUE border at the canvas bounds, every frame. If the two don't
+ * perfectly overlap, the renderer is leaving pixels uncovered (the classic
+ * cause of a baked-in band). Enabled in dev via `?debugBorders=1` in the
+ * URL or `localStorage['framevo:debugBorders'] = '1'`. NEVER on in prod.
+ *
+ * Remove once the green-band investigation is closed.
+ */
+function debugBordersEnabled(): boolean {
+  if (process.env.NODE_ENV === "production") return false;
+  if (typeof window === "undefined") return false;
+  try {
+    const url = new URL(window.location.href);
+    if (url.searchParams.get("debugBorders") === "1") return true;
+    return window.localStorage.getItem("framevo:debugBorders") === "1";
+  } catch {
+    return false;
+  }
 }
 
 export interface ExportProgress {
@@ -116,28 +139,103 @@ export async function renderProjectClientSide(
   const sourceW = video.videoWidth || 1920;
   const sourceH = video.videoHeight || 1080;
 
-  // Fixed output size — independent of source dimensions. The export must
-  // be a clean container aspect (16:9 horizontal or 9:16 vertical) so the
-  // file plays predictably in every player. Source aspect mismatch is
-  // handled by `drawCover` (object-fit: cover semantics, center-cropped).
+  // Output size — resolved by the SHARED `resolveOutputDims` helper so the
+  // editor preview and this renderer always agree on framing. The default
+  // "Source" mode sets the canvas aspect EQUAL to the source aspect, so the
+  // full captured viewport is preserved with zero crop. The fixed-aspect
+  // presets ("YouTube 16:9", "TikTok 9:16", legacy verticalExport) are the
+  // only paths that crop, via `coverFitDims` (object-fit: cover semantics).
   //
   // Note on `"Custom"`: the literal is still in `ExportFormat` for type
   // compatibility with persisted defaults, but the UI no longer exposes
-  // it (no width/height/bitrate panel exists yet). Any project that
-  // somehow carries `format: "Custom"` falls through to horizontal here
-  // — which is the safe fallback until the Custom configuration panel
-  // ships. Don't add a `"Custom"` branch without also adding the UI for
-  // entering the dimensions; otherwise the renderer can't know what to
-  // produce.
-  const vertical = format === "TikTok 9:16" || effects.verticalExport;
-  let canvasW: number;
-  let canvasH: number;
-  if (vertical) {
-    canvasW = resolution === "4K" ? 2160 : 1080;
-    canvasH = resolution === "4K" ? 3840 : 1920;
-  } else {
-    canvasW = resolution === "4K" ? 3840 : 1920;
-    canvasH = resolution === "4K" ? 2160 : 1080;
+  // it (no width/height/bitrate panel exists yet). It maps to the safe
+  // 16:9 crop fallback inside `resolveOutputDims` until the Custom
+  // configuration panel ships. Don't add a `"Custom"` branch without also
+  // adding the UI for entering the dimensions; otherwise the renderer
+  // can't know what to produce.
+  const out = resolveOutputDims(sourceW, sourceH, resolution, format, effects);
+  const canvasW = out.canvasW;
+  const canvasH = out.canvasH;
+  const debugBorders = debugBordersEnabled();
+
+  // Cover-fit drives both the drawImage destination rect AND the per-frame
+  // diagnostics below; compute it once here (also recomputed verbatim at
+  // line ~209, but we need it now for the audit log).
+  const auditCover = coverFitDims(sourceW, sourceH, canvasW, canvasH);
+
+  // ── Pipeline dimension audit ────────────────────────────────────────
+  // The full capture → render → export chain in one log, so a "there's a
+  // band / it's cropped" report can be diagnosed from the console alone.
+  //
+  //   drawImage SOURCE rect      = the whole source frame (0,0 → src W×H)
+  //   drawImage DESTINATION rect = the cover-fit rect, centred on canvas
+  //   gapBelowVideoPx            = canvas rows NOT covered by the video at
+  //                                the bottom edge. Anything > 0 here is a
+  //                                renderer-introduced band; the black
+  //                                fill colours it black (never green), so
+  //                                a GREEN band cannot originate here.
+  if (process.env.NODE_ENV !== "production") {
+    const srcAspect = sourceW / sourceH;
+    const outAspect = canvasW / canvasH;
+    const destX = canvasW / 2 - auditCover.drawW / 2;
+    const destY = canvasH / 2 - auditCover.drawH / 2;
+    // Bottom gap with the camera at identity (worst case for a bottom band).
+    const gapBelow = Math.max(0, canvasH - (destY + auditCover.drawH));
+    console.info("[export] dimension audit", {
+      videoWidth: sourceW,
+      videoHeight: sourceH,
+      sourceAspect: srcAspect.toFixed(4),
+      format,
+      verticalExport: effects.verticalExport === true,
+      mode: out.mode,
+      resolution,
+      canvasWidth: canvasW,
+      canvasHeight: canvasH,
+      exportWidth: canvasW,
+      exportHeight: canvasH,
+      exportAspect: outAspect.toFixed(4),
+      willCrop: out.cropped,
+      drawImageSourceRect: { sx: 0, sy: 0, sw: sourceW, sh: sourceH },
+      drawImageDestRect: {
+        dx: +destX.toFixed(1),
+        dy: +destY.toFixed(1),
+        dw: +auditCover.drawW.toFixed(1),
+        dh: +auditCover.drawH.toFixed(1),
+      },
+      gapBelowVideoPx: +gapBelow.toFixed(2),
+      gapAboveVideoPx: +Math.max(0, destY).toFixed(2),
+      debugBorders,
+    });
+    if (gapBelow > 0.5 || destY > 0.5) {
+      console.warn(
+        `[export] renderer leaves ${gapBelow.toFixed(1)}px below / ${Math.max(0, destY).toFixed(1)}px above the video uncovered — these rows are BLACK-filled, not green. A green band there is NOT from this renderer.`
+      );
+    }
+    if (out.cropped && Math.abs(srcAspect - outAspect) > 0.001) {
+      console.warn(
+        `[export] CROP PRESET active (${out.mode}): source ${srcAspect.toFixed(3)} ≠ output ${outAspect.toFixed(3)} — content at the ${
+          srcAspect > outAspect ? "left/right" : "top/bottom"
+        } edges will be cropped. Pick "Source" format to keep the full viewport.`
+      );
+    }
+
+    // Decisive green-origin probe: sample the SOURCE video's own bottom
+    // rows. If they're green HERE, the band is baked into the recorded
+    // file at capture time (Chrome's tab-share strip) and no canvas
+    // change can remove it without cropping. If they're NOT green here but
+    // the export IS, the bug is downstream in our rendering.
+    const probe = probeVideoBottomBand(video);
+    if (probe) {
+      const verdict =
+        probe.bandHeightPx >= 3
+          ? `GREEN BAND IN SOURCE (${probe.bandHeightPx}px, bottom-row ${(probe.bottomRowGreenRatio * 100).toFixed(0)}% green) — baked in at capture, NOT a render bug. Crop it (cropBottomBand) to remove.`
+          : `source bottom is clean (bottom-row ${(probe.bottomRowGreenRatio * 100).toFixed(0)}% green) — any band in the export would be renderer-introduced.`;
+      console.info("[export] source bottom-band probe", { ...probe, verdict });
+    } else {
+      console.info(
+        "[export] source bottom-band probe: unreadable (no metadata or CORS taint)"
+      );
+    }
   }
 
   const canvas = document.createElement("canvas");
@@ -221,8 +319,10 @@ export async function renderProjectClientSide(
     effects,
     canvasW,
     canvasH,
-    cover
+    cover,
+    debugBorders
   );
+  if (debugBorders) drawDebugCanvasBorder(ctx, canvasW, canvasH);
   // Defensive boolean coercion so a stray truthy value (e.g. an old
   // string "true" left in Firestore by a hand-edit) can't flip the
   // vignette on. The schema field is `vignette?: boolean` — only a
@@ -285,8 +385,10 @@ export async function renderProjectClientSide(
       effects,
       canvasW,
       canvasH,
-      cover
+      cover,
+      debugBorders
     );
+    if (debugBorders) drawDebugCanvasBorder(ctx, canvasW, canvasH);
 
     // Vignette + watermark sit OUTSIDE the camera transform so they
     // stay anchored to the output frame (not zooming with the video).
@@ -399,7 +501,8 @@ function applyCameraFrame(
   effects: EffectsSettings,
   canvasW: number,
   canvasH: number,
-  cover: { drawW: number; drawH: number }
+  cover: { drawW: number; drawH: number },
+  debugBorders = false
 ): void {
   // Single source of truth — same call the preview makes. Returns the
   // moment's camera state OR identity when no moment overlaps.
@@ -413,6 +516,14 @@ function applyCameraFrame(
   ctx.scale(camera.scale, camera.scale);
   ctx.translate(tx, ty);
   ctx.drawImage(video, -cover.drawW / 2, -cover.drawH / 2, cover.drawW, cover.drawH);
+
+  // DEBUG: RED border = the video's drawImage destination bounds. Line
+  // width is divided by scale so it renders ~4px regardless of zoom.
+  if (debugBorders) {
+    ctx.lineWidth = 4 / camera.scale;
+    ctx.strokeStyle = "rgba(255,0,0,0.95)";
+    ctx.strokeRect(-cover.drawW / 2, -cover.drawH / 2, cover.drawW, cover.drawH);
+  }
 
   // Click-highlight overlay — drawn INSIDE the camera transform so the
   // ring/pulse/burst scales with the zoom, matching the preview where
@@ -452,6 +563,27 @@ function applyCameraFrame(
  * with the video. Opt-in via `effects.vignette` so the user controls
  * whether the gradient gets baked in.
  */
+/**
+ * DEBUG: BLUE border = the canvas (export frame) bounds. Drawn OUTSIDE the
+ * camera transform so it's always flush to the encoded frame edges. Pair
+ * with the RED video-bounds border in `applyCameraFrame`: at rest (no
+ * zoom) RED should sit exactly under BLUE. Any visible BLUE-only strip is
+ * a region the video doesn't cover — i.e. a renderer-introduced band.
+ * Inset by half the line width so the stroke isn't clipped at the edge.
+ */
+function drawDebugCanvasBorder(
+  ctx: CanvasRenderingContext2D,
+  canvasW: number,
+  canvasH: number
+): void {
+  const lw = 4;
+  ctx.save();
+  ctx.lineWidth = lw;
+  ctx.strokeStyle = "rgba(0,120,255,0.95)";
+  ctx.strokeRect(lw / 2, lw / 2, canvasW - lw, canvasH - lw);
+  ctx.restore();
+}
+
 function drawVignette(
   ctx: CanvasRenderingContext2D,
   canvasW: number,

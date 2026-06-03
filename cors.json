@@ -1,6 +1,8 @@
 [
   {
     "origin": [
+       "https://framevo.app",
+      "https://www.framevo.app",
       "https://adzoom-prod--adzoom-prod.us-east4.hosted.app",
       "http://localhost:3000"
     ],

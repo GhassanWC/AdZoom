@@ -6,6 +6,7 @@ import {
   Download,
   Smartphone,
   Monitor,
+  Maximize,
   AlertCircle,
   Loader2,
   ExternalLink,
@@ -36,9 +37,19 @@ import { useNotifications } from "@/lib/notifications/store";
 
 const resolutions = ["1080p", "4K"] as const;
 const fpsOptions = [30, 60] as const;
-const formats: { id: ExportFormat; label: string; desc: string; Icon: typeof Smartphone }[] = [
-  { id: "TikTok 9:16", label: "TikTok", desc: "9:16", Icon: Smartphone },
-  { id: "YouTube 16:9", label: "YouTube", desc: "16:9", Icon: Monitor },
+// "Source" is first AND the default — it preserves the full captured
+// viewport (no crop). The other two are explicit CROP presets that force a
+// fixed aspect and center-crop the source to fill it; their copy says so
+// outright so a crop is never a surprise.
+const formats: {
+  id: ExportFormat;
+  label: string;
+  desc: string;
+  Icon: typeof Smartphone;
+}[] = [
+  { id: "Source", label: "Source", desc: "Full frame", Icon: Maximize },
+  { id: "YouTube 16:9", label: "YouTube", desc: "16:9 · crops", Icon: Monitor },
+  { id: "TikTok 9:16", label: "TikTok", desc: "9:16 · crops", Icon: Smartphone },
 ];
 
 export function RealExportPanel() {
@@ -56,7 +67,7 @@ export function RealExportPanel() {
 
   const [resolution, setResolution] = React.useState<"1080p" | "4K">("1080p");
   const [fps, setFps] = React.useState<30 | 60>(30);
-  const [format, setFormat] = React.useState<ExportFormat>("YouTube 16:9");
+  const [format, setFormat] = React.useState<ExportFormat>("Source");
   const [progress, setProgress] = React.useState<ExportProgress | null>(null);
   const [error, setError] = React.useState<string | null>(null);
   const [downloadURL, setDownloadURL] = React.useState<string | null>(null);
@@ -264,16 +275,14 @@ export function RealExportPanel() {
           <div className="mb-2 text-[10px] font-semibold uppercase tracking-[0.18em] text-fog">
             Format
           </div>
-          {/* "Custom" was a third option here. It surfaced as a button but
-              the renderer in `export.ts` only branches on TikTok 9:16 vs
-              the default — there's no width/height/aspect/bitrate UI
+          {/* "Custom" was an option here. It surfaced as a button but the
+              renderer in `export.ts` has no width/height/aspect/bitrate UI
               wired up, so selecting it silently exported at YouTube 16:9
-              dimensions. Hidden until the Custom configuration panel
-              ships (per user direction). The `"Custom"` literal stays in
-              the `ExportFormat` union so any persisted defaults still
-              type-check; the renderer's defensive fallback maps it to a
-              safe horizontal output. */}
-          <div className="grid grid-cols-2 gap-1.5">
+              dimensions. Hidden until the Custom configuration panel ships
+              (per user direction). The `"Custom"` literal stays in the
+              `ExportFormat` union so any persisted defaults still
+              type-check; `resolveOutputDims` maps it to a safe 16:9 crop. */}
+          <div className="grid grid-cols-3 gap-1.5">
             {formats.map((f) => {
               const active = format === f.id;
               return (
@@ -294,6 +303,13 @@ export function RealExportPanel() {
               );
             })}
           </div>
+          {/* Honest copy about what each mode does to the frame. The
+              default ("Source") never crops; the presets always do. */}
+          <p className="mt-2 text-[10.5px] leading-relaxed text-fog/80">
+            {format === "Source"
+              ? "Source keeps your full recording frame — nothing is cropped off the edges."
+              : "This preset crops your recording to fit a fixed aspect. Pick Source to keep the whole frame."}
+          </p>
         </div>
 
         {/* Cinematic vignette — opt-in. When on, BOTH preview and

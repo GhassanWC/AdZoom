@@ -1,3 +1,6 @@
+"use client";
+
+import { useId } from "react";
 import { cn } from "@/lib/cn";
 import { BRAND } from "@/lib/branding";
 
@@ -11,11 +14,17 @@ import { BRAND } from "@/lib/branding";
  * Logos on the same page don't clash on the SVG fragment graph
  * (`<defs>` ids are page-global).
  *
+ * The id comes from React's `useId()` — NOT a module-level counter. A
+ * counter increments in a different order on the server vs the client
+ * (depends on how many Logos rendered before this one in each
+ * environment), so the gradient id diverged at hydration ("…-1" on the
+ * server, "…-2" on the client) and React threw a hydration mismatch.
+ * `useId` produces the same value on both sides. Colons are stripped so
+ * the id is a clean SVG fragment identifier.
+ *
  * Wordmark text reads `BRAND.name` from src/lib/branding.ts — never
  * hard-code the product name here.
  */
-let logoIdCounter = 0;
-
 export function Logo({
   className,
   withWordmark = true,
@@ -26,8 +35,7 @@ export function Logo({
   /** Pixel size of the mark. Wordmark scales with it. */
   size?: number;
 }) {
-  const uid = (logoIdCounter += 1);
-  const gradId = `framevo-violet-${uid}`;
+  const gradId = `framevo-violet-${useId().replace(/:/g, "")}`;
   const wordmarkPx = Math.round(size * 0.6); // ~17px for size=28
 
   return (
