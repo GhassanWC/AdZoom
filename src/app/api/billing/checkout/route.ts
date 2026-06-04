@@ -55,8 +55,22 @@ export async function POST(req: NextRequest) {
     }
 
     const variantId = planToVariantId(plan);
-    const origin = req.nextUrl.origin;
-    const redirectUrl = `${origin}/dashboard/billing?checkout=success&plan=${plan}`;
+    // Derive the public base URL from a configured canonical value, NOT from
+    // the request. Behind a reverse proxy (Firebase App Hosting / containers),
+    // `req.nextUrl.origin` reflects the internal bind address (e.g.
+    // https://0.0.0.0:8080), which would send LS buyers to a dead redirect.
+    const appUrl = process.env.NEXT_PUBLIC_APP_URL ?? req.nextUrl.origin;
+    const redirectUrl = `${appUrl}/dashboard/billing?checkout=success&plan=${plan}`;
+
+    // TEMP: confirm the resolved redirect host in production. Remove once the
+    // 0.0.0.0:8080 redirect issue is verified fixed.
+    console.log("[billing/checkout] redirect debug", {
+      origin: req.nextUrl.origin,
+      host: req.headers.get("host"),
+      forwardedHost: req.headers.get("x-forwarded-host"),
+      configuredAppUrl: process.env.NEXT_PUBLIC_APP_URL ?? null,
+      redirectUrl,
+    });
 
     const { url } = await createCheckout({
       variantId,
