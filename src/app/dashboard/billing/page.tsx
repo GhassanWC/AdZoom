@@ -19,6 +19,9 @@ interface PlanCopy {
   features: string[];
 }
 
+// Keyed by INTERNAL tier. Note the display-name swap (see plan.ts header):
+// the `creator` key is shown to users as "Pro" ($19), and the `pro` key as
+// "Creator" ($49). Copy below matches the /pricing page.
 const PLAN_COPY: Record<PlanTier, PlanCopy> = {
   free: {
     price: "$0",
@@ -26,33 +29,35 @@ const PLAN_COPY: Record<PlanTier, PlanCopy> = {
     features: [
       "5 exports per month",
       "1080p exports",
-      "Watermark on exports",
-      "Basic AI analysis",
-      "5 GB project storage",
+      "Watermark included",
+      "All AI effects",
+      "Community presets",
     ],
   },
   creator: {
-    price: "$15",
+    // Shown as "Pro" — the $19 "For serious creators" tier.
+    price: "$19",
     cadence: "month",
     features: [
+      "Unlimited exports",
+      "4K + 60fps exports",
       "No watermark",
-      "Unlimited recordings",
-      "HD exports",
-      "Advanced AI timeline balancing",
-      "Cinematic zoom presets",
-      "50 GB project storage",
+      "All AI effects + presets",
+      "Vertical & TikTok reframes",
+      "Priority render queue",
     ],
   },
   pro: {
+    // Shown as "Creator" — the $49 "Teams & agencies" tier.
     price: "$49",
     cadence: "month",
     features: [
-      "Everything in Creator",
-      "4K exports",
-      "Team workspace support",
-      "Brand presets",
-      "Priority rendering",
-      "500 GB project storage",
+      "Everything in Pro",
+      "Team workspace, 5 seats",
+      "Brand presets & lockups",
+      "API access",
+      "Priority support",
+      "Custom export formats",
     ],
   },
 };
@@ -126,17 +131,20 @@ export default function BillingPage() {
   // Primary + secondary CTAs depend on the current tier.
   const ctaBlock = (() => {
     if (tier === "free") {
+      // Display names: plan="creator" is shown "Pro" ($19, popular);
+      // plan="pro" is shown "Creator" ($49, teams).
       return (
         <div className="mt-6 flex flex-wrap gap-2">
-          <CheckoutButton plan="creator" label="Upgrade to Creator" variant="primary" />
-          <CheckoutButton plan="pro" label="Go Pro" variant="ghost" />
+          <CheckoutButton plan="creator" label="Go Pro" variant="primary" />
+          <CheckoutButton plan="pro" label="Start Creator" variant="ghost" />
         </div>
       );
     }
     if (tier === "creator") {
+      // User is on "Pro" ($19) → upgrade to "Creator" ($49, internal `pro`).
       return (
         <div className="mt-6 flex flex-wrap gap-2">
-          <CheckoutButton plan="pro" label="Upgrade to Pro" variant="primary" />
+          <CheckoutButton plan="pro" label="Upgrade to Creator" variant="primary" />
           <ManageSubscriptionButton variant="ghost" />
         </div>
       );

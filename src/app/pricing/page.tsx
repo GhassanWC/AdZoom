@@ -11,37 +11,27 @@ export const metadata = {
 const FREE_FEATURES = [
   "5 exports per month",
   "1080p exports",
-  "Watermark on exports",
-  "Basic AI analysis",
-  "5 GB project storage",
-  "Limited cinematic presets",
-];
-
-const CREATOR_FEATURES = [
-  "Unlimited recordings",
-  "No watermark on exports",
-  "HD (1080p) exports",
-  "Advanced AI timeline balancing",
-  "Attention-aware editing",
-  "Cinematic zoom presets",
-  "Smart focus engine",
-  "AI narrative chapters",
-  "Custom intensity tuning",
-  "Cursor enhancement",
-  "50 GB project storage",
+  "Watermark included",
+  "All AI effects",
+  "Community presets",
 ];
 
 const PRO_FEATURES = [
-  "Everything in Creator",
-  "4K exports",
-  "Team workspace support",
-  "Shared & brand presets",
-  "Advanced AI editing modes",
-  "Priority rendering",
-  "Batch export",
-  "Collaboration-ready structure",
-  "Future API & webhook support",
-  "500 GB project storage",
+  "Unlimited exports",
+  "4K + 60fps exports",
+  "No watermark",
+  "All AI effects + presets",
+  "Vertical & TikTok reframes",
+  "Priority render queue",
+];
+
+const CREATOR_FEATURES = [
+  "Everything in Pro",
+  "Team workspace, 5 seats",
+  "Brand presets & lockups",
+  "API access",
+  "Priority support",
+  "Custom export formats",
 ];
 
 export default function PricingPage() {
@@ -74,37 +64,39 @@ export default function PricingPage() {
           name="Free"
           price="$0"
           cadence="forever"
-          tagline="Try the product — see the AI editing value first-hand."
+          tagline="Try the magic."
           features={FREE_FEATURES}
           icon={<Sparkles size={14} />}
           cta={
             <Button variant="ghost" size="md" href="/login">
-              Start free
+              Start Free
             </Button>
           }
         />
 
-        {/* Creator — featured */}
-        <PlanCard
-          name="Creator"
-          price="$15"
-          cadence="month"
-          tagline="For creators, indie hackers, tutorial makers, and SaaS demos."
-          features={CREATOR_FEATURES}
-          icon={<Crown size={14} />}
-          featured
-          cta={<CheckoutButton plan="creator" label="Start Creator" variant="primary" />}
-        />
-
-        {/* Pro */}
+        {/* Pro — featured / most popular. Display name "Pro" is backed by the
+            internal `creator` tier (mid: 50 GB, HD). See note in PRO_FEATURES. */}
         <PlanCard
           name="Pro"
-          price="$49"
-          cadence="month"
-          tagline="For agencies, teams, educators, and SaaS companies."
+          price="$19"
+          cadence="per month"
+          tagline="For serious creators."
           features={PRO_FEATURES}
+          icon={<Crown size={14} />}
+          featured
+          cta={<CheckoutButton plan="creator" label="Go Pro" variant="primary" />}
+        />
+
+        {/* Creator — teams & agencies. Display name "Creator" is backed by the
+            internal `pro` tier (top: 500 GB, 4K) so "Everything in Pro" holds. */}
+        <PlanCard
+          name="Creator"
+          price="$49"
+          cadence="per month"
+          tagline="Teams & agencies."
+          features={CREATOR_FEATURES}
           icon={<Users size={14} />}
-          cta={<CheckoutButton plan="pro" label="Start Pro" variant="primary" />}
+          cta={<CheckoutButton plan="pro" label="Start Creator" variant="primary" />}
         />
       </div>
 

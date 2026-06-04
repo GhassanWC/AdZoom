@@ -12,16 +12,16 @@ import type { PlanTier } from "./plan";
 // a small client-side mirror. Keep these in sync if you change the caps.
 const CLIENT_EXPORT_LIMITS: Record<PlanTier, number> = {
   free: 5,
-  creator: 300,
+  creator: Number.POSITIVE_INFINITY,
   pro: Number.POSITIVE_INFINITY,
 };
 
 export interface MonthlyUsageState {
   /** Exports used this month. 0 until the listener resolves. */
   used: number;
-  /** Plan cap; Infinity for Pro. */
+  /** Plan cap; Infinity for paid tiers. */
   limit: number;
-  /** Remaining = max(0, limit - used). Infinity for Pro. */
+  /** Remaining = max(0, limit - used). Infinity for paid tiers. */
   remaining: number;
   /** Current plan tier (mirror of useStoragePlan). */
   plan: PlanTier;

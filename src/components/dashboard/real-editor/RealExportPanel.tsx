@@ -59,8 +59,9 @@ export function RealExportPanel() {
   const usage = useMonthlyUsage();
   const { getIdToken } = useAuth();
 
-  // 4K is Pro-only. Free + Creator are capped at 1080p.
-  const canExport4k = planMeetsMinimum(plan.tier, "pro");
+  // 4K requires a paid plan (the $19 "Pro" tier, internal `creator`, and up).
+  // Free is capped at 1080p.
+  const canExport4k = planMeetsMinimum(plan.tier, "creator");
   const availableResolutions = (
     canExport4k ? resolutions : (["1080p"] as const)
   ) as readonly ("1080p" | "4K")[];
@@ -73,8 +74,8 @@ export function RealExportPanel() {
   const [downloadURL, setDownloadURL] = React.useState<string | null>(null);
   const cancelRef = React.useRef<AbortController | null>(null);
 
-  // Defensive: if the user was on Pro at 4K and downgraded mid-session,
-  // snap them back to 1080p before they hit Export.
+  // Defensive: if the user was on a paid plan at 4K and downgraded to free
+  // mid-session, snap them back to 1080p before they hit Export.
   React.useEffect(() => {
     if (!canExport4k && resolution === "4K") setResolution("1080p");
   }, [canExport4k, resolution]);

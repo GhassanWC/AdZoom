@@ -1,12 +1,18 @@
 /**
  * Plan tiers, storage limits, and tier helpers.
  *
- * Tier hierarchy (free < creator < pro):
- *   • Free      — onboarding / try-the-product. 5 GB storage.
- *   • Creator   — main paid plan (~$15/mo). 50 GB storage. No watermark,
- *                 HD exports, advanced AI editing, premium presets.
- *   • Pro       — team / agency plan (~$49/mo). 500 GB storage. Adds 4K
- *                 export, brand presets, priority rendering, future API.
+ * Tier hierarchy (free < creator < pro) — note the DISPLAY names are swapped
+ * relative to the internal keys (the keys are load-bearing for gating and the
+ * LS variant binding, so they don't change):
+ *   • Free                       — onboarding / try-the-product. 5 GB storage.
+ *   • `creator` key, shown "Pro" — main paid plan (~$19/mo). 50 GB storage.
+ *                                  Unlimited exports, no watermark, 4K + 60fps,
+ *                                  advanced AI editing, priority rendering, all
+ *                                  premium presets.
+ *   • `pro` key, shown "Creator" — team / agency plan (~$49/mo). 500 GB storage.
+ *                                  Everything in "Pro" plus brand-kit presets,
+ *                                  team seats, and API access (the "Everything
+ *                                  in Pro" marketing tier).
  *
  * A user's tier is read from `users/{uid}.plan`; absent = "free". The plan
  * field is mirrored from `subscriptions/{uid}.plan` by the Lemon Squeezy
@@ -35,13 +41,15 @@ export const PLAN_DEFS: Record<PlanTier, PlanDef> = {
   },
   creator: {
     tier: "creator",
-    name: "Creator plan",
+    // Display name intentionally "Pro" — see header note on the swap.
+    name: "Pro plan",
     storageBytes: 50 * GB,
     ctaLabel: "Manage",
   },
   pro: {
     tier: "pro",
-    name: "Pro plan",
+    // Display name intentionally "Creator" — see header note on the swap.
+    name: "Creator plan",
     storageBytes: 500 * GB,
     ctaLabel: "Manage",
   },

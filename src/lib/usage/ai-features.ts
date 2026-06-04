@@ -25,6 +25,10 @@ export type AiFeatureKey =
   | "4k-export"             // 4K resolution in the export panel
   | "brand-presets";        // Future brand-kit feature (placeholder)
 
+// Boundaries follow the marketing tiers: the $19 "Pro" plan (internal
+// `creator`) unlocks 4K, priority rendering, and all premium presets; the
+// $49 "Creator" plan (internal `pro`) is the team tier and additionally
+// unlocks brand-kit presets.
 export const AI_FEATURE_MIN_PLAN: Record<AiFeatureKey, PlanTier> = {
   "basic-analysis": "free",
   "advanced-balancing": "creator",
@@ -32,8 +36,8 @@ export const AI_FEATURE_MIN_PLAN: Record<AiFeatureKey, PlanTier> = {
   "ai-rebalance": "creator",
   "cinematic-presets": "creator",
   "export-styles": "creator",
-  "priority-rendering": "pro",
-  "4k-export": "pro",
+  "priority-rendering": "creator",
+  "4k-export": "creator",
   "brand-presets": "pro",
 };
 
