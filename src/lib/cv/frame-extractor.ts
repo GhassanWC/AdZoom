@@ -18,6 +18,8 @@
 import {
   FRAME_W,
   FRAME_H,
+  DETECT_W,
+  DETECT_H,
   SAMPLE_FPS,
   SAMPLE_FPS_LONG,
   LONG_VIDEO_SECONDS,
@@ -29,8 +31,10 @@ import {
 export interface ExtractedFrame {
   /** Actual video.currentTime after the seek settled (seconds). */
   t: number;
-  /** Grayscale buffer, FRAME_W × FRAME_H, one byte per pixel. */
+  /** Grayscale buffer, FRAME_W × FRAME_H, one byte per pixel (legacy consumers). */
   frame: GrayFrame;
+  /** Higher-res grayscale buffer, DETECT_W × DETECT_H, for cursor/UI tracking. */
+  detectFrame: GrayFrame;
 }
 
 /** Pick the sampling rate — calmer rate for long videos to bound wall-clock. */
@@ -112,8 +116,8 @@ export async function* extractFrames(
   const step = 1 / fps;
 
   const canvas = document.createElement("canvas");
-  canvas.width = FRAME_W;
-  canvas.height = FRAME_H;
+  canvas.width = DETECT_W;
+  canvas.height = DETECT_H;
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
   if (!ctx) throw new Error("2D canvas context unavailable");
 
@@ -131,18 +135,19 @@ export async function* extractFrames(
       await seekTo(video, Math.min(t, Math.max(0, duration - 0.05)), signal);
       await rafSettle();
 
-      ctx.drawImage(video, 0, 0, FRAME_W, FRAME_H);
+      ctx.drawImage(video, 0, 0, DETECT_W, DETECT_H);
 
       let pixels: ImageData;
       try {
-        pixels = ctx.getImageData(0, 0, FRAME_W, FRAME_H);
+        pixels = ctx.getImageData(0, 0, DETECT_W, DETECT_H);
       } catch {
         // SecurityError → tainted canvas (cross-origin video, no CORS headers).
         throw new CvTaintedError();
       }
 
-      const frame = toGrayscale(pixels.data);
-      yield { t: video.currentTime, frame };
+      const detectFrame = toGrayscale(pixels.data, DETECT_W, DETECT_H);
+      const frame = downsample2x(detectFrame);
+      yield { t: video.currentTime, frame, detectFrame };
     }
   } finally {
     // Best-effort restore — never throw out of cleanup.
@@ -157,10 +162,28 @@ export async function* extractFrames(
 }
 
 /** RGBA ImageData → single-channel luma buffer (Rec. 601 weights). */
-function toGrayscale(rgba: Uint8ClampedArray): GrayFrame {
-  const out = new Uint8ClampedArray(FRAME_W * FRAME_H);
-  for (let i = 0, p = 0; i < rgba.length; i += 4, p++) {
+function toGrayscale(rgba: Uint8ClampedArray, w: number, h: number): GrayFrame {
+  const out = new Uint8ClampedArray(w * h);
+  for (let i = 0, p = 0; p < out.length; i += 4, p++) {
     out[p] = (rgba[i] * 0.299 + rgba[i + 1] * 0.587 + rgba[i + 2] * 0.114) | 0;
+  }
+  return out;
+}
+
+/**
+ * Box-downsample a DETECT_W×DETECT_H gray buffer to FRAME_W×FRAME_H by
+ * averaging each 2×2 source block. Requires DETECT = 2× FRAME on both axes.
+ */
+function downsample2x(src: GrayFrame): GrayFrame {
+  const out = new Uint8ClampedArray(FRAME_W * FRAME_H);
+  for (let y = 0; y < FRAME_H; y++) {
+    const sy = y * 2;
+    for (let x = 0; x < FRAME_W; x++) {
+      const sx = x * 2;
+      const i = sy * DETECT_W + sx;
+      out[y * FRAME_W + x] =
+        (src[i] + src[i + 1] + src[i + DETECT_W] + src[i + DETECT_W + 1]) >> 2;
+    }
   }
   return out;
 }

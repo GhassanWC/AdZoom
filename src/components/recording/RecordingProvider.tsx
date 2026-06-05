@@ -213,6 +213,7 @@ export function RecordingProvider({ children }: { children: React.ReactNode }) {
         onProgress: (pct) => setUploadPct(pct),
         interactions: result.interactions,
         interactionScope: result.interactionScope,
+        captureDimensions: result.captureDimensions,
       });
       // Persistent notification — the navbar bell carries the take
       // forward even if the user navigates away mid-upload. The id is

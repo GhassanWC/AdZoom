@@ -6,8 +6,20 @@
  * samples × 6 arrays ≈ 12 KB encoded — comfortably under the 1 MB doc limit.
  */
 
-import type { VisualAnalysis, VisualEvent } from "../firebase/schema";
+import type {
+  InferredClick,
+  UIRegion,
+  VisualAnalysis,
+  VisualDwell,
+  VisualEvent,
+} from "../firebase/schema";
 import type { RawFrameSignal } from "./types";
+import type { CursorEstimate } from "./cursor-track";
+
+/** Cap persisted UI regions for doc-size safety. */
+const MAX_UI_REGIONS = 200;
+/** Cap persisted dwells (dev-tuning visibility only). */
+const MAX_DWELLS = 120;
 
 /** Above this many samples (~40 min @ 1 Hz) drop to 0.5 Hz. */
 const MAX_SAMPLES_AT_1HZ = 2400;
@@ -36,12 +48,30 @@ export interface ResampleInput {
   duration: number;
   sceneChanges: VisualEvent[];
   clickEvents: VisualEvent[];
+  /** Per-frame cursor estimates (same order/length as `signals`). v3. */
+  cursors?: CursorEstimate[];
+  /** UI-change-grounded inferred clicks. v3. */
+  inferredClicks?: InferredClick[];
+  /** Cursor dwells (dev-tuning visibility only). v3. */
+  dwells?: VisualDwell[];
+  /** Detected UI regions. v3. */
+  uiRegions?: UIRegion[];
   computeMs: number;
 }
 
 /** Build the persisted `VisualAnalysis` from dense per-frame signals. */
 export function resample(input: ResampleInput): VisualAnalysis {
-  const { signals, duration, sceneChanges, clickEvents, computeMs } = input;
+  const {
+    signals,
+    duration,
+    sceneChanges,
+    clickEvents,
+    cursors,
+    inferredClicks,
+    dwells,
+    uiRegions,
+    computeMs,
+  } = input;
 
   const sampleRate =
     Math.ceil(duration) > MAX_SAMPLES_AT_1HZ ? 0.5 : 1;
@@ -108,8 +138,42 @@ export function resample(input: ResampleInput): VisualAnalysis {
     sampleCount
   );
 
-  return {
-    version: 1,
+  // Cursor track → per-second confidence-weighted position + mean confidence.
+  const cursorX = new Array<number>(sampleCount).fill(0);
+  const cursorY = new Array<number>(sampleCount).fill(0);
+  const cursorConf = new Array<number>(sampleCount).fill(0);
+  const hasCursors = !!cursors && cursors.length === signals.length;
+  if (hasCursors && cursors) {
+    const cxs = new Float64Array(sampleCount);
+    const cys = new Float64Array(sampleCount);
+    const cw = new Float64Array(sampleCount);
+    const confSum = new Float64Array(sampleCount);
+    const cCount = new Float64Array(sampleCount);
+    for (let i = 0; i < cursors.length; i++) {
+      const b = Math.min(sampleCount - 1, Math.max(0, Math.floor(signals[i].t / bucketLen)));
+      const cu = cursors[i];
+      const w = Math.max(0.01, cu.confidence);
+      cxs[b] += cu.x * w;
+      cys[b] += cu.y * w;
+      cw[b] += w;
+      confSum[b] += cu.confidence;
+      cCount[b]++;
+    }
+    let lx = 0.5;
+    let ly = 0.5;
+    for (let b = 0; b < sampleCount; b++) {
+      if (cw[b] > 0) {
+        lx = cxs[b] / cw[b];
+        ly = cys[b] / cw[b];
+      }
+      cursorX[b] = quantize(lx);
+      cursorY[b] = quantize(ly);
+      cursorConf[b] = quantize(cCount[b] > 0 ? confSum[b] / cCount[b] : 0);
+    }
+  }
+
+  const va: VisualAnalysis = {
+    version: hasCursors ? 3 : 1,
     sampleRate,
     sampleCount,
     motion,
@@ -122,6 +186,23 @@ export function resample(input: ResampleInput): VisualAnalysis {
     attentionCurve,
     computeMs: Math.round(computeMs),
   };
+  // Only attach v3 fields when present — keeps legacy docs/writes clean
+  // (Firestore rejects `undefined`).
+  if (hasCursors) {
+    va.cursorX = cursorX;
+    va.cursorY = cursorY;
+    va.cursorConf = cursorConf;
+  }
+  if (inferredClicks && inferredClicks.length > 0) {
+    va.inferredClicks = inferredClicks;
+  }
+  if (dwells && dwells.length > 0) {
+    va.dwells = dwells.slice(0, MAX_DWELLS);
+  }
+  if (uiRegions && uiRegions.length > 0) {
+    va.uiRegions = uiRegions.slice(0, MAX_UI_REGIONS);
+  }
+  return va;
 }
 
 /**

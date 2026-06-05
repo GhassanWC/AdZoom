@@ -27,6 +27,10 @@ import {
 } from "./types";
 import type { InteractionProvider } from "./interaction-provider";
 import { createBrowserInteractionProvider } from "./browser-interaction-provider";
+import {
+  decideInteractionScope,
+  type CaptureDimensions,
+} from "./scope-detect";
 
 /**
  * `getDisplayMedia` options that aren't in the stock `lib.dom.d.ts` yet.
@@ -75,6 +79,8 @@ interface InternalState {
    * RecordingResult so the preview can warn about likely sharing-bar capture.
    */
   displaySurface: "monitor" | "window" | "browser" | null;
+  /** Capture geometry recorded at scope-decision time (for re-validation). */
+  captureDimensions: CaptureDimensions | null;
 }
 
 export interface CreateRecordingEngineOptions {
@@ -138,6 +144,7 @@ export function createRecordingEngine(
     micLevel: 0,
     interactionScope: "tab",
     displaySurface: null,
+    captureDimensions: null,
   };
 
   const listeners = new Set<(e: RecordingEvent) => void>();
@@ -351,15 +358,35 @@ export function createRecordingEngine(
     // *which* tab without CaptureController (Chrome 116+) but if the picked
     // tab dimensions match our viewport, it's almost certainly ours.
     // Anything else (monitor, window) is definitely external.
-    if (settings.displaySurface === "browser") {
-      const viewportW = window.innerWidth;
-      const viewportH = window.innerHeight;
-      const dimsMatch =
-        Math.abs((settings.width ?? 0) - viewportW) <= Math.max(64, viewportW * 0.1) &&
-        Math.abs((settings.height ?? 0) - viewportH) <= Math.max(64, viewportH * 0.1);
-      s.interactionScope = dimsMatch ? "tab" : "external";
-    } else {
-      s.interactionScope = "external";
+    //
+    // CRITICAL: getDisplayMedia track dimensions are reported in *physical
+    // device pixels*, while `window.innerWidth/Height` are *CSS pixels*. On a
+    // HiDPI display (devicePixelRatio > 1) a recording of our own tab reports
+    // e.g. 2880×1800 against a 1440×900 viewport — a 2× mismatch that wrongly
+    // flagged the take as "external" and discarded the whole click stream.
+    // Compare against the DPI-scaled viewport (and accept a direct CSS-pixel
+    // match for browsers that report CSS px), with an aspect-ratio match as a
+    // DPI-invariant fallback for fractional ratios / browser zoom.
+    const trackW = settings.width ?? 0;
+    const trackH = settings.height ?? 0;
+    const captureDimensions: CaptureDimensions = {
+      trackWidth: trackW,
+      trackHeight: trackH,
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight,
+      devicePixelRatio: window.devicePixelRatio || 1,
+      displaySurface: settings.displaySurface ?? "unknown",
+      captureAspect: trackW / Math.max(1, trackH),
+    };
+    s.captureDimensions = captureDimensions;
+    const scopeDecision = decideInteractionScope(captureDimensions);
+    s.interactionScope = scopeDecision.scope;
+    if (process.env.NODE_ENV !== "production") {
+      console.info("[recording] scope decision", {
+        ...captureDimensions,
+        scope: scopeDecision.scope,
+        reason: scopeDecision.reason,
+      });
     }
 
     // If the user clicks the browser's "Stop sharing" button, we get an
@@ -507,6 +534,7 @@ export function createRecordingEngine(
         const mimeType = s.mime;
         const interactionScope = s.interactionScope;
         const displaySurface = s.displaySurface;
+        const captureDimensions = s.captureDimensions;
         const blob = new Blob(s.chunks, { type: mimeType });
         // Drain the interaction provider before tearing down. If the surface
         // was external we still keep the events around (they describe what
@@ -527,6 +555,7 @@ export function createRecordingEngine(
           interactions,
           interactionScope,
           displaySurface,
+          ...(captureDimensions ? { captureDimensions } : {}),
         };
         teardown();
         setState("stopped");

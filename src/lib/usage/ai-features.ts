@@ -23,7 +23,8 @@ export type AiFeatureKey =
   | "export-styles"         // Future export style variants (placeholder)
   | "priority-rendering"    // Future priority queue (placeholder)
   | "4k-export"             // 4K resolution in the export panel
-  | "brand-presets";        // Future brand-kit feature (placeholder)
+  | "brand-presets"         // Future brand-kit feature (placeholder)
+  | "ai-visual-moments";    // Gemini vision moment-detection for uploads
 
 // Boundaries follow the marketing tiers: the $19 "Pro" plan unlocks 4K,
 // priority rendering, and all premium presets; the $49 "Creator" plan is the
@@ -38,6 +39,9 @@ export const AI_FEATURE_MIN_PLAN: Record<AiFeatureKey, PlanTier> = {
   "priority-rendering": "pro",
   "4k-export": "pro",
   "brand-presets": "creator",
+  // Gemini watches the uploaded video and proposes moments directly — a paid
+  // enhancement on top of the FREE deterministic CV editing engine.
+  "ai-visual-moments": "pro",
 };
 
 /** True when the user's plan meets the minimum tier for the given feature. */

@@ -817,6 +817,119 @@ export async function proposeGapFills(opts: {
   return candidates;
 }
 
+const VISUAL_MOMENTS_SYSTEM = `You are the PRIMARY editor for an UPLOADED screen recording that has NO interaction/click data — only the pixels. Watch the video and identify the moments a human editor would emphasise.
+
+You will receive:
+- The video.
+- Optionally, stretches already classified as quiet/boring — AVOID proposing inside those.
+- A maxMoments budget.
+
+WHAT TO FIND (visual evidence only)
+- Clicks/taps: the cursor settles, then a button / menu / control reacts.
+- Reveals: a modal, dialog, dropdown, result, or output appears.
+- Navigation: a page / view / tab changes (emphasise AFTER the new view settles).
+- Key typing / form focus: a field becomes active and content appears.
+Ground every moment in something visible. Never invent activity.
+
+ABSTENTION
+- Prefer FEWER, high-quality moments over filling the budget. Skip idle / loading / repetitive stretches.
+- For a repeated action, emphasise only the FIRST or LAST.
+
+EFFECT-TYPE GUIDANCE (do NOT default to zoom)
+- modal / dialog / result reveal → zoom (0.6-0.8).
+- navigation / scene transition → zoom after the view stabilises.
+- code editor activity → cursor-focus (0.25-0.4).
+- form fields → cursor-focus (0.4-0.5).
+- ordinary CTA / single click → click-highlight.
+- scroll burst in progress → speed-up (only after it settles).
+
+OUTPUT FORMAT
+- focusRegion coordinates in [0, 1], TIGHTLY framed around the meaningful UI element (never the whole frame).
+- Spread moments across the whole timeline; never overlap them; never start within 0.2s of a scene transition.
+- Output ONLY the JSON schema. No commentary.`;
+
+/**
+ * Ask Gemini to detect the most edit-worthy moments DIRECTLY from the video —
+ * the paid "visual moments" enhancement for uploads with no interaction data.
+ * Unlike `proposeGapFills`, this is not constrained to empty windows: Gemini
+ * proposes across the whole timeline (the balancer + quota bound the influence).
+ */
+export async function proposeVisualMoments(opts: {
+  video: GeminiVideoRef;
+  hintedDuration?: number;
+  maxMoments: number;
+  boringSections?: Array<{ startTime: number; endTime: number }>;
+}): Promise<GapFillCandidate[]> {
+  if (opts.maxMoments <= 0) return [];
+  const ai = getGemini();
+  const boringList = (opts.boringSections ?? [])
+    .map((b) => `  · ${b.startTime.toFixed(1)}s → ${b.endTime.toFixed(1)}s`)
+    .join("\n");
+  const userPrompt = [
+    `This recording has NO click data. Watch it and propose AT MOST ${opts.maxMoments} edit-worthy moments, each grounded in visible activity. Returning fewer is correct when little happens.`,
+    opts.hintedDuration ? `Video duration: ${opts.hintedDuration.toFixed(1)}s.` : "",
+    boringList
+      ? `AVOID proposing moments inside these quiet/boring stretches:\n${boringList}`
+      : "",
+    `focusRegion must be TIGHTLY framed around the meaningful element, coordinates in [0, 1].`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+  const response: GenerateContentResponse = await ai.models.generateContent({
+    model: ANALYSIS_MODEL,
+    contents: [
+      {
+        role: "user",
+        parts: [videoPart(opts.video), { text: userPrompt }],
+      },
+    ],
+    config: {
+      systemInstruction: VISUAL_MOMENTS_SYSTEM,
+      responseMimeType: "application/json",
+      responseSchema: GAPFILL_SCHEMA as never,
+      temperature: 0.3,
+    },
+  });
+  const text = response.text;
+  if (!text) return [];
+  let parsed: { moments?: Array<Record<string, unknown>> };
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return [];
+  }
+  const dur =
+    opts.hintedDuration && opts.hintedDuration > 0
+      ? opts.hintedDuration
+      : Number.POSITIVE_INFINITY;
+  const candidates = (parsed.moments ?? [])
+    .map<GapFillCandidate>((m) => ({
+      startTime: Math.max(0, Number(m.startTime) || 0),
+      endTime: Math.max(0, Number(m.endTime) || 0),
+      focusRegion: {
+        x: clamp01((m.focusRegion as Record<string, number>)?.x ?? 0.325),
+        y: clamp01((m.focusRegion as Record<string, number>)?.y ?? 0.325),
+        width: clamp01((m.focusRegion as Record<string, number>)?.width ?? 0.35),
+        height: clamp01((m.focusRegion as Record<string, number>)?.height ?? 0.35),
+      },
+      effectType: (["zoom", "click-highlight", "cursor-focus", "speed-up"] as const).includes(
+        m.effectType as never
+      )
+        ? (m.effectType as GapFillCandidate["effectType"])
+        : "zoom",
+      uiContext: pickEnum<UIContext>(m.uiContext, UI_CONTEXTS, "other"),
+      attentionScore: clamp01(Number(m.attentionScore) || 0.5),
+      recommendedIntensity: clamp01(Number(m.recommendedIntensity) || 0.5),
+      label: typeof m.label === "string" ? m.label.slice(0, 80) : undefined,
+      reason: typeof m.reason === "string" ? m.reason.slice(0, 240) : undefined,
+    }))
+    .filter((c) => c.endTime > c.startTime)
+    .filter((c) => c.startTime >= 0 && c.endTime <= dur + 0.05)
+    .slice(0, opts.maxMoments)
+    .sort((a, b) => a.startTime - b.startTime);
+  return candidates;
+}
+
 // ── 3. MOMENT LABELING ───────────────────────────────────────────────────────
 
 const LABEL_SCHEMA = {

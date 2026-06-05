@@ -13,7 +13,7 @@
 export const BRAND = {
   name: "Framevo",
   shortName: "Framevo",
-  tagline: "AI-powered screen recording editor",
+  tagline: "AI editor for screen recordings — upload and it edits for you",
   /** Long-form marketing tagline used on the hero. */
   longTagline: "AI video editing that follows the action.",
   domain: "framevo.app",

@@ -44,11 +44,11 @@ export function DashboardHome() {
         subtitle="Upload a recording, let the AI plan the cinematic cut, then export it cleanly."
         action={
           <div className="flex flex-wrap gap-2">
-            <Button href="/dashboard/record" variant="primary" size="md" leftIcon={<Video size={14} />}>
-              Record
-            </Button>
-            <Button href="/dashboard/upload" variant="ghost" size="md" leftIcon={<UploadIcon size={14} />}>
+            <Button href="/dashboard/upload" variant="primary" size="md" leftIcon={<UploadIcon size={14} />}>
               Upload
+            </Button>
+            <Button href="/dashboard/record" variant="ghost" size="md" leftIcon={<Video size={14} />}>
+              Record
             </Button>
             {projects.length > 0 && (
               <Button href="/dashboard/projects" variant="ghost" size="md">

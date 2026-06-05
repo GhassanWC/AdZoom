@@ -15,6 +15,8 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { useEditorReal } from "./context";
+import { useDebugParam } from "./use-debug-param";
+import { CvDebugOverlay } from "./CvDebugOverlay";
 import { dequantize } from "@/lib/cv/resample";
 import {
   resolveCameraFrame,
@@ -243,6 +245,9 @@ export function RealVideoPlayer() {
     cvDebug,
     updateMoment,
   } = useEditorReal();
+
+  // Dev-only CV debug overlay gate (?debug=1 / Ctrl+Shift+D).
+  const cvDebugOverlay = useDebugParam();
 
   const containerRef = React.useRef<HTMLDivElement | null>(null);
   const aspectRef = React.useRef<HTMLDivElement | null>(null);
@@ -507,6 +512,16 @@ export function RealVideoPlayer() {
               visualAnalysis={va}
               currentTime={currentTime}
               duration={duration > 0 ? duration : project.duration ?? 0}
+            />
+          )}
+
+          {/* Dev-only visual-engine overlay (?debug=1): cursor track, inferred
+              click markers, focus boxes, scene badge, CV moment labels. */}
+          {cvDebugOverlay && va && va.sampleCount > 0 && (
+            <CvDebugOverlay
+              visualAnalysis={va}
+              moments={project.analysis?.detectedMoments ?? []}
+              currentTime={currentTime}
             />
           )}
         </div>

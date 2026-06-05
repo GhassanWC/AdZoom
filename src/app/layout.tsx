@@ -27,7 +27,7 @@ export const metadata: Metadata = {
   metadataBase: new URL(BRAND.url),
   openGraph: {
     title: PAGE_TITLE.landing,
-    description: "Turn boring screen recordings into cinematic videos with AI.",
+    description: "Upload a screen recording. Framevo edits it with AI.",
     type: "website",
   },
 };

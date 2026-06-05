@@ -23,6 +23,10 @@ import { canUseAiFeature } from "@/lib/usage/ai-features";
 import { canUsePreset } from "@/lib/usage/gating";
 import { stripUndefined } from "@/lib/firebase/sanitize";
 import type { Interaction } from "@/lib/recording/types";
+import {
+  resolveScopeAndTrust,
+  type CaptureDimensions,
+} from "@/lib/recording/scope-detect";
 import type {
   Analysis,
   DetectedMoment,
@@ -111,10 +115,14 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     | "tab"
     | "external"
     | undefined;
+  const captureDimensions = project.captureDimensions as
+    | CaptureDimensions
+    | undefined;
 
-  // 3. Load interactions if present — zero-cost re-balance for in-tab recordings.
+  // 3. Load interactions whenever a manifest exists (load is independent of
+  // scope); trust is decided separately via re-validated scope.
   let interactions: Interaction[] = [];
-  if (interactionsPath && interactionScope === "tab") {
+  if (interactionsPath) {
     try {
       const bucket = storage.bucket();
       const [iBuf] = await bucket.file(interactionsPath).download();
@@ -128,31 +136,38 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       console.warn("[rebalance] interactions load failed", err);
     }
   }
+  const resolvedScope = resolveScopeAndTrust(interactionScope, captureDimensions);
+  const effectiveScope = resolvedScope.scopeValidated;
+  // Only trusted coordinates feed the pipeline; untrusted/external streams
+  // stay loaded for diagnostics but never drive zooms.
+  const trustedInteractions: Interaction[] = resolvedScope.coordinatesTrusted
+    ? interactions
+    : [];
 
   // 4. Re-run phases C → E.
   const cursorIntentSeries =
-    interactions.length > 0
+    trustedInteractions.length > 0
       ? cursorIntent(
-          interactions,
+          trustedInteractions,
           duration,
           visualAnalysis?.sampleRate ?? 10
         )
       : undefined;
 
   const eventMoments =
-    interactions.length > 0
-      ? momentsFromEvents(interactions, {
+    trustedInteractions.length > 0
+      ? momentsFromEvents(trustedInteractions, {
           duration,
           cursorIntent: cursorIntentSeries,
           visualAnalysis,
-          scope: interactionScope,
+          scope: effectiveScope,
         })
       : [];
 
   const attention = attentionCurve({
     duration,
-    interactions,
-    interactionScope,
+    interactions: trustedInteractions,
+    interactionScope: effectiveScope,
     visualAnalysis,
     uiRegions: visualAnalysis?.uiRegions,
   });

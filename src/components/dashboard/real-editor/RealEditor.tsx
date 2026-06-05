@@ -31,6 +31,8 @@ import { WorkflowStepper, type WorkflowStep } from "./WorkflowStepper";
 import { EditorToolbar } from "./EditorToolbar";
 import { DebugOverlay } from "./DebugOverlay";
 import { ClickPipelinePanel } from "./ClickPipelinePanel";
+import { EditDiagnosticsPanel } from "./EditDiagnosticsPanel";
+import { CvDebugPanel } from "./CvDebugPanel";
 import { disposeThumbnails } from "./timeline/thumbnails";
 
 export function RealEditorPage({ projectId }: { projectId: string }) {
@@ -303,6 +305,12 @@ function Body() {
 
       {/* ── 4b. Click pipeline diagnostics — visible debug surface. ─────── */}
       <ClickPipelinePanel />
+
+      {/* ── 4c. Edit-coverage funnel — internal/dev-only (?debug=1). ────── */}
+      <EditDiagnosticsPanel />
+
+      {/* ── 4d. CV tuning panel — internal/dev-only (?debug=1). ─────────── */}
+      <CvDebugPanel />
 
       {/* ── 5. Presets — recommended hero + full rail ─────────────────────── */}
       <RecommendedPresets />

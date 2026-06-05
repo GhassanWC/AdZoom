@@ -59,19 +59,20 @@ export function Hero() {
           </h1>
 
           <p className="mx-auto mt-7 max-w-[660px] text-[17.5px] leading-relaxed text-fog">
-            Record in your browser. Framevo reads every click and navigation,
-            understands the workflow, and composes a first-draft edit with
-            cinematic camera moves. You stay in control of the timeline.
+            Upload a screen recording. Framevo&apos;s visual engine reads the
+            pixels — tracking the cursor, clicks, and key moments — and composes
+            a first-draft edit with cinematic camera moves. You stay in control
+            of the timeline.
           </p>
 
           <div className="mt-10 flex flex-wrap items-center justify-center gap-3">
             <Button
-              href="/dashboard"
+              href="/dashboard/upload"
               variant="primary"
               size="lg"
               rightIcon={<ArrowRight size={15} />}
             >
-              Start Free
+              Upload a recording
             </Button>
             <Button href="#showcase" variant="glass" size="lg">
               See the output

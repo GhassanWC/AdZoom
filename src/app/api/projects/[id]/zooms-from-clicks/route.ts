@@ -20,6 +20,10 @@ import { FieldValue } from "firebase-admin/firestore";
 import { getAdmin } from "@/lib/firebase/admin";
 import { stripUndefined } from "@/lib/firebase/sanitize";
 import type { Interaction } from "@/lib/recording/types";
+import {
+  resolveScopeAndTrust,
+  type CaptureDimensions,
+} from "@/lib/recording/scope-detect";
 import type { DetectedMoment, ProjectStatus } from "@/lib/firebase/schema";
 
 export const runtime = "nodejs";
@@ -63,6 +67,10 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     | "tab"
     | "external"
     | undefined;
+  const captureDimensions = project.captureDimensions as
+    | CaptureDimensions
+    | undefined;
+  const resolvedScope = resolveScopeAndTrust(interactionScope, captureDimensions);
 
   if (!interactionsPath) {
     return NextResponse.json(
@@ -91,13 +99,28 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     );
   }
 
+  // This route turns click COORDINATES directly into zooms — so it must refuse
+  // when the coordinates aren't trusted (external surface): they live in the
+  // Framevo viewport, not the recorded frame, and would place zooms at random.
+  if (!resolvedScope.coordinatesTrusted) {
+    return NextResponse.json(
+      {
+        error: `Coordinates not trusted — ${resolvedScope.trustReason}. Refusing to generate zooms from unmapped coordinates.`,
+        scopeAssigned: resolvedScope.scopeAssigned ?? null,
+        scopeValidated: resolvedScope.scopeValidated ?? null,
+        totalInteractions: interactions.length,
+      },
+      { status: 422 }
+    );
+  }
+
   const clicks = interactions.filter(
     (e): e is Extract<Interaction, { type: "click" | "dblclick" | "rightclick" }> =>
       e.type === "click" || e.type === "dblclick" || e.type === "rightclick"
   );
 
   const moments: DetectedMoment[] = clicks.map((c, i) => {
-    const useRect = interactionScope === "tab" && c.targetRect;
+    const useRect = resolvedScope.scopeValidated === "tab" && c.targetRect;
     const cx = useRect && c.targetRect
       ? c.targetRect.x + c.targetRect.width / 2
       : c.x;
@@ -157,7 +180,8 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     totalInteractions: interactions.length,
     totalClicks: clicks.length,
     momentsWritten: moments.length,
-    scope: interactionScope ?? null,
+    scope: resolvedScope.scopeValidated ?? null,
+    scopeAssigned: resolvedScope.scopeAssigned ?? null,
     interactionsPath,
   });
 }

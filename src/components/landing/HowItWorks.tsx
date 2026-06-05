@@ -1,5 +1,5 @@
 import {
-  Video,
+  Upload,
   BrainCircuit,
   Wand2,
   Download,
@@ -18,15 +18,15 @@ interface Step {
 const steps: Step[] = [
   {
     n: "01",
-    Icon: Video,
-    title: "Record",
-    body: "Capture any browser tab or app window. Every click, scroll, and navigation is captured alongside the pixels.",
+    Icon: Upload,
+    title: "Upload",
+    body: "Drop in any screen recording (MP4, MOV, WebM, MKV). No browser extension, no plugin — your existing footage is all Framevo needs.",
   },
   {
     n: "02",
     Icon: BrainCircuit,
     title: "Analyze",
-    body: "Gemini reads the recording. Framevo classifies the video, splits it into narrative chapters, and turns each meaningful click into a camera move.",
+    body: "Framevo's visual engine reads the pixels — tracking the cursor, clicks, and scene changes — and turns each meaningful moment into a camera move. Works even with no click data; Gemini adds extra polish.",
   },
   {
     n: "03",

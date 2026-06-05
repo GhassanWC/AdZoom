@@ -13,6 +13,7 @@ import {
   Settings,
   Sparkles,
   Video,
+  Activity,
   X,
   type LucideIcon,
 } from "lucide-react";
@@ -32,7 +33,15 @@ const icons: Record<string, LucideIcon> = {
   CreditCard,
   Settings,
   Video,
+  Activity,
 };
+
+// Diagnostics is an internal/dev tool — hide it from the production nav.
+const DEV_ONLY_HREFS = new Set(["/dashboard/diagnostics"]);
+const navItems =
+  process.env.NODE_ENV === "production"
+    ? sidebarItems.filter((i) => !DEV_ONLY_HREFS.has(i.href))
+    : sidebarItems;
 
 export function Sidebar({
   open,
@@ -61,7 +70,7 @@ export function Sidebar({
       </div>
 
       <ul className="flex-1 space-y-0.5 px-3 py-2">
-        {sidebarItems.map((item) => {
+        {navItems.map((item) => {
           const Icon = icons[item.icon];
           const active =
             pathname === item.href ||

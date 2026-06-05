@@ -32,7 +32,7 @@ import type {
 } from "./firebase/schema";
 import { AI_MOMENT_QUOTA, PROVENANCE_RANK } from "./firebase/schema";
 import { sampleCvForMoment, fuseAttention, nearestClickEvent } from "./cv/fusion";
-import { cvCandidateMoments } from "./cv/peaks";
+import { visualMomentsFromCv } from "./cv/visual-moments";
 import type { Interaction } from "./recording/types";
 import { refineMomentFocalRegion } from "./timeline/focal-region";
 
@@ -1044,7 +1044,11 @@ export function balanceTimeline(input: BalancerInput): BalancerResult {
     effectiveRaw = [...evOnly, ...fusion.moments];
 
     if (input.useCvCandidates) {
-      const candidates = cvCandidateMoments(visualAnalysis, duration, minSpacing).map((c) => ({
+      // Visual editing engine: cursor-grounded clicks (tight regions) + peak
+      // backstop. Preserve each candidate's own targetRegionSource — the
+      // inferred-click moments carry "cv-inferred-click" so the reject pass
+      // keeps them; only peak fallbacks default to "motion-centroid".
+      const candidates = visualMomentsFromCv(visualAnalysis, duration, minSpacing).map((c) => ({
         ...c,
         provenance: "cv" as MomentProvenance,
         source: c.source ?? "ai",

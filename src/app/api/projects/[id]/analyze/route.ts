@@ -6,6 +6,7 @@ import {
   classifyVideoSections,
   labelMoments,
   proposeGapFills,
+  proposeVisualMoments,
   uploadVideoToGemini,
   waitForGeminiFileActive,
   GeminiCancelled,
@@ -16,6 +17,7 @@ import {
   estimateAnalysisSeconds,
 } from "@/lib/analysis-stages";
 import { balanceTimeline, distributionScore } from "@/lib/timeline-balancer";
+import { buildEditDiagnostics } from "@/lib/diagnostics/edit-diagnostics";
 import { momentsFromEvents } from "@/lib/attention/events";
 import { attentionCurve } from "@/lib/attention/score";
 import { cursorIntent } from "@/lib/attention/cursor-intent";
@@ -23,6 +25,10 @@ import { classifyClick, type ClickTier } from "@/lib/attention/click-classifier"
 import { canUseAiFeature } from "@/lib/usage/ai-features";
 import { canUsePreset } from "@/lib/usage/gating";
 import type { Interaction } from "@/lib/recording/types";
+import {
+  resolveScopeAndTrust,
+  type CaptureDimensions,
+} from "@/lib/recording/scope-detect";
 import {
   AI_MOMENT_QUOTA,
   type AnalysisActivityEvent,
@@ -169,6 +175,9 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       | "external"
       | undefined;
     const interactionsPath = project.interactionsPath as string | undefined;
+    const captureDimensions = project.captureDimensions as
+      | CaptureDimensions
+      | undefined;
     const selectedPresetId = project.selectedPresetId as string | undefined;
 
     if (!storagePath) {
@@ -191,6 +200,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     // Pre-compute AI feature flags once so the gates below stay readable.
     const allowGapFill = await canUseAiFeature(uid, "advanced-balancing");
     const allowLabeling = await canUseAiFeature(uid, "ai-labeling");
+    const allowVisualMoments = await canUseAiFeature(uid, "ai-visual-moments");
     if (!process.env.GEMINI_API_KEY) {
       await bail(ref, "unknown", "GEMINI_API_KEY is not configured on the server.");
       return NextResponse.json(
@@ -246,7 +256,10 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       interactionsLoaded: boolean;
       loadReason?: string;
     } = { attemptedLoad: false, interactionsLoaded: false };
-    if (interactionsPath && interactionScope === "tab") {
+    // LOAD is now independent of scope: if a manifest exists, read it so its
+    // clicks are at least counted. Whether the coordinates are TRUSTED (and
+    // therefore drive zooms) is decided separately, just below.
+    if (interactionsPath) {
       loadDiag.attemptedLoad = true;
       console.info("[analyze] loading interactions", {
         projectId,
@@ -270,7 +283,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
         await emitActivity(
           ref,
           "ok",
-          `Loaded ${interactions.length} real interaction event${interactions.length === 1 ? "" : "s"}`
+          `Loaded ${interactions.length} interaction event${interactions.length === 1 ? "" : "s"}`
         );
       } catch (err) {
         console.warn("[analyze] interactions load failed", err);
@@ -284,17 +297,39 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
           "Interaction manifest unreadable — falling back to CV-only"
         );
       }
-    } else if (interactionScope === "external") {
-      loadDiag.loadReason = "scope=external";
+    } else {
+      loadDiag.loadReason =
+        interactionScope === "external"
+          ? "scope=external (no interactions manifest saved)"
+          : "no-interactionsPath";
+    }
+
+    // Separate LOAD from TRUST. We loaded the stream above regardless of scope
+    // so diagnostics can count it, but only TRUSTED coordinates may drive
+    // camera zooms. Rather than trust the capture-time scope blindly, we
+    // INDEPENDENTLY re-validate it from the persisted capture dimensions —
+    // a HiDPI tab that was misclassified at capture is corrected here.
+    const resolvedScope = resolveScopeAndTrust(interactionScope, captureDimensions);
+    const coordinatesTrusted = resolvedScope.coordinatesTrusted;
+    const effectiveScope = resolvedScope.scopeValidated;
+    const trustedInteractions: Interaction[] = coordinatesTrusted
+      ? interactions
+      : [];
+    console.info("[analyze] scope validation", {
+      projectId,
+      scopeAssigned: resolvedScope.scopeAssigned,
+      scopeValidated: resolvedScope.scopeValidated,
+      coordinatesTrusted,
+      validationReason: resolvedScope.validationReason,
+    });
+    if (interactions.length > 0) {
       await emitActivity(
         ref,
-        "info",
-        "External-surface recording — relying on CV signals only"
+        coordinatesTrusted ? "ok" : "warn",
+        coordinatesTrusted
+          ? `Coordinates trusted — ${resolvedScope.trustReason}`
+          : `Coordinates not trusted — ${resolvedScope.trustReason}; counting clicks for diagnostics only`
       );
-    } else if (!interactionsPath) {
-      loadDiag.loadReason = "no-interactionsPath";
-    } else {
-      loadDiag.loadReason = `scope=${interactionScope ?? "undefined"}`;
     }
 
     await ensureNotCancelled(ref);
@@ -362,22 +397,25 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     // classifier's "deliberate approach" signal — small bump per click
     // when the user slowed before pressing. Cheap; skip when there's
     // no interaction stream.
+    // Pipeline consumers see only TRUSTED interactions. For untrusted/external
+    // recordings this is `[]`, preserving the existing CV-only behaviour while
+    // the full loaded stream is still counted in diagnostics below.
     const cursorIntentSeries =
-      interactions.length > 0
+      trustedInteractions.length > 0
         ? cursorIntent(
-            interactions,
+            trustedInteractions,
             duration ?? 0,
             visualAnalysis?.sampleRate ?? 10
           )
         : undefined;
 
     const eventMoments =
-      interactions.length > 0
-        ? momentsFromEvents(interactions, {
+      trustedInteractions.length > 0
+        ? momentsFromEvents(trustedInteractions, {
             duration: duration ?? 0,
             cursorIntent: cursorIntentSeries,
             visualAnalysis,
-            scope: interactionScope,
+            scope: effectiveScope,
           })
         : [];
 
@@ -412,7 +450,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
           click: { x: e.x, y: e.y, t: e.t, targetRect: e.targetRect },
           cursorIntent: cursorIntentSeries,
           visualAnalysis,
-          scope: interactionScope ?? "tab",
+          scope: effectiveScope ?? "tab",
         });
         clickMomentsByTier[cls.tier as ClickTier] += 1;
       } else if (e.type === "dblclick" || e.type === "rightclick") {
@@ -442,10 +480,12 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     }
 
     // Canonical attention curve — single importance signal across the product.
+    // Only trusted interactions feed it (external coords would be noise; the
+    // curve's own `useEvents` gate also drops them, so this is belt-and-braces).
     const attention = attentionCurve({
       duration: duration ?? 0,
-      interactions,
-      interactionScope,
+      interactions: trustedInteractions,
+      interactionScope: effectiveScope,
       visualAnalysis,
       uiRegions: visualAnalysis?.uiRegions,
     });
@@ -572,6 +612,64 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       await emitActivity(ref, "info", "No coverage gaps ≥15s — skipping AI gap-fill");
     }
 
+    // 8b. Phase C2 — Gemini VISUAL MOMENTS (paid enhancement). For uploads with
+    // no real interaction events, Gemini watches the video and proposes moments
+    // directly (not gap-bounded). The deterministic CV engine still carries the
+    // FREE base timeline; these merge into the AI pool and are bounded by the
+    // same AI_MOMENT_QUOTA at the final balance. Skipped when real events exist
+    // (the event path is authoritative) or the user lacks the feature.
+    let aiVisualMoments: DetectedMoment[] = [];
+    if (eventMoments.length === 0 && allowVisualMoments && dur > 0) {
+      const visualBudget = Math.max(4, Math.min(12, Math.ceil(dur / 20)));
+      await emitActivity(
+        ref,
+        "info",
+        `Asking Gemini to find visual moments (budget ${visualBudget})`
+      );
+      try {
+        const proposals = await proposeVisualMoments({
+          video: geminiVideo,
+          hintedDuration: dur,
+          maxMoments: visualBudget,
+          boringSections: sections.boringSections,
+        });
+        aiVisualMoments = proposals.map((p, i) => ({
+          id: `mom_vis_${i + 1}`,
+          startTime: p.startTime,
+          endTime: p.endTime,
+          label: p.label || "Visual moment",
+          reason: p.reason || "",
+          focusRegion: p.focusRegion,
+          effectType: p.effectType,
+          uiContext: p.uiContext,
+          attentionScore: p.attentionScore,
+          recommendedIntensity: p.recommendedIntensity,
+          source: "ai",
+          provenance: "ai" as MomentProvenance,
+          confidenceScore: Math.max(0.3, Math.min(0.6, p.attentionScore)),
+          confidenceSource: "ai-gap-fill" as const,
+          confidenceReason: `${Math.max(0.3, Math.min(0.6, p.attentionScore)).toFixed(2)} — Gemini visual moment at ${p.startTime.toFixed(1)}s`,
+          whyEffectType: `Gemini visual detection → ${p.effectType}${p.uiContext ? ` (${p.uiContext} context)` : ""}`,
+          targetRegionSource: "ai-proposal" as const,
+          sourceSignals: ["ai-visual-moment", `t@${p.startTime.toFixed(1)}`],
+        }));
+        await emitActivity(
+          ref,
+          "ok",
+          `Gemini proposed ${aiVisualMoments.length} visual moment${aiVisualMoments.length === 1 ? "" : "s"}`
+        );
+      } catch (err) {
+        console.warn("[analyze] visual-moments failed", err);
+        await emitActivity(ref, "warn", "Visual-moments call failed — using the deterministic visual engine only");
+      }
+    } else if (eventMoments.length === 0 && !allowVisualMoments) {
+      await emitActivity(
+        ref,
+        "info",
+        "Visual AI moments are a Pro feature — using the free on-device visual engine"
+      );
+    }
+
     await ensureNotCancelled(ref);
 
     // 9. Phase D — Final balance pass with the unified pool. Priority +
@@ -580,7 +678,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     // for the rebalance endpoint. boringSections + interactions feed the
     // reject pass so AI gap-fills in idle / quiet stretches are dropped.
     const balanced = balanceTimeline({
-      raw: aiGapMoments,
+      raw: [...aiGapMoments, ...aiVisualMoments],
       duration: dur,
       pacing,
       videoType: sections.videoType,
@@ -771,6 +869,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     const rawPool: DetectedMoment[] = [
       ...eventMoments,
       ...aiGapMoments,
+      ...aiVisualMoments,
       ...balanced.rejectedPool,
     ];
     // Firestore rejects writes containing `undefined` anywhere in the
@@ -790,8 +889,14 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       interactionsPath,
       attemptedLoad: loadDiag.attemptedLoad,
       interactionsLoaded: loadDiag.interactionsLoaded,
-      scope: interactionScope,
+      scope: effectiveScope,
       loadReason: loadDiag.loadReason,
+      coordinatesTrusted,
+      trustReason: resolvedScope.trustReason,
+      scopeAssigned: resolvedScope.scopeAssigned,
+      scopeValidated: resolvedScope.scopeValidated,
+      scopeDecisionReason: resolvedScope.validationReason,
+      captureDimensions,
       totalInteractions: interactions.length,
       totalClicks,
       eventMomentsEmitted: eventMoments.length,
@@ -806,6 +911,28 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       eventKept: balanced.stats.eventStats.eventKept,
     };
     console.info("[analyze] clickPipeline", { projectId, ...clickPipeline });
+
+    // Consolidated editing-funnel diagnostics: interactions → important →
+    // generated → applied + coverage. Reporting-only; assembled from the
+    // locals above (no recomputation, no Gemini). See edit-diagnostics.ts.
+    const editDiagnostics = buildEditDiagnostics({
+      interactions,
+      visualAnalysis,
+      clickMomentsByTier,
+      rawPool,
+      appliedMoments: balanced.moments,
+      aiProposed: aiGapMoments.length + aiVisualMoments.length,
+      stats: balanced.stats,
+      computedAt: Date.now(),
+    });
+    console.info("[analyze] editDiagnostics", {
+      projectId,
+      coverageAdjusted: editDiagnostics.coverageAdjusted,
+      coverageRaw: editDiagnostics.coverageRaw,
+      importantDetected: editDiagnostics.importantDetected,
+      timelineApplied: editDiagnostics.timelineApplied,
+      suppressedDrops: editDiagnostics.suppressedDrops,
+    });
 
     await ref.set(
       {
@@ -824,6 +951,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
           attentionCurve: attention.curveQ8,
           attentionSampleRate: attention.sampleRate,
           clickPipeline: stripUndefined(clickPipeline),
+          editDiagnostics: stripUndefined(editDiagnostics),
           completedAt: Date.now(),
           cancelRequested: false,
         },

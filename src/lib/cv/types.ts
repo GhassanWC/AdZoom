@@ -10,6 +10,20 @@
 export const FRAME_W = 128;
 export const FRAME_H = 72;
 
+/**
+ * Higher-resolution "detection" frame, used only for cursor / UI-change
+ * tracking (NOT persisted). One decode/seek yields both: the detect frame is
+ * grabbed at this size, then box-downsampled 2:1 to the legacy FRAME_W×FRAME_H
+ * buffer that every existing consumer keeps using. Exact 2× ratio so the
+ * downsample is a clean 2×2 average.
+ */
+export const DETECT_W = 256;
+export const DETECT_H = 144;
+
+/** Cursor-tracking grid over the detect frame (~8×8 px cells). */
+export const DETECT_GRID_COLS = 32;
+export const DETECT_GRID_ROWS = 18;
+
 /** Motion-centroid grid — 8×8 cells over the downscaled frame. */
 export const GRID_COLS = 8;
 export const GRID_ROWS = 8;

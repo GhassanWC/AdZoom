@@ -50,13 +50,13 @@ export function FinalCTA() {
           </h2>
 
           <p className="mx-auto mt-7 max-w-xl text-[15.5px] leading-relaxed text-[rgba(255,255,255,0.78)] sm:text-[16.5px]">
-            Record in your browser. Framevo reads every click, builds
+            Upload your screen recording. Framevo reads the pixels, builds
             the timeline, and hands you a first-draft cut you can ship.
           </p>
 
           <div className="mt-12">
-            <Button href="/dashboard" variant="primary" size="lg">
-              Start building your first edit
+            <Button href="/dashboard/upload" variant="primary" size="lg">
+              Upload your first recording
             </Button>
           </div>
         </div>

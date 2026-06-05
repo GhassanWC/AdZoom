@@ -7,6 +7,8 @@
  * recorded video in v1 — that happens at export time, Screen-Studio-style.
  */
 
+import type { CaptureDimensions } from "./scope-detect";
+
 export type RecordingState =
   | "idle"
   | "preparing"
@@ -57,6 +59,12 @@ export interface RecordingResult {
    * The preview uses this to decide whether to run the green-band detector.
    */
   displaySurface: "monitor" | "window" | "browser" | null;
+  /**
+   * Capture geometry (track dims, viewport, DPR) recorded at scope-decision
+   * time. Persisted on the project doc so the analyzer can independently
+   * re-validate scope instead of blindly trusting the capture-time call.
+   */
+  captureDimensions?: CaptureDimensions;
 }
 
 /**

@@ -23,6 +23,8 @@ import {
   type UploadTaskSnapshot,
 } from "firebase/storage";
 import type { Interaction } from "@/lib/recording/types";
+import { assessCoordinateTrust } from "@/lib/recording/interaction-trust";
+import type { CaptureDimensions } from "@/lib/recording/scope-detect";
 import { getFirebase } from "./client";
 import {
   DEFAULT_EFFECTS_SETTINGS,
@@ -61,6 +63,8 @@ interface CreateProjectInput {
   interactions?: Interaction[];
   /** "tab" means events are authoritative; "external" means rely on CV. */
   interactionScope?: "tab" | "external";
+  /** Capture geometry, persisted so the analyzer can re-validate scope. */
+  captureDimensions?: CaptureDimensions;
 }
 
 /**
@@ -115,6 +119,7 @@ export async function createProjectFromFile({
   onProgress,
   interactions,
   interactionScope,
+  captureDimensions,
 }: CreateProjectInput): Promise<UploadResult> {
   if (!isVideoAccepted(file)) {
     throw new Error(`Unsupported file type: ${file.type || file.name}`);
@@ -166,12 +171,27 @@ export async function createProjectFromFile({
   // 3. Get the download URL and finalize the Firestore doc.
   const downloadURL = await getDownloadURL(sRef);
 
-  // 4. Upload interactions.json if we have any (in-tab recordings only). Done
-  // after the video lands so the project is usable even if this step fails.
+  // 4. Upload interactions.json whenever we captured ANY events — regardless
+  // of scope. Discarding external/untrusted streams here used to hide a click
+  // stream that the analyzer could at least count (and, for HiDPI tabs that
+  // were misclassified as external, actually use). The manifest carries the
+  // scope + a coordinate-trust assessment so the analyzer can LOAD it always
+  // and decide separately whether to TRUST the coordinates. Done after the
+  // video lands so the project is usable even if this step fails.
+  const scope = interactionScope ?? "external";
+  const trust = assessCoordinateTrust(scope);
   let interactionsPath: string | null = null;
-  if (interactions && interactions.length > 0 && interactionScope === "tab") {
+  if (interactions && interactions.length > 0) {
     const interactionsBlob = new Blob(
-      [JSON.stringify({ version: 1, scope: interactionScope, events: interactions })],
+      [
+        JSON.stringify({
+          version: 2,
+          scope,
+          trusted: trust.trusted,
+          trustReason: trust.reason,
+          events: interactions,
+        }),
+      ],
       { type: "application/json" }
     );
     interactionsPath = `users/${uid}/projects/${projectId}/original/interactions.json`;
@@ -190,8 +210,9 @@ export async function createProjectFromFile({
     status: "uploaded" as ProjectStatus,
     storagePath: path,
     originalVideoUrl: downloadURL,
-    interactionScope: interactionScope ?? "external",
+    interactionScope: scope,
     ...(interactionsPath ? { interactionsPath } : {}),
+    ...(captureDimensions ? { captureDimensions } : {}),
     updatedAt: serverTimestamp(),
   });
 
@@ -300,6 +321,7 @@ function materializeProject(id: string, data: Record<string, unknown>): ProjectD
     exportUrl: (data.exportUrl as string) ?? undefined,
     interactionScope: (data.interactionScope as ProjectDoc["interactionScope"]) ?? undefined,
     interactionsPath: (data.interactionsPath as string) ?? undefined,
+    captureDimensions: (data.captureDimensions as ProjectDoc["captureDimensions"]) ?? undefined,
     createdAt: tsMs(data.createdAt) ?? Date.now(),
     updatedAt: tsMs(data.updatedAt) ?? Date.now(),
   };

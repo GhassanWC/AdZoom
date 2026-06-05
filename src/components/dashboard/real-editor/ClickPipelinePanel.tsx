@@ -36,6 +36,7 @@ import { useAuth } from "@/lib/firebase/AuthProvider";
 import { getFirebase } from "@/lib/firebase/client";
 import { doc, serverTimestamp, setDoc } from "firebase/firestore";
 import { useEditorReal } from "./context";
+import { Stat, Field, Stage } from "./diag-bits";
 import type { ClickPipelineDiagnostics } from "@/lib/firebase/schema";
 
 type DiagnoseResult = {
@@ -182,6 +183,9 @@ export function ClickPipelinePanel() {
     if (!stored.attemptedLoad) return "skipped";
     if (!stored.interactionsLoaded) return "load-failed";
     if (stored.totalClicks === 0) return "zero-clicks";
+    // Clicks loaded but coordinates not trusted (external surface) — this is
+    // expected, not a drop bug, so don't raise the "all dropped" alarm.
+    if (stored.coordinatesTrusted === false) return "untrusted";
     if (stored.eventKept === 0) return "all-dropped";
     if (stored.totalClicks > 0 && stored.eventKept < stored.totalClicks) return "partial-dropped";
     return "ok";
@@ -320,6 +324,14 @@ function StatusBadge({
       </span>
     );
   }
+  if (status === "untrusted") {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full border border-amber-400/30 bg-amber-500/10 px-2 py-0.5 text-[10px] uppercase tracking-wider text-amber-200">
+        <AlertTriangle size={10} />
+        {stored?.totalClicks ?? 0} clicks · coords untrusted
+      </span>
+    );
+  }
   if (status === "all-dropped") {
     return (
       <span className="inline-flex items-center gap-1 rounded-full border border-rose-400/30 bg-rose-500/10 px-2 py-0.5 text-[10px] uppercase tracking-wider text-rose-200">
@@ -357,6 +369,39 @@ function StoredStages({ diag }: { diag: ClickPipelineDiagnostics }) {
           value={diag.interactionsPath ?? "(not set on project)"}
           mono
         />
+        {diag.captureDimensions ? (
+          <>
+            <Field
+              label="display surface"
+              value={diag.captureDimensions.displaySurface || "unknown"}
+            />
+            <Field
+              label="track (recorded px)"
+              value={`${diag.captureDimensions.trackWidth}×${diag.captureDimensions.trackHeight}`}
+            />
+            <Field
+              label="viewport (css px)"
+              value={`${diag.captureDimensions.viewportWidth}×${diag.captureDimensions.viewportHeight}`}
+            />
+            <Field
+              label="devicePixelRatio"
+              value={String(diag.captureDimensions.devicePixelRatio)}
+            />
+            <Field
+              label="capture aspect"
+              value={diag.captureDimensions.captureAspect.toFixed(4)}
+            />
+          </>
+        ) : (
+          <Field
+            label="capture geometry"
+            value="(not recorded — uploaded file or pre-update take)"
+            tone="warn"
+          />
+        )}
+        {diag.scopeDecisionReason && (
+          <Field label="scope decision" value={diag.scopeDecisionReason} />
+        )}
       </Stage>
 
       <Stage
@@ -377,6 +422,10 @@ function StoredStages({ diag }: { diag: ClickPipelineDiagnostics }) {
             : "warn"
         }
       >
+        <Field
+          label="interactions.json exists"
+          value={diag.interactionsPath ? "yes" : "no"}
+        />
         <Field label="attempted load" value={diag.attemptedLoad ? "yes" : "no"} />
         <Field
           label="loaded ok"
@@ -385,6 +434,22 @@ function StoredStages({ diag }: { diag: ClickPipelineDiagnostics }) {
         {diag.loadReason && <Field label="reason" value={diag.loadReason} mono />}
         <Field label="total interactions" value={String(diag.totalInteractions)} />
         <Field label="total clicks" value={String(diag.totalClicks)} />
+        {diag.coordinatesTrusted !== undefined && (
+          <Field
+            label="coordinates trusted"
+            value={diag.coordinatesTrusted ? "yes" : "no"}
+            tone={diag.coordinatesTrusted ? "ok" : "warn"}
+          />
+        )}
+        {diag.trustReason && (
+          <Field label="trust reason" value={diag.trustReason} />
+        )}
+        {diag.scopeAssigned && (
+          <Field label="scope assigned" value={diag.scopeAssigned} />
+        )}
+        {diag.scopeValidated && (
+          <Field label="scope validated" value={diag.scopeValidated} />
+        )}
       </Stage>
 
       <Stage
@@ -543,103 +608,3 @@ function FreshDiagnose({ result }: { result: DiagnoseResult }) {
   );
 }
 
-function Stage({
-  n,
-  title,
-  right,
-  tone,
-  children,
-}: {
-  n: number;
-  title: string;
-  right?: string;
-  tone?: "ok" | "warn" | "error";
-  children: React.ReactNode;
-}) {
-  const toneColor =
-    tone === "error"
-      ? "text-rose-300"
-      : tone === "warn"
-      ? "text-amber-300"
-      : tone === "ok"
-      ? "text-emerald-300"
-      : "text-fog";
-  return (
-    <div className="rounded-lg border border-white/10 bg-white/[0.02] p-3">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <span className="inline-flex size-5 items-center justify-center rounded-full border border-white/10 bg-white/[0.04] text-[10px] font-semibold text-fog">
-            {n}
-          </span>
-          <h4 className="text-[13px] font-semibold text-white">{title}</h4>
-        </div>
-        {right && (
-          <span className={`text-[11px] uppercase tracking-wider ${toneColor}`}>
-            {right}
-          </span>
-        )}
-      </div>
-      <div className="mt-2 space-y-1.5">{children}</div>
-    </div>
-  );
-}
-
-function Field({
-  label,
-  value,
-  mono,
-  tone,
-}: {
-  label: string;
-  value: string;
-  mono?: boolean;
-  tone?: "ok" | "warn" | "error";
-}) {
-  const toneColor =
-    tone === "error"
-      ? "text-rose-300"
-      : tone === "warn"
-      ? "text-amber-300"
-      : tone === "ok"
-      ? "text-emerald-300"
-      : "text-white/85";
-  return (
-    <div className="flex items-baseline justify-between gap-3">
-      <span className="text-[11px] text-fog">{label}</span>
-      <span
-        className={`text-[12px] ${toneColor} ${
-          mono ? "font-mono text-[11px]" : ""
-        } break-all text-right`}
-      >
-        {value}
-      </span>
-    </div>
-  );
-}
-
-function Stat({
-  label,
-  value,
-  tone,
-}: {
-  label: string;
-  value: string;
-  tone?: "ok" | "warn" | "error";
-}) {
-  const toneBg =
-    tone === "error"
-      ? "border-rose-400/30 bg-rose-500/10"
-      : tone === "warn"
-      ? "border-amber-400/30 bg-amber-500/10"
-      : tone === "ok"
-      ? "border-emerald-400/30 bg-emerald-500/10"
-      : "border-white/10 bg-white/[0.03]";
-  return (
-    <div className={`rounded-lg border px-3 py-2 ${toneBg}`}>
-      <div className="text-[10px] uppercase tracking-wider text-fog">
-        {label}
-      </div>
-      <div className="text-[18px] font-semibold text-white">{value}</div>
-    </div>
-  );
-}

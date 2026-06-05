@@ -210,11 +210,17 @@ export const navLinks = [
 
 export const sidebarItems = [
   { label: "Dashboard", href: "/dashboard", icon: "LayoutDashboard" as const },
-  { label: "Record", href: "/dashboard/record", icon: "Video" as const },
-  { label: "Projects", href: "/dashboard/projects", icon: "Folder" as const },
   { label: "Upload", href: "/dashboard/upload", icon: "Upload" as const },
+  { label: "Projects", href: "/dashboard/projects", icon: "Folder" as const },
+  { label: "Record", href: "/dashboard/record", icon: "Video" as const },
   { label: "Presets", href: "/dashboard/presets", icon: "Wand2" as const },
   { label: "Exports", href: "/dashboard/exports", icon: "Download" as const },
   { label: "Billing", href: "/dashboard/billing", icon: "CreditCard" as const },
   { label: "Settings", href: "/dashboard/settings", icon: "Settings" as const },
+  // Internal/dev-only — filtered out in production by the Sidebar.
+  {
+    label: "Diagnostics",
+    href: "/dashboard/diagnostics",
+    icon: "Activity" as const,
+  },
 ];

@@ -1,5 +1,7 @@
 // Shared types for Firestore documents — used on both client and server.
 
+import type { CaptureDimensions } from "@/lib/recording/scope-detect";
+
 export type ProjectStatus =
   | "uploading"
   | "uploaded"
@@ -158,7 +160,9 @@ export type TargetRegionSource =
   | "ui-region"
   | "ai-proposal"
   | "default"
-  | "user";
+  | "user"
+  /** CV: a cursor-dwell + post-action UI change grounded this region (tight bbox). */
+  | "cv-inferred-click";
 
 /**
  * Compact record of a candidate that was rejected near a surviving moment.
@@ -367,6 +371,30 @@ export interface VisualEvent {
 }
 
 /**
+ * A CV-inferred click (v3): a cursor dwell followed by a localized UI change.
+ * Carries the tight changed-region rect (0..1 normalized) so the moment
+ * generator can frame a precise zoom instead of a generic box.
+ */
+export interface InferredClick {
+  /** Seconds into the video (the moment of the UI change). */
+  t: number;
+  /** Confidence 0..1 (cursor-dwell quality × UI-change magnitude). */
+  strength: number;
+  /** Changed-region rect, normalized 0..1 — the zoom focus target. */
+  region: { x: number; y: number; w: number; h: number };
+}
+
+/**
+ * A detected cursor dwell (v3) — where the cursor settled. Persisted (capped)
+ * for dev tuning visibility only; not consumed by the editing pipeline.
+ */
+export interface VisualDwell {
+  t: number;
+  x: number;
+  y: number;
+}
+
+/**
  * Compact, downsampled output of the client-side computer-vision pass.
  *
  * Produced in the browser by `src/lib/cv/pipeline.ts` from the actual decoded
@@ -380,8 +408,12 @@ export interface VisualEvent {
  * cursor — it tracks where inter-frame change concentrates.
  */
 export interface VisualAnalysis {
-  /** v1 = CV-only, ad-hoc attentionCurve. v2 = hybrid-ready (curve from src/lib/attention/score.ts). */
-  version: 1 | 2;
+  /**
+   * v1 = CV-only, ad-hoc attentionCurve. v2 = hybrid-ready (curve from
+   * src/lib/attention/score.ts). v3 = visual editing engine: adds a cursor
+   * track + UI-change-grounded inferred clicks + populated uiRegions.
+   */
+  version: 1 | 2 | 3;
   /** Samples per second of the per-second arrays. v1 = 1 (0.5 for very long videos). */
   sampleRate: number;
   /** Length of the per-second arrays. */
@@ -402,6 +434,24 @@ export interface VisualAnalysis {
   clickEvents: VisualEvent[];
   /** Per-second smoothed, normalized fused attention curve, 8-bit. */
   attentionCurve: number[];
+  /**
+   * Visual editing engine (v3). Per-second visual cursor estimate from
+   * localized-motion blob tracking — `cursorX/Y` are 8-bit (0..255 → 0..1)
+   * like `centroidX/Y`; `cursorConf` is the 8-bit confidence the estimate is a
+   * real cursor (low → fell back to the motion hotspot). Optional/back-compat.
+   */
+  cursorX?: number[];
+  cursorY?: number[];
+  cursorConf?: number[];
+  /**
+   * Visual editing engine (v3). Click-like moments grounded by a cursor dwell
+   * followed by a localized UI change — distinct from `clickEvents` (raw
+   * motion-spike heuristic). Each carries the changed-region center as `{x,y}`
+   * so the moment generator can frame a tight zoom. Capped for doc size.
+   */
+  inferredClicks?: InferredClick[];
+  /** Cursor dwells (v3) — dev-tuning visibility only, capped. */
+  dwells?: VisualDwell[];
   /** Wall-clock the CV pass took, ms — surfaced for the honest report. */
   computeMs: number;
   /**
@@ -475,6 +525,14 @@ export interface Analysis {
    * click is locatable to a specific stage.
    */
   clickPipeline?: ClickPipelineDiagnostics;
+  /**
+   * Consolidated editing-funnel diagnostics. Answers "out of N meaningful
+   * interactions, how many did we actually edit?" by joining the interaction
+   * counts, the candidate pool, and the final timeline into one record.
+   * Reporting-only — NEVER read by the editing/balancing code. Built by
+   * `buildEditDiagnostics` in `src/lib/diagnostics/edit-diagnostics.ts`.
+   */
+  editDiagnostics?: EditDiagnostics;
 }
 
 export interface ClickPipelineDiagnostics {
@@ -488,6 +546,22 @@ export interface ClickPipelineDiagnostics {
   scope?: "tab" | "external";
   /** Why the load was skipped or failed (e.g. "scope=external", "no interactionsPath", "404"). */
   loadReason?: string;
+  /**
+   * Whether the loaded coordinates are trusted to map onto the recorded frame.
+   * Loading is now independent of trust: an external recording loads (so its
+   * clicks are counted) but its coordinates are NOT used for camera zooms.
+   */
+  coordinatesTrusted?: boolean;
+  /** One-line justification for the trust decision (e.g. "self-tab capture …"). */
+  trustReason?: string;
+  /** Scope as originally assigned at capture time. */
+  scopeAssigned?: "tab" | "external";
+  /** Scope after the analyzer's validation (equal to assigned unless overridden). */
+  scopeValidated?: "tab" | "external";
+  /** How the validated scope was derived (e.g. which dims check fired, or why external). */
+  scopeDecisionReason?: string;
+  /** Capture geometry the scope decision was based on (absent on uploads / legacy takes). */
+  captureDimensions?: CaptureDimensions;
   /** Total interaction events parsed (clicks + hovers + idles + …). */
   totalInteractions: number;
   /** click + dblclick + rightclick events. */
@@ -516,6 +590,109 @@ export interface ClickPipelineDiagnostics {
   eventDroppedTooDense: number;
   /** Event moments present in the final timeline. */
   eventKept: number;
+}
+
+/** Why a candidate moment never made it onto the final timeline. */
+export type EditDropClass =
+  /** Correct-by-design drop (collapse/de-dupe/quota). Not a coverage failure. */
+  | "intentional"
+  /** A genuinely lost edit (boring/idle/no-target/empty-quartile). */
+  | "suppressed";
+
+/** Which stage of the funnel is the dominant bottleneck for a recording. */
+export type EditBottleneck =
+  | "understanding" // interactions captured but few classified important
+  | "planning" // important moments but few edit instructions generated
+  | "execution" // edits generated but few applied to the timeline
+  | "coverage" // edits applied but spread thin despite available candidates
+  | "user-expectation" // pipeline healthy; mismatch is the user's mental model
+  | "healthy"; // no clear bottleneck
+
+/** One row of the diagnostics drill-down table (a single candidate moment). */
+export interface EditDiagnosticRow {
+  id: string;
+  /** Seconds into the video (moment.startTime). */
+  ts: number;
+  /** Human label for what was detected (moment.label or effect/provenance). */
+  detectedEvent: string;
+  provenance?: MomentProvenance;
+  /** 0..1 importance — attentionScore ?? confidenceScore ?? 0. */
+  importanceScore: number;
+  /** Was an AI edit instruction generated for this moment? */
+  aiGenerated: boolean;
+  /** Did this moment land on the final timeline? */
+  timelineApplied: boolean;
+  /** Why it was dropped (from `rejectedReason`), if it was. */
+  rejectedReason?: string;
+  /** Bucket for the drop — only present when not applied. */
+  dropClass?: EditDropClass;
+}
+
+/**
+ * Consolidated editing-funnel diagnostics for one analyzed recording.
+ * Reporting-only; assembled from already-computed analyze locals. See
+ * `buildEditDiagnostics` in `src/lib/diagnostics/edit-diagnostics.ts`.
+ */
+export interface EditDiagnostics {
+  schemaVersion: 1;
+  /** Wall-clock when these diagnostics were computed (staleness marker). */
+  computedAt: number;
+
+  // ── Raw interaction funnel (from interactions.json, in-scope events) ──
+  /** Per-type interaction tally (click, scroll, hover, …). String-keyed. */
+  interactionCounts: Record<string, number>;
+  totalInteractions: number;
+  totalClicks: number;
+  totalScroll: number;
+  totalScrollPause: number;
+  totalHover: number;
+  /** Navigation headline — CV scene changes (page switches / modal opens). */
+  navScene: number;
+  /** Navigation sub-line — clicks the classifier tagged as "nav" tier. */
+  navClick: number;
+
+  // ── Visual editing engine (v3) ──
+  /** Did the CV cursor tracker find a confident cursor anywhere in the take? */
+  cursorTrackFound?: boolean;
+  /** Number of UI-change-grounded inferred clicks the visual engine produced. */
+  inferredClickCount?: number;
+  /** CV candidate moments the visual engine added to the pool. */
+  cvMomentsEmitted?: number;
+
+  // ── Detection → generation → application funnel ──
+  /** Candidates deemed important (coverage denominator). See `important()`. */
+  importantDetected: number;
+  /** All candidates that entered the balancer (== stats.inputCount). */
+  candidatesProposed: number;
+  /** AI gap-fill moments proposed by Gemini (== aiGapMoments.length). */
+  aiProposed: number;
+  /** Moments on the final timeline (== detectedMoments.length). */
+  timelineApplied: number;
+
+  // ── Drop accounting (reused from balancer stats) ──
+  /** Correct-by-design drops (collapse/de-dupe/quota). */
+  intentionalDrops: number;
+  /** Genuinely lost edits (boring/idle/no-target). */
+  suppressedDrops: number;
+  /** Quartiles left empty after rejection (a coverage gap). */
+  quartileLeftEmpty: number;
+  dropBreakdown: {
+    eventOverlapsResolved: number;
+    droppedTooClose: number;
+    quotaDropped: number;
+    aiRejectedBoring: number;
+    aiRejectedIdle: number;
+    aiRejectedNoTarget: number;
+  };
+
+  // ── Coverage ──
+  /** Literal `applied / important` (user's formula; can look low when healthy). */
+  coverageRaw: number;
+  /** `applied / (important − intentionalDrops)` — the honest headline. */
+  coverageAdjusted: number;
+
+  /** Drill-down rows (capped ~200), sorted by ts. */
+  rows: EditDiagnosticRow[];
 }
 
 export type Pacing = "slow" | "moderate" | "fast";
@@ -669,9 +846,15 @@ export interface ProjectDoc {
   interactionScope?: "tab" | "external";
   /**
    * Storage path of the serialized `Interaction[]` JSON, written next to the
-   * video. Absent for uploads and for in-tab recordings with zero events.
+   * video. Absent for uploads and for recordings with zero captured events.
    */
   interactionsPath?: string;
+  /**
+   * Capture geometry recorded at scope-decision time. Lets the analyzer
+   * independently re-validate `interactionScope` instead of trusting the
+   * capture-time call. Absent on plain uploads and pre-existing recordings.
+   */
+  captureDimensions?: CaptureDimensions;
   createdAt: number;
   updatedAt: number;
 }

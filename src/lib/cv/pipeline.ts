@@ -23,6 +23,13 @@ import { diffFrames } from "./frame-diff";
 import { visualDensity } from "./visual-density";
 import { detectScenes } from "./scene-detect";
 import { detectInteractions } from "./interaction";
+import { detectRegions } from "./regions";
+import {
+  createCursorTracker,
+  type CursorEstimate,
+  type ChangeCluster,
+} from "./cursor-track";
+import { detectVisualInteractions } from "./visual-interactions";
 import { resample } from "./resample";
 
 const BATCH_SIZE = 20;
@@ -58,17 +65,28 @@ export async function runVisualAnalysis(
   const signals: RawFrameSignal[] = [];
   const blockDeltas: number[] = [];
   const times: number[] = [];
+  // Visual editing engine (v3): per-frame cursor estimate + change clusters,
+  // tracked incrementally so we never retain all detect frames.
+  const cursors: CursorEstimate[] = [];
+  const clusterSeq: ChangeCluster[][] = [];
+  const tracker = createCursorTracker();
 
   let prevFrame: Uint8ClampedArray | null = null;
   let processed = 0;
 
-  for await (const { t, frame } of extractFrames(video, duration, opts.signal)) {
+  for await (const { t, frame, detectFrame } of extractFrames(
+    video,
+    duration,
+    opts.signal
+  )) {
     if (opts.signal?.aborted) throw new CvAbortError();
 
     const density = visualDensity(frame);
 
+    let centroid: RawFrameSignal["centroid"] = null;
     if (prevFrame) {
       const d = diffFrames(prevFrame, frame);
+      centroid = d.centroid;
       signals.push({
         t,
         meanDelta: d.meanDelta,
@@ -96,6 +114,11 @@ export async function runVisualAnalysis(
     }
     times.push(t);
 
+    // Cursor tracking (incremental) on the higher-res detect frame.
+    const { cursor, clusters } = tracker.step(detectFrame, centroid);
+    cursors.push(cursor);
+    clusterSeq.push(clusters);
+
     prevFrame = frame;
     processed++;
     if (processed % BATCH_SIZE === 0) {
@@ -112,9 +135,21 @@ export async function runVisualAnalysis(
   const { sceneFlags, events: sceneChanges } = detectScenes(blockDeltas, times);
   for (let i = 0; i < signals.length; i++) signals[i].sceneChange = sceneFlags[i];
 
-  // Click-like interaction inference over the motion sequence.
+  // Click-like interaction inference over the motion sequence (legacy soft signal).
   const motionSeq = signals.map((s) => s.motionIntensity);
   const clickEvents = detectInteractions(motionSeq, times);
+
+  // Visual editing engine: cursor-grounded clicks + UI regions (v3).
+  const { inferredClicks, dwells } = detectVisualInteractions(
+    cursors,
+    clusterSeq,
+    times,
+    sceneChanges
+  );
+  const uiRegions = detectRegions({
+    gridDeltas: signals.map((s) => s.gridDelta),
+    times,
+  });
 
   report("resampling", 0.97);
   const visualAnalysis = resample({
@@ -122,6 +157,10 @@ export async function runVisualAnalysis(
     duration,
     sceneChanges,
     clickEvents,
+    cursors,
+    inferredClicks,
+    dwells,
+    uiRegions,
     computeMs: performance.now() - startedAt,
   });
 

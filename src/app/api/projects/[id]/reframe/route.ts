@@ -19,6 +19,10 @@ import { getAdmin } from "@/lib/firebase/admin";
 import { refineMomentFocalRegion } from "@/lib/timeline/focal-region";
 import { stripUndefined } from "@/lib/firebase/sanitize";
 import type { Interaction } from "@/lib/recording/types";
+import {
+  resolveScopeAndTrust,
+  type CaptureDimensions,
+} from "@/lib/recording/scope-detect";
 import type {
   Analysis,
   DetectedMoment,
@@ -71,10 +75,14 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     | "tab"
     | "external"
     | undefined;
+  const captureDimensions = project.captureDimensions as
+    | CaptureDimensions
+    | undefined;
 
-  // ── Load saved interactions (zero-cost when the take was in-tab) ──
+  // ── Load saved interactions whenever a manifest exists (load is independent
+  // of scope); trust is decided separately via re-validated scope. ──
   let interactions: Interaction[] = [];
-  if (interactionsPath && interactionScope === "tab") {
+  if (interactionsPath) {
     try {
       const bucket = storage.bucket();
       const [iBuf] = await bucket.file(interactionsPath).download();
@@ -88,6 +96,12 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       console.warn("[reframe] interactions load failed", err);
     }
   }
+  const resolvedScope = resolveScopeAndTrust(interactionScope, captureDimensions);
+  // Only trusted click coordinates feed focal-region refinement; for untrusted
+  // recordings we refine from CV/defaults only (pass no interactions).
+  const trustedInteractions: Interaction[] = resolvedScope.coordinatesTrusted
+    ? interactions
+    : [];
 
   // ── Apply refinement ──────────────────────────────────────────────
   // `refineMomentFocalRegion` is the single source of truth for the
@@ -96,7 +110,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
   const detected = analysis.detectedMoments as DetectedMoment[];
   let changedCount = 0;
   const refined: DetectedMoment[] = detected.map((m) => {
-    const next = refineMomentFocalRegion(m, interactions, visualAnalysis ?? null);
+    const next = refineMomentFocalRegion(m, trustedInteractions, visualAnalysis ?? null);
     if (next !== m) changedCount++;
     return next;
   });
