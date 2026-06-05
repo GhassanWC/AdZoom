@@ -19,9 +19,7 @@ interface PlanCopy {
   features: string[];
 }
 
-// Keyed by INTERNAL tier. Note the display-name swap (see plan.ts header):
-// the `creator` key is shown to users as "Pro" ($19), and the `pro` key as
-// "Creator" ($49). Copy below matches the /pricing page.
+// Keyed by INTERNAL tier; names/prices match the /pricing page 1:1.
 const PLAN_COPY: Record<PlanTier, PlanCopy> = {
   free: {
     price: "$0",
@@ -34,8 +32,8 @@ const PLAN_COPY: Record<PlanTier, PlanCopy> = {
       "Community presets",
     ],
   },
-  creator: {
-    // Shown as "Pro" — the $19 "For serious creators" tier.
+  pro: {
+    // "Pro" — the $19 "For serious creators" tier.
     price: "$19",
     cadence: "month",
     features: [
@@ -47,8 +45,8 @@ const PLAN_COPY: Record<PlanTier, PlanCopy> = {
       "Priority render queue",
     ],
   },
-  pro: {
-    // Shown as "Creator" — the $49 "Teams & agencies" tier.
+  creator: {
+    // "Creator" — the $49 "Teams & agencies" tier.
     price: "$49",
     cadence: "month",
     features: [
@@ -131,20 +129,18 @@ export default function BillingPage() {
   // Primary + secondary CTAs depend on the current tier.
   const ctaBlock = (() => {
     if (tier === "free") {
-      // Display names: plan="creator" is shown "Pro" ($19, popular);
-      // plan="pro" is shown "Creator" ($49, teams).
       return (
         <div className="mt-6 flex flex-wrap gap-2">
-          <CheckoutButton plan="creator" label="Go Pro" variant="primary" />
-          <CheckoutButton plan="pro" label="Start Creator" variant="ghost" />
+          <CheckoutButton plan="pro" label="Go Pro" variant="primary" />
+          <CheckoutButton plan="creator" label="Start Creator" variant="ghost" />
         </div>
       );
     }
-    if (tier === "creator") {
-      // User is on "Pro" ($19) → upgrade to "Creator" ($49, internal `pro`).
+    if (tier === "pro") {
+      // On the $19 Pro plan → upgrade to the $49 Creator (top) tier.
       return (
         <div className="mt-6 flex flex-wrap gap-2">
-          <CheckoutButton plan="pro" label="Upgrade to Creator" variant="primary" />
+          <CheckoutButton plan="creator" label="Upgrade to Creator" variant="primary" />
           <ManageSubscriptionButton variant="ghost" />
         </div>
       );

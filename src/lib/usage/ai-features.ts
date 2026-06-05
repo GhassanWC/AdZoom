@@ -19,26 +19,25 @@ export type AiFeatureKey =
   | "advanced-balancing"    // Gemini gap-fill (analyze phase C)
   | "ai-labeling"           // Gemini moment labeling (analyze phase E)
   | "ai-rebalance"          // Re-running balance under denser pacing presets
-  | "cinematic-presets"     // Creator-tier builtin presets
+  | "cinematic-presets"     // Pro-tier builtin presets
   | "export-styles"         // Future export style variants (placeholder)
   | "priority-rendering"    // Future priority queue (placeholder)
   | "4k-export"             // 4K resolution in the export panel
   | "brand-presets";        // Future brand-kit feature (placeholder)
 
-// Boundaries follow the marketing tiers: the $19 "Pro" plan (internal
-// `creator`) unlocks 4K, priority rendering, and all premium presets; the
-// $49 "Creator" plan (internal `pro`) is the team tier and additionally
-// unlocks brand-kit presets.
+// Boundaries follow the marketing tiers: the $19 "Pro" plan unlocks 4K,
+// priority rendering, and all premium presets; the $49 "Creator" plan is the
+// top team tier and additionally unlocks brand-kit presets.
 export const AI_FEATURE_MIN_PLAN: Record<AiFeatureKey, PlanTier> = {
   "basic-analysis": "free",
-  "advanced-balancing": "creator",
-  "ai-labeling": "creator",
-  "ai-rebalance": "creator",
-  "cinematic-presets": "creator",
-  "export-styles": "creator",
-  "priority-rendering": "creator",
-  "4k-export": "creator",
-  "brand-presets": "pro",
+  "advanced-balancing": "pro",
+  "ai-labeling": "pro",
+  "ai-rebalance": "pro",
+  "cinematic-presets": "pro",
+  "export-styles": "pro",
+  "priority-rendering": "pro",
+  "4k-export": "pro",
+  "brand-presets": "creator",
 };
 
 /** True when the user's plan meets the minimum tier for the given feature. */

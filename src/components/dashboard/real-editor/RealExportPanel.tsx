@@ -59,9 +59,8 @@ export function RealExportPanel() {
   const usage = useMonthlyUsage();
   const { getIdToken } = useAuth();
 
-  // 4K requires a paid plan (the $19 "Pro" tier, internal `creator`, and up).
-  // Free is capped at 1080p.
-  const canExport4k = planMeetsMinimum(plan.tier, "creator");
+  // 4K requires a paid plan (Pro $19 and up). Free is capped at 1080p.
+  const canExport4k = planMeetsMinimum(plan.tier, "pro");
   const availableResolutions = (
     canExport4k ? resolutions : (["1080p"] as const)
   ) as readonly ("1080p" | "4K")[];

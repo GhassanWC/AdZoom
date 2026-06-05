@@ -74,8 +74,7 @@ export default function PricingPage() {
           }
         />
 
-        {/* Pro — featured / most popular. Display name "Pro" is backed by the
-            internal `creator` tier (mid: 50 GB, HD). See note in PRO_FEATURES. */}
+        {/* Pro — featured / most popular ($19, mid paid tier). */}
         <PlanCard
           name="Pro"
           price="$19"
@@ -84,11 +83,10 @@ export default function PricingPage() {
           features={PRO_FEATURES}
           icon={<Crown size={14} />}
           featured
-          cta={<CheckoutButton plan="creator" label="Go Pro" variant="primary" />}
+          cta={<CheckoutButton plan="pro" label="Go Pro" variant="primary" />}
         />
 
-        {/* Creator — teams & agencies. Display name "Creator" is backed by the
-            internal `pro` tier (top: 500 GB, 4K) so "Everything in Pro" holds. */}
+        {/* Creator — teams & agencies ($49, top tier; "Everything in Pro"). */}
         <PlanCard
           name="Creator"
           price="$49"
@@ -96,7 +94,7 @@ export default function PricingPage() {
           tagline="Teams & agencies."
           features={CREATOR_FEATURES}
           icon={<Users size={14} />}
-          cta={<CheckoutButton plan="pro" label="Start Creator" variant="primary" />}
+          cta={<CheckoutButton plan="creator" label="Start Creator" variant="primary" />}
         />
       </div>
 

@@ -1,22 +1,21 @@
 /**
  * Plan tiers, storage limits, and tier helpers.
  *
- * Tier hierarchy (free < creator < pro) — note the DISPLAY names are swapped
- * relative to the internal keys (the keys are load-bearing for gating and the
- * LS variant binding, so they don't change):
- *   • Free                       — onboarding / try-the-product. 5 GB storage.
- *   • `creator` key, shown "Pro" — main paid plan (~$19/mo). 50 GB storage.
- *                                  Unlimited exports, no watermark, 4K + 60fps,
- *                                  advanced AI editing, priority rendering, all
- *                                  premium presets.
- *   • `pro` key, shown "Creator" — team / agency plan (~$49/mo). 500 GB storage.
- *                                  Everything in "Pro" plus brand-kit presets,
- *                                  team seats, and API access (the "Everything
- *                                  in Pro" marketing tier).
+ * Tier hierarchy (free < pro < creator). Display names match the internal
+ * keys 1:1, and each key binds to the like-named LS variant
+ * (`pro` → PRO_VARIANT_ID, `creator` → CREATOR_VARIANT_ID):
+ *   • Free   — onboarding / try-the-product. 5 GB storage.
+ *   • Pro    — main paid plan (~$19/mo), "most popular". 50 GB storage.
+ *              Unlimited exports, no watermark, 4K + 60fps, advanced AI
+ *              editing, priority rendering, all premium presets.
+ *   • Creator — team / agency plan (~$49/mo). 500 GB storage. "Everything in
+ *              Pro" plus brand-kit presets, team seats, and API access.
  *
- * A user's tier is read from `users/{uid}.plan`; absent = "free". The plan
- * field is mirrored from `subscriptions/{uid}.plan` by the Lemon Squeezy
- * webhook so the client can stay on a single Firestore listener.
+ * Note the ordering: Creator is the TOP tier (it's the $49 superset), so
+ * `planRank` puts creator above pro. A user's tier is read from
+ * `users/{uid}.plan`; absent = "free". The plan field is mirrored from
+ * `subscriptions/{uid}.plan` by the Lemon Squeezy webhook so the client can
+ * stay on a single Firestore listener.
  */
 
 export type PlanTier = "free" | "creator" | "pro";
@@ -39,16 +38,15 @@ export const PLAN_DEFS: Record<PlanTier, PlanDef> = {
     storageBytes: 5 * GB,
     ctaLabel: "Upgrade",
   },
-  creator: {
-    tier: "creator",
-    // Display name intentionally "Pro" — see header note on the swap.
+  // Pro is the mid paid tier ($19); Creator is the top team tier ($49).
+  pro: {
+    tier: "pro",
     name: "Pro plan",
     storageBytes: 50 * GB,
     ctaLabel: "Manage",
   },
-  pro: {
-    tier: "pro",
-    // Display name intentionally "Creator" — see header note on the swap.
+  creator: {
+    tier: "creator",
     name: "Creator plan",
     storageBytes: 500 * GB,
     ctaLabel: "Manage",
@@ -62,12 +60,13 @@ export function normalizePlan(raw: unknown): PlanTier {
 }
 
 /**
- * Ordinal rank of a tier — `free=0 < creator=1 < pro=2`. Used by the
+ * Ordinal rank of a tier — `free=0 < pro=1 < creator=2`. Used by the
  * gating helpers (`requirePlan`, `canExportResolution`, etc.) so the
- * comparison is a single integer compare.
+ * comparison is a single integer compare. Creator outranks Pro because it's
+ * the $49 "Everything in Pro" superset tier.
  */
 export function planRank(p: PlanTier): number {
-  return p === "pro" ? 2 : p === "creator" ? 1 : 0;
+  return p === "creator" ? 2 : p === "pro" ? 1 : 0;
 }
 
 /** True when `actual` ≥ `minimum` in the tier ordering. */

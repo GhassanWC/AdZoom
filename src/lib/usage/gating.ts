@@ -19,7 +19,7 @@ import { BUILTIN_PRESETS_BY_ID } from "@/lib/presets";
  *
  * Monthly export limits live in `EXPORT_LIMITS`. The Free cap (5/mo) is the
  * "$0 trial" funnel; both paid tiers are uncapped — the marketing copy
- * promises "Unlimited exports" on the $19 tier (internal `creator`).
+ * promises "Unlimited exports" starting at the $19 Pro tier.
  * Adjust by editing the constant.
  */
 
@@ -106,15 +106,14 @@ export async function getRemainingExports(uid: string): Promise<{
 
 /**
  * Whether the user can export at the requested resolution. 1080p is
- * available on any plan; 4K requires a paid plan (the $19 "Pro" tier,
- * internal `creator`, and above).
+ * available on any plan; 4K requires a paid plan (Pro $19 and above).
  */
 export async function canExportResolution(
   uid: string,
   res: "1080p" | "4K"
 ): Promise<boolean> {
   if (res === "1080p") return true;
-  return planMeetsMinimum(await getUserPlan(uid), "creator");
+  return planMeetsMinimum(await getUserPlan(uid), "pro");
 }
 
 /**

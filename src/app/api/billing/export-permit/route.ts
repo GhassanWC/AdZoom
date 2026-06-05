@@ -31,7 +31,7 @@ interface PermitBody {
  * jobs in one transaction:
  *
  *   1. Verify the user's plan allows the requested resolution.
- *      4K requires a paid plan (internal `creator`+); 1080p is universal.
+ *      4K requires a paid plan (Pro $19+); 1080p is universal.
  *
  *   2. Verify the user is under their monthly export cap.
  *      Free: 5 / both paid tiers: Infinity. Read + increment in a
@@ -91,15 +91,14 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // 1. Plan vs resolution. 4K requires a paid plan (the $19 "Pro" tier,
-    //    internal `creator`, and up).
+    // 1. Plan vs resolution. 4K requires a paid plan (Pro $19 and up).
     if (!(await canExportResolution(uid, resolution))) {
       const plan = await getUserPlan(uid);
       return NextResponse.json(
         {
           error: "A paid plan is required for 4K export",
           kind: "plan_required",
-          required: "creator",
+          required: "pro",
           actual: plan,
         },
         { status: 402 }
@@ -137,7 +136,7 @@ export async function POST(req: NextRequest) {
           throw new ExportLimitError(prev.exportCount, limit, plan);
         }
 
-        applyWatermark = !planMeetsMinimum(plan, "creator");
+        applyWatermark = !planMeetsMinimum(plan, "pro");
 
         const now = Date.now();
         nextUsage = {
