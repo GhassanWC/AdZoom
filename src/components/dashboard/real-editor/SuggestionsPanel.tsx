@@ -26,6 +26,12 @@ const KIND_META: Record<
   "pacing-gap": { Icon: Clock, tone: "text-amber-300", accept: "Add edit" },
   "too-aggressive": { Icon: ZoomOut, tone: "text-rose-300", accept: "Soften" },
   tighten: { Icon: Crop, tone: "text-amber-300", accept: "Tighten" },
+  // Future manual-effect suggestions — declared for exhaustiveness; never
+  // generated or auto-applied yet (the user adds crop/speed manually).
+  "suggest-speed-up": { Icon: Clock, tone: "text-amber-300", accept: "Add speed" },
+  "suggest-crop": { Icon: Crop, tone: "text-teal-300", accept: "Add crop" },
+  "suggest-reframe": { Icon: Crop, tone: "text-teal-300", accept: "Reframe" },
+  "suggest-remove-idle": { Icon: Clock, tone: "text-amber-300", accept: "Trim idle" },
 };
 
 function fmt(s: number): string {

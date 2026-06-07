@@ -3,6 +3,7 @@
 import * as React from "react";
 import { cn } from "@/lib/cn";
 import type { LucideIcon } from "lucide-react";
+import type { TimelineTrackTone } from "./trackModel";
 
 /**
  * A single timeline row. The pills + markers inside are absolutely positioned
@@ -16,11 +17,14 @@ export function TimelineTrack({
   className,
   children,
   ariaLabel,
+  dimmed,
 }: {
   height: number;
   className?: string;
   children: React.ReactNode;
   ariaLabel: string;
+  /** Placeholder / read-only lanes render with a faint recessed surface. */
+  dimmed?: boolean;
 }) {
   return (
     <div
@@ -28,6 +32,7 @@ export function TimelineTrack({
       aria-label={ariaLabel}
       className={cn(
         "relative border-b border-white/[0.04] last:border-b-0",
+        dimmed && "bg-white/[0.012]",
         className
       )}
       style={{ height }}
@@ -37,32 +42,39 @@ export function TimelineTrack({
   );
 }
 
+const TONE_TINT: Record<TimelineTrackTone, string> = {
+  violet: "text-violet-200",
+  cyan: "text-cyan-200",
+  amber: "text-amber-200",
+  teal: "text-teal-200",
+  fog: "text-fog",
+};
+
 /**
  * The left-side label gutter shown alongside each track. Sits outside the
  * horizontally-scrolling lane area, so it's always visible regardless of
- * scroll position. Collapses to icon-only on small screens.
+ * scroll position. Shows the label from `md` up; collapses to an icon (with a
+ * title tooltip) on the narrowest gutters.
  */
 export function TrackLabel({
   Icon,
   label,
   count,
   height,
-  tone,
+  tone = "violet",
+  comingSoon,
 }: {
   Icon: LucideIcon;
   label: string;
   count?: number;
   height: number;
-  tone?: "violet" | "cyan" | "fog";
+  tone?: TimelineTrackTone;
+  comingSoon?: boolean;
 }) {
-  const tint =
-    tone === "cyan"
-      ? "text-cyan-200"
-      : tone === "fog"
-        ? "text-fog"
-        : "text-violet-200";
+  const tint = comingSoon ? "text-fog/55" : TONE_TINT[tone];
   return (
     <div
+      title={label}
       style={{ height }}
       className="flex items-center gap-2 border-b border-white/[0.04] pr-3 last:border-b-0"
     >
@@ -74,14 +86,25 @@ export function TrackLabel({
       >
         <Icon size={13} />
       </span>
-      <div className="hidden min-w-0 lg:block">
-        <div className={cn("text-[11.5px] font-semibold leading-tight", tint)}>
-          {label}
+      <div className="hidden min-w-0 md:block">
+        <div
+          className={cn(
+            "flex items-center gap-1 text-[11.5px] font-semibold leading-tight",
+            tint
+          )}
+        >
+          <span className="truncate">{label}</span>
         </div>
-        {typeof count === "number" && (
-          <div className="font-mono text-[10px] leading-tight text-fog">
-            {count}
+        {comingSoon ? (
+          <div className="text-[9.5px] font-medium uppercase tracking-[0.12em] leading-tight text-fog/45">
+            Soon
           </div>
+        ) : (
+          typeof count === "number" && (
+            <div className="font-mono text-[10px] leading-tight text-fog">
+              {count}
+            </div>
+          )
         )}
       </div>
     </div>

@@ -15,6 +15,7 @@ import {
 } from "@/lib/timeline/camera";
 import { coverFitDims } from "@/lib/timeline/cover";
 import { resolveOutputDims } from "@/lib/timeline/output-dims";
+import { activeSpeedAt, outputDurationFor } from "@/lib/timeline/crop-speed";
 import { probeVideoBottomBand } from "@/lib/recording/health-check";
 import { drawClickHighlight } from "@/lib/timeline/click-highlight";
 import type {
@@ -373,8 +374,28 @@ export async function renderProjectClientSide(
     logExportCameraSnapshots(moments, effects.autoZoom, cover);
   }
 
+  // Crop/Speed export diagnostics (req): counts, source vs output duration,
+  // and the timing strategy. We use real-time playbackRate (no offline timing
+  // map), reported honestly so "did speed/crop apply?" is answerable.
+  {
+    const cropSections = moments.filter((m) => m.effectType === "crop").length;
+    const speedSections = moments.filter((m) => m.effectType === "speed-up").length;
+    console.info("[export] crop/speed", {
+      cropSections,
+      speedSections,
+      sourceDuration: +input.duration.toFixed(2),
+      outputDuration: +outputDurationFor(moments, input.duration).toFixed(2),
+      timingMode: "realtime-playbackRate",
+      timingMapGenerated: false,
+    });
+  }
+
   const draw = () => {
     if (stopped) return;
+    // Speed sections: real-time capture at a higher playbackRate makes the
+    // recorded output genuinely shorter for that span (not faked). Audio
+    // follows the section's mode (mute / keep-shifted / pitch-corrected).
+    applySpeedForFrame(video, moments);
     ctx.fillStyle = "#000";
     ctx.fillRect(0, 0, canvasW, canvasH);
     applyCameraFrame(
@@ -433,6 +454,12 @@ export async function renderProjectClientSide(
     clearTimeout(safety);
     signal?.removeEventListener("abort", abortHandler);
     video.pause();
+    // Restore normal playback so the editor preview isn't left sped/muted.
+    try {
+      video.playbackRate = 1;
+    } catch {
+      /* ignore */
+    }
   }
 
   if (aborted) throw new Error("Export cancelled");
@@ -493,6 +520,31 @@ export async function renderProjectClientSide(
  * Note `effects` is the FULL `EffectsSettings` (not just `autoZoom`)
  * because layers 3 and 4 need fields from the same record.
  */
+/**
+ * Set the source element's playbackRate (+ audio mode) for the speed section
+ * under the current playhead. Real-time MediaRecorder capture then records
+ * that span faster, shortening the output. Audio: "mute" silences the element
+ * (its captured track goes quiet), "keep" lets pitch shift up, "pitch-correct"
+ * time-stretches without pitch change. Reset to 1× / unmuted outside sections.
+ */
+function applySpeedForFrame(
+  video: HTMLVideoElement,
+  moments: DetectedMoment[]
+): void {
+  const sp = activeSpeedAt(moments, video.currentTime);
+  const rate = sp ? Math.max(0.0625, Math.min(16, sp.multiplier)) : 1;
+  if (Math.abs(video.playbackRate - rate) > 0.001) video.playbackRate = rate;
+  const wantMute = !!(sp && sp.audioMode === "mute");
+  if (video.muted !== wantMute) video.muted = wantMute;
+  try {
+    (video as HTMLVideoElement & { preservesPitch?: boolean }).preservesPitch = sp
+      ? sp.audioMode !== "keep"
+      : true;
+  } catch {
+    /* not supported — ignore */
+  }
+}
+
 function applyCameraFrame(
   ctx: CanvasRenderingContext2D,
   video: HTMLVideoElement,

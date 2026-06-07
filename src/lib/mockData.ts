@@ -213,6 +213,7 @@ export const sidebarItems = [
   { label: "Upload", href: "/dashboard/upload", icon: "Upload" as const },
   { label: "Projects", href: "/dashboard/projects", icon: "Folder" as const },
   { label: "Record", href: "/dashboard/record", icon: "Video" as const },
+  { label: "Processing", href: "/dashboard/processing", icon: "Cpu" as const },
   { label: "Presets", href: "/dashboard/presets", icon: "Wand2" as const },
   { label: "Exports", href: "/dashboard/exports", icon: "Download" as const },
   { label: "Billing", href: "/dashboard/billing", icon: "CreditCard" as const },

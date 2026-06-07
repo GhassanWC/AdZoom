@@ -24,6 +24,15 @@ const MAX_DWELLS = 120;
 /** Above this many samples (~40 min @ 1 Hz) drop to 0.5 Hz. */
 const MAX_SAMPLES_AT_1HZ = 2400;
 
+/**
+ * The persisted sample rate for a given WHOLE-video duration. Exported so the
+ * chunked engine can resample each window at the whole-video rate (otherwise a
+ * 30s window would always pick 1 Hz and fail to merge with a 0.5 Hz long video).
+ */
+export function sampleRateFor(duration: number): number {
+  return Math.ceil(duration) > MAX_SAMPLES_AT_1HZ ? 0.5 : 1;
+}
+
 /** Scene-proximity falloff for the attention curve, in seconds. */
 const SCENE_FALLOFF = 2;
 
@@ -46,6 +55,12 @@ export function dequantizeArray(arr: number[] | undefined): number[] {
 export interface ResampleInput {
   signals: RawFrameSignal[];
   duration: number;
+  /**
+   * Force the per-second sample rate instead of deriving it from `duration`.
+   * The chunked engine passes the WHOLE-video rate so every window-local
+   * `VisualAnalysis` shares a rate and merges cleanly.
+   */
+  sampleRate?: number;
   sceneChanges: VisualEvent[];
   clickEvents: VisualEvent[];
   /** Per-frame cursor estimates (same order/length as `signals`). v3. */
@@ -73,8 +88,7 @@ export function resample(input: ResampleInput): VisualAnalysis {
     computeMs,
   } = input;
 
-  const sampleRate =
-    Math.ceil(duration) > MAX_SAMPLES_AT_1HZ ? 0.5 : 1;
+  const sampleRate = input.sampleRate ?? sampleRateFor(duration);
   const bucketLen = 1 / sampleRate; // seconds per bucket
   const sampleCount = Math.max(1, Math.ceil(duration * sampleRate));
 

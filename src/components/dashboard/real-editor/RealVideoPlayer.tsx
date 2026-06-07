@@ -26,6 +26,7 @@ import {
 } from "@/lib/timeline/camera";
 import { clickHighlightGeometry } from "@/lib/timeline/click-highlight";
 import { coverFitDims } from "@/lib/timeline/cover";
+import { activeSpeedAt, DEFAULT_CROP } from "@/lib/timeline/crop-speed";
 import { probeVideoBottomBand } from "@/lib/recording/health-check";
 import { FocalPathOverlay } from "./FocalPathOverlay";
 import type {
@@ -112,6 +113,24 @@ function useCinematicCamera(
       const dt = Math.min(0.05, (now - last) / 1000);
       last = now;
       const s = stateRef.current;
+
+      // Speed sections drive playbackRate — an approximate accelerated preview
+      // (the export bakes the exact shorter duration). Outside a speed section,
+      // or with preview off, playback runs at 1×.
+      const vEl = videoRef.current;
+      if (vEl) {
+        const sp = s.previewMode ? activeSpeedAt(s.moments, vEl.currentTime) : null;
+        const rate = sp ? Math.max(0.0625, Math.min(16, sp.multiplier)) : 1;
+        if (Math.abs(vEl.playbackRate - rate) > 0.001) {
+          vEl.playbackRate = rate;
+          // Keep pitch natural during speed-ups (browser time-stretch).
+          try {
+            (vEl as HTMLVideoElement & { preservesPitch?: boolean }).preservesPitch = true;
+          } catch {
+            /* not supported — ignore */
+          }
+        }
+      }
 
       // Recompute the target from the live playhead each frame.
       let tgt: CameraState = IDENTITY_CAMERA;
@@ -558,21 +577,35 @@ export function RealVideoPlayer() {
             preview mode the box drops to ghost opacity so the cinematic
             framing isn't visually obstructed but the user can still drag
             (hover to bring it back to full opacity). */}
-        {activeMoment && (
+        {/* Crop guides — title-safe inset + rule-of-thirds, shown while a
+            crop/reframe moment is active so the user can frame intentionally.
+            The draggable box below is the output framing itself. */}
+        {activeMoment?.effectType === "crop" && previewMode && <CropGuides />}
+
+        {/* Speed moments don't frame a region — no box for them. */}
+        {activeMoment && activeMoment.effectType !== "speed-up" && (
           <EditableFocusBox
             key={activeMoment.id}
             moment={activeMoment}
             aspectRef={aspectRef}
             ghost={previewMode}
-            onCommit={(focusRegion) =>
+            onCommit={(focusRegion) => {
               // Stamp `targetRegionSource: "user"` so the balancer's
               // `refineMomentFocalRegion` pass leaves this region alone on
               // any subsequent re-analyze / reframe — user intent wins.
-              updateMoment(activeMoment.id, {
+              const patch: Partial<DetectedMoment> = {
                 focusRegion,
                 targetRegionSource: "user",
-              })
-            }
+              };
+              // A manual box drag makes the crop position "custom".
+              if (activeMoment.effectType === "crop") {
+                patch.crop = {
+                  ...(activeMoment.crop ?? DEFAULT_CROP),
+                  position: "custom",
+                };
+              }
+              updateMoment(activeMoment.id, patch);
+            }}
           />
         )}
 
@@ -855,6 +888,27 @@ type FocusHandle =
 const MIN_FOCUS = 0.08;
 
 /**
+ * Framing guides shown while a Crop/Reframe moment is active: a title-safe
+ * inset rectangle + a rule-of-thirds grid over the frame. Pure CSS, no
+ * geometry — purely advisory. The draggable box (EditableFocusBox) is the
+ * actual output framing. Preview-only; never drawn into the export.
+ */
+function CropGuides() {
+  return (
+    <div className="pointer-events-none absolute inset-0 z-[6]">
+      <div className="absolute inset-[6%] rounded-[3px] border border-dashed border-white/25" />
+      <div className="absolute left-1/3 top-0 h-full w-px bg-white/12" />
+      <div className="absolute left-2/3 top-0 h-full w-px bg-white/12" />
+      <div className="absolute left-0 top-1/3 h-px w-full bg-white/12" />
+      <div className="absolute left-0 top-2/3 h-px w-full bg-white/12" />
+      <span className="absolute left-1/2 top-2 -translate-x-1/2 rounded bg-black/50 px-2 py-0.5 text-[9px] font-medium uppercase tracking-wider text-white/70">
+        Safe area
+      </span>
+    </div>
+  );
+}
+
+/**
  * Draggable + resizable focus region, drawn directly on the frame. Move the
  * body to retarget the zoom centre; drag a handle to resize. Updates a local
  * draft live (instant visual feedback) and commits to the moment on release.
@@ -876,6 +930,10 @@ function EditableFocusBox({
   ghost?: boolean;
 }) {
   const [draft, setDraft] = React.useState<FocusRegion>(moment.focusRegion);
+  // Mirror of `draft` so the pointerup handler can read the latest region
+  // WITHOUT calling onCommit inside a setState updater (that runs during render
+  // → "Cannot update a component while rendering a different component").
+  const draftRef = React.useRef<FocusRegion>(draft);
   const dragRef = React.useRef<{
     handle: FocusHandle;
     startX: number;
@@ -885,7 +943,10 @@ function EditableFocusBox({
 
   // Keep the draft in sync when the underlying moment changes externally.
   React.useEffect(() => {
-    if (!dragRef.current) setDraft(moment.focusRegion);
+    if (!dragRef.current) {
+      setDraft(moment.focusRegion);
+      draftRef.current = moment.focusRegion;
+    }
   }, [moment.focusRegion]);
 
   const begin = (e: React.PointerEvent, handle: FocusHandle) => {
@@ -930,20 +991,21 @@ function EditableFocusBox({
           height = clamp(d.orig.height + dy, MIN_FOCUS, 1 - d.orig.y);
         }
       }
-      setDraft({
+      const next = {
         x: round3(x),
         y: round3(y),
         width: round3(width),
         height: round3(height),
-      });
+      };
+      draftRef.current = next;
+      setDraft(next);
     };
     const onUp = () => {
       if (dragRef.current) {
         dragRef.current = null;
-        setDraft((d) => {
-          onCommit(d);
-          return d;
-        });
+        // Commit from the ref in the event handler — NOT inside a setState
+        // updater (which would run during render and warn).
+        onCommit(draftRef.current);
       }
     };
     window.addEventListener("pointermove", onMove);

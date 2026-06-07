@@ -10,6 +10,7 @@ import {
   User,
   Pointer,
   RefreshCcw,
+  Crop,
   type LucideIcon,
 } from "lucide-react";
 import type {
@@ -23,6 +24,7 @@ export const EFFECT_ICONS: Record<EffectType, LucideIcon> = {
   "click-highlight": Target,
   "cursor-focus": MousePointer2,
   "speed-up": FastForward,
+  crop: Crop,
 };
 
 /**
@@ -112,11 +114,19 @@ export const EFFECT_TONES: Record<
   },
   "speed-up": {
     ai: "from-amber-400/85 via-amber-400/60 to-orange-500/40 border-amber-200/50",
-    user: "from-cyan-400/80 via-amber-400/55 to-amber-500/40 border-cyan-200/50",
+    user: "from-amber-400/85 via-amber-400/60 to-orange-500/40 border-amber-200/50",
     dot: "bg-amber-300",
     label: "Speed",
     glow: "shadow-[0_8px_36px_-12px_rgba(251,191,36,0.85)]",
     hoverGlow: "hover:shadow-[0_8px_36px_-12px_rgba(251,191,36,0.85)]",
+  },
+  crop: {
+    ai: "from-teal-400/85 via-teal-500/55 to-emerald-600/40 border-teal-200/40",
+    user: "from-teal-400/85 via-teal-500/55 to-emerald-600/40 border-teal-200/45",
+    dot: "bg-teal-300",
+    label: "Crop / Reframe",
+    glow: "shadow-[0_8px_36px_-12px_rgba(45,212,191,0.9)]",
+    hoverGlow: "hover:shadow-[0_8px_36px_-12px_rgba(45,212,191,0.9)]",
   },
 };
 
@@ -195,6 +205,19 @@ export const CLICK_PX = 4;
 export const MIN_MOMENT_LEN = 0.3;
 
 /**
+ * Minimum rendered width (px) for a moment clip / chapter. A short clip (e.g. a
+ * 1.6s CV zoom on a long video) is a tiny % of the timeline, so a pure `%`
+ * width turns it into a hairline "marker". This px floor keeps real-duration
+ * clips reading as blocks while longer ones still scale by `(end-start)/total`.
+ */
+export const MIN_PILL_PX = 34;
+/**
+ * Fallback clip length (seconds) when a moment's duration is missing/zero/NaN —
+ * it still renders as a small block instead of collapsing to nothing.
+ */
+export const MIN_RENDER_DURATION = 0.5;
+
+/**
  * Cinematic track heights. The AI/user rows are tall enough to show a
  * thumbnail strip + title + reasoning + intensity micro-bar without crowding.
  */
@@ -207,6 +230,10 @@ export const TRACK_HEIGHTS = {
   chapters: 56,
   /** Attention waveform layer drawn behind the AI track. */
   attention: 96,
+  /** Read-only cursor / click / focus marker lane. */
+  interactions: 44,
+  /** Future-feature placeholder lanes (speed / crop) — dimmed, non-interactive. */
+  placeholder: 40,
 } as const;
 
 /** Width of the static left label gutter (px). */

@@ -14,6 +14,7 @@ import {
   Sparkles,
   Video,
   Activity,
+  Cpu,
   X,
   type LucideIcon,
 } from "lucide-react";
@@ -34,6 +35,7 @@ const icons: Record<string, LucideIcon> = {
   Settings,
   Video,
   Activity,
+  Cpu,
 };
 
 // Diagnostics is an internal/dev tool — hide it from the production nav.

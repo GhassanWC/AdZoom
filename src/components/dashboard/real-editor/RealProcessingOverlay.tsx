@@ -40,6 +40,7 @@ export function RealProcessingOverlay() {
     cvProgress,
     processingMinimized,
     setProcessingMinimized,
+    chunkedJob,
   } = useEditorReal();
 
   const status = project.status;
@@ -47,6 +48,30 @@ export function RealProcessingOverlay() {
   const failed = analysis?.status === "failed" || status === "failed";
   const cancelled = analysis?.status === "cancelled" || status === "cancelled";
   const currentlyProcessing = isProcessing(status);
+
+  // Completion detection — independent of `project.status`, which can lag or be
+  // transiently reset by a chunked re-run. Treats the run as DONE when the
+  // analysis is terminal, the chunked job is complete, OR the explicit safety
+  // fallback holds (all chunks done + moments present + an "Analysis complete"
+  // activity). This is what unsticks the overlay when status desyncs.
+  const lastActivityComplete = (analysis?.activity ?? []).some((a) =>
+    a.text?.includes("Analysis complete")
+  );
+  const allChunksDone =
+    !!chunkedJob &&
+    chunkedJob.chunkCount > 0 &&
+    chunkedJob.completedCount >= chunkedJob.chunkCount;
+  const momentsPresent = (analysis?.detectedMoments?.length ?? 0) > 0;
+  const done =
+    !failed &&
+    !cancelled &&
+    (analysis?.status === "complete" ||
+      chunkedJob?.status === "complete" ||
+      (allChunksDone && momentsPresent && lastActivityComplete));
+  const editsCount = analysis?.detectedMoments?.length ?? 0;
+
+  // When `done`, the run is no longer processing regardless of a lagging status.
+  const effectivelyProcessing = currentlyProcessing && !done;
 
   // Show the overlay when:
   //   - actively processing AND user hasn't minimized
@@ -56,19 +81,35 @@ export function RealProcessingOverlay() {
     null
   );
   React.useEffect(() => {
-    // If the user starts a fresh analysis, forget the previous dismissal.
-    if (currentlyProcessing) setDismissedTerminal(null);
-  }, [currentlyProcessing]);
+    // If the user starts a fresh analysis, forget the previous dismissal. Guard
+    // on `!done` so a stuck status (processing + done) doesn't re-open the
+    // success state right after its auto-dismiss.
+    if (currentlyProcessing && !done) setDismissedTerminal(null);
+  }, [currentlyProcessing, done]);
 
+  // A success "complete" terminal only pops the overlay when it was already
+  // open (not minimized) — when minimized (the chunked default) we just let the
+  // pill clear + the navbar "AI analysis ready" notification fire, so we don't
+  // interrupt the user mid-edit.
   const terminalKey = failed
     ? `failed:${analysis?.errorKind ?? "unknown"}:${analysis?.completedAt ?? ""}`
     : cancelled
       ? `cancelled:${analysis?.completedAt ?? ""}`
-      : null;
+      : done && !processingMinimized
+        ? `complete:${analysis?.completedAt ?? chunkedJob?.completedAt ?? "now"}`
+        : null;
   const showTerminal = Boolean(terminalKey) && dismissedTerminal !== terminalKey;
 
+  // Auto-dismiss the success state after a short confirmation beat.
+  const isCompleteTerminal = showTerminal && done && !failed && !cancelled;
+  React.useEffect(() => {
+    if (!isCompleteTerminal || !terminalKey) return;
+    const t = setTimeout(() => setDismissedTerminal(terminalKey), 2500);
+    return () => clearTimeout(t);
+  }, [isCompleteTerminal, terminalKey]);
+
   const visible =
-    (currentlyProcessing && !processingMinimized) || showTerminal;
+    (effectivelyProcessing && !processingMinimized) || showTerminal;
 
   // Mount portal only after client-side hydration.
   const [mounted, setMounted] = React.useState(false);
@@ -118,7 +159,7 @@ export function RealProcessingOverlay() {
                 Framevo AI
               </div>
               <div className="flex items-center gap-1.5">
-                {currentlyProcessing && (
+                {effectivelyProcessing && (
                   <button
                     onClick={onMinimize}
                     aria-label="Continue in background"
@@ -129,7 +170,7 @@ export function RealProcessingOverlay() {
                     Run in background
                   </button>
                 )}
-                {showTerminal && !currentlyProcessing && (
+                {showTerminal && !effectivelyProcessing && (
                   <button
                     onClick={onCloseTerminal}
                     aria-label="Close"
@@ -151,6 +192,8 @@ export function RealProcessingOverlay() {
               />
             ) : cancelled ? (
               <CancelledBody onRetry={onRetry} onClose={onCloseTerminal} />
+            ) : done ? (
+              <CompleteBody editsCount={editsCount} onClose={onCloseTerminal} />
             ) : (
               <ActiveBody
                 stage={stage}
@@ -169,6 +212,38 @@ export function RealProcessingOverlay() {
       )}
     </AnimatePresence>,
     document.body
+  );
+}
+
+// ─── COMPLETE BODY ───────────────────────────────────────────────────────────
+
+function CompleteBody({
+  editsCount,
+  onClose,
+}: {
+  editsCount: number;
+  onClose: () => void;
+}) {
+  return (
+    <div className="p-8 text-center">
+      <div className="mx-auto inline-flex size-14 items-center justify-center rounded-2xl bg-emerald-500/15 text-emerald-300 ring-1 ring-emerald-400/30">
+        <Check size={26} strokeWidth={2.5} />
+      </div>
+      <h3 className="mt-4 font-display text-xl font-semibold tracking-tight text-white">
+        Analysis complete
+      </h3>
+      <p className="mt-1.5 text-sm text-fog">
+        {editsCount > 0
+          ? `${editsCount} edit${editsCount === 1 ? "" : "s"} on your timeline — ready to refine.`
+          : "Your timeline is ready to refine."}
+      </p>
+      <button
+        onClick={onClose}
+        className="mt-5 inline-flex items-center gap-1.5 rounded-xl border border-violet-400/35 bg-violet-500/15 px-4 py-2 text-[13px] font-medium text-violet-100 transition-colors duration-200 hover:bg-violet-500/25"
+      >
+        Start editing
+      </button>
+    </div>
   );
 }
 
@@ -196,6 +271,11 @@ function ActiveBody({
   onMinimize: () => void;
 }) {
   const [detailsOpen, setDetailsOpen] = React.useState(false);
+  const { chunkedJob } = useEditorReal();
+  const job =
+    chunkedJob && (chunkedJob.status === "running" || chunkedJob.status === "queued")
+      ? chunkedJob
+      : null;
   const stageIdx = Math.max(
     0,
     ANALYSIS_STAGES.findIndex((s) => s.id === status)
@@ -232,6 +312,30 @@ function ActiveBody({
             {ANALYSIS_STAGES.find((s) => s.id === status)?.description ||
               "Framevo is processing your recording."}
           </p>
+
+          {job && (
+            <div className="mt-4 rounded-xl border border-violet-400/25 bg-violet-500/[0.08] px-4 py-3">
+              <div className="flex items-center justify-between text-[12px]">
+                <span className="font-semibold text-violet-100">
+                  Chunk {Math.min(job.completedCount + 1, job.chunkCount)} of{" "}
+                  {job.chunkCount}
+                </span>
+                <span className="font-mono tabular-nums text-violet-200/80">
+                  {Math.round(job.progress * 100)}%
+                </span>
+              </div>
+              <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-white/[0.08]">
+                <div
+                  className="h-full rounded-full bg-gradient-to-r from-violet-500 to-fuchsia-500 transition-[width] duration-500"
+                  style={{ width: `${Math.max(2, job.progress * 100)}%` }}
+                />
+              </div>
+              <p className="mt-2 text-[11.5px] text-violet-100/80">
+                {job.momentsSoFar} edit{job.momentsSoFar === 1 ? "" : "s"} generated
+                so far — you can start editing the completed sections now.
+              </p>
+            </div>
+          )}
 
           <ul className="mt-5 space-y-2.5">
             {ANALYSIS_STAGES.map((s, i) => {

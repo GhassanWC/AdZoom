@@ -21,7 +21,7 @@ import {
  * pill from project state.
  */
 export function ProcessingMiniPill() {
-  const { project, processingMinimized, setProcessingMinimized } =
+  const { project, processingMinimized, setProcessingMinimized, chunkedJob } =
     useEditorReal();
   const [mounted, setMounted] = React.useState(false);
   React.useEffect(() => setMounted(true), []);
@@ -35,7 +35,24 @@ export function ProcessingMiniPill() {
 
   if (!mounted) return null;
 
-  const visible = processingMinimized && isProcessing(project.status);
+  // Completion detection mirrors the overlay — hide the pill the instant the run
+  // is done even if `project.status` lags or was transiently reset.
+  const analysis = project.analysis;
+  const allChunksDone =
+    !!chunkedJob &&
+    chunkedJob.chunkCount > 0 &&
+    chunkedJob.completedCount >= chunkedJob.chunkCount;
+  const lastActivityComplete = (analysis?.activity ?? []).some((a) =>
+    a.text?.includes("Analysis complete")
+  );
+  const momentsPresent = (analysis?.detectedMoments?.length ?? 0) > 0;
+  const done =
+    analysis?.status === "complete" ||
+    chunkedJob?.status === "complete" ||
+    (allChunksDone && momentsPresent && lastActivityComplete);
+
+  const visible =
+    processingMinimized && isProcessing(project.status) && !done;
 
   const stageIdx = Math.max(
     0,
@@ -53,6 +70,19 @@ export function ProcessingMiniPill() {
   const elapsedMs = project.analysis?.startedAt
     ? now - project.analysis.startedAt
     : 0;
+
+  // Chunked analysis overrides the stage text + progress with live chunk state.
+  const job =
+    chunkedJob && (chunkedJob.status === "running" || chunkedJob.status === "queued")
+      ? chunkedJob
+      : null;
+  const stageText = job
+    ? `Chunk ${Math.min(job.completedCount + 1, job.chunkCount)} of ${job.chunkCount}`
+    : project.analysis?.stage ?? "Analyzing";
+  const pctFinal = job ? Math.max(0.02, job.progress) : pct;
+  const subtitle = job
+    ? `${job.momentsSoFar} edit${job.momentsSoFar === 1 ? "" : "s"} so far · editable now`
+    : project.title;
 
   return createPortal(
     <AnimatePresence>
@@ -76,7 +106,7 @@ export function ProcessingMiniPill() {
           <div className="min-w-0 flex-1">
             <div className="flex items-center justify-between gap-2">
               <span className="truncate text-xs font-semibold text-white">
-                {project.analysis?.stage ?? "Analyzing"}
+                {stageText}
               </span>
               <span className="font-mono text-[10px] tabular-nums text-fog">
                 {fmtElapsed(elapsedMs)}
@@ -85,11 +115,11 @@ export function ProcessingMiniPill() {
             <div className="mt-1.5 h-1 overflow-hidden rounded-full bg-white/[0.06]">
               <div
                 className="h-full rounded-full bg-gradient-to-r from-violet-500 to-cyan-400"
-                style={{ width: `${pct * 100}%` }}
+                style={{ width: `${pctFinal * 100}%` }}
               />
             </div>
             <div className="mt-1 truncate text-[10px] text-fog">
-              {project.title}
+              {subtitle}
             </div>
           </div>
           <Maximize2 size={12} className="shrink-0 text-fog" />

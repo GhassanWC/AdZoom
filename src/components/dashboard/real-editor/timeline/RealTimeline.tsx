@@ -3,14 +3,15 @@
 import * as React from "react";
 import {
   Sparkles,
-  User,
+  MousePointer2,
+  FastForward,
+  Crop,
   AlertTriangle,
   Trash2,
   Check,
   X as XIcon,
   Film,
   Diamond,
-  Layers,
   Bug,
   Activity,
 } from "lucide-react";
@@ -23,6 +24,7 @@ import {
   EFFECT_TONES,
   GUTTER_WIDTH,
   MIN_MOMENT_LEN,
+  MIN_PILL_PX,
   SNAP_PX,
   CLICK_PX,
   TRACK_HEIGHTS,
@@ -30,25 +32,32 @@ import {
 } from "./constants";
 import { readPersistedBool, writePersistedBool } from "./utils";
 import type { DragState, DragMode } from "./utils";
-import { MomentPill } from "./MomentPill";
 import { TimelineTrack, TrackLabel } from "./TimelineTrack";
 import { TimelineRuler, GridLines } from "./TimelineRuler";
 import { Playhead } from "./Playhead";
 import { GapIndicator, emptyQuartileRanges } from "./GapIndicator";
-import { TimelineHeader, type TimelineHealth } from "./TimelineHeader";
+import { TimelineToolbar, type TimelineHealth } from "./TimelineToolbar";
 import { NarrativeBand } from "./NarrativeBand";
 import { DensityBar } from "./DensityBar";
 import { AttentionWaveform } from "./AttentionWaveform";
+import { useTimelineMetrics } from "./useTimelineMetrics";
+import { MomentLane } from "./MomentLane";
+import { InteractionsLane } from "./InteractionsLane";
+import type { TimelineTrackDescriptor } from "./trackModel";
 
 /**
  * Track-based timeline orchestrator. Owns drag math, snap math, multi-select
- * state, and keyboard shortcuts. Visual structure splits across `timeline/*`
- * primitives — this file is the cinematic stage that puts chapters, the
- * attention waveform, the tracks, and the playhead together.
+ * state, and keyboard shortcuts. The visual surface is a stack of DAW-style
+ * track rows (Edits, Crop / Reframe, Speed, and Cursor / Focus when real
+ * cursor data exists) built from an ordered `TimelineTrackDescriptor[]`, so new
+ * track types are config, not a render-tree rewrite. Analytics chrome
+ * (attention waveform, narrative chapters, density) stays behind the Insights
+ * toggle.
  */
 export function RealTimeline() {
   const {
     project,
+    videoRef,
     currentTime,
     duration,
     seek,
@@ -64,6 +73,13 @@ export function RealTimeline() {
     updateMoment,
     deleteMoment,
     duplicateMoment,
+    addMomentAtPlayhead,
+    undo,
+    redo,
+    canUndo,
+    canRedo,
+    interactions,
+    interactionsLoading,
   } = useEditorReal();
 
   const moments = project.analysis?.detectedMoments ?? [];
@@ -72,12 +88,22 @@ export function RealTimeline() {
   const narrativeSegments = project.analysis?.narrativeStructure ?? [];
   const attentionCurve = project.analysis?.attentionCurve;
 
-  const aiMoments = React.useMemo(
-    () => moments.filter((m) => m.source !== "user"),
+  // Crop and Speed each live on their OWN track (any source). The unified
+  // "Edits" track holds ALL camera/click effects — AI-generated AND manual —
+  // so there's no redundant empty "Your edits" row (manual zoom/focus edits
+  // appear here alongside AI ones, distinguished by their provenance colour).
+  const isSpeedCrop = (m: DetectedMoment) =>
+    m.effectType === "crop" || m.effectType === "speed-up";
+  const cropMoments = React.useMemo(
+    () => moments.filter((m) => m.effectType === "crop"),
     [moments]
   );
-  const userMoments = React.useMemo(
-    () => moments.filter((m) => m.source === "user"),
+  const speedMoments = React.useMemo(
+    () => moments.filter((m) => m.effectType === "speed-up"),
+    [moments]
+  );
+  const editMoments = React.useMemo(
+    () => moments.filter((m) => !isSpeedCrop(m)),
     [moments]
   );
   const provenanceCounts = React.useMemo(() => {
@@ -95,8 +121,43 @@ export function RealTimeline() {
     return counts;
   }, [moments]);
 
-  const [zoom, setZoom] = React.useState(1);
   const trackRef = React.useRef<HTMLDivElement | null>(null);
+  const viewportRef = React.useRef<HTMLDivElement | null>(null);
+  // Scale model: percentage layout stays, but zoom + a measured px/sec are
+  // derived here. `trackRef` (the content element) is what the drag math also
+  // reads, so the two never disagree.
+  const { zoom, pxPerSec, zoomIn, zoomOut, fitToScreen, minZoom, maxZoom } =
+    useTimelineMetrics({ total, contentRef: trackRef });
+  const onFit = React.useCallback(() => {
+    fitToScreen();
+    if (viewportRef.current) viewportRef.current.scrollLeft = 0;
+  }, [fitToScreen]);
+
+  // Per-moment render diagnostics (req): start / end / duration / renderedWidthPx.
+  // Logged once per (count, total, zoom) change so a "narrow marker" regression
+  // is immediately visible (e.g. duration ~0 or renderedWidthPx ≈ MIN_PILL_PX).
+  const momentDiagRef = React.useRef<string>("");
+  React.useEffect(() => {
+    if (moments.length === 0 || total <= 0) return;
+    const sig = `${moments.length}:${total.toFixed(1)}:${Math.round(pxPerSec)}`;
+    if (momentDiagRef.current === sig) return;
+    momentDiagRef.current = sig;
+    // eslint-disable-next-line no-console
+    console.info(
+      "[timeline] moment render",
+      moments.map((m) => {
+        const dur = m.endTime - m.startTime;
+        const validDur = Number.isFinite(dur) && dur > 0 ? dur : 0;
+        return {
+          id: m.id,
+          startTime: Number(m.startTime?.toFixed?.(2) ?? m.startTime),
+          endTime: Number(m.endTime?.toFixed?.(2) ?? m.endTime),
+          duration: Number(validDur.toFixed(2)),
+          renderedWidthPx: Math.round(Math.max(MIN_PILL_PX, validDur * pxPerSec)),
+        };
+      })
+    );
+  }, [moments, total, pxPerSec]);
 
   const [draft, setDraft] = React.useState<{
     id: string;
@@ -117,8 +178,7 @@ export function RealTimeline() {
   const emptyQuartiles = emptyRanges.length;
   const densityPerMin = total > 0 ? moments.length / (total / 60) : 0;
   const isClustered = moments.length >= 3 && distScore < 0.55;
-  const aiCount = aiMoments.length;
-  const userCount = userMoments.length;
+  const editCount = editMoments.length;
 
   const snapTime = React.useCallback(
     (
@@ -263,8 +323,50 @@ export function RealTimeline() {
 
   React.useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      const tag = (e.target as HTMLElement)?.tagName;
-      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      const el = e.target as HTMLElement | null;
+      const tag = el?.tagName;
+      const typing =
+        tag === "INPUT" ||
+        tag === "TEXTAREA" ||
+        tag === "SELECT" ||
+        el?.isContentEditable === true;
+      if (typing) return;
+
+      const mod = e.metaKey || e.ctrlKey;
+      const key = e.key.toLowerCase();
+
+      // ── Undo / redo (global — no selection required) ───────────────────
+      if (mod && key === "z") {
+        e.preventDefault();
+        if (e.shiftKey) void redo();
+        else void undo();
+        return;
+      }
+      if (mod && key === "y") {
+        e.preventDefault();
+        void redo();
+        return;
+      }
+
+      // ── Space → play / pause ───────────────────────────────────────────
+      if ((e.key === " " || e.code === "Space") && !mod) {
+        // Defer to natively-activatable controls (the play button, toolbar
+        // buttons, links) so Space doesn't toggle twice when one is focused.
+        const interactive =
+          tag === "BUTTON" ||
+          tag === "A" ||
+          el?.getAttribute("role") === "button";
+        if (interactive) return;
+        e.preventDefault();
+        const v = videoRef.current;
+        if (v) {
+          if (v.paused) void v.play().catch(() => {});
+          else v.pause();
+        }
+        return;
+      }
+
+      // ── Selection-scoped actions ───────────────────────────────────────
       if (multiSelectIds.length > 0) {
         if (e.key === "Delete" || e.key === "Backspace") {
           e.preventDefault();
@@ -281,7 +383,7 @@ export function RealTimeline() {
       if (e.key === "Delete" || e.key === "Backspace") {
         e.preventDefault();
         void deleteMoment(selectedMomentId);
-      } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "d") {
+      } else if (mod && key === "d") {
         e.preventDefault();
         void duplicateMoment(selectedMomentId);
       }
@@ -295,6 +397,9 @@ export function RealTimeline() {
     duplicateMoment,
     deleteMultiSelected,
     clearMultiSelect,
+    undo,
+    redo,
+    videoRef,
   ]);
 
   const withDraft = (m: DetectedMoment): DetectedMoment =>
@@ -304,16 +409,9 @@ export function RealTimeline() {
 
   // ── Insights state ───────────────────────────────────────────────────
   // The whole analytics block — attention waveform, balance/density/quiet
-  // pills, distribution histogram, sources/effects legend, CV debug toggle,
-  // and the AI/User track split — lives behind a single "Insights" toggle
-  // in the header. Default closed: most users don't need it constantly
-  // visible, and the editing surface stays calm.
-  //
-  // These hooks live ABOVE the empty-timeline early return so React's
-  // call order stays stable across renders. The first render of an
-  // empty project would otherwise skip these four hooks; once a moment
-  // arrived the hook count would jump and React would throw "change in
-  // the order of Hooks" (Rules of Hooks).
+  // pills, distribution histogram, sources/effects legend, CV debug toggle —
+  // lives behind a single "Insights" toggle in the toolbar. Default closed so
+  // the DAW editing surface stays calm; power users pin it open.
   const [insightsOpen, setInsightsOpen] = React.useState(false);
   React.useEffect(() => {
     setInsightsOpen(readPersistedBool("adzoom.timeline.insights.open", false));
@@ -323,32 +421,11 @@ export function RealTimeline() {
     setInsightsOpen(next);
     writePersistedBool("adzoom.timeline.insights.open", next);
   };
-  // Show-separate-lanes is opt-in inside Insights so we don't surprise users
-  // with two stacked tracks before they ask for the split.
-  const [separateLanes, setSeparateLanes] = React.useState(false);
-  React.useEffect(() => {
-    setSeparateLanes(readPersistedBool("adzoom.timeline.separateLanes", false));
-  }, []);
-  const toggleSeparateLanes = () => {
-    const next = !separateLanes;
-    setSeparateLanes(next);
-    writePersistedBool("adzoom.timeline.separateLanes", next);
-  };
 
-  if (total > 0 && moments.length === 0) {
-    return <EmptyTimeline analyzed={project.analysis?.status === "complete"} />;
-  }
-
+  const hasMoments = moments.length > 0;
   const showNarrative = narrativeSegments.length > 0;
 
-  const showUserRow = separateLanes && userCount > 0;
-  const aiHeight = TRACK_HEIGHTS.ai;
-  const userHeight = TRACK_HEIGHTS.user;
-  // Single merged track when not split — slightly taller than the old AI
-  // track so the pills breathe with the extra spacing the brief calls for.
-  const mergedHeight = TRACK_HEIGHTS.ai;
-
-  // Single-signal AI health for the header dot. Priority:
+  // Single-signal AI health for the toolbar dot. Priority:
   // empty → quiet (any empty quartile) → clustered → balanced.
   const health: TimelineHealth =
     moments.length === 0
@@ -382,17 +459,180 @@ export function RealTimeline() {
     clickPipeline.eventKept > 0 &&
     clickPipeline.eventKept < clickPipeline.totalClicks * 0.4;
 
+  // "Edit" = select the moment; the docked inspector reflects it, and the
+  // modal fallback (small screens) opens off `inspectorOpen`.
+  const onEditMoment = (id: string) => {
+    setSelectedMomentId(id);
+    openInspector();
+  };
+
+  // Count of discrete cursor events for the interactions-lane label.
+  const interactionClickCount = interactions
+    ? interactions.filter(
+        (e) =>
+          e.type === "click" || e.type === "dblclick" || e.type === "rightclick"
+      ).length
+    : clickPipeline?.totalClicks ?? 0;
+
+  // Show the Cursor/Focus track ONLY when real interaction data exists — hide
+  // the bare "No cursor data" lane for uploads / recordings without a cursor
+  // sidecar. Counts hovers too (they're cursor data) and detected clicks. Kept
+  // visible while a sidecar is still loading so the track doesn't pop in late.
+  const cursorMarkerCount = interactions
+    ? interactions.filter(
+        (e) =>
+          e.type === "click" ||
+          e.type === "dblclick" ||
+          e.type === "rightclick" ||
+          e.type === "hover"
+      ).length
+    : 0;
+  const hasCursorData =
+    cursorMarkerCount > 0 || (clickPipeline?.totalClicks ?? 0) > 0;
+  const showInteractionsTrack =
+    hasCursorData || (interactionsLoading && !!project.interactionsPath);
+
+  // ── Ordered DAW track stack ─────────────────────────────────────────────
+  // The orchestrator maps this twice: gutter labels + lanes. Future track
+  // kinds (captions, audio, transitions, real speed/crop) slot in as more
+  // descriptors — no render-tree surgery.
+  const tracks: TimelineTrackDescriptor[] = [
+    {
+      id: "ai",
+      kind: "ai",
+      // Unified camera-edits track — AI + manual zoom/focus/click together.
+      label: "Edits",
+      Icon: Sparkles,
+      height: TRACK_HEIGHTS.ai,
+      tone: "violet",
+      interactive: true,
+      count: editCount,
+      renderLane: () => (
+        <>
+          {insightsOpen && attentionCurve && attentionCurve.length > 0 && (
+            <div className="pointer-events-none absolute inset-x-0 inset-y-0 z-0">
+              <AttentionWaveform
+                curve={attentionCurve}
+                duration={total}
+                height={TRACK_HEIGHTS.ai}
+                variant="full"
+                className="opacity-70"
+              />
+            </div>
+          )}
+          <MomentLane
+            moments={editMoments}
+            total={total}
+            selectedMomentId={selectedMomentId}
+            multiSelectIds={multiSelectIds}
+            draftId={draft?.id ?? null}
+            withDraft={withDraft}
+            onBeginDrag={beginDrag}
+            onDuplicate={(id) => void duplicateMoment(id)}
+            onDelete={(id) => void deleteMoment(id)}
+            onEdit={onEditMoment}
+          />
+        </>
+      ),
+    },
+    {
+      id: "crop",
+      kind: "crop",
+      label: "Crop / Reframe",
+      Icon: Crop,
+      height: TRACK_HEIGHTS.user,
+      tone: "teal",
+      interactive: true,
+      count: cropMoments.length,
+      renderLane: () => (
+        <MomentLane
+          moments={cropMoments}
+          total={total}
+          selectedMomentId={selectedMomentId}
+          multiSelectIds={multiSelectIds}
+          draftId={draft?.id ?? null}
+          withDraft={withDraft}
+          onBeginDrag={beginDrag}
+          onDuplicate={(id) => void duplicateMoment(id)}
+          onDelete={(id) => void deleteMoment(id)}
+          onEdit={onEditMoment}
+        />
+      ),
+    },
+    {
+      id: "speed",
+      kind: "speed",
+      label: "Speed",
+      Icon: FastForward,
+      height: TRACK_HEIGHTS.user,
+      tone: "amber",
+      interactive: true,
+      count: speedMoments.length,
+      renderLane: () => (
+        <MomentLane
+          moments={speedMoments}
+          total={total}
+          selectedMomentId={selectedMomentId}
+          multiSelectIds={multiSelectIds}
+          draftId={draft?.id ?? null}
+          withDraft={withDraft}
+          onBeginDrag={beginDrag}
+          onDuplicate={(id) => void duplicateMoment(id)}
+          onDelete={(id) => void deleteMoment(id)}
+          onEdit={onEditMoment}
+        />
+      ),
+    },
+    // Cursor / Focus — last, and only present when there's real cursor data.
+    ...(showInteractionsTrack
+      ? ([
+          {
+            id: "interactions",
+            kind: "interactions",
+            label: "Cursor / Focus",
+            Icon: MousePointer2,
+            height: TRACK_HEIGHTS.interactions,
+            tone: "fog",
+            interactive: false,
+            count: interactionClickCount,
+            renderLane: () => (
+              <InteractionsLane
+                interactions={interactions}
+                loading={interactionsLoading}
+                total={total}
+                totalClicks={clickPipeline?.totalClicks}
+                onSeek={seek}
+              />
+            ),
+          },
+        ] as TimelineTrackDescriptor[])
+      : []),
+  ];
+
   return (
     <div className="glass relative overflow-hidden rounded-3xl">
-      <TimelineHeader
+      <TimelineToolbar
         health={health}
         zoom={zoom}
-        onZoomOut={() => setZoom((z) => Math.max(1, Math.round((z - 0.5) * 2) / 2))}
-        onZoomIn={() => setZoom((z) => Math.min(8, Math.round((z + 0.5) * 2) / 2))}
+        minZoom={minZoom}
+        maxZoom={maxZoom}
+        onZoomOut={zoomOut}
+        onZoomIn={zoomIn}
+        onFit={onFit}
         currentTime={currentTime}
         total={total}
         insightsOpen={insightsOpen}
         onToggleInsights={toggleInsights}
+        canUndo={canUndo}
+        canRedo={canRedo}
+        onUndo={() => void undo()}
+        onRedo={() => void redo()}
+        hasSelection={!!selectedMomentId}
+        onAdd={(effectType) => void addMomentAtPlayhead(effectType)}
+        onDuplicate={() =>
+          selectedMomentId && void duplicateMoment(selectedMomentId)
+        }
+        onDelete={() => selectedMomentId && void deleteMoment(selectedMomentId)}
       />
 
       {showClickLossWarning && (
@@ -476,55 +716,37 @@ export function RealTimeline() {
       )}
 
       {/* ── Tracks ───────────────────────────────────────────────────── */}
-      <div className="px-6 pt-5">
+      <div className="px-4 pb-2 pt-4">
         <div
           className="grid"
           style={{
-            gridTemplateColumns: `clamp(40px, 12vw, ${GUTTER_WIDTH}px) minmax(0, 1fr)`,
+            gridTemplateColumns: `clamp(44px, 13vw, ${GUTTER_WIDTH}px) minmax(0, 1fr)`,
           }}
         >
-          {/* Left gutter — labels only appear when separate lanes are on.
-              In the merged default, the track speaks for itself. */}
+          {/* Left gutter — one always-visible label per track. */}
           <div className="flex flex-col pr-3">
             <div style={{ height: TRACK_HEIGHTS.ruler }} />
-            <div style={{ height: TRACK_HEIGHTS.gap }} />
-            {separateLanes ? (
-              <>
-                <TrackLabel
-                  Icon={Sparkles}
-                  label="AI edits"
-                  count={aiCount}
-                  height={aiHeight}
-                  tone="violet"
-                />
-                {showUserRow && (
-                  <TrackLabel
-                    Icon={User}
-                    label="Your edits"
-                    count={userCount}
-                    height={userHeight}
-                    tone="cyan"
-                  />
-                )}
-              </>
-            ) : (
+            {insightsOpen && <div style={{ height: TRACK_HEIGHTS.gap }} />}
+            {tracks.map((t) => (
               <TrackLabel
-                Icon={Film}
-                label="Edits"
-                count={moments.length}
-                height={mergedHeight}
-                tone="fog"
+                key={t.id}
+                Icon={t.Icon}
+                label={t.label}
+                count={t.count}
+                height={t.height}
+                tone={t.tone}
+                comingSoon={t.comingSoon}
               />
-            )}
+            ))}
           </div>
 
           {/* Right side — scrollable, zoom-scaled lane viewport */}
-          <div className="overflow-x-auto overflow-y-visible pb-3">
+          <div ref={viewportRef} className="overflow-x-auto overflow-y-visible pb-2">
             <div
               className="relative select-none"
               style={{ width: `${zoom * 100}%`, minWidth: "100%" }}
             >
-              <TimelineRuler total={total} />
+              <TimelineRuler total={total} pxPerSec={pxPerSec} />
 
               <div
                 ref={trackRef}
@@ -537,126 +759,16 @@ export function RealTimeline() {
                     panel is closed we keep the surface clean. */}
                 {insightsOpen && <GapIndicator ranges={emptyRanges} />}
 
-                {separateLanes ? (
-                  <>
-                    {/* AI lane — attention waveform only renders here when
-                        Insights is open, so the default surface is flat. */}
-                    <TimelineTrack
-                      ariaLabel="AI edits track"
-                      height={aiHeight}
-                    >
-                      {insightsOpen &&
-                        attentionCurve &&
-                        attentionCurve.length > 0 && (
-                          <div className="pointer-events-none absolute inset-x-0 inset-y-0 z-0">
-                            <AttentionWaveform
-                              curve={attentionCurve}
-                              duration={total}
-                              height={aiHeight}
-                              variant="full"
-                              className="opacity-70"
-                            />
-                          </div>
-                        )}
-                      <div className="absolute inset-0 z-10">
-                        {aiMoments.map((m0) => {
-                          const m = withDraft(m0);
-                          return (
-                            <MomentPill
-                              key={m0.id}
-                              moment={m}
-                              total={total}
-                              selected={selectedMomentId === m0.id}
-                              multiSelected={multiSelectIds.includes(m0.id)}
-                              dragging={draft?.id === m0.id}
-                              onBeginDrag={beginDrag}
-                              onDuplicate={() => duplicateMoment(m0.id)}
-                              onDelete={() => deleteMoment(m0.id)}
-                              onEdit={() => {
-                                setSelectedMomentId(m0.id);
-                                openInspector();
-                              }}
-                            />
-                          );
-                        })}
-                      </div>
-                    </TimelineTrack>
-
-                    {showUserRow && (
-                      <TimelineTrack
-                        ariaLabel="Your edits track"
-                        height={userHeight}
-                      >
-                        {userMoments.map((m0) => {
-                          const m = withDraft(m0);
-                          return (
-                            <MomentPill
-                              key={m0.id}
-                              moment={m}
-                              total={total}
-                              selected={selectedMomentId === m0.id}
-                              multiSelected={multiSelectIds.includes(m0.id)}
-                              dragging={draft?.id === m0.id}
-                              onBeginDrag={beginDrag}
-                              onDuplicate={() => duplicateMoment(m0.id)}
-                              onDelete={() => deleteMoment(m0.id)}
-                              onEdit={() => {
-                                setSelectedMomentId(m0.id);
-                                openInspector();
-                              }}
-                            />
-                          );
-                        })}
-                      </TimelineTrack>
-                    )}
-                  </>
-                ) : (
-                  // ── Merged "Edits" track ─────────────────────────────
-                  // Single calm lane that holds AI + user moments together.
-                  // MomentPill already differentiates source via tone (violet
-                  // accent for AI, cyan for user) so the visual signal is
-                  // preserved without two lanes competing for attention.
+                {tracks.map((t) => (
                   <TimelineTrack
-                    ariaLabel="Edits track"
-                    height={mergedHeight}
+                    key={t.id}
+                    ariaLabel={`${t.label} track`}
+                    height={t.height}
+                    dimmed={!t.interactive}
                   >
-                    {insightsOpen &&
-                      attentionCurve &&
-                      attentionCurve.length > 0 && (
-                        <div className="pointer-events-none absolute inset-x-0 inset-y-0 z-0">
-                          <AttentionWaveform
-                            curve={attentionCurve}
-                            duration={total}
-                            height={mergedHeight}
-                            variant="full"
-                            className="opacity-60"
-                          />
-                        </div>
-                      )}
-                    <div className="absolute inset-0 z-10">
-                      {moments.map((m0) => {
-                        const m = withDraft(m0);
-                        return (
-                          <MomentPill
-                            key={m0.id}
-                            moment={m}
-                            total={total}
-                            selected={selectedMomentId === m0.id}
-                            multiSelected={multiSelectIds.includes(m0.id)}
-                            dragging={draft?.id === m0.id}
-                            onBeginDrag={beginDrag}
-                            onDuplicate={() => duplicateMoment(m0.id)}
-                            onDelete={() => deleteMoment(m0.id)}
-                            onEdit={() => {
-                              setSelectedMomentId(m0.id);
-                              openInspector();
-                            }}
-                          />
-                        );
-                      })}
-                    </div>
+                    {t.renderLane({ total, pxPerSec, zoom })}
                   </TimelineTrack>
-                )}
+                ))}
 
                 {snapGuide !== null && total > 0 && (
                   <span
@@ -674,6 +786,12 @@ export function RealTimeline() {
             </div>
           </div>
         </div>
+
+        {/* Empty-state overlay — keeps the track structure visible while
+            telling the user how to populate it. */}
+        {!hasMoments && (
+          <EmptyTimelineHint analyzed={project.analysis?.status === "complete"} />
+        )}
       </div>
 
       {/* ── Cluster nudge ────────────────────────────────────────────────
@@ -699,8 +817,6 @@ export function RealTimeline() {
           emptyQuartiles={emptyQuartiles}
           isClustered={isClustered}
           provenanceCounts={provenanceCounts}
-          separateLanes={separateLanes}
-          onToggleSeparateLanes={toggleSeparateLanes}
           showCvDebugToggle={!!va && va.sampleCount > 0}
           cvDebug={cvDebug}
           onToggleCvDebug={() => setCvDebug(!cvDebug)}
@@ -738,8 +854,6 @@ function InsightsPanel({
   emptyQuartiles,
   isClustered,
   provenanceCounts,
-  separateLanes,
-  onToggleSeparateLanes,
   showCvDebugToggle,
   cvDebug,
   onToggleCvDebug,
@@ -751,8 +865,6 @@ function InsightsPanel({
   emptyQuartiles: number;
   isClustered: boolean;
   provenanceCounts: { event: number; cv: number; ai: number; user: number };
-  separateLanes: boolean;
-  onToggleSeparateLanes: () => void;
   showCvDebugToggle: boolean;
   cvDebug: boolean;
   onToggleCvDebug: () => void;
@@ -840,23 +952,17 @@ function InsightsPanel({
         </span>
       </div>
 
-      {/* Advanced toggles — separate lanes + CV debug. */}
-      <div className="mt-5 flex flex-wrap items-center gap-2">
-        <ToggleChip
-          active={separateLanes}
-          onClick={onToggleSeparateLanes}
-          Icon={Layers}
-          label="Split AI / user lanes"
-        />
-        {showCvDebugToggle && (
+      {/* Advanced toggles — CV debug. */}
+      {showCvDebugToggle && (
+        <div className="mt-5 flex flex-wrap items-center gap-2">
           <ToggleChip
             active={cvDebug}
             onClick={onToggleCvDebug}
             Icon={Bug}
             label="CV debug signals"
           />
-        )}
-      </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -920,26 +1026,25 @@ function ToggleChip({
   );
 }
 
-function EmptyTimeline({ analyzed }: { analyzed: boolean }) {
+/**
+ * Empty-state hint rendered inside the timeline card (over the still-visible
+ * track structure) so users always see the editing surface and a clear path to
+ * populate it — via the toolbar's Add menu or AI analysis.
+ */
+function EmptyTimelineHint({ analyzed }: { analyzed: boolean }) {
   return (
-    <div className="glass relative overflow-hidden rounded-3xl p-10">
-      <div
-        aria-hidden
-        className="pointer-events-none absolute -top-16 left-1/3 h-48 w-1/2 bg-[radial-gradient(ellipse_at_top,rgba(139,92,246,0.22),transparent_70%)] blur-2xl"
-      />
-      <div className="relative grid place-items-center text-center">
-        <div className="inline-flex size-14 items-center justify-center rounded-2xl bg-violet-500/15 text-violet-200 ring-1 ring-violet-400/25 shadow-[0_8px_24px_-12px_rgba(139,92,246,0.6)]">
-          <Film size={22} />
-        </div>
-        <h3 className="mt-5 font-display text-xl font-semibold tracking-tight text-white">
-          {analyzed ? "Your timeline is empty" : "Nothing on the timeline yet"}
-        </h3>
-        <p className="mt-2 max-w-md text-[13.5px] leading-relaxed text-fog">
-          {analyzed
-            ? "Use the toolbar above to add your first zoom, focus, or click highlight at the playhead."
-            : "Run AI analysis to generate a first-draft edit, or add edits manually with the toolbar above."}
-        </p>
+    <div className="relative mt-3 grid place-items-center rounded-2xl border border-white/[0.06] bg-white/[0.015] px-6 py-7 text-center">
+      <div className="inline-flex size-11 items-center justify-center rounded-2xl bg-violet-500/15 text-violet-200 ring-1 ring-violet-400/25 shadow-[0_8px_24px_-12px_rgba(139,92,246,0.6)]">
+        <Film size={18} />
       </div>
+      <h3 className="mt-3 font-display text-[15px] font-semibold tracking-tight text-white">
+        {analyzed ? "Your timeline is empty" : "Nothing on the timeline yet"}
+      </h3>
+      <p className="mt-1.5 max-w-md text-[12.5px] leading-relaxed text-fog">
+        {analyzed
+          ? "Use the Add button above to insert your first zoom, focus, or click highlight at the playhead."
+          : "Run AI analysis for a first-draft edit, or use the Add button above to place edits manually."}
+      </p>
     </div>
   );
 }

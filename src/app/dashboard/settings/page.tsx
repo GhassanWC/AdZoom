@@ -19,6 +19,7 @@ import { PageHeader } from "@/components/dashboard/PageHeader";
 import { Button } from "@/components/ui/Button";
 import { Toggle } from "@/components/ui/Toggle";
 import { useToast } from "@/components/ui/Toast";
+import { useConfirm } from "@/components/ui/ConfirmDialog";
 import { useAuth } from "@/lib/firebase/AuthProvider";
 import {
   useWorkspaceSettings,
@@ -232,6 +233,7 @@ function ApiKeysSection() {
   const { getIdToken } = useAuth();
   const { keys, loading, error } = useApiKeys();
   const toast = useToast();
+  const confirm = useConfirm();
   const [creating, setCreating] = React.useState(false);
   const [showCreate, setShowCreate] = React.useState(false);
   const [justCreated, setJustCreated] = React.useState<CreatedApiKey | null>(null);
@@ -262,13 +264,13 @@ function ApiKeysSection() {
   };
 
   const onRevoke = async (key: ApiKeyDoc) => {
-    if (
-      !window.confirm(
-        `Revoke "${key.name}"? Any service using it will immediately stop working.`
-      )
-    ) {
-      return;
-    }
+    const ok = await confirm({
+      title: `Revoke "${key.name}"?`,
+      message: "Any service using it will immediately stop working.",
+      confirmLabel: "Revoke key",
+      tone: "danger",
+    });
+    if (!ok) return;
     try {
       await revokeApiKeyClient(getIdToken, key.id);
       toast.success("Key revoked", `"${key.name}" can no longer authenticate.`);

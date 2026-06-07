@@ -69,6 +69,19 @@ service cloud.firestore {
         allow read, create, update, delete: if isOwner(uid);
       }
 
+      // ── Progressive analysis jobs (fully client-owned) ────────────────
+      // The chunked-analysis orchestrator runs in the browser and writes job
+      // + per-chunk state here so a refresh resumes without losing progress.
+      // These hold only analysis bookkeeping (chunk windows, statuses, the
+      // moments/CV a chunk produced) — nothing billing-relevant — so the
+      // same fully-owner-RW model as projects/presets applies.
+      match /analysisJobs/{jobId} {
+        allow read, create, update, delete: if isOwner(uid);
+        match /chunks/{chunkId} {
+          allow read, create, update, delete: if isOwner(uid);
+        }
+      }
+
       // ── Exports ───────────────────────────────────────────────────────
       // Server creates the export doc via /api/billing/export-permit with
       // `status: "permitted"`. After uploading the bytes to Storage, the

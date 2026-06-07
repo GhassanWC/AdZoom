@@ -11,13 +11,20 @@ import { fmt } from "./utils";
  * The ruler is intentionally taller than before (36px) so the timecodes can
  * breathe and the tick rhythm reads cinematically.
  */
-export function TimelineRuler({ total }: { total: number }) {
+export function TimelineRuler({
+  total,
+  pxPerSec = 0,
+}: {
+  total: number;
+  /** Measured px/sec — when > 0, drives tick density so zooming reveals finer ticks. */
+  pxPerSec?: number;
+}) {
   if (total <= 0) {
     return (
       <div style={{ height: TRACK_HEIGHTS.ruler }} aria-hidden />
     );
   }
-  const { major, minor } = pickTickInterval(total);
+  const { major, minor } = pickTickInterval(total, pxPerSec);
   const majors: number[] = [];
   for (let t = 0; t <= total + 1e-3; t += major) majors.push(t);
   if (majors[majors.length - 1] < total - 1e-3) majors.push(total);
@@ -74,18 +81,31 @@ export function TimelineRuler({ total }: { total: number }) {
   );
 }
 
+/** Target on-screen spacing between major ticks (px). */
+const TARGET_MAJOR_PX = 92;
+
 /**
- * Major + minor tick intervals (seconds) sized for the current duration.
- * Aim for 6-10 major ticks at any zoom; minors subdivide each major into
- * roughly 5 ticks.
+ * Major + minor tick intervals (seconds). When a measured `pxPerSec` is
+ * available, ticks are chosen so majors land ~`TARGET_MAJOR_PX` apart — so
+ * zooming a long video in reveals second-level ticks instead of staying at
+ * minute granularity. Without a measurement it falls back to a duration
+ * heuristic aiming for 6-10 majors across the whole timeline.
  */
-function pickTickInterval(total: number): { major: number; minor: number } {
+function pickTickInterval(
+  total: number,
+  pxPerSec = 0
+): { major: number; minor: number } {
   const candidates = [0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600];
   let major = candidates[candidates.length - 1];
-  for (const c of candidates) {
-    if (total / c <= 10) {
-      major = c;
-      break;
+  if (pxPerSec > 0) {
+    const wanted = TARGET_MAJOR_PX / pxPerSec; // seconds per major to hit target px
+    major = candidates.find((c) => c >= wanted) ?? candidates[candidates.length - 1];
+  } else {
+    for (const c of candidates) {
+      if (total / c <= 10) {
+        major = c;
+        break;
+      }
     }
   }
   const minor =

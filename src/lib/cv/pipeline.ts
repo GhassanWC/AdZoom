@@ -18,7 +18,11 @@ import {
   type RawFrameSignal,
   type RunVisualAnalysisOptions,
 } from "./types";
-import { extractFrames, sampleFpsFor } from "./frame-extractor";
+import {
+  extractFrames,
+  sampleFpsFor,
+  type ExtractedFrame,
+} from "./frame-extractor";
 import { diffFrames } from "./frame-diff";
 import { visualDensity } from "./visual-density";
 import { detectScenes } from "./scene-detect";
@@ -30,7 +34,7 @@ import {
   type ChangeCluster,
 } from "./cursor-track";
 import { detectVisualInteractions } from "./visual-interactions";
-import { resample } from "./resample";
+import { resample, sampleRateFor } from "./resample";
 
 const BATCH_SIZE = 20;
 
@@ -38,27 +42,47 @@ const BATCH_SIZE = 20;
 export { CvAbortError, CvTaintedError } from "./types";
 
 /**
- * Run the full client-side CV pass over a video element.
+ * Engine-agnostic CV analysis. Consumes a stream of grayscale frames (produced
+ * however the caller likes — by seeking a hidden `<video>`, or by decoding with
+ * WebCodecs in a worker) and runs the full per-frame + post-processing pass,
+ * returning a compact `VisualAnalysis`.
  *
- * @throws {CvAbortError}   if `opts.signal` aborts
- * @throws {CvTaintedError} if the video is cross-origin without CORS headers
+ * Pure (no DOM): the frame *production* is the only engine-specific part, so
+ * this function runs unchanged on the main thread (hidden-video engine) or
+ * inside a Web Worker (WebCodecs engine).
+ *
+ * Windowing: when `startTime > 0` the produced `VisualAnalysis` is
+ * WINDOW-LOCAL — every time is relative to `startTime` and the per-second
+ * arrays are sized to the window. The orchestrator offsets it back to absolute
+ * time at merge. `duration` is always the WHOLE-video duration so the fps and
+ * sample rate stay consistent across chunks.
  */
-export async function runVisualAnalysis(
-  video: HTMLVideoElement,
-  opts: RunVisualAnalysisOptions = {}
+export interface AnalyzeFrameStreamOptions {
+  /** Whole-video duration (seconds) — drives fps + sample rate. */
+  duration: number;
+  /** Window start (absolute seconds). Default 0. */
+  startTime?: number;
+  /** Window end (absolute seconds). Default = duration. */
+  endTime?: number;
+  onProgress?: (p: CvProgress) => void;
+  signal?: AbortSignal;
+}
+
+export async function analyzeFrameStream(
+  frames: AsyncIterable<ExtractedFrame>,
+  opts: AnalyzeFrameStreamOptions
 ): Promise<VisualAnalysis> {
   const startedAt = performance.now();
-  const duration =
-    opts.duration && Number.isFinite(opts.duration) && opts.duration > 0
-      ? opts.duration
-      : video.duration;
-
+  const duration = opts.duration;
   if (!duration || !Number.isFinite(duration) || duration <= 0) {
     throw new Error("Video duration is unknown — cannot run visual analysis.");
   }
+  const windowStart = Math.max(0, opts.startTime ?? 0);
+  const windowEnd = Math.min(duration, opts.endTime ?? duration);
+  const windowLen = Math.max(1 / sampleFpsFor(duration), windowEnd - windowStart);
 
   const fps = sampleFpsFor(duration);
-  const expectedFrames = Math.max(1, Math.ceil(duration * fps));
+  const expectedFrames = Math.max(1, Math.ceil(windowLen * fps));
   const report = (phase: CvProgress["phase"], done: number) =>
     opts.onProgress?.({ phase, done: Math.max(0, Math.min(1, done)) });
 
@@ -74,13 +98,12 @@ export async function runVisualAnalysis(
   let prevFrame: Uint8ClampedArray | null = null;
   let processed = 0;
 
-  for await (const { t, frame, detectFrame } of extractFrames(
-    video,
-    duration,
-    opts.signal
-  )) {
+  for await (const { t: absT, frame, detectFrame } of frames) {
     if (opts.signal?.aborted) throw new CvAbortError();
 
+    // Localize to the window so the resampled arrays + sparse events are
+    // window-relative (index 0 = the window's first second).
+    const t = absT - windowStart;
     const density = visualDensity(frame);
 
     let centroid: RawFrameSignal["centroid"] = null;
@@ -154,7 +177,9 @@ export async function runVisualAnalysis(
   report("resampling", 0.97);
   const visualAnalysis = resample({
     signals,
-    duration,
+    duration: windowLen,
+    // Force the whole-video rate so windows merge cleanly.
+    sampleRate: sampleRateFor(duration),
     sceneChanges,
     clickEvents,
     cursors,
@@ -166,4 +191,42 @@ export async function runVisualAnalysis(
 
   report("resampling", 1);
   return visualAnalysis;
+}
+
+/**
+ * Run the full client-side CV pass over a video element (hidden-video engine).
+ * Thin wrapper: produce frames by seeking, then `analyzeFrameStream`.
+ *
+ * @throws {CvAbortError}   if `opts.signal` aborts
+ * @throws {CvTaintedError} if the video is cross-origin without CORS headers
+ */
+export async function runVisualAnalysis(
+  video: HTMLVideoElement,
+  opts: RunVisualAnalysisOptions = {}
+): Promise<VisualAnalysis> {
+  const duration =
+    opts.duration && Number.isFinite(opts.duration) && opts.duration > 0
+      ? opts.duration
+      : video.duration;
+
+  if (!duration || !Number.isFinite(duration) || duration <= 0) {
+    throw new Error("Video duration is unknown — cannot run visual analysis.");
+  }
+
+  const startTime = opts.startTime ?? 0;
+  const endTime = opts.endTime ?? duration;
+
+  const frames = extractFrames(video, duration, {
+    signal: opts.signal,
+    startTime,
+    endTime,
+  });
+
+  return analyzeFrameStream(frames, {
+    duration,
+    startTime,
+    endTime,
+    onProgress: opts.onProgress,
+    signal: opts.signal,
+  });
 }

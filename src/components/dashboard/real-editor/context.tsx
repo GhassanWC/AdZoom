@@ -19,6 +19,8 @@ import type {
   ProjectDoc,
 } from "@/lib/firebase/schema";
 import { applyPresetToSettings } from "@/lib/presets";
+import { useInteractions } from "./useInteractions";
+import type { Interaction } from "@/lib/recording/types";
 import { getDoc } from "firebase/firestore";
 import { normalizePlan, planMeetsMinimum } from "@/lib/usage/plan";
 import {
@@ -26,6 +28,16 @@ import {
   CvAbortError,
   CvTaintedError,
 } from "@/lib/cv/pipeline";
+import { runChunkedAnalysis } from "@/lib/analysis/chunk-orchestrator";
+import { shouldChunk } from "@/lib/analysis/chunk-config";
+import { getActiveJobForProject } from "@/lib/firebase/analysis-jobs";
+import {
+  enqueueProjectWrite,
+  isAnalysisActive,
+} from "@/lib/firebase/project-writer";
+import { isProcessing } from "@/lib/analysis-stages";
+import { cropBoxFor, DEFAULT_CROP, DEFAULT_SPEED } from "@/lib/timeline/crop-speed";
+import type { AnalysisJob } from "@/lib/firebase/schema";
 import { useNotifications } from "@/lib/notifications/store";
 
 interface EditorRealContextValue {
@@ -93,6 +105,24 @@ interface EditorRealContextValue {
   processingMinimized: boolean;
   setProcessingMinimized: (v: boolean) => void;
   seek: (t: number) => void;
+
+  // ── Edit history (session-only, in-memory) ──────────────────────────────
+  /** Revert the last moment mutation. No-op when the undo stack is empty. */
+  undo: () => Promise<void>;
+  /** Re-apply the last undone moment mutation. No-op when redo is empty. */
+  redo: () => Promise<void>;
+  canUndo: boolean;
+  canRedo: boolean;
+
+  // ── Recording interactions (lazy-loaded sidecar, shared) ────────────────
+  /** Cursor/click/focus events for tab recordings, or null when unavailable. */
+  interactions: Interaction[] | null;
+  /** True while the interactions sidecar is being fetched. */
+  interactionsLoading: boolean;
+
+  // ── Progressive chunked analysis ────────────────────────────────────────
+  /** Live job state when a long video is analyzing in chunks, else null. */
+  chunkedJob: AnalysisJob | null;
 }
 
 const Ctx = React.createContext<EditorRealContextValue | null>(null);
@@ -123,7 +153,8 @@ const DEFAULT_EFFECT_LABEL: Record<EffectType, string> = {
   zoom: "Zoom",
   "click-highlight": "Click emphasis",
   "cursor-focus": "Focus",
-  "speed-up": "Speed ramp",
+  "speed-up": "Speed",
+  crop: "Crop / Reframe",
 };
 
 export function EditorRealProvider({
@@ -152,7 +183,12 @@ export function EditorRealProvider({
   const [analyzeError, setAnalyzeError] = React.useState<string | null>(null);
   const [processingMinimized, setProcessingMinimized] = React.useState(false);
   const [cvProgress, setCvProgress] = React.useState<number | null>(null);
+  const [chunkedJob, setChunkedJob] = React.useState<AnalysisJob | null>(null);
   const cvAbortRef = React.useRef<AbortController | null>(null);
+  // Single-flight: only one chunked orchestrator may run per editor session.
+  // Prevents the double-run that resets `project.status` back to "analyzing"
+  // after a run already finalized (the "stuck processing" bug).
+  const chunkRunningRef = React.useRef(false);
 
   // ── Analysis completion → notification ─────────────────────────────────
   // `startAnalyze` kicks off the server route and returns immediately;
@@ -225,52 +261,129 @@ export function EditorRealProvider({
     return doc(db, "users", uid, "projects", project.id);
   }, [uid, project.id]);
 
+  // ── Shared interactions sidecar ─────────────────────────────────────────
+  // Lazy-loaded once here (instead of per-consumer) so the inspector's
+  // "Follow cursor" preset and the timeline's cursor/click lane share a
+  // single fetch + cache for the lifetime of the project view.
+  const { interactions, loading: interactionsLoading } = useInteractions({
+    interactionsPath: project.interactionsPath,
+    scope: project.interactionScope,
+  });
+
+  // ── Edit history (session-only, in-memory) ──────────────────────────────
+  // Every moment mutation funnels through `commitMoments`, which snapshots the
+  // prior array onto an undo stack before writing. `undo`/`redo` move whole
+  // `detectedMoments` arrays between the two stacks and persist via the same
+  // `setDoc` path — so the camera/export contract (which only reads the array)
+  // is never touched. History is in-memory: a refresh starts fresh, matching
+  // editor-session expectations and keeping the Firestore doc lean.
+  const HISTORY_LIMIT = 50;
+  const momentsRef = React.useRef<DetectedMoment[]>(
+    project.analysis?.detectedMoments ?? []
+  );
+  React.useEffect(() => {
+    momentsRef.current = project.analysis?.detectedMoments ?? [];
+  }, [project.analysis?.detectedMoments]);
+  const undoStackRef = React.useRef<DetectedMoment[][]>([]);
+  const redoStackRef = React.useRef<DetectedMoment[][]>([]);
+  const [canUndo, setCanUndo] = React.useState(false);
+  const [canRedo, setCanRedo] = React.useState(false);
+
+  // The single funnel: persist `next`, recording the prior array for undo.
+  // `stripUndefined` runs on every write (Firestore rejects literal
+  // `undefined` anywhere in the doc) — centralising it here removes the
+  // earlier inconsistency where only some mutators scrubbed.
+  const writeMoments = React.useCallback(
+    async (next: DetectedMoment[]) => {
+      // Serialize through the per-project write queue so a user edit can't
+      // collide with a chunk append / finalize write ("Another write batch or
+      // compaction is already active").
+      await enqueueProjectWrite(project.id, "user-moments-write", () =>
+        setDoc(
+          projectRef,
+          {
+            analysis: stripUndefined({
+              ...(project.analysis ?? {}),
+              detectedMoments: next,
+            }),
+            updatedAt: serverTimestamp(),
+          },
+          { merge: true }
+        )
+      );
+    },
+    [project.analysis, project.id, projectRef]
+  );
+
+  const commitMoments = React.useCallback(
+    async (next: DetectedMoment[]) => {
+      undoStackRef.current.push(momentsRef.current);
+      if (undoStackRef.current.length > HISTORY_LIMIT) {
+        undoStackRef.current.shift();
+      }
+      redoStackRef.current = [];
+      setCanUndo(true);
+      setCanRedo(false);
+      // Optimistic ref update so two rapid edits chain off each other's
+      // result instead of both reading the same (now stale) snapshot.
+      momentsRef.current = next;
+      await writeMoments(next);
+    },
+    [writeMoments]
+  );
+
+  const undo = React.useCallback(async () => {
+    const prev = undoStackRef.current.pop();
+    if (!prev) return;
+    redoStackRef.current.push(momentsRef.current);
+    momentsRef.current = prev;
+    setCanUndo(undoStackRef.current.length > 0);
+    setCanRedo(true);
+    await writeMoments(prev);
+  }, [writeMoments]);
+
+  const redo = React.useCallback(async () => {
+    const next = redoStackRef.current.pop();
+    if (!next) return;
+    undoStackRef.current.push(momentsRef.current);
+    momentsRef.current = next;
+    setCanUndo(true);
+    setCanRedo(redoStackRef.current.length > 0);
+    await writeMoments(next);
+  }, [writeMoments]);
+
+  // A fresh analysis replaces the entire moment set, so any captured
+  // snapshots become meaningless — clear both stacks at that transition.
+  const lastCompletedAtRef = React.useRef(project.analysis?.completedAt);
+  React.useEffect(() => {
+    if (project.analysis?.completedAt !== lastCompletedAtRef.current) {
+      lastCompletedAtRef.current = project.analysis?.completedAt;
+      undoStackRef.current = [];
+      redoStackRef.current = [];
+      setCanUndo(false);
+      setCanRedo(false);
+    }
+  }, [project.analysis?.completedAt]);
+
   // Write helpers — all merge-safe writes that the security rules allow.
   const updateMoment: EditorRealContextValue["updateMoment"] = React.useCallback(
     async (id, patch) => {
-      const moments = project.analysis?.detectedMoments ?? [];
-      const next = moments.map((m) =>
+      const next = momentsRef.current.map((m) =>
         m.id === id ? ({ ...m, ...patch, edited: true } as DetectedMoment) : m
       );
-      // Firestore rejects writes that carry `undefined` values anywhere in
-      // the document. Two ways those slip in here:
-      //   1. Callers pass `{ keyframes: undefined }` to clear a field —
-      //      e.g. the directional preset chips that reset a moment back to
-      //      static framing. The spread above preserves the `undefined`.
-      //   2. The moment we spread was previously read from Firestore and
-      //      still carries explicit-`undefined` optional fields (legacy).
-      // Strip both with the same recursive helper duplicateMoment uses.
-      await setDoc(
-        projectRef,
-        {
-          analysis: stripUndefined({
-            ...(project.analysis ?? {}),
-            detectedMoments: next,
-          }),
-          updatedAt: serverTimestamp(),
-        },
-        { merge: true }
-      );
+      await commitMoments(next);
     },
-    [project.analysis, projectRef]
+    [commitMoments]
   );
 
   const deleteMoment: EditorRealContextValue["deleteMoment"] = React.useCallback(
     async (id) => {
-      const moments = project.analysis?.detectedMoments ?? [];
-      const next = moments.filter((m) => m.id !== id);
-      await setDoc(
-        projectRef,
-        {
-          analysis: { ...(project.analysis ?? {}), detectedMoments: next },
-          updatedAt: serverTimestamp(),
-        },
-        { merge: true }
-      );
+      const next = momentsRef.current.filter((m) => m.id !== id);
+      await commitMoments(next);
       if (selectedMomentId === id) setSelectedMomentId(null);
       setMultiSelectIds((ids) => ids.filter((x) => x !== id));
     },
-    [project.analysis, projectRef, selectedMomentId]
+    [commitMoments, selectedMomentId]
   );
 
   const toggleMultiSelect = React.useCallback((id: string) => {
@@ -285,34 +398,20 @@ export function EditorRealProvider({
     React.useCallback(async () => {
       if (multiSelectIds.length === 0) return;
       const kill = new Set(multiSelectIds);
-      const moments = project.analysis?.detectedMoments ?? [];
-      const next = moments.filter((m) => !kill.has(m.id));
-      await setDoc(
-        projectRef,
-        {
-          analysis: { ...(project.analysis ?? {}), detectedMoments: next },
-          updatedAt: serverTimestamp(),
-        },
-        { merge: true }
-      );
+      const next = momentsRef.current.filter((m) => !kill.has(m.id));
+      await commitMoments(next);
       if (selectedMomentId && kill.has(selectedMomentId)) setSelectedMomentId(null);
       setMultiSelectIds([]);
-    }, [multiSelectIds, project.analysis, projectRef, selectedMomentId]);
+    }, [commitMoments, multiSelectIds, selectedMomentId]);
 
   const addMoment: EditorRealContextValue["addMoment"] = React.useCallback(
     async (m) => {
-      const moments = project.analysis?.detectedMoments ?? [];
-      const next = [...moments, m].sort((a, b) => a.startTime - b.startTime);
-      await setDoc(
-        projectRef,
-        {
-          analysis: { ...(project.analysis ?? {}), detectedMoments: next },
-          updatedAt: serverTimestamp(),
-        },
-        { merge: true }
+      const next = [...momentsRef.current, m].sort(
+        (a, b) => a.startTime - b.startTime
       );
+      await commitMoments(next);
     },
-    [project.analysis, projectRef]
+    [commitMoments]
   );
 
   // Stable unique ids for user-created moments — never collide with the
@@ -326,7 +425,7 @@ export function EditorRealProvider({
   const duplicateMoment: EditorRealContextValue["duplicateMoment"] =
     React.useCallback(
       async (id) => {
-        const moments = project.analysis?.detectedMoments ?? [];
+        const moments = momentsRef.current;
         const src = moments.find((m) => m.id === id);
         if (!src) return;
         const dur = Math.max(0.4, src.endTime - src.startTime);
@@ -347,36 +446,42 @@ export function EditorRealProvider({
             : {}),
         });
         const next = [...moments, copy].sort((a, b) => a.startTime - b.startTime);
-        await setDoc(
-          projectRef,
-          {
-            analysis: stripUndefined({
-              ...(project.analysis ?? {}),
-              detectedMoments: next,
-            }),
-            updatedAt: serverTimestamp(),
-          },
-          { merge: true }
-        );
+        await commitMoments(next);
         setSelectedMomentId(copy.id);
       },
-      [project.analysis, projectRef, duration, newMomentId]
+      [commitMoments, duration, newMomentId]
     );
 
   const addMomentAtPlayhead: EditorRealContextValue["addMomentAtPlayhead"] =
     React.useCallback(
       async (effectType) => {
-        const moments = project.analysis?.detectedMoments ?? [];
-        const span = effectType === "speed-up" ? 2.6 : 1.8;
+        const isCrop = effectType === "crop";
+        const isSpeed = effectType === "speed-up";
+        const span = isSpeed ? 2.6 : isCrop ? 3 : 1.8;
         const total = duration || project.duration || 0;
         const start = total > 0 ? Math.min(currentTime, Math.max(0, total - span)) : currentTime;
+        // Source aspect drives the initial crop box shape.
+        const sourceAspect =
+          project.width && project.height
+            ? project.width / project.height
+            : videoRef.current?.videoWidth && videoRef.current?.videoHeight
+              ? videoRef.current.videoWidth / videoRef.current.videoHeight
+              : 16 / 9;
+        const focusRegion = isCrop
+          ? cropBoxFor(
+              DEFAULT_CROP.aspectRatio,
+              DEFAULT_CROP.position,
+              DEFAULT_CROP.scale,
+              sourceAspect
+            )
+          : { x: 0.3, y: 0.3, width: 0.4, height: 0.4 };
         const m: DetectedMoment = {
           id: newMomentId(),
           startTime: start,
           endTime: total > 0 ? Math.min(total, start + span) : start + span,
           label: DEFAULT_EFFECT_LABEL[effectType],
           reason: "Manually added.",
-          focusRegion: { x: 0.3, y: 0.3, width: 0.4, height: 0.4 },
+          focusRegion,
           effectType,
           intensity: 0.7,
           attentionScore: 0.6,
@@ -387,20 +492,20 @@ export function EditorRealProvider({
           // centered framing is intentional until they drag the focus box.
           targetRegionSource: "user",
           edited: true,
+          // Manual-effect settings (only the matching one is attached).
+          ...(isCrop ? { crop: { ...DEFAULT_CROP } } : {}),
+          ...(isSpeed ? { speed: { ...DEFAULT_SPEED } } : {}),
         };
-        const next = [...moments, m].sort((a, b) => a.startTime - b.startTime);
-        await setDoc(
-          projectRef,
-          {
-            analysis: { ...(project.analysis ?? {}), detectedMoments: next },
-            updatedAt: serverTimestamp(),
-          },
-          { merge: true }
+        const next = [...momentsRef.current, m].sort(
+          (a, b) => a.startTime - b.startTime
         );
+        await commitMoments(next);
+        // Select the new moment so the docked inspector surfaces it; the modal
+        // fallback (small screens) keys off inspectorOpen.
         setSelectedMomentId(m.id);
         setInspectorOpen(true);
       },
-      [project.analysis, project.duration, projectRef, currentTime, duration, newMomentId]
+      [commitMoments, project.duration, currentTime, duration, newMomentId]
     );
 
   const dismissSuggestion: EditorRealContextValue["dismissSuggestion"] =
@@ -544,6 +649,38 @@ export function EditorRealProvider({
     cvAbortRef.current = abort;
 
     try {
+      // ── Progressive chunked path for long videos ───────────────────────
+      // Above the threshold, hand off to the chunk orchestrator: CV runs per
+      // 30s window and its deterministic moments stream onto the timeline as
+      // each chunk finishes, with one whole-video AI pass at the end. A canvas
+      // taint (cross-origin, no CORS) can't be read on-device, so we fall
+      // through to the existing server-side direct path in that case.
+      const chunkDuration = project.duration ?? videoRef.current?.duration ?? 0;
+      if (shouldChunk(chunkDuration)) {
+        // Single-flight: ignore a re-trigger while a chunked run is in flight.
+        if (chunkRunningRef.current) return;
+        chunkRunningRef.current = true;
+        // Chunked runs in the background by default so the user can edit the
+        // sections that have already streamed in while later chunks process.
+        setProcessingMinimized(true);
+        try {
+          await runChunkedAnalysis({
+            uid,
+            project,
+            interactions,
+            idTokenGetter,
+            signal: abort.signal,
+            onJob: setChunkedJob,
+          });
+          return;
+        } catch (chunkErr) {
+          if (!(chunkErr instanceof CvTaintedError)) throw chunkErr;
+          // taint → fall through to the direct whole-video flow below
+        } finally {
+          chunkRunningRef.current = false;
+        }
+      }
+
       // ── Phase 0: client-side computer-vision pass ──────────────────────
       // Runs in the browser (the server route has no pixels). The result is
       // persisted top-level so the route's `analysis` reset can't clobber it,
@@ -658,7 +795,109 @@ export function EditorRealProvider({
       setCvProgress(null);
       setAnalyzing(false);
     }
-  }, [idTokenGetter, project.id, project.duration, projectRef, videoRef]);
+  }, [idTokenGetter, uid, project, projectRef, videoRef, interactions]);
+
+  // ── Resume an in-flight chunked job after a refresh ─────────────────────
+  // Completed chunks already wrote their moments to the project doc, so the
+  // timeline shows them instantly; we just re-attach the orchestrator to drive
+  // the remaining chunks + finalize. Runs once, after interactions resolve.
+  const resumeAttemptedRef = React.useRef(false);
+  React.useEffect(() => {
+    if (resumeAttemptedRef.current || interactionsLoading) return;
+    resumeAttemptedRef.current = true;
+    let cancelled = false;
+    (async () => {
+      const job = await getActiveJobForProject(uid, project.id);
+      if (cancelled || !job || analyzing || chunkRunningRef.current) return;
+      chunkRunningRef.current = true;
+      setAnalyzing(true);
+      setProcessingMinimized(true); // resumed jobs run in the background
+      const abort = new AbortController();
+      cvAbortRef.current = abort;
+      try {
+        await runChunkedAnalysis({
+          uid,
+          project,
+          interactions,
+          idTokenGetter,
+          signal: abort.signal,
+          onJob: setChunkedJob,
+          resume: true,
+        });
+      } catch (err) {
+        if (!(err instanceof CvAbortError) && !(err instanceof CvTaintedError)) {
+          setAnalyzeError(err instanceof Error ? err.message : "Resume failed.");
+        }
+      } finally {
+        chunkRunningRef.current = false;
+        cvAbortRef.current = null;
+        setAnalyzing(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // Run once after interactions resolve; intentionally not re-firing on
+    // every project snapshot (the ref guard + getActiveJobForProject gate it).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [uid, project.id, interactionsLoading]);
+
+  // ── Stuck-completion repair (timeout guard) ─────────────────────────────
+  // Safety net: if all chunks are done but the project never reached a terminal
+  // state (a lost/raced finalize write, a hung pool, or cross-tab residue), and
+  // the run is clearly complete (moments present + an "Analysis complete"
+  // activity), force the terminal state so the overlay/pill can clear. Waits
+  // 10s of stable "done" state and re-reads Firestore before repairing, so it
+  // never fights a legitimate in-flight finalize.
+  const repairedRef = React.useRef<string | null>(null);
+  React.useEffect(() => {
+    const job = chunkedJob;
+    if (!job) return;
+    const allChunksDone = job.chunkCount > 0 && job.completedCount >= job.chunkCount;
+    if (!allChunksDone) return;
+    if (project.analysis?.status === "complete" || project.status === "analyzed") return;
+    if (!isProcessing(project.status)) return;
+    const repairKey = `${job.id}:${job.completedCount}`;
+    if (repairedRef.current === repairKey) return;
+
+    const timer = setTimeout(async () => {
+      // Don't repair while the orchestrator is still actively writing — its own
+      // terminal write will land. Repair is only for orphaned/stuck runs.
+      if (isAnalysisActive(project.id)) return;
+      const snap = await getDoc(projectRef);
+      const analysis = (snap.data() as ProjectDoc | undefined)?.analysis;
+      const statusNow = (snap.data() as ProjectDoc | undefined)?.status;
+      if (!analysis) return;
+      if (analysis.status === "complete" || statusNow === "analyzed") return; // self-healed
+      const moments = analysis.detectedMoments?.length ?? 0;
+      const completeActivity = (analysis.activity ?? []).some((a) =>
+        a.text?.includes("Analysis complete")
+      );
+      if (moments > 0 && completeActivity) {
+        repairedRef.current = repairKey;
+        // Route the repair through the serialized queue too.
+        await enqueueProjectWrite(project.id, "repair-terminal", () =>
+          setDoc(
+            projectRef,
+            {
+              status: "analyzed",
+              analysis: { status: "complete", stage: "Complete", cancelRequested: false },
+              updatedAt: serverTimestamp(),
+            },
+            { merge: true }
+          )
+        );
+      }
+    }, 10_000);
+    return () => clearTimeout(timer);
+  }, [
+    chunkedJob,
+    project.id,
+    project.status,
+    project.analysis?.status,
+    project.analysis?.detectedMoments?.length,
+    projectRef,
+  ]);
 
   /**
    * "Cancel" both flags the server route AND optimistically writes the
@@ -780,6 +1019,13 @@ export function EditorRealProvider({
     processingMinimized,
     setProcessingMinimized,
     seek,
+    undo,
+    redo,
+    canUndo,
+    canRedo,
+    interactions,
+    interactionsLoading,
+    chunkedJob,
   };
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

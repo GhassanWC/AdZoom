@@ -4,6 +4,7 @@ import "./globals.css";
 import { NoiseOverlay } from "@/components/ui/NoiseOverlay";
 import { AuthProvider } from "@/lib/firebase/AuthProvider";
 import { ToastProvider } from "@/components/ui/Toast";
+import { ConfirmProvider } from "@/components/ui/ConfirmDialog";
 import { ThemeProvider, themeInitScript } from "@/lib/theme";
 import { ChatWidget } from "@/components/chat/ChatWidget";
 import { BRAND, PAGE_TITLE } from "@/lib/branding";
@@ -57,8 +58,10 @@ export default function RootLayout({
         <ThemeProvider>
           <AuthProvider>
             <ToastProvider>
-              {children}
-              <ChatWidget />
+              <ConfirmProvider>
+                {children}
+                <ChatWidget />
+              </ConfirmProvider>
             </ToastProvider>
           </AuthProvider>
         </ThemeProvider>

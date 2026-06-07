@@ -28,12 +28,12 @@ import { PresetsRail } from "./PresetsRail";
 import { RecommendedPresets } from "./RecommendedPresets";
 import { ProcessingMiniPill } from "./ProcessingMiniPill";
 import { WorkflowStepper, type WorkflowStep } from "./WorkflowStepper";
-import { EditorToolbar } from "./EditorToolbar";
 import { DebugOverlay } from "./DebugOverlay";
 import { ClickPipelinePanel } from "./ClickPipelinePanel";
 import { EditDiagnosticsPanel } from "./EditDiagnosticsPanel";
 import { CvDebugPanel } from "./CvDebugPanel";
 import { disposeThumbnails } from "./timeline/thumbnails";
+import { restoreEditorScrollLock } from "./scroll-lock";
 
 export function RealEditorPage({ projectId }: { projectId: string }) {
   const { user, getIdToken } = useAuth();
@@ -58,6 +58,8 @@ export function RealEditorPage({ projectId }: { projectId: string }) {
   React.useEffect(
     () => () => {
       disposeThumbnails();
+      // Safety: never leave a leaked modal scroll-lock behind on navigation.
+      restoreEditorScrollLock();
     },
     []
   );
@@ -293,17 +295,20 @@ function Body() {
           first-draft edit you can refine.
         </p>
       )}
-      <div className="min-w-0 space-y-4">
+      {/* ── 3b. Preview (full width) ─────────────────────────────────────
+          The video preview gets the full content width — no reserved side
+          rail. Moment settings open in a compact floating dialog
+          (`MomentInspectorModal`) on Edit, so the player stays large and the
+          crop box stays visible while editing. */}
+      <div className="space-y-4">
         <RealVideoPlayer />
-        {/* Toolbar is always available — manual editing shouldn't require
-            running AI analysis first. */}
-        <EditorToolbar />
       </div>
 
       {/* ── 4. Full-width timeline ───────────────────────────────────────── */}
       <RealTimeline />
 
-      {/* ── 4b. Click pipeline diagnostics — visible debug surface. ─────── */}
+      {/* ── 4b. Click pipeline diagnostics — dev-visible; in production
+              hidden unless ?debug=1 / Ctrl+Shift+D. ─────────────────────── */}
       <ClickPipelinePanel />
 
       {/* ── 4c. Edit-coverage funnel — internal/dev-only (?debug=1). ────── */}

@@ -71,8 +71,20 @@ export interface CvProgress {
 }
 
 export interface RunVisualAnalysisOptions {
-  /** Video duration in seconds (from project metadata; falls back to video.duration). */
+  /**
+   * WHOLE-video duration in seconds (from project metadata; falls back to
+   * `video.duration`). Always the full duration even when analyzing a window —
+   * it drives the sample fps + rate so per-chunk results merge consistently.
+   */
   duration?: number;
+  /**
+   * Analyze only `[startTime, endTime)` (absolute seconds). Used by the
+   * progressive chunked engine. Default: the whole video. The produced
+   * `VisualAnalysis` is WINDOW-LOCAL (times relative to `startTime`); the
+   * orchestrator offsets it back at merge time.
+   */
+  startTime?: number;
+  endTime?: number;
   onProgress?: (p: CvProgress) => void;
   signal?: AbortSignal;
 }

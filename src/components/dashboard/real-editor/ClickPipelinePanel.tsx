@@ -16,7 +16,9 @@
  *   • Force re-analyze      — clear detectedMoments + rawMoments, then
  *                             re-run /analyze
  *
- * Lives in the editor UI under the timeline, not behind the dev hotkey.
+ * Lives in the editor UI under the timeline. Visible in development; in
+ * production it's hidden from end users and only shown behind the shared
+ * debug gate (?debug=1 or Ctrl/Cmd+Shift+D).
  */
 
 import * as React from "react";
@@ -32,10 +34,12 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { useToast } from "@/components/ui/Toast";
+import { useConfirm } from "@/components/ui/ConfirmDialog";
 import { useAuth } from "@/lib/firebase/AuthProvider";
 import { getFirebase } from "@/lib/firebase/client";
 import { doc, serverTimestamp, setDoc } from "firebase/firestore";
 import { useEditorReal } from "./context";
+import { useDebugParam } from "./use-debug-param";
 import { Stat, Field, Stage } from "./diag-bits";
 import type { ClickPipelineDiagnostics } from "@/lib/firebase/schema";
 
@@ -84,8 +88,10 @@ type DiagnoseResult = {
 
 export function ClickPipelinePanel() {
   const { project, uid, startAnalyze, analyzing } = useEditorReal();
+  const debugEnabled = useDebugParam();
   const { getIdToken } = useAuth();
   const toast = useToast();
+  const confirm = useConfirm();
   const [open, setOpen] = React.useState(true);
   const [diagnose, setDiagnose] = React.useState<DiagnoseResult | null>(null);
   const [diagnoseLoading, setDiagnoseLoading] = React.useState(false);
@@ -117,13 +123,16 @@ export function ClickPipelinePanel() {
   };
 
   const runBypass = async () => {
-    if (!confirm(
-      "This will REPLACE all current edits on this project with one zoom per real click " +
-      "from interactions.json. No balancer, no AI. Use Re-analyze afterwards to restore " +
-      "the normal pipeline. Continue?"
-    )) {
-      return;
-    }
+    const ok = await confirm({
+      title: "Generate zooms from clicks only?",
+      message:
+        "This will REPLACE all current edits on this project with one zoom per real click " +
+        "from interactions.json. No balancer, no AI. Use Re-analyze afterwards to restore " +
+        "the normal pipeline.",
+      confirmLabel: "Replace edits",
+      tone: "danger",
+    });
+    if (!ok) return;
     setBypassLoading(true);
     try {
       const token = await getIdToken();
@@ -146,12 +155,15 @@ export function ClickPipelinePanel() {
   };
 
   const runForceReanalyze = async () => {
-    if (!confirm(
-      "This will CLEAR the current edits, rejected pool, and clickPipeline diagnostics, " +
-      "then re-run the full analysis from interactions.json. Continue?"
-    )) {
-      return;
-    }
+    const ok = await confirm({
+      title: "Force re-analyze from interactions?",
+      message:
+        "This will CLEAR the current edits, rejected pool, and clickPipeline diagnostics, " +
+        "then re-run the full analysis from interactions.json.",
+      confirmLabel: "Clear & re-analyze",
+      tone: "danger",
+    });
+    if (!ok) return;
     setForceLoading(true);
     try {
       const { db } = getFirebase();
@@ -190,6 +202,11 @@ export function ClickPipelinePanel() {
     if (stored.totalClicks > 0 && stored.eventKept < stored.totalClicks) return "partial-dropped";
     return "ok";
   })();
+
+  // Internal debug surface — hidden from production end users. Stays visible
+  // in development, and remains reachable in production via the shared debug
+  // gate (?debug=1 or Ctrl/Cmd+Shift+D), matching the sibling debug panels.
+  if (process.env.NODE_ENV === "production" && !debugEnabled) return null;
 
   return (
     <section className="glass rounded-2xl border border-white/10 bg-ink/40 p-5">

@@ -55,6 +55,8 @@ export const IDENTITY_CAMERA: CameraState = {
 };
 
 const MAX_SCALE = 2.4;
+/** Crop/reframe can zoom harder than a normal cinematic zoom (e.g. 16:9→9:16). */
+const CROP_MAX_SCALE = 6;
 
 /** Edge-envelope: ramps scale + pan from identity → target → identity. */
 const EDGE_FRACTION = 0.18; // 18% of the moment on each edge
@@ -192,11 +194,52 @@ function edgeEnvelope(localProg: number, durSec: number): number {
  * Keyframed moment: interpolate centre + intensity through the keyframes.
  * No envelope — the user's keyframes own the motion, including any edges.
  */
+/**
+ * Crop/Reframe camera: frame the crop box (the moment's `focusRegion`) to
+ * COVER the output (scale so the box fills the frame; excess cropped). Reuses
+ * the shared edge envelope unless `crop.easing === "instant"` (then it holds
+ * the framing for the whole section). Allows a higher scale cap than zoom so a
+ * tight reframe (e.g. 16:9 → 9:16) isn't clamped.
+ */
+function cropCamera(m: DetectedMoment, localProgressValue: number): CameraState {
+  const box = m.focusRegion;
+  const cxRaw = box.x + box.width / 2;
+  const cyRaw = box.y + box.height / 2;
+  const fill =
+    box.width > 0 && box.height > 0
+      ? Math.max(1 / box.width, 1 / box.height)
+      : 1;
+  const targetScale = clampRange(fill, 1, CROP_MAX_SCALE);
+  const { cx, cy } = clampCenterToFrame(cxRaw, cyRaw, targetScale);
+
+  if (m.crop?.easing === "instant") {
+    return {
+      scale: targetScale,
+      panXPct: (0.5 - cx) * 100,
+      panYPct: (0.5 - cy) * 100,
+      cx,
+      cy,
+    };
+  }
+  const env = edgeEnvelope(
+    clamp01(localProgressValue),
+    Math.max(0, m.endTime - m.startTime)
+  );
+  return {
+    scale: 1 + (targetScale - 1) * env,
+    panXPct: (0.5 - cx) * 100 * env,
+    panYPct: (0.5 - cy) * 100 * env,
+    cx: 0.5 + (cx - 0.5) * env,
+    cy: 0.5 + (cy - 0.5) * env,
+  };
+}
+
 export function cameraForMoment(
   m: DetectedMoment,
   blendedIntensity: number,
   localProgressValue: number
 ): CameraState {
+  if (m.effectType === "crop") return cropCamera(m, localProgressValue);
   const kfs = m.keyframes;
   if (kfs && kfs.length > 0) {
     const { a, b, f } = bracket(kfs, clamp01(localProgressValue));
@@ -308,9 +351,19 @@ export function resolveCameraFrame(
 }
 
 /**
- * Deterministic moment selection for a given playhead time. When moments
- * overlap (rare but legal), prefer the one with the LATEST startTime —
- * matches the editor's "last-authored wins" intuition. The export and
+ * Camera priority for overlap resolution: user crop/reframe > user zoom/focus
+ * > AI zoom/focus. Higher wins; ties break on latest startTime.
+ */
+function cameraPriority(m: DetectedMoment): number {
+  if (m.effectType === "crop") return m.source === "user" ? 5 : 4;
+  return m.source === "user" ? 3 : 2;
+}
+
+/**
+ * Deterministic moment selection for a given playhead time. SPEED moments
+ * never move the camera (they only affect timing), so they're skipped here.
+ * Among the rest, the highest `cameraPriority` wins (user crop > user zoom >
+ * AI), ties break on the LATEST startTime ("last-authored wins"). Export and
  * preview both call this, so they always agree on which moment is active.
  */
 function pickActiveMoment(
@@ -318,9 +371,15 @@ function pickActiveMoment(
   t: number
 ): DetectedMoment | null {
   let pick: DetectedMoment | null = null;
+  let pickPri = -1;
   for (const m of moments) {
+    if (m.effectType === "speed-up") continue;
     if (t < m.startTime || t > m.endTime) continue;
-    if (!pick || m.startTime > pick.startTime) pick = m;
+    const pri = cameraPriority(m);
+    if (!pick || pri > pickPri || (pri === pickPri && m.startTime > pick.startTime)) {
+      pick = m;
+      pickPri = pri;
+    }
   }
   return pick;
 }

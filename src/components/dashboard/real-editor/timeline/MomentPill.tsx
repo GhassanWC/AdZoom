@@ -20,11 +20,14 @@ import {
   EFFECT_ICONS,
   EFFECT_TONES,
   PROVENANCE_PRESENTATION,
+  MIN_PILL_PX,
+  MIN_RENDER_DURATION,
 } from "./constants";
 import type { DragMode } from "./utils";
 import { captureFrame } from "./thumbnails";
 import { useEditorReal } from "../context";
 import { AttentionWaveform } from "./AttentionWaveform";
+import { cropAspectLabel } from "@/lib/timeline/crop-speed";
 
 function provenanceOf(m: DetectedMoment): MomentProvenance {
   if (m.provenance) return m.provenance;
@@ -109,9 +112,15 @@ export function MomentPill({
   onEdit: () => void;
 }) {
   const { project } = useEditorReal();
-  const left = (m.startTime / total) * 100;
-  const widthPct = Math.max(1.2, ((m.endTime - m.startTime) / total) * 100);
-  const duration = m.endTime - m.startTime;
+  // Duration drives the clip width. Guard against missing/zero/NaN end times so
+  // a moment never collapses to a zero-width sliver — it still renders as a
+  // small block (and a px floor below keeps short clips from becoming hairline
+  // markers). Real durations scale proportionally.
+  const rawDur = m.endTime - m.startTime;
+  const duration = Number.isFinite(rawDur) && rawDur > 0 ? rawDur : 0;
+  const renderDur = duration > 0 ? duration : MIN_RENDER_DURATION;
+  const left = total > 0 ? (m.startTime / total) * 100 : 0;
+  const widthPct = total > 0 ? (renderDur / total) * 100 : 2;
   const Icon = EFFECT_ICONS[m.effectType] ?? Sparkles;
   const isUser = m.source === "user";
   const hasKeyframes = (m.keyframes?.length ?? 0) > 0;
@@ -122,6 +131,13 @@ export function MomentPill({
     m.intensity ?? m.recommendedIntensity ?? attention ?? 0.5;
   const prov = provenanceOf(m);
   const provInfo = PROVENANCE_PRESENTATION[prov];
+  // Crop shows its target aspect (9:16); speed shows its multiplier (2×).
+  const badge =
+    m.effectType === "speed-up"
+      ? `${m.speed?.multiplier ?? 2}×`
+      : m.effectType === "crop"
+        ? cropAspectLabel(m.crop?.aspectRatio)
+        : null;
   const confidence = m.confidenceScore ?? attention;
   const reasoning = shortReasoning(m);
   const ctxLabel = m.uiContext ? CONTEXT_LABEL[m.uiContext] : undefined;
@@ -169,6 +185,9 @@ export function MomentPill({
       style={{
         left: `${left}%`,
         width: `${widthPct}%`,
+        // Floor the rendered width so short real-duration clips read as blocks,
+        // not hairline markers, while longer clips still scale by %.
+        minWidth: `${MIN_PILL_PX}px`,
         top: insetY,
         bottom: insetY,
         opacity: bodyOpacity,
@@ -254,6 +273,11 @@ export function MomentPill({
             {tier !== "icon" && (
               <span className="truncate text-[12.5px] font-semibold leading-tight tracking-tight">
                 {m.label}
+              </span>
+            )}
+            {badge && (
+              <span className="ml-0.5 shrink-0 rounded bg-black/40 px-1 py-[1px] text-[9.5px] font-bold tabular-nums leading-none ring-1 ring-white/25">
+                {badge}
               </span>
             )}
             {tier !== "icon" && hasKeyframes && (

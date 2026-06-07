@@ -108,12 +108,17 @@ function seekTo(video: HTMLVideoElement, t: number, signal?: AbortSignal): Promi
 export async function* extractFrames(
   video: HTMLVideoElement,
   duration: number,
-  signal?: AbortSignal
+  opts: { signal?: AbortSignal; startTime?: number; endTime?: number } = {}
 ): AsyncGenerator<ExtractedFrame, void, void> {
   if (duration <= 0 || !Number.isFinite(duration)) return;
 
+  const { signal } = opts;
+  // fps is keyed to the WHOLE-video duration (not the window length) so every
+  // chunk samples at the same rate and the per-chunk results merge cleanly.
   const fps = sampleFpsFor(duration);
   const step = 1 / fps;
+  const from = Math.max(0, opts.startTime ?? 0);
+  const to = Math.min(duration, opts.endTime ?? duration);
 
   const canvas = document.createElement("canvas");
   canvas.width = DETECT_W;
@@ -129,7 +134,7 @@ export async function* extractFrames(
   if (!prevPaused) video.pause();
 
   try {
-    for (let t = 0; t < duration; t += step) {
+    for (let t = from; t < to; t += step) {
       if (signal?.aborted) throw new CvAbortError();
 
       await seekTo(video, Math.min(t, Math.max(0, duration - 0.05)), signal);
@@ -162,7 +167,7 @@ export async function* extractFrames(
 }
 
 /** RGBA ImageData → single-channel luma buffer (Rec. 601 weights). */
-function toGrayscale(rgba: Uint8ClampedArray, w: number, h: number): GrayFrame {
+export function toGrayscale(rgba: Uint8ClampedArray, w: number, h: number): GrayFrame {
   const out = new Uint8ClampedArray(w * h);
   for (let i = 0, p = 0; p < out.length; i += 4, p++) {
     out[p] = (rgba[i] * 0.299 + rgba[i + 1] * 0.587 + rgba[i + 2] * 0.114) | 0;
@@ -174,7 +179,7 @@ function toGrayscale(rgba: Uint8ClampedArray, w: number, h: number): GrayFrame {
  * Box-downsample a DETECT_W×DETECT_H gray buffer to FRAME_W×FRAME_H by
  * averaging each 2×2 source block. Requires DETECT = 2× FRAME on both axes.
  */
-function downsample2x(src: GrayFrame): GrayFrame {
+export function downsample2x(src: GrayFrame): GrayFrame {
   const out = new Uint8ClampedArray(FRAME_W * FRAME_H);
   for (let y = 0; y < FRAME_H; y++) {
     const sy = y * 2;

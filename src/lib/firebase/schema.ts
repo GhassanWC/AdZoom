@@ -43,7 +43,47 @@ export interface AnalysisActivityEvent {
   text: string;
 }
 
-export type EffectType = "zoom" | "click-highlight" | "cursor-focus" | "speed-up";
+export type EffectType =
+  | "zoom"
+  | "click-highlight"
+  | "cursor-focus"
+  | "speed-up"
+  | "crop";
+
+// ── Manual Crop/Reframe + Speed settings (additive) ─────────────────────────
+// Crop/Reframe and Speed are manual timeline effects. They extend
+// `DetectedMoment` without a parallel type so existing projects decode
+// unchanged. The crop BOX reuses the moment's `focusRegion`; `crop` holds the
+// extra framing controls. Speed reuses the existing `"speed-up"` effectType.
+export type CropAspect = "original" | "16:9" | "9:16" | "1:1" | "4:5" | "custom";
+export type CropPosition =
+  | "center"
+  | "left"
+  | "right"
+  | "top"
+  | "bottom"
+  | "custom";
+export type SpeedAudioMode = "mute" | "keep" | "pitch-correct";
+/** "ramp" is a placeholder — treated as a hard cut until smooth ramps ship. */
+export type SpeedTransition = "cut" | "ramp";
+
+export interface CropSettings {
+  /** Target output aspect the box is shaped to (UI helper; box lives in focusRegion). */
+  aspectRatio: CropAspect;
+  /** Extra zoom into the crop box (1 = fit the box to the output). */
+  scale: number;
+  /** Preset placement of the box; "custom" once the user drags it. */
+  position: CropPosition;
+  /** "instant" holds the framing for the whole section; otherwise the camera eases. */
+  easing: EaseKind | "instant";
+}
+
+export interface SpeedSettings {
+  /** Playback multiplier during the section (e.g. 2 = 2× → half the output time). */
+  multiplier: number;
+  audioMode: SpeedAudioMode;
+  transition: SpeedTransition;
+}
 
 export type UIContext =
   | "button"
@@ -222,6 +262,18 @@ export interface DetectedMoment {
    */
   keyframes?: MomentKeyframe[];
 
+  /**
+   * Manual Crop/Reframe settings — present when `effectType === "crop"`. The
+   * crop BOX is the moment's `focusRegion`; this holds aspect/scale/position/
+   * easing. The camera frames the box into the output (baked into export).
+   */
+  crop?: CropSettings;
+  /**
+   * Manual Speed settings — present when `effectType === "speed-up"`. Drives
+   * `playbackRate` in preview + real-time export (shortening output duration).
+   */
+  speed?: SpeedSettings;
+
   // ── Attention-aware fields (Gemini-supplied, post-processed by balancer) ──
   /** Composite priority (0..1) — replaces importance going forward. */
   attentionScore?: number;
@@ -337,7 +389,13 @@ export type SuggestionKind =
   | "add-focus" // an interaction the camera doesn't follow
   | "pacing-gap" // a long dead stretch between moments
   | "too-aggressive" // an edit that may feel heavy-handed
-  | "tighten"; // a moment that runs longer than its action
+  | "tighten" // a moment that runs longer than its action
+  // ── Future manual-effect suggestions (declared only; never generated or
+  //    auto-applied yet — the user always adds crop/speed manually). ──
+  | "suggest-speed-up"
+  | "suggest-crop"
+  | "suggest-reframe"
+  | "suggest-remove-idle";
 
 /**
  * A non-destructive AI recommendation. The AI proposes; the user accepts or
@@ -533,6 +591,83 @@ export interface Analysis {
    * `buildEditDiagnostics` in `src/lib/diagnostics/edit-diagnostics.ts`.
    */
   editDiagnostics?: EditDiagnostics;
+}
+
+// ── Progressive chunked analysis ────────────────────────────────────────────
+// Long videos (> CHUNKED_ANALYSIS_THRESHOLD_S) are analyzed progressively: the
+// video is split into fixed-size chunks, each analyzed independently on the
+// client (CV + interaction events), with its moments appended to the timeline
+// the instant it finishes. Job + chunk state lives at
+//   users/{uid}/analysisJobs/{jobId}
+//   users/{uid}/analysisJobs/{jobId}/chunks/{chunkId}
+// so a refresh resumes without losing progress. The whole-video AI pass runs
+// once at the end via the existing analyze route.
+
+export type AnalysisJobStatus =
+  | "queued"
+  | "running"
+  | "complete"
+  | "failed"
+  | "cancelled";
+
+/** Which CV engine processed the job — informational + diagnostics. */
+export type CvEngineKind = "webcodecs" | "hidden-video";
+
+export interface AnalysisJob {
+  id: string;
+  projectId: string;
+  projectTitle: string;
+  status: AnalysisJobStatus;
+  engine: CvEngineKind;
+  /** Whole-video duration in seconds. */
+  duration: number;
+  /** Target chunk length in seconds (CHUNK_SIZE_S). */
+  chunkSize: number;
+  chunkCount: number;
+  // Denormalized chunk counters so the Jobs page renders without a sub-read.
+  queuedCount: number;
+  processingCount: number;
+  completedCount: number;
+  failedCount: number;
+  /** 0..1 — completedCount / chunkCount. */
+  progress: number;
+  /** Moments appended across completed chunks so far (pre-final-merge). */
+  momentsSoFar: number;
+  /** Rolling estimate of remaining wall-clock, ms. */
+  estimateRemainingMs?: number;
+  /** Set when the user cancels — the orchestrator polls this between chunks. */
+  cancelRequested?: boolean;
+  errorMessage?: string;
+  startedAt: number;
+  completedAt?: number;
+  updatedAt: number;
+}
+
+export type AnalysisChunkStatus =
+  | "queued"
+  | "cv-running"
+  | "completed"
+  | "failed";
+
+export interface AnalysisChunk {
+  id: string;
+  index: number;
+  /** Absolute seconds. */
+  startTime: number;
+  endTime: number;
+  status: AnalysisChunkStatus;
+  /** 0..1 within this chunk's CV pass. */
+  progress: number;
+  /** Deterministic (CV + event) moments this chunk produced — absolute time. */
+  moments: DetectedMoment[];
+  /**
+   * Window-local CV result. Persisted (≈1KB at 1Hz) so a mid-job refresh can
+   * run the final merge without re-decoding completed chunks.
+   */
+  va?: VisualAnalysis;
+  attempts: number;
+  errorMessage?: string;
+  updatedAt: number;
 }
 
 export interface ClickPipelineDiagnostics {

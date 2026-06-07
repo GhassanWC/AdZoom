@@ -1444,6 +1444,7 @@ export function effectTypeBreakdown(
     "click-highlight": 0,
     "cursor-focus": 0,
     "speed-up": 0,
+    crop: 0,
   };
   for (const m of moments) out[m.effectType]++;
   return out;

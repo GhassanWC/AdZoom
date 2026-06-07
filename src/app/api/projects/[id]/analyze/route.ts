@@ -137,6 +137,66 @@ async function ensureNotCancelled(ref: DocumentReference) {
   if (await isCancelled(ref)) throw new CancelledError();
 }
 
+// ── Finalize (chunked) helpers — non-destructive merge of progressive moments ──
+
+/** Focus-region center (normalized 0..1). */
+function regionCenter(m: DetectedMoment): { x: number; y: number } {
+  const r = m.focusRegion;
+  return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+}
+
+/** True when two moments target nearly the same spot — used for dedupe + guard. */
+function regionClose(a: DetectedMoment, b: DetectedMoment): boolean {
+  const ca = regionCenter(a);
+  const cb = regionCenter(b);
+  return Math.hypot(ca.x - cb.x, ca.y - cb.y) < 0.08;
+}
+
+/**
+ * Merge "obvious" boundary duplicates: moments whose starts are within 0.4s AND
+ * whose focus regions point at nearly the same spot. Keeps the higher-confidence
+ * one. Conservative — the chunk orchestrator's primary-span ownership already
+ * prevents most overlap duplicates, so this normally merges 0.
+ */
+function dedupeBoundaryDuplicates(moments: DetectedMoment[]): {
+  kept: DetectedMoment[];
+  merged: Array<{ id: string; reason: string }>;
+} {
+  const sorted = [...moments].sort((a, b) => a.startTime - b.startTime);
+  const kept: DetectedMoment[] = [];
+  const merged: Array<{ id: string; reason: string }> = [];
+  for (const m of sorted) {
+    const twin = kept.find(
+      (k) => Math.abs(k.startTime - m.startTime) < 0.4 && regionClose(k, m)
+    );
+    if (twin) {
+      const mConf = m.confidenceScore ?? m.attentionScore ?? 0;
+      const tConf = twin.confidenceScore ?? twin.attentionScore ?? 0;
+      if (mConf > tConf) {
+        kept[kept.indexOf(twin)] = m;
+        merged.push({ id: twin.id, reason: `duplicate of ${m.id}` });
+      } else {
+        merged.push({ id: m.id, reason: `duplicate of ${twin.id}` });
+      }
+      continue;
+    }
+    kept.push(m);
+  }
+  return { kept, merged };
+}
+
+/** Patch label/reason from `labeled` (by id) onto `base`, non-destructively. */
+function applyLabels(
+  base: DetectedMoment[],
+  labeled: DetectedMoment[]
+): DetectedMoment[] {
+  const byId = new Map(labeled.map((m) => [m.id, m]));
+  return base.map((m) => {
+    const l = byId.get(m.id);
+    return l ? { ...m, label: l.label, reason: l.reason } : m;
+  });
+}
+
 export async function POST(req: NextRequest, { params }: RouteContext) {
   const { id: projectId } = await params;
   let ref: DocumentReference | null = null;
@@ -180,6 +240,44 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       | undefined;
     const selectedPresetId = project.selectedPresetId as string | undefined;
 
+    // Finalize mode (progressive chunked path): the client orchestrator already
+    // streamed the timeline (progressive CV/event moments) + a merged
+    // `visualAnalysis`. This pass is NON-DESTRUCTIVE — the progressive moments
+    // are the source of truth. We PRESERVE ALL of them (not just user-edited):
+    // because they are `provenance:"cv"`/`"event"`, the balancer keeps every
+    // preserved moment (quota only drops `ai`/`ai-override`), so finalize can
+    // only LABEL them, MERGE obvious boundary duplicates, ADD a few gap-fills,
+    // and refresh chapter/preset metadata — never prune the timeline down to a
+    // fresh whole-video balance. Direct runs send no body (a parse failure →
+    // the normal flow), so all of this is gated on `isFinalize`.
+    const reqBody = (await req
+      .json()
+      .catch(() => null)) as { mode?: string; chunkCount?: number; progressiveCount?: number } | null;
+    const isFinalize = reqBody?.mode === "finalize";
+    const finalizeChunkCount =
+      typeof reqBody?.chunkCount === "number" ? reqBody.chunkCount : undefined;
+    const progressiveMoments =
+      (project.analysis as { detectedMoments?: DetectedMoment[] } | undefined)
+        ?.detectedMoments ?? [];
+    const dedup = isFinalize
+      ? dedupeBoundaryDuplicates(progressiveMoments)
+      : { kept: [] as DetectedMoment[], merged: [] as Array<{ id: string; reason: string }> };
+    const preservedMoments: DetectedMoment[] = isFinalize ? dedup.kept : [];
+
+    if (isFinalize) {
+      const perChunk =
+        finalizeChunkCount && finalizeChunkCount > 0
+          ? (progressiveMoments.length / finalizeChunkCount).toFixed(1)
+          : "n/a";
+      console.info("[finalize] before", {
+        projectId,
+        progressiveMoments: progressiveMoments.length,
+        chunkCount: finalizeChunkCount ?? "unknown",
+        momentsPerChunk: perChunk,
+        boundaryDuplicatesMerged: dedup.merged.length,
+      });
+    }
+
     if (!storagePath) {
       return NextResponse.json({ error: "Project has no video uploaded" }, { status: 400 });
     }
@@ -216,8 +314,10 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
         status: "preparing" as ProjectStatus,
         analysis: {
           status: "analyzing",
-          stage: "Preparing analysis",
-          detectedMoments: [],
+          stage: isFinalize ? "Finalizing timeline" : "Preparing analysis",
+          // Finalize keeps the progressively-streamed moments on screen while
+          // the AI pass runs; a direct run clears them for a fresh timeline.
+          ...(isFinalize ? {} : { detectedMoments: [] }),
           boringSections: [],
           recommendedPresetIds: [],
           activity: [],
@@ -501,9 +601,12 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       videoType: sections.videoType,
       visualAnalysis,
       eventMoments,
-      useCvCandidates: true,
+      // Finalize: the progressive moments ARE the CV result — don't regenerate
+      // CV candidates (that's what pruned 17 → 6–7). Direct runs still do.
+      useCvCandidates: !isFinalize,
       boringSections: sections.boringSections,
       interactions,
+      preserved: preservedMoments,
     });
 
     await ensureNotCancelled(ref);
@@ -619,7 +722,10 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     // same AI_MOMENT_QUOTA at the final balance. Skipped when real events exist
     // (the event path is authoritative) or the user lacks the feature.
     let aiVisualMoments: DetectedMoment[] = [];
-    if (eventMoments.length === 0 && allowVisualMoments && dur > 0) {
+    // Skipped in finalize: this IS the whole-video CV generator whose output the
+    // balancer pruned down to 6–7. The progressive chunk pass already produced
+    // the CV timeline, so finalize must not regenerate it.
+    if (!isFinalize && eventMoments.length === 0 && allowVisualMoments && dur > 0) {
       const visualBudget = Math.max(4, Math.min(12, Math.ceil(dur / 20)));
       await emitActivity(
         ref,
@@ -684,9 +790,11 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       videoType: sections.videoType,
       visualAnalysis,
       eventMoments,
-      useCvCandidates: true,
+      // Finalize keeps progressive moments as `preserved`; don't regenerate CV.
+      useCvCandidates: !isFinalize,
       boringSections: sections.boringSections,
       interactions,
+      preserved: preservedMoments,
     });
 
     await ensureNotCancelled(ref);
@@ -876,7 +984,87 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     // document. Optional fields like `whyEffectType` or `targetRegionSource`
     // are absent on legacy / CV / preserved moments — strip them out before
     // persisting so the write doesn't blow up.
-    const cleanMoments = stripUndefined(balanced.moments);
+    // ── Finalize safety guard ──────────────────────────────────────────────
+    // Progressive moments are the source of truth. With preserve-all +
+    // useCvCandidates:false they always survive, so `balanced.moments` is
+    // `progressive + a few gap-fills` and `removed` is normally empty. The guard
+    // is belt-and-braces: if the balance somehow dropped >20% of the progressive
+    // moments (and the drops aren't just duplicates), keep the progressive
+    // timeline (with labels applied) + the surviving additive gap-fills.
+    let finalMoments = balanced.moments;
+    if (isFinalize) {
+      const balancedIds = new Set(balanced.moments.map((m) => m.id));
+      const removed = preservedMoments.filter((m) => !balancedIds.has(m.id));
+      const onlyDuplicates =
+        removed.length > 0 &&
+        removed.every((r) =>
+          balanced.moments.some(
+            (b) => Math.abs(b.startTime - r.startTime) < 0.4 && regionClose(b, r)
+          )
+        );
+      const removedRatio =
+        preservedMoments.length > 0 ? removed.length / preservedMoments.length : 0;
+      const added = balanced.moments.filter(
+        (m) => !preservedMoments.some((p) => p.id === m.id)
+      );
+
+      if (removed.length > 0 && removedRatio > 0.2 && !onlyDuplicates) {
+        // Block the destructive write — rebuild from the preserved timeline.
+        finalMoments = [...applyLabels(preservedMoments, balanced.moments), ...added].sort(
+          (a, b) => a.startTime - b.startTime
+        );
+        await emitActivity(
+          ref,
+          "warn",
+          `Finalize protection — kept ${preservedMoments.length} progressive edits (balance tried to drop ${removed.length}).`
+        );
+      }
+
+      // Duration-preservation guard: a final moment must never collapse to a
+      // zero-width marker. Clamp any missing/zero/inverted endTime to
+      // startTime + a minimum length so the timeline renders a real clip.
+      const MIN_FINAL_LEN = 0.5;
+      let durationFixed = 0;
+      finalMoments = finalMoments.map((m) => {
+        const d = m.endTime - m.startTime;
+        if (!Number.isFinite(d) || d < MIN_FINAL_LEN) {
+          durationFixed++;
+          return { ...m, endTime: Number(m.startTime || 0) + MIN_FINAL_LEN };
+        }
+        return m;
+      });
+
+      console.info("[finalize] after", {
+        projectId,
+        finalMoments: finalMoments.length,
+        progressive: preservedMoments.length,
+        added: added.length,
+        removed: removed.length,
+        boundaryDuplicatesMerged: dedup.merged.length,
+        durationFixed,
+        removedReasons: [
+          ...dedup.merged,
+          ...removed.map((r) => ({
+            id: r.id,
+            reason: onlyDuplicates ? "duplicate (allowed)" : "balancer-dropped (blocked)",
+          })),
+        ],
+        // Per-moment timing diagnostics (req): start / end / duration.
+        moments: finalMoments.map((m) => ({
+          id: m.id,
+          startTime: Number(m.startTime.toFixed(2)),
+          endTime: Number(m.endTime.toFixed(2)),
+          duration: Number((m.endTime - m.startTime).toFixed(2)),
+        })),
+      });
+      await emitActivity(
+        ref,
+        "ok",
+        `Finalize: ${preservedMoments.length} progressive → ${finalMoments.length} edits (+${added.length} added, ${removed.length} removed, ${dedup.merged.length} dup-merged).`
+      );
+    }
+
+    const cleanMoments = stripUndefined(finalMoments);
     const cleanRawPool = stripUndefined(rawPool);
     const cleanRejectedPool = stripUndefined(balanced.rejectedPool);
 

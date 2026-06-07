@@ -7,10 +7,31 @@ import { X as XIcon } from "lucide-react";
 import { useEditorReal } from "./context";
 import { MomentInspector } from "./MomentInspector";
 
+function dialogDebugOn(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    return new URL(window.location.href).searchParams.get("debug") === "1";
+  } catch {
+    return false;
+  }
+}
+
 /**
- * Floating "moment editor" — wraps `MomentInspector` in a backdrop/portal so it
- * pops up on add (toolbar buttons) or edit (pill pencil icon) instead of taking
- * permanent space in the page flow.
+ * Moment-settings dialog — a COMPACT FLOATING panel (not a full-screen modal),
+ * centered on the page. It opens only when the user clicks Edit on a selected
+ * moment (or adds one), never on plain selection. Deliberately:
+ *
+ *   - NO backdrop  → the full-width video preview + the draggable crop box stay
+ *     fully visible and interactive while editing (crop framing needs the
+ *     video, which sits "behind" where a modal backdrop would be).
+ *   - NO body scroll lock → the page + horizontal timeline keep scrolling; this
+ *     also removes the earlier "page frozen after Edit" class of bug entirely.
+ *   - Esc / ✕ close. Outside-click is intentionally NOT a close trigger because
+ *     the crop box lives on the video (outside the dialog) and dragging it must
+ *     not dismiss the settings.
+ *
+ * `MomentInspector` (rendered inside) already shows the right controls per
+ * effect type — crop, speed, or the zoom/focus/click set.
  */
 export function MomentInspectorModal() {
   const {
@@ -27,8 +48,7 @@ export function MomentInspectorModal() {
   const visible = inspectorOpen && moment !== null;
 
   // Esc closes — capture phase so it wins over the timeline's Esc handler
-  // (which clears multi-select). The modal taking priority feels right when
-  // it's open.
+  // (which clears multi-select).
   React.useEffect(() => {
     if (!visible) return;
     const onKey = (e: KeyboardEvent) => {
@@ -42,58 +62,53 @@ export function MomentInspectorModal() {
     return () => window.removeEventListener("keydown", onKey, true);
   }, [visible, closeInspector]);
 
-  // Lock body scroll while open.
-  React.useEffect(() => {
-    if (!visible) return;
-    const prev = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
-    return () => {
-      document.body.style.overflow = prev;
-    };
-  }, [visible]);
-
   const [mounted, setMounted] = React.useState(false);
   React.useEffect(() => setMounted(true), []);
   if (!mounted) return null;
 
   return createPortal(
-    <AnimatePresence>
-      {visible && (
-        <motion.div
-          key="moment-inspector-overlay"
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          exit={{ opacity: 0 }}
-          transition={{ duration: 0.18 }}
-          className="fixed inset-0 z-[115] flex items-center justify-center bg-ink/80 px-4 py-6 backdrop-blur-xl"
-        >
+    <>
+      {dialogDebugOn() && (
+        <div className="pointer-events-none fixed bottom-2 left-2 z-[200] rounded bg-black/85 px-2 py-1 font-mono text-[10px] leading-tight text-lime-300">
+          settings-dialog: open={String(inspectorOpen)} · visible=
+          {String(visible)}
+        </div>
+      )}
+      <AnimatePresence>
+        {visible && (
           <motion.div
-            initial={{ opacity: 0, y: 16, scale: 0.97 }}
+            key="moment-settings-dialog"
+            role="dialog"
+            aria-label="Moment settings"
+            initial={{ opacity: 0, y: 8, scale: 0.97 }}
             animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, y: 16, scale: 0.97 }}
-            transition={{ duration: 0.26, ease: [0.22, 1, 0.36, 1] }}
-            className="relative flex max-h-[88vh] w-full max-w-md flex-col overflow-hidden shadow-cinematic"
+            exit={{ opacity: 0, y: 8, scale: 0.97 }}
+            transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
+            // Compact SOLID panel CENTERED on the page. No backdrop, so the
+            // video edges + timeline around it stay visible/usable and there's
+            // no dim or scroll-lock. `bg-panel` is opaque in both themes so
+            // nothing bleeds through; strong border + shadow read as a real
+            // floating inspector.
+            className="fixed left-1/2 top-1/2 z-[115] flex max-h-[80vh] w-[440px] max-w-[calc(100vw-1.5rem)] -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-2xl border border-white/[0.12] bg-panel shadow-cinematic"
           >
             <button
               type="button"
               onClick={closeInspector}
-              aria-label="Close moment editor"
+              aria-label="Close moment settings"
               title="Close (Esc)"
-              className="absolute right-3 top-3 z-20 inline-flex size-8 items-center justify-center rounded-full border border-white/15 bg-ink/90 text-fog backdrop-blur-md transition-colors duration-150 hover:border-white/30 hover:text-white"
+              className="absolute right-2.5 top-2.5 z-20 inline-flex size-7 items-center justify-center rounded-full border border-white/[0.12] bg-white/[0.06] text-fog transition-colors duration-150 hover:border-white/25 hover:text-white"
             >
               <XIcon size={14} />
             </button>
-            {/* Inner scrollable region — keeps the scrollbar inside the card
-                so backdrop clicks (and accidental scrollbar grabs) don't leak
-                to the overlay. The overlay itself no longer scrolls or
-                closes on outside clicks; only the X / Esc dismiss it. */}
-            <div className="min-h-0 flex-1 overflow-y-auto">
+            {/* Inner scroll region — caps height + scrolls overflow. The
+                panel above is the solid surface. */}
+            <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
               <MomentInspector />
             </div>
           </motion.div>
-        </motion.div>
-      )}
-    </AnimatePresence>,
+        )}
+      </AnimatePresence>
+    </>,
     document.body
   );
 }

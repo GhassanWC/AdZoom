@@ -8,6 +8,8 @@ import {
   NARRATIVE_LABEL,
   NARRATIVE_TEXT,
   TRACK_HEIGHTS,
+  MIN_PILL_PX,
+  MIN_RENDER_DURATION,
 } from "./constants";
 
 interface Segment {
@@ -41,12 +43,15 @@ export function NarrativeBand({
       className="relative flex w-full items-stretch gap-[3px]"
     >
       {segments.map((s, i) => {
-        const widthPct = ((s.endTime - s.startTime) / duration) * 100;
+        // Guard against a missing/zero/NaN range so a chapter never collapses.
+        const rawDur = s.endTime - s.startTime;
+        const dur = Number.isFinite(rawDur) && rawDur > 0 ? rawDur : 0;
+        const renderDur = dur > 0 ? dur : MIN_RENDER_DURATION;
+        const widthPct = duration > 0 ? (renderDur / duration) * 100 : 0;
         const active = currentTime >= s.startTime && currentTime <= s.endTime;
         const gradient = NARRATIVE_COLORS[s.role];
         const textTone = NARRATIVE_TEXT[s.role];
         const tag = NARRATIVE_LABEL[s.role];
-        const dur = s.endTime - s.startTime;
         const isWide = widthPct > 14;
         return (
           <button
@@ -54,7 +59,15 @@ export function NarrativeBand({
             type="button"
             onClick={() => onSeek(s.startTime + 0.01)}
             title={`${tag} · ${s.label} · ${dur.toFixed(1)}s`}
-            style={{ width: `${Math.max(2.4, widthPct)}%` }}
+            // flex-grow proportional to duration (flex-basis 0) so chapters
+            // always fill the band in proportion — never pack-left as narrow
+            // pills when segment widths don't sum to ~100%. The px floor keeps
+            // short chapters legible.
+            style={{
+              flexGrow: Math.max(0.01, widthPct),
+              flexBasis: 0,
+              minWidth: `${MIN_PILL_PX}px`,
+            }}
             className={cn(
               "group relative flex h-full min-w-0 items-stretch overflow-hidden rounded-[10px] border border-white/[0.06] bg-gradient-to-br text-left transition-all duration-200",
               gradient,

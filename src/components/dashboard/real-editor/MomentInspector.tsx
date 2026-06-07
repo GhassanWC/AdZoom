@@ -18,17 +18,27 @@ import {
   Copy,
 } from "lucide-react";
 import { useEditorReal } from "./context";
-import { useInteractions } from "./useInteractions";
 import { DirectionalPresetRow } from "./DirectionalPresetRow";
 import { Slider } from "@/components/ui/Slider";
 import { cn } from "@/lib/cn";
 import { seedKeyframes } from "@/lib/timeline/camera";
+import {
+  cropBoxFor,
+  outputDurationFor,
+  DEFAULT_CROP,
+  DEFAULT_SPEED,
+} from "@/lib/timeline/crop-speed";
 import type {
+  CropAspect,
+  CropPosition,
+  CropSettings,
   DetectedMoment,
   EaseKind,
   EffectType,
   MomentKeyframe,
   MomentProvenance,
+  SpeedAudioMode,
+  SpeedSettings,
 } from "@/lib/firebase/schema";
 
 /**
@@ -111,12 +121,27 @@ const EFFECTS: EffectSpec[] = [
   { id: "zoom", label: "Zoom", Icon: Zap, accent: "text-violet-300" },
   { id: "click-highlight", label: "Click", Icon: Target, accent: "text-fuchsia-300" },
   { id: "cursor-focus", label: "Focus", Icon: MousePointer2, accent: "text-indigo-300" },
+  { id: "crop", label: "Crop", Icon: Crop, accent: "text-teal-300" },
   { id: "speed-up", label: "Speed", Icon: FastForward, accent: "text-amber-300" },
 ];
 
 const EFFECT_BY_ID: Record<EffectType, EffectSpec> = Object.fromEntries(
   EFFECTS.map((e) => [e.id, e])
 ) as Record<EffectType, EffectSpec>;
+
+/** Switchable camera effects — the only ones offered in the compact tab row. */
+const CAMERA_EFFECTS = EFFECTS.filter(
+  (e) => e.id === "zoom" || e.id === "click-highlight" || e.id === "cursor-focus"
+);
+
+/** Full, readable header title per effect type (never truncated). */
+const EFFECT_FULL_NAME: Record<EffectType, string> = {
+  zoom: "Zoom",
+  "click-highlight": "Click",
+  "cursor-focus": "Focus",
+  crop: "Crop / Reframe",
+  "speed-up": "Speed",
+};
 
 /**
  * Which advanced sections matter for which effects. Anything not listed is
@@ -133,6 +158,7 @@ const ADVANCED_RELEVANCE: Record<
   "click-highlight": { keyframes: false, cursor: true },
   "cursor-focus": { keyframes: true, cursor: true },
   "speed-up": { keyframes: false, cursor: false },
+  crop: { keyframes: false, cursor: false },
 };
 
 export function MomentInspector() {
@@ -144,20 +170,18 @@ export function MomentInspector() {
     deleteMoment,
     duplicateMoment,
     currentTime,
+    duration,
     seek,
+    interactions,
+    interactionsLoading,
   } = useEditorReal();
 
   const moments = project.analysis?.detectedMoments ?? [];
+  const sourceAspect =
+    project.width && project.height ? project.width / project.height : 16 / 9;
+  const sourceDuration = duration || project.duration || 0;
   const moment =
     moments.find((m) => m.id === selectedMomentId) || activeMoment || null;
-
-  // Lazy-load the recording's interactions stream so the "Follow cursor"
-  // chip can compute a real path. Cheap when absent (external recording);
-  // a one-time GCS fetch the first time the inspector opens otherwise.
-  const interactionsState = useInteractions({
-    interactionsPath: project.interactionsPath,
-    scope: project.interactionScope,
-  });
 
   // Show all advanced sections — opt-in escape hatch so power users can
   // still reach Cursor controls on a Zoom moment without changing effect.
@@ -176,10 +200,36 @@ export function MomentInspector() {
   // click coords) and don't need a manual camera nudge.
   const showCameraPresets =
     moment.effectType === "zoom" || moment.effectType === "cursor-focus";
-  const duration = moment.endTime - moment.startTime;
+  const isCrop = moment.effectType === "crop";
+  const isSpeed = moment.effectType === "speed-up";
+  // Crop frames a box; speed only retimes — neither uses the zoom-intensity
+  // slider (they have their own controls below).
+  const showIntensity = !isCrop && !isSpeed;
+  const momentDuration = moment.endTime - moment.startTime;
+
+  // Switching effect type seeds the matching settings so the new controls have
+  // sensible defaults immediately (and the camera/timing behave at once).
+  const onEffectChange = (effectType: EffectType) => {
+    const patch: Partial<DetectedMoment> = { effectType };
+    if (effectType === "crop" && !moment.crop) {
+      patch.crop = { ...DEFAULT_CROP };
+      patch.focusRegion = cropBoxFor(
+        DEFAULT_CROP.aspectRatio,
+        DEFAULT_CROP.position,
+        DEFAULT_CROP.scale,
+        sourceAspect
+      );
+      patch.targetRegionSource = "user";
+    }
+    if (effectType === "speed-up" && !moment.speed) patch.speed = { ...DEFAULT_SPEED };
+    updateMoment(moment.id, patch);
+  };
 
   return (
-    <div className="glass overflow-hidden rounded-2xl">
+    // No own surface — the floating dialog provides the solid `bg-panel`
+    // background, border + shadow. Keeping this transparent avoids a
+    // translucent card-on-panel "washed out" look.
+    <div>
       {/* ── Compact header ─────────────────────────────────────────────── */}
       <Header
         moment={moment}
@@ -190,34 +240,56 @@ export function MomentInspector() {
       />
 
       {/* ── Body ───────────────────────────────────────────────────────── */}
-      <div className="space-y-5 px-5 pb-5 pt-4">
-        {/* Effect + intensity — primary editing controls live here. */}
+      <div className="space-y-4 px-4 pb-4 pt-3">
+        {/* Effect type switcher — only for the camera effects (zoom/focus/
+            click). Crop + Speed have their own tracks/tools, so the dialog
+            shows their settings directly instead of a 5-tab row that overflows. */}
         <section className="space-y-3">
-          <SegmentedEffect
-            value={moment.effectType}
-            onChange={(effectType) => updateMoment(moment.id, { effectType })}
-          />
+          {!isCrop && !isSpeed && (
+            <SegmentedEffect value={moment.effectType} onChange={onEffectChange} />
+          )}
           {showCameraPresets && (
             <DirectionalPresetRow
               moment={moment}
-              interactions={interactionsState.interactions}
-              interactionsLoading={interactionsState.loading}
+              interactions={interactions}
+              interactionsLoading={interactionsLoading}
               onUpdate={(patch) => updateMoment(moment.id, patch)}
             />
           )}
-          <Slider
-            label={`${effectSpec.label} intensity`}
-            value={Math.round((moment.intensity ?? 1) * 100)}
-            min={20}
-            max={150}
-            onChange={(v) => updateMoment(moment.id, { intensity: v / 100 })}
-          />
+          {showIntensity && (
+            <Slider
+              label={`${effectSpec.label} intensity`}
+              value={Math.round((moment.intensity ?? 1) * 100)}
+              min={20}
+              max={150}
+              onChange={(v) => updateMoment(moment.id, { intensity: v / 100 })}
+            />
+          )}
         </section>
+
+        {/* Crop / Reframe controls — only for crop moments. */}
+        {isCrop && (
+          <CropControls
+            moment={moment}
+            sourceAspect={sourceAspect}
+            onUpdate={(patch) => updateMoment(moment.id, patch)}
+          />
+        )}
+
+        {/* Speed controls — only for speed moments. */}
+        {isSpeed && (
+          <SpeedControls
+            moment={moment}
+            allMoments={moments}
+            sourceDuration={sourceDuration}
+            onUpdate={(patch) => updateMoment(moment.id, patch)}
+          />
+        )}
 
         {/* Timing — single row, no boxes, click-to-seek chips. */}
         <TimingRow
           moment={moment}
-          duration={duration}
+          duration={momentDuration}
           onStartChange={(v) => updateMoment(moment.id, { startTime: Math.max(0, v) })}
           onEndChange={(v) =>
             updateMoment(moment.id, {
@@ -323,7 +395,10 @@ function Header({
 }) {
   const prov = PROVENANCE_PRESENTATION[provenanceOf(moment)];
   return (
-    <div className="flex items-center gap-3 px-5 py-3.5">
+    // `pr-12` reserves space for the settings-dialog ✕ button (absolute,
+    // top-right). Bottom border separates the header from the body now that
+    // the dialog (not a glass card) owns the surface.
+    <div className="flex items-center gap-2.5 border-b border-white/[0.06] py-3 pl-4 pr-12">
       <span
         className={cn(
           "inline-flex size-8 shrink-0 items-center justify-center rounded-lg bg-white/[0.03] ring-1 ring-white/10",
@@ -333,12 +408,19 @@ function Header({
       >
         <effectSpec.Icon size={14} />
       </span>
-      <input
-        value={moment.label}
-        onChange={(e) => onTitleChange(e.target.value)}
-        placeholder="Untitled moment"
-        className="-mx-1.5 min-w-0 flex-1 truncate rounded-md px-1.5 py-0.5 font-display text-[15px] font-semibold leading-tight text-white outline-none transition-colors duration-150 placeholder:text-fog/60 focus:bg-white/[0.04]"
-      />
+      <div className="min-w-0 flex-1">
+        {/* Full effect-type title — short, always readable (no truncation). */}
+        <div className="truncate font-display text-[15px] font-semibold leading-tight text-white">
+          {EFFECT_FULL_NAME[moment.effectType]}
+        </div>
+        {/* Editable label as a quiet subtitle (rename without stealing the title). */}
+        <input
+          value={moment.label}
+          onChange={(e) => onTitleChange(e.target.value)}
+          placeholder="Add a label…"
+          className="-mx-1 mt-0.5 block w-full truncate rounded px-1 py-0.5 text-[11.5px] leading-tight text-fog outline-none transition-colors duration-150 placeholder:text-fog/50 focus:bg-white/[0.05] focus:text-white"
+        />
+      </div>
       <span
         title={prov.text}
         className="inline-flex shrink-0 items-center gap-1.5 text-[10.5px] text-fog"
@@ -459,7 +541,7 @@ function SegmentedEffect({
       aria-label="Effect type"
       className="inline-flex w-full items-center rounded-lg border border-white/[0.08] bg-white/[0.02] p-1"
     >
-      {EFFECTS.map((e) => {
+      {CAMERA_EFFECTS.map((e) => {
         const active = value === e.id;
         return (
           <button
@@ -659,6 +741,299 @@ function AiReasoningSection({ moment }: { moment: DetectedMoment }) {
 
 // ─── Empty state ─────────────────────────────────────────────────────────
 
+// ─── Generic segmented control (crop/speed option rows) ───────────────────
+
+function Segmented<T extends string>({
+  label,
+  value,
+  options,
+  onChange,
+  disabled,
+}: {
+  label: string;
+  value: T;
+  options: { id: T; label: string }[];
+  onChange: (v: T) => void;
+  disabled?: boolean;
+}) {
+  return (
+    <div className="space-y-1.5">
+      <span className="text-[10px] font-medium uppercase tracking-[0.12em] text-fog">
+        {label}
+      </span>
+      <div
+        role="radiogroup"
+        aria-label={label}
+        className={cn(
+          "flex w-full flex-wrap items-center gap-1 rounded-lg border border-white/[0.08] bg-white/[0.02] p-1",
+          disabled && "pointer-events-none opacity-45"
+        )}
+      >
+        {options.map((o) => {
+          const active = value === o.id;
+          return (
+            <button
+              key={o.id}
+              type="button"
+              role="radio"
+              aria-checked={active}
+              disabled={disabled}
+              onClick={() => onChange(o.id)}
+              className={cn(
+                "inline-flex flex-1 items-center justify-center whitespace-nowrap rounded-md px-2 py-1.5 text-[11.5px] font-medium transition-colors duration-150",
+                active
+                  ? "bg-white/[0.07] text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]"
+                  : "text-fog hover:text-white"
+              )}
+            >
+              {o.label}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function fmtClock(s: number): string {
+  if (!Number.isFinite(s) || s < 0) return "0:00";
+  const m = Math.floor(s / 60);
+  const r = Math.floor(s % 60);
+  return `${m}:${String(r).padStart(2, "0")}`;
+}
+
+// ─── Crop / Reframe controls ───────────────────────────────────────────────
+
+const CROP_ASPECTS: { id: CropAspect; label: string }[] = [
+  { id: "original", label: "Original" },
+  { id: "16:9", label: "16:9" },
+  { id: "9:16", label: "9:16" },
+  { id: "1:1", label: "1:1" },
+  { id: "4:5", label: "4:5" },
+  { id: "custom", label: "Custom" },
+];
+const CROP_POSITIONS: { id: CropPosition; label: string }[] = [
+  { id: "center", label: "Center" },
+  { id: "left", label: "Left" },
+  { id: "right", label: "Right" },
+  { id: "top", label: "Top" },
+  { id: "bottom", label: "Bottom" },
+];
+const CROP_EASINGS: { id: CropSettings["easing"]; label: string }[] = [
+  { id: "instant", label: "Instant" },
+  { id: "ease-in-out", label: "Smooth" },
+  { id: "ease-in", label: "Ease in" },
+  { id: "ease-out", label: "Ease out" },
+];
+
+function CropControls({
+  moment,
+  sourceAspect,
+  onUpdate,
+}: {
+  moment: DetectedMoment;
+  sourceAspect: number;
+  onUpdate: (patch: Partial<DetectedMoment>) => void;
+}) {
+  const crop = moment.crop ?? DEFAULT_CROP;
+  // Apply a settings patch; when `recompute` and the box is preset-driven,
+  // reshape `focusRegion` from the (aspect, position, scale).
+  const apply = (patch: Partial<CropSettings>, recompute: boolean) => {
+    const next = { ...crop, ...patch };
+    const out: Partial<DetectedMoment> = { crop: next };
+    if (recompute && next.position !== "custom" && next.aspectRatio !== "custom") {
+      out.focusRegion = cropBoxFor(
+        next.aspectRatio,
+        next.position,
+        next.scale,
+        sourceAspect
+      );
+      out.targetRegionSource = "user";
+    }
+    onUpdate(out);
+  };
+  return (
+    <section className="space-y-3 rounded-xl border border-teal-400/15 bg-teal-500/[0.04] p-3">
+      <div className="flex items-center justify-between">
+        <span className="text-[11px] font-semibold uppercase tracking-[0.14em] text-teal-200">
+          Crop / Reframe
+        </span>
+        <button
+          type="button"
+          onClick={() => apply({ ...DEFAULT_CROP }, true)}
+          className="text-[11px] font-medium text-fog transition-colors hover:text-white"
+        >
+          Reset crop
+        </button>
+      </div>
+      <Segmented
+        label="Aspect ratio"
+        value={crop.aspectRatio}
+        options={CROP_ASPECTS}
+        onChange={(v) =>
+          apply(
+            {
+              aspectRatio: v,
+              ...(v !== "custom" && crop.position === "custom"
+                ? { position: "center" as CropPosition }
+                : {}),
+            },
+            true
+          )
+        }
+      />
+      <Slider
+        label="Scale / zoom"
+        value={Math.round((crop.scale ?? 1) * 100)}
+        min={100}
+        max={400}
+        onChange={(v) => apply({ scale: v / 100 }, true)}
+      />
+      <Segmented
+        label="Position"
+        value={crop.position}
+        options={CROP_POSITIONS}
+        onChange={(v) => apply({ position: v }, true)}
+      />
+      <Segmented
+        label="Easing"
+        value={crop.easing}
+        options={CROP_EASINGS}
+        onChange={(v) => apply({ easing: v }, false)}
+      />
+      <div className="space-y-1.5">
+        <span className="text-[10px] font-medium uppercase tracking-[0.12em] text-fog">
+          Crop box
+        </span>
+        <FocusRegionEditor
+          moment={moment}
+          onChange={(fr) =>
+            onUpdate({
+              focusRegion: fr,
+              targetRegionSource: "user",
+              crop: { ...crop, position: "custom" },
+            })
+          }
+        />
+      </div>
+      <p className="text-[10.5px] leading-relaxed text-fog/70">
+        Applied during preview &amp; export — your source video is never
+        modified. AI crop/reframe suggestions coming soon.
+      </p>
+    </section>
+  );
+}
+
+// ─── Speed controls ────────────────────────────────────────────────────────
+
+const SPEED_MULTS = [1.25, 1.5, 2, 3, 4];
+const SPEED_AUDIO: { id: SpeedAudioMode; label: string }[] = [
+  { id: "mute", label: "Mute" },
+  { id: "keep", label: "Keep" },
+  { id: "pitch-correct", label: "Pitch fix" },
+];
+
+function SpeedControls({
+  moment,
+  allMoments,
+  sourceDuration,
+  onUpdate,
+}: {
+  moment: DetectedMoment;
+  allMoments: DetectedMoment[];
+  sourceDuration: number;
+  onUpdate: (patch: Partial<DetectedMoment>) => void;
+}) {
+  const speed = moment.speed ?? DEFAULT_SPEED;
+  const set = (patch: Partial<SpeedSettings>) =>
+    onUpdate({ speed: { ...speed, ...patch } });
+  const secDur = Math.max(0, moment.endTime - moment.startTime);
+  const secOut = secDur / Math.max(1, speed.multiplier);
+  const projOut = outputDurationFor(allMoments, sourceDuration);
+  return (
+    <section className="space-y-3 rounded-xl border border-amber-400/15 bg-amber-500/[0.04] p-3">
+      <div className="flex items-center justify-between">
+        <span className="text-[11px] font-semibold uppercase tracking-[0.14em] text-amber-200">
+          Speed
+        </span>
+        <button
+          type="button"
+          onClick={() => set({ ...DEFAULT_SPEED })}
+          className="text-[11px] font-medium text-fog transition-colors hover:text-white"
+        >
+          Reset speed
+        </button>
+      </div>
+      <div className="space-y-1.5">
+        <span className="text-[10px] font-medium uppercase tracking-[0.12em] text-fog">
+          Speed multiplier
+        </span>
+        <div className="flex w-full items-center gap-1 rounded-lg border border-white/[0.08] bg-white/[0.02] p-1">
+          {SPEED_MULTS.map((mlt) => {
+            const active = Math.abs(speed.multiplier - mlt) < 0.001;
+            return (
+              <button
+                key={mlt}
+                type="button"
+                onClick={() => set({ multiplier: mlt })}
+                className={cn(
+                  "inline-flex flex-1 items-center justify-center rounded-md px-2 py-1.5 text-[11.5px] font-semibold tabular-nums transition-colors duration-150",
+                  active
+                    ? "bg-white/[0.07] text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]"
+                    : "text-fog hover:text-white"
+                )}
+              >
+                {mlt}×
+              </button>
+            );
+          })}
+        </div>
+      </div>
+      <Slider
+        label="Custom multiplier"
+        value={Math.round(speed.multiplier * 100)}
+        min={110}
+        max={800}
+        onChange={(v) => set({ multiplier: Math.round(v) / 100 })}
+      />
+      <div className="space-y-1 rounded-lg bg-black/20 p-2.5">
+        <div className="flex items-center justify-between text-[11.5px]">
+          <span className="text-fog">This section</span>
+          <span className="font-mono tabular-nums text-white">
+            {secDur.toFixed(1)}s → {secOut.toFixed(1)}s
+          </span>
+        </div>
+        <div className="flex items-center justify-between text-[11.5px]">
+          <span className="text-fog">Project output</span>
+          <span className="font-mono tabular-nums text-white">
+            {fmtClock(projOut)}
+          </span>
+        </div>
+      </div>
+      <Segmented
+        label="Audio handling"
+        value={speed.audioMode}
+        options={SPEED_AUDIO}
+        onChange={(v) => set({ audioMode: v })}
+      />
+      <Segmented
+        label="Transition"
+        value={speed.transition}
+        options={[
+          { id: "cut", label: "Hard cut" },
+          { id: "ramp", label: "Smooth ramp (soon)" },
+        ]}
+        onChange={(v) => set({ transition: v })}
+        disabled
+      />
+      <p className="text-[10.5px] leading-relaxed text-fog/70">
+        Speed changes preview playback and the exported video duration. AI
+        speed suggestions coming soon.
+      </p>
+    </section>
+  );
+}
+
 function EmptyInspector({
   hasMoments,
   status,
@@ -676,7 +1051,7 @@ function EmptyInspector({
       </h3>
       {hasMoments ? (
         <p className="mt-1 text-[12.5px] leading-relaxed text-fog">
-          Select a moment to edit its effect, timing, and reasoning.
+          Select a timeline edit to adjust crop, speed, zoom, or focus.
         </p>
       ) : status !== "analyzed" && status !== "completed" ? (
         <p className="mt-1 text-[12.5px] leading-relaxed text-fog">

@@ -2,12 +2,14 @@ import * as React from "react";
 import Link from "next/link";
 import { cn } from "@/lib/cn";
 
-type Variant = "primary" | "ghost" | "glass" | "subtle";
+type Variant = "primary" | "ghost" | "glass" | "subtle" | "danger";
 type Size = "sm" | "md" | "lg";
 
 const variantStyles: Record<Variant, string> = {
   primary:
     "bg-violet-500 text-white shadow-[0_8px_24px_-8px_rgba(139,92,246,0.6)] hover:bg-violet-500/90 active:scale-[0.98] focus-visible:ring-2 focus-visible:ring-violet-500/60",
+  danger:
+    "bg-rose-500 text-white shadow-[0_8px_24px_-8px_rgba(244,63,94,0.6)] hover:bg-rose-500/90 active:scale-[0.98] focus-visible:ring-2 focus-visible:ring-rose-500/60",
   ghost:
     "border border-white/10 bg-white/[0.02] text-white/90 hover:border-white/20 hover:bg-white/[0.04] focus-visible:ring-2 focus-visible:ring-white/30",
   glass:
