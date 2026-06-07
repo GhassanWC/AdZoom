@@ -37,9 +37,23 @@ export function chunkCountFor(duration: number): number {
   return Math.max(1, Math.ceil(duration / CHUNK_SIZE_S));
 }
 
-/** Should this duration use the progressive chunked path? */
+/**
+ * Single source of truth for the analysis-path decision: any video longer than
+ * the cutoff uses the progressive chunked path, regardless of how old the
+ * project is. Callers MUST pass a RELIABLE duration (resolved from the video
+ * element when the stored `project.duration` is missing/0) — a 0/NaN duration
+ * routes to the direct flow.
+ */
+export function shouldUseChunkedAnalysis(durationSeconds: number): boolean {
+  return (
+    Number.isFinite(durationSeconds) &&
+    durationSeconds > CHUNKED_ANALYSIS_THRESHOLD_S
+  );
+}
+
+/** @deprecated use {@link shouldUseChunkedAnalysis} */
 export function shouldChunk(duration: number): boolean {
-  return Number.isFinite(duration) && duration > CHUNKED_ANALYSIS_THRESHOLD_S;
+  return shouldUseChunkedAnalysis(duration);
 }
 
 /** Build the ordered absolute-time chunk windows for a duration. */

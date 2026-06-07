@@ -29,6 +29,8 @@ import {
   CHUNK_SIZE_S,
   chunkWindows,
 } from "./chunk-config";
+import { cropSectionsForChunk } from "./crop-engine";
+import { speedSectionsForChunk } from "./speed-engine";
 import {
   createAnalysisJob,
   createChunks,
@@ -277,7 +279,21 @@ export async function runChunkedAnalysis(args: ChunkedRunArgs): Promise<void> {
           },
         });
 
-        const moments = deterministicChunkMoments(w, va, interactions, project);
+        // Three engines per chunk: zoom/focus (existing) + crop + speed. Crop
+        // and speed are DetectedMoments (effectType "crop"/"speed-up") that
+        // ride the same append + track-routing + export path. Speed runs last
+        // so it can carve protective buffers around the zoom moments.
+        const zoom = deterministicChunkMoments(w, va, interactions, project);
+        const primaryEnd = Math.min(duration, w.startTime + CHUNK_SIZE_S);
+        const cropRes = cropSectionsForChunk(va, w, project, primaryEnd);
+        const speedRes = speedSectionsForChunk(va, w, project, zoom, primaryEnd);
+        const moments = [...zoom, ...cropRes.sections, ...speedRes.sections];
+        if (process.env.NODE_ENV !== "production") {
+          console.info(
+            `[chunk ${w.index}] zoom ${zoom.length}, crop ${cropRes.sections.length}, speed ${speedRes.sections.length}`,
+            { crop: cropRes.diag, speed: speedRes.diag }
+          );
+        }
 
         // Persist chunk result + append to the live timeline (both serialized).
         await Promise.all([

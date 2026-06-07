@@ -138,6 +138,18 @@ export function MomentPill({
       : m.effectType === "crop"
         ? cropAspectLabel(m.crop?.aspectRatio)
         : null;
+  // Source chip for crop/speed: who generated it — you, AI (Gemini), or the
+  // deterministic engine.
+  const provBadge =
+    m.effectType === "crop" || m.effectType === "speed-up"
+      ? isUser
+        ? "You"
+        : prov === "ai"
+          ? m.effectType === "crop"
+            ? "AI Reframe"
+            : "AI pacing"
+          : "Engine"
+      : null;
   const confidence = m.confidenceScore ?? attention;
   const reasoning = shortReasoning(m);
   const ctxLabel = m.uiContext ? CONTEXT_LABEL[m.uiContext] : undefined;
@@ -278,6 +290,11 @@ export function MomentPill({
             {badge && (
               <span className="ml-0.5 shrink-0 rounded bg-black/40 px-1 py-[1px] text-[9.5px] font-bold tabular-nums leading-none ring-1 ring-white/25">
                 {badge}
+              </span>
+            )}
+            {tier !== "icon" && provBadge && (
+              <span className="shrink-0 rounded bg-white/10 px-1 py-[1px] text-[9px] font-semibold uppercase tracking-wide leading-none text-white/80 ring-1 ring-white/15">
+                {provBadge}
               </span>
             )}
             {tier !== "icon" && hasKeyframes && (

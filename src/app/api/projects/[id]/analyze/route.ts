@@ -197,6 +197,126 @@ function applyLabels(
   });
 }
 
+// ── Crop / Speed finalize — non-destructive merge (never drops standalone) ──
+
+/** Generic adjacent-merge over a time-sorted list. */
+function mergeRun(
+  sorted: DetectedMoment[],
+  canMerge: (prev: DetectedMoment, cur: DetectedMoment) => boolean,
+  combine: (prev: DetectedMoment, cur: DetectedMoment) => DetectedMoment
+): DetectedMoment[] {
+  const out: DetectedMoment[] = [];
+  for (const cur of sorted) {
+    const prev = out[out.length - 1];
+    if (prev && canMerge(prev, cur)) out[out.length - 1] = combine(prev, cur);
+    else out.push(cur);
+  }
+  return out;
+}
+
+/** Drop AI sections that overlap a user section of the same type (user wins). */
+function dropAiOverlappingUser(
+  sections: DetectedMoment[],
+  merged: Array<{ id: string; reason: string }>
+): DetectedMoment[] {
+  const users = sections.filter((s) => s.source === "user");
+  if (!users.length) return sections;
+  return sections.filter((s) => {
+    if (s.source === "user") return true;
+    const overlaps = users.some(
+      (u) => !(s.endTime <= u.startTime || s.startTime >= u.endTime)
+    );
+    if (overlaps) {
+      merged.push({ id: s.id, reason: "user-section-wins" });
+      return false;
+    }
+    return true;
+  });
+}
+
+/**
+ * Finalize crop + speed sections WITHOUT dropping data: merge adjacent same-type
+ * AI sections (a boring run / stable region split across chunk boundaries) and
+ * let user sections always win. Camera moments are returned untouched.
+ */
+function mergeCropSpeedSections(moments: DetectedMoment[]): {
+  moments: DetectedMoment[];
+  merged: Array<{ id: string; reason: string }>;
+  cropBefore: number;
+  cropAfter: number;
+  speedBefore: number;
+  speedAfter: number;
+} {
+  const GAP = 1.0; // seconds — sections within this gap (or overlapping) merge.
+  const merged: Array<{ id: string; reason: string }> = [];
+  const camera = moments.filter(
+    (m) => m.effectType !== "crop" && m.effectType !== "speed-up"
+  );
+  const crops = dropAiOverlappingUser(
+    moments.filter((m) => m.effectType === "crop"),
+    merged
+  ).sort((a, b) => a.startTime - b.startTime);
+  const speeds = dropAiOverlappingUser(
+    moments.filter((m) => m.effectType === "speed-up"),
+    merged
+  ).sort((a, b) => a.startTime - b.startTime);
+
+  const mergedCrops = mergeRun(
+    crops,
+    (prev, cur) =>
+      prev.source !== "user" &&
+      cur.source !== "user" &&
+      prev.crop?.aspectRatio === cur.crop?.aspectRatio &&
+      cur.startTime - prev.endTime <= GAP &&
+      regionClose(prev, cur),
+    (prev, cur) => {
+      const keepCur = (cur.confidenceScore ?? 0) > (prev.confidenceScore ?? 0);
+      merged.push({ id: keepCur ? prev.id : cur.id, reason: "merged-adjacent-crop" });
+      return {
+        ...(keepCur ? cur : prev),
+        startTime: Math.min(prev.startTime, cur.startTime),
+        endTime: Math.max(prev.endTime, cur.endTime),
+      };
+    }
+  );
+
+  const mergedSpeeds = mergeRun(
+    speeds,
+    (prev, cur) =>
+      prev.source !== "user" &&
+      cur.source !== "user" &&
+      cur.startTime - prev.endTime <= GAP,
+    (prev, cur) => {
+      const mult = Math.max(
+        prev.speed?.multiplier ?? 1,
+        cur.speed?.multiplier ?? 1
+      );
+      const audioMode =
+        prev.speed?.audioMode === "mute" || cur.speed?.audioMode === "mute"
+          ? "mute"
+          : prev.speed?.audioMode ?? "keep";
+      merged.push({ id: cur.id, reason: "merged-adjacent-speed" });
+      return {
+        ...prev,
+        endTime: Math.max(prev.endTime, cur.endTime),
+        label: `Speed ${mult}×`,
+        speed: { multiplier: mult, audioMode, transition: prev.speed?.transition ?? "cut" },
+      };
+    }
+  );
+
+  return {
+    moments: [...camera, ...mergedCrops, ...mergedSpeeds].sort(
+      (a, b) => a.startTime - b.startTime
+    ),
+    merged,
+    cropBefore: crops.length,
+    cropAfter: mergedCrops.length,
+    speedBefore: speeds.length,
+    speedAfter: mergedSpeeds.length,
+  };
+}
+
 export async function POST(req: NextRequest, { params }: RouteContext) {
   const { id: projectId } = await params;
   let ref: DocumentReference | null = null;
@@ -1034,6 +1154,16 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
         return m;
       });
 
+      // Non-destructive crop/speed finalize: merge adjacent same-type AI
+      // sections (cross-chunk runs) + let user sections win. Never drops a
+      // standalone section, so this can't trip the zoom guard above.
+      const cropSpeedBefore = {
+        crop: finalMoments.filter((m) => m.effectType === "crop").length,
+        speed: finalMoments.filter((m) => m.effectType === "speed-up").length,
+      };
+      const cs = mergeCropSpeedSections(finalMoments);
+      finalMoments = cs.moments;
+
       console.info("[finalize] after", {
         projectId,
         finalMoments: finalMoments.length,
@@ -1042,8 +1172,13 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
         removed: removed.length,
         boundaryDuplicatesMerged: dedup.merged.length,
         durationFixed,
+        // Crop/Speed engine finalize diagnostics (req).
+        cropSections: { before: cropSpeedBefore.crop, after: cs.cropAfter },
+        speedSections: { before: cropSpeedBefore.speed, after: cs.speedAfter },
+        cropSpeedMerged: cs.merged,
         removedReasons: [
           ...dedup.merged,
+          ...cs.merged,
           ...removed.map((r) => ({
             id: r.id,
             reason: onlyDuplicates ? "duplicate (allowed)" : "balancer-dropped (blocked)",

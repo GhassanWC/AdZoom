@@ -29,7 +29,6 @@ import {
   CvTaintedError,
 } from "@/lib/cv/pipeline";
 import { runChunkedAnalysis } from "@/lib/analysis/chunk-orchestrator";
-import { shouldChunk } from "@/lib/analysis/chunk-config";
 import { getActiveJobForProject } from "@/lib/firebase/analysis-jobs";
 import {
   enqueueProjectWrite,
@@ -156,6 +155,69 @@ const DEFAULT_EFFECT_LABEL: Record<EffectType, string> = {
   "speed-up": "Speed",
   crop: "Crop / Reframe",
 };
+
+function isGoodDuration(d: number | undefined | null): d is number {
+  return typeof d === "number" && Number.isFinite(d) && d > 0;
+}
+
+/**
+ * Resolve a RELIABLE video duration for the analysis-path decision. The stored
+ * `project.duration` can be missing or `0` on old projects (and `??` won't fall
+ * through a `0`), and `video.duration` is `NaN` until metadata loads — both
+ * cases previously mis-routed long videos to the direct path. Prefer the loaded
+ * element, then the stored value, and as a last resort wait for `loadedmetadata`
+ * before giving up. Returns `0` only when nothing yields a real duration.
+ */
+async function resolveReliableDuration(
+  video: HTMLVideoElement | null,
+  project: ProjectDoc
+): Promise<number> {
+  if (video && isGoodDuration(video.duration)) return video.duration;
+  if (isGoodDuration(project.duration)) return project.duration;
+  if (video && video.readyState < 1 /* HAVE_METADATA */) {
+    await new Promise<void>((resolve) => {
+      const done = () => {
+        video.removeEventListener("loadedmetadata", done);
+        resolve();
+      };
+      video.addEventListener("loadedmetadata", done);
+      window.setTimeout(done, 4000);
+    });
+    if (isGoodDuration(video.duration)) return video.duration;
+  }
+  return 0;
+}
+
+type AnalysisMode = "chunked" | "direct";
+
+/** Explicit debug fallback to the legacy direct flow. */
+function debugForceDirect(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    if (new URL(window.location.href).searchParams.get("debug") === "direct")
+      return true;
+    return window.localStorage.getItem("framevo:forceDirect") === "1";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Single source of truth for the analysis architecture. Chunked progressive
+ * analysis is the DEFAULT for every video (short or long, new or old) — it runs
+ * the CV/zoom/crop/speed engines on-device per 30s window, streams results
+ * immediately, and finalizes with Gemini in the background. The legacy direct
+ * (whole-video → Gemini) flow is reserved for an explicit debug fallback; the
+ * other emergency fallback (chunked failed at runtime / no resolvable duration)
+ * is decided in `startAnalyze`, not here. Duration is NOT a routing factor.
+ */
+function selectAnalysisMode(
+  _project: ProjectDoc,
+  _video: HTMLVideoElement | null
+): { mode: AnalysisMode; reason: string } {
+  if (debugForceDirect()) return { mode: "direct", reason: "debug-fallback" };
+  return { mode: "chunked", reason: "default" };
+}
 
 export function EditorRealProvider({
   uid,
@@ -649,24 +711,65 @@ export function EditorRealProvider({
     cvAbortRef.current = abort;
 
     try {
-      // ── Progressive chunked path for long videos ───────────────────────
-      // Above the threshold, hand off to the chunk orchestrator: CV runs per
-      // 30s window and its deterministic moments stream onto the timeline as
-      // each chunk finishes, with one whole-video AI pass at the end. A canvas
-      // taint (cross-origin, no CORS) can't be read on-device, so we fall
-      // through to the existing server-side direct path in that case.
-      const chunkDuration = project.duration ?? videoRef.current?.duration ?? 0;
-      if (shouldChunk(chunkDuration)) {
+      // ── Centralized analysis-mode decision ─────────────────────────────
+      // Chunked progressive analysis is the DEFAULT for every video — short or
+      // long, new or old. Resolve a RELIABLE duration (chunking needs one);
+      // direct is reached only on an explicit debug fallback, when no duration
+      // is resolvable, or when chunked fails on-device at runtime (below).
+      const resolvedDuration = await resolveReliableDuration(
+        videoRef.current,
+        project
+      );
+      const decision = selectAnalysisMode(project, videoRef.current);
+      const wantChunked = decision.mode === "chunked" && resolvedDuration > 0;
+      const selectedMode: AnalysisMode = wantChunked ? "chunked" : "direct";
+      console.info("[analysis-mode]", {
+        projectId: project.id,
+        duration: resolvedDuration,
+        selectedMode,
+        reason:
+          decision.mode === "direct"
+            ? decision.reason
+            : resolvedDuration > 0
+              ? "default"
+              : "unknown-duration",
+      });
+
+      // ── Progressive chunked path — the normal path for ALL videos ──────
+      // CV/zoom/crop/speed engines run per 30s window (a short video is one
+      // chunk), streaming onto the timeline as each chunk finishes, with the
+      // Gemini finalize in the background. If chunked can't run on-device
+      // (canvas taint, no readable frames, engine unsupported), we fall back to
+      // the legacy direct flow below.
+      if (wantChunked) {
         // Single-flight: ignore a re-trigger while a chunked run is in flight.
         if (chunkRunningRef.current) return;
         chunkRunningRef.current = true;
         // Chunked runs in the background by default so the user can edit the
         // sections that have already streamed in while later chunks process.
         setProcessingMinimized(true);
+        // One write that both (a) migrates a missing/0 duration on old projects
+        // so future loads route correctly, and (b) flips the overlay to
+        // "Analyzing in chunks" immediately so the old "Uploading to Gemini"
+        // stages never flash.
+        await setDoc(
+          projectRef,
+          {
+            ...(isGoodDuration(project.duration)
+              ? {}
+              : { duration: resolvedDuration }),
+            status: "analyzing",
+            analysis: { status: "analyzing", stage: "Analyzing in chunks" },
+            updatedAt: serverTimestamp(),
+          },
+          { merge: true }
+        );
         try {
           await runChunkedAnalysis({
             uid,
-            project,
+            // Feed the resolved duration so the orchestrator never throws
+            // "Unknown duration" on an old project with a missing field.
+            project: { ...project, duration: resolvedDuration },
             interactions,
             idTokenGetter,
             signal: abort.signal,
@@ -674,8 +777,31 @@ export function EditorRealProvider({
           });
           return;
         } catch (chunkErr) {
-          if (!(chunkErr instanceof CvTaintedError)) throw chunkErr;
-          // taint → fall through to the direct whole-video flow below
+          // User cancelled mid-run — not a failure, don't fall back.
+          if (abort.signal.aborted) return;
+          // EMERGENCY FALLBACK: chunked failed on-device (canvas taint, no
+          // readable frames, engine unsupported, …). Drop to the legacy direct
+          // flow below so the user still gets a result. Logged loudly + noted
+          // in the activity feed so this exceptional path is visible.
+          console.warn(
+            "[analysis-mode] chunked failed → direct fallback",
+            chunkErr
+          );
+          await setDoc(
+            projectRef,
+            {
+              analysis: {
+                activity: arrayUnion({
+                  ts: Date.now(),
+                  kind: "warn",
+                  text: "Chunked analysis unavailable — using server fallback.",
+                }),
+              },
+              updatedAt: serverTimestamp(),
+            },
+            { merge: true }
+          ).catch(() => {});
+          // fall through to the direct whole-video flow below
         } finally {
           chunkRunningRef.current = false;
         }
@@ -686,7 +812,7 @@ export function EditorRealProvider({
       // persisted top-level so the route's `analysis` reset can't clobber it,
       // then the route reads it back and fuses it in the balancer.
       const video = videoRef.current;
-      const cvDuration = project.duration ?? video?.duration ?? 0;
+      const cvDuration = resolvedDuration;
       if (video && cvDuration > 0) {
         try {
           await setDoc(
