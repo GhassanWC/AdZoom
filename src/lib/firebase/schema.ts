@@ -846,6 +846,44 @@ export type ExportFormat =
   | "YouTube 16:9"
   | "Custom";
 
+// ── Global output canvas (Canvas Fit / Resize) ───────────────────────────────
+// Decides how the WHOLE source video sits inside the chosen export aspect
+// ratio. This is the OUTER layer: the canvas layout is applied first, then the
+// per-moment camera (AI zoom / crop / speed) composes inside it. Distinct from
+// the per-moment `CropSettings` (a timeline effect). See `canvas-layout.ts` for
+// the placement math and `resolveOutputCanvas` for back-compat resolution.
+
+/** Output aspect ratio. "custom" uses the explicit width/height. */
+export type AspectRatioId = "16:9" | "9:16" | "1:1" | "4:5" | "custom";
+
+/**
+ * How the source fills the output canvas:
+ *  - "fit"       → contain the whole video (letterbox; background fills the gap)
+ *  - "fill"      → cover the canvas (crop the overflowing edges) — today's default
+ *  - "smart-fit" → cover + auto-pan to keep the important content in frame
+ *  - "manual"    → user-positioned (drag) + scaled video over the background
+ */
+export type FitMode = "fit" | "fill" | "smart-fit" | "manual";
+
+/** Background shown behind the video when "fit"/"manual" leaves empty space. */
+export type BackgroundMode = "blur" | "solid" | "dark" | "light";
+
+export interface OutputCanvas {
+  aspectRatio: AspectRatioId;
+  /** Output pixel size — derived for presets, user-set for "custom". */
+  width: number;
+  height: number;
+  fitMode: FitMode;
+  /** MANUAL only — extra layout zoom on top of the fit (1 = base fit). */
+  scale: number;
+  /** MANUAL only — drag offset, CANVAS-NORMALIZED (0 = centred, ±1 = clamp). */
+  offsetX: number;
+  offsetY: number;
+  backgroundMode: BackgroundMode;
+  /** Only meaningful when `backgroundMode === "solid"`. */
+  backgroundColor?: string;
+}
+
 export interface EffectsSettings {
   autoZoom: number;
   cursorSize: number;
@@ -865,6 +903,15 @@ export interface EffectsSettings {
    * the consumer treats that as off).
    */
   vignette?: boolean;
+  /**
+   * Global output-canvas layout (Canvas Fit / Resize). Optional + absent on
+   * older docs — `resolveOutputCanvas` in `canvas-layout.ts` is the single
+   * source of truth that maps absent/legacy (`verticalExport`,
+   * `defaultExportFormat`) state onto a concrete canvas (or `null` for the
+   * full-frame "Source" path). Not added to DEFAULT_EFFECTS_SETTINGS for the
+   * same reason: the resolver owns the default so there's one code path.
+   */
+  outputCanvas?: OutputCanvas;
   // ── preset-driven ──
   pacing: Pacing;
   targetPlatform: TargetPlatform;

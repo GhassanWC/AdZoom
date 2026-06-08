@@ -15,14 +15,34 @@ import {
 } from "@/lib/timeline/camera";
 import { coverFitDims } from "@/lib/timeline/cover";
 import { resolveOutputDims } from "@/lib/timeline/output-dims";
+import {
+  resolveOutputCanvas,
+  resolveCanvasDims,
+  resolveCanvasPlacement,
+  computeSmartFitOffset,
+  buildSmartSignals,
+  type CanvasPlacement,
+  type SmartFitResult,
+} from "@/lib/timeline/canvas-layout";
 import { activeSpeedAt, outputDurationFor } from "@/lib/timeline/crop-speed";
 import { probeVideoBottomBand } from "@/lib/recording/health-check";
 import { drawClickHighlight } from "@/lib/timeline/click-highlight";
 import type {
+  BackgroundMode,
   DetectedMoment,
   EffectsSettings,
   ExportFormat,
+  FitMode,
+  VisualAnalysis,
 } from "@/lib/firebase/schema";
+
+/** The source's base placement in the output canvas, before the per-moment camera. */
+interface BasePlacement {
+  drawW: number;
+  drawH: number;
+  offsetX: number;
+  offsetY: number;
+}
 
 const PREFERRED_MIMES = [
   "video/mp4;codecs=avc1.42E01E",
@@ -87,6 +107,11 @@ interface RenderInput {
   resolution: "1080p" | "4K";
   fps: 30 | 60;
   format: ExportFormat;
+  /**
+   * Client CV pass — feeds Smart-Fit's importance signals. Optional; absent
+   * on older projects (Smart-Fit then falls back to a blurred fit).
+   */
+  visualAnalysis?: VisualAnalysis;
   onProgress: (p: ExportProgress) => void;
   signal?: AbortSignal;
   /**
@@ -154,15 +179,80 @@ export async function renderProjectClientSide(
   // configuration panel ships. Don't add a `"Custom"` branch without also
   // adding the UI for entering the dimensions; otherwise the renderer
   // can't know what to produce.
-  const out = resolveOutputDims(sourceW, sourceH, resolution, format, effects);
-  const canvasW = out.canvasW;
-  const canvasH = out.canvasH;
+  // ── Global output canvas (Canvas Fit / Resize) ─────────────────────────
+  // `resolveOutputCanvas` is the single back-compat source of truth: it
+  // returns a concrete OutputCanvas for an explicit aspect/fit choice, or
+  // `null` for the full-frame "Source" path — in which case we keep the
+  // existing `resolveOutputDims` + centred-cover behaviour byte-for-byte.
+  const oc = resolveOutputCanvas(effects, format);
+
+  let canvasW: number;
+  let canvasH: number;
+  let outMode: string;
+  let outCropped: boolean;
+  let placement: CanvasPlacement | null = null;
+  let smart: SmartFitResult | undefined;
+
+  if (oc) {
+    const dims = resolveCanvasDims(
+      sourceW,
+      sourceH,
+      oc.aspectRatio,
+      resolution,
+      oc.aspectRatio === "custom"
+        ? { width: oc.width, height: oc.height }
+        : undefined
+    );
+    canvasW = dims.canvasW;
+    canvasH = dims.canvasH;
+    if (oc.fitMode === "smart-fit") {
+      smart = computeSmartFitOffset(
+        sourceW,
+        sourceH,
+        canvasW,
+        canvasH,
+        buildSmartSignals(input.visualAnalysis, moments)
+      );
+    }
+    placement = resolveCanvasPlacement(sourceW, sourceH, canvasW, canvasH, oc, smart);
+    outMode = `canvas-${oc.aspectRatio}/${oc.fitMode}${smart?.fallbackToBlur ? "→fit" : ""}`;
+    outCropped = !placement.hasLetterbox;
+  } else {
+    const out = resolveOutputDims(sourceW, sourceH, resolution, format, effects);
+    canvasW = out.canvasW;
+    canvasH = out.canvasH;
+    outMode = out.mode;
+    outCropped = out.cropped;
+  }
   const debugBorders = debugBordersEnabled();
 
-  // Cover-fit drives both the drawImage destination rect AND the per-frame
-  // diagnostics below; compute it once here (also recomputed verbatim at
-  // line ~209, but we need it now for the audit log).
-  const auditCover = coverFitDims(sourceW, sourceH, canvasW, canvasH);
+  // Effective fit + background after the Smart-Fit fallback decision. The
+  // background layer fills the whole canvas behind the (crisp) video whenever
+  // the placement leaves empty space — Fit always, Manual when scaled < cover.
+  const effectiveFit: FitMode =
+    oc && oc.fitMode === "smart-fit" && smart?.fallbackToBlur ? "fit" : oc?.fitMode ?? "fill";
+  const bgMode: BackgroundMode = smart?.fallbackToBlur
+    ? "blur"
+    : oc?.backgroundMode ?? "blur";
+  const bgActive =
+    !!placement &&
+    placement.hasLetterbox &&
+    (effectiveFit === "fit" || effectiveFit === "manual");
+
+  // The source's base placement inside the canvas. Legacy/null path keeps the
+  // historical centred cover; the canvas path uses the resolved placement.
+  const cover = coverFitDims(sourceW, sourceH, canvasW, canvasH);
+  const base: BasePlacement = placement
+    ? {
+        drawW: placement.drawW,
+        drawH: placement.drawH,
+        offsetX: placement.baseOffsetX,
+        offsetY: placement.baseOffsetY,
+      }
+    : { drawW: cover.drawW, drawH: cover.drawH, offsetX: 0, offsetY: 0 };
+
+  // Drives the audit log + bottom-band probe below — the rect actually drawn.
+  const auditCover = { drawW: base.drawW, drawH: base.drawH };
 
   // ── Pipeline dimension audit ────────────────────────────────────────
   // The full capture → render → export chain in one log, so a "there's a
@@ -178,8 +268,8 @@ export async function renderProjectClientSide(
   if (process.env.NODE_ENV !== "production") {
     const srcAspect = sourceW / sourceH;
     const outAspect = canvasW / canvasH;
-    const destX = canvasW / 2 - auditCover.drawW / 2;
-    const destY = canvasH / 2 - auditCover.drawH / 2;
+    const destX = canvasW / 2 + base.offsetX - auditCover.drawW / 2;
+    const destY = canvasH / 2 + base.offsetY - auditCover.drawH / 2;
     // Bottom gap with the camera at identity (worst case for a bottom band).
     const gapBelow = Math.max(0, canvasH - (destY + auditCover.drawH));
     console.info("[export] dimension audit", {
@@ -188,14 +278,18 @@ export async function renderProjectClientSide(
       sourceAspect: srcAspect.toFixed(4),
       format,
       verticalExport: effects.verticalExport === true,
-      mode: out.mode,
+      mode: outMode,
+      fitMode: oc?.fitMode ?? "source",
+      effectiveFit: oc ? effectiveFit : "source",
+      background: bgActive ? bgMode : "none",
+      baseOffset: { x: +base.offsetX.toFixed(1), y: +base.offsetY.toFixed(1) },
       resolution,
       canvasWidth: canvasW,
       canvasHeight: canvasH,
       exportWidth: canvasW,
       exportHeight: canvasH,
       exportAspect: outAspect.toFixed(4),
-      willCrop: out.cropped,
+      willCrop: outCropped,
       drawImageSourceRect: { sx: 0, sy: 0, sw: sourceW, sh: sourceH },
       drawImageDestRect: {
         dx: +destX.toFixed(1),
@@ -207,16 +301,20 @@ export async function renderProjectClientSide(
       gapAboveVideoPx: +Math.max(0, destY).toFixed(2),
       debugBorders,
     });
-    if (gapBelow > 0.5 || destY > 0.5) {
+    if (!bgActive && (gapBelow > 0.5 || destY > 0.5)) {
       console.warn(
         `[export] renderer leaves ${gapBelow.toFixed(1)}px below / ${Math.max(0, destY).toFixed(1)}px above the video uncovered — these rows are BLACK-filled, not green. A green band there is NOT from this renderer.`
       );
+    } else if (bgActive) {
+      console.info(
+        `[export] Canvas Fit "${effectiveFit}" leaves empty space, intentionally filled by the "${bgMode}" background.`
+      );
     }
-    if (out.cropped && Math.abs(srcAspect - outAspect) > 0.001) {
+    if (outCropped && Math.abs(srcAspect - outAspect) > 0.001) {
       console.warn(
-        `[export] CROP PRESET active (${out.mode}): source ${srcAspect.toFixed(3)} ≠ output ${outAspect.toFixed(3)} — content at the ${
+        `[export] CROP active (${outMode}): source ${srcAspect.toFixed(3)} ≠ output ${outAspect.toFixed(3)} — content at the ${
           srcAspect > outAspect ? "left/right" : "top/bottom"
-        } edges will be cropped. Pick "Source" format to keep the full viewport.`
+        } edges is cropped. Use Fit (with a background) in the Canvas panel to keep the whole frame.`
       );
     }
 
@@ -298,20 +396,21 @@ export async function renderProjectClientSide(
     video.addEventListener("seeked", onSeek);
   });
 
-  // Pre-compute cover-fit dimensions once — they only depend on source +
-  // canvas sizes, both of which are fixed for the duration of the export.
-  // `drawW`/`drawH` are the SCALED source dimensions inside the
-  // transformed frame. They (not canvasW/canvasH) drive the pan pixel
-  // offsets so vertical exports of 16:9 recordings (and any other aspect
-  // mismatch) place the focal point at the canvas centre instead of
-  // off-screen.
-  const cover = coverFitDims(sourceW, sourceH, canvasW, canvasH);
+  // `base` (the source placement: drawW/drawH + offsetX/offsetY) and `cover`
+  // were resolved once above — they depend only on source + canvas + fit mode,
+  // all fixed for the export. `base.drawW`/`drawH` (not canvasW/canvasH) drive
+  // the pan pixel offsets so an aspect mismatch places the focal point at the
+  // canvas centre instead of off-screen; `base.offsetX/Y` shifts the whole
+  // placement (Smart-Fit pan / Manual drag).
 
   // Paint the t=0 frame BEFORE the recorder picks up its first chunk so the
   // start of the export isn't a green/black flash. Also re-fills black under
   // the video in case the canvas got reset by the captureStream pipeline.
   ctx.fillStyle = "#000";
   ctx.fillRect(0, 0, canvasW, canvasH);
+  if (bgActive) {
+    drawCanvasBackground(ctx, video, bgMode, oc?.backgroundColor, canvasW, canvasH, sourceW, sourceH);
+  }
   applyCameraFrame(
     ctx,
     video,
@@ -320,7 +419,7 @@ export async function renderProjectClientSide(
     effects,
     canvasW,
     canvasH,
-    cover,
+    base,
     debugBorders
   );
   if (debugBorders) drawDebugCanvasBorder(ctx, canvasW, canvasH);
@@ -369,9 +468,10 @@ export async function renderProjectClientSide(
       momentCount: moments.length,
       canvasW,
       canvasH,
-      cover,
+      base,
+      background: bgActive ? bgMode : "none",
     });
-    logExportCameraSnapshots(moments, effects.autoZoom, cover);
+    logExportCameraSnapshots(moments, effects.autoZoom, base);
   }
 
   // Crop/Speed export diagnostics (req): counts, source vs output duration,
@@ -398,6 +498,12 @@ export async function renderProjectClientSide(
     applySpeedForFrame(video, moments);
     ctx.fillStyle = "#000";
     ctx.fillRect(0, 0, canvasW, canvasH);
+    // Canvas Fit background — fills the whole frame behind the (crisp) video
+    // when the placement leaves empty space. Drawn OUTSIDE the camera, before
+    // the source, so the foreground paints over it.
+    if (bgActive) {
+      drawCanvasBackground(ctx, video, bgMode, oc?.backgroundColor, canvasW, canvasH, sourceW, sourceH);
+    }
     applyCameraFrame(
       ctx,
       video,
@@ -406,7 +512,7 @@ export async function renderProjectClientSide(
       effects,
       canvasW,
       canvasH,
-      cover,
+      base,
       debugBorders
     );
     if (debugBorders) drawDebugCanvasBorder(ctx, canvasW, canvasH);
@@ -553,7 +659,7 @@ function applyCameraFrame(
   effects: EffectsSettings,
   canvasW: number,
   canvasH: number,
-  cover: { drawW: number; drawH: number },
+  base: BasePlacement,
   debugBorders = false
 ): void {
   // Single source of truth — same call the preview makes. Returns the
@@ -561,20 +667,23 @@ function applyCameraFrame(
   const { camera, moment } = resolveCameraFrame(moments, t, {
     autoZoom: effects.autoZoom,
   });
-  const { tx, ty } = canvasTranslateFor(camera, cover.drawW, cover.drawH);
+  const { tx, ty } = canvasTranslateFor(camera, base.drawW, base.drawH);
 
+  // The Canvas Fit base placement (`base.offsetX/Y`) shifts the placement
+  // centre — Smart-Fit pan / Manual drag / Fit letterbox. The per-moment
+  // camera (scale + tx/ty) then composes relative to the placed source.
   ctx.save();
-  ctx.translate(canvasW / 2, canvasH / 2);
+  ctx.translate(canvasW / 2 + base.offsetX, canvasH / 2 + base.offsetY);
   ctx.scale(camera.scale, camera.scale);
   ctx.translate(tx, ty);
-  ctx.drawImage(video, -cover.drawW / 2, -cover.drawH / 2, cover.drawW, cover.drawH);
+  ctx.drawImage(video, -base.drawW / 2, -base.drawH / 2, base.drawW, base.drawH);
 
   // DEBUG: RED border = the video's drawImage destination bounds. Line
   // width is divided by scale so it renders ~4px regardless of zoom.
   if (debugBorders) {
     ctx.lineWidth = 4 / camera.scale;
     ctx.strokeStyle = "rgba(255,0,0,0.95)";
-    ctx.strokeRect(-cover.drawW / 2, -cover.drawH / 2, cover.drawW, cover.drawH);
+    ctx.strokeRect(-base.drawW / 2, -base.drawH / 2, base.drawW, base.drawH);
   }
 
   // Click-highlight overlay — drawn INSIDE the camera transform so the
@@ -597,12 +706,61 @@ function applyCameraFrame(
         style: effects.clickHighlightStyle,
         sizePct: effects.clickHighlightSize,
       },
-      cover.drawW,
-      cover.drawH,
+      base.drawW,
+      base.drawH,
       canvasW
     );
   }
 
+  ctx.restore();
+}
+
+/**
+ * Canvas Fit background — fills the WHOLE output frame behind the (crisp)
+ * source video whenever the placement leaves empty space (Fit always; Manual
+ * when scaled below cover; Smart-Fit's blur fallback). Drawn OUTSIDE the
+ * camera transform, before the video, so the foreground paints over it and we
+ * never need to compute the exact gap rectangle.
+ *
+ *  - "blur"  → the same frame, cover-placed + Gaussian-blurred + dimmed
+ *              (the classic vertical-video backdrop), overscaled to hide bleed.
+ *  - "solid" → `backgroundColor` (defaults to black).
+ *  - "dark"  → near-black; "light" → near-white.
+ */
+function drawCanvasBackground(
+  ctx: CanvasRenderingContext2D,
+  video: HTMLVideoElement,
+  bgMode: BackgroundMode,
+  backgroundColor: string | undefined,
+  canvasW: number,
+  canvasH: number,
+  sourceW: number,
+  sourceH: number
+): void {
+  if (bgMode === "blur") {
+    const bg = coverFitDims(sourceW, sourceH, canvasW, canvasH);
+    const k = 1.08; // overscale to hide the blur kernel's transparent edge
+    ctx.save();
+    ctx.filter = "blur(40px) brightness(0.7)";
+    ctx.drawImage(
+      video,
+      canvasW / 2 - (bg.drawW * k) / 2,
+      canvasH / 2 - (bg.drawH * k) / 2,
+      bg.drawW * k,
+      bg.drawH * k
+    );
+    ctx.filter = "none";
+    ctx.restore();
+    return;
+  }
+  ctx.save();
+  ctx.fillStyle =
+    bgMode === "solid"
+      ? backgroundColor || "#000000"
+      : bgMode === "light"
+        ? "#f5f5f5"
+        : "#0a0a0a"; // "dark"
+  ctx.fillRect(0, 0, canvasW, canvasH);
   ctx.restore();
 }
 
@@ -678,7 +836,8 @@ function logRenderManifest(state: {
   momentCount: number;
   canvasW: number;
   canvasH: number;
-  cover: { drawW: number; drawH: number };
+  base: BasePlacement;
+  background: BackgroundMode | "none";
 }): void {
   console.groupCollapsed(
     `[export] render manifest — ${state.canvasW}×${state.canvasH}, ${state.momentCount} moments`
@@ -690,9 +849,17 @@ function logRenderManifest(state: {
       detail: "Fills canvas before video draw — masked by cover-fit video",
     },
     {
+      layer: "1b. Canvas background",
+      enabled: state.background === "none" ? "off" : "ON",
+      detail:
+        state.background === "none"
+          ? "Fit mode covers / no empty space"
+          : `"${state.background}" fills the empty space (Canvas Fit)`,
+    },
+    {
       layer: "2. Source video",
       enabled: "ALWAYS",
-      detail: `cover=${state.cover.drawW.toFixed(0)}×${state.cover.drawH.toFixed(0)}, framed by resolver`,
+      detail: `place=${state.base.drawW.toFixed(0)}×${state.base.drawH.toFixed(0)} @ offset(${state.base.offsetX.toFixed(0)},${state.base.offsetY.toFixed(0)})`,
     },
     {
       layer: "3. Click highlight",
@@ -730,7 +897,7 @@ function logRenderManifest(state: {
 function logExportCameraSnapshots(
   moments: DetectedMoment[],
   autoZoom: number,
-  cover: { drawW: number; drawH: number }
+  base: BasePlacement
 ): void {
   if (moments.length === 0) return;
   const samples: number[] = [];
@@ -741,12 +908,12 @@ function logExportCameraSnapshots(
   const rows = samples.map((t) =>
     cameraDiagnostic(moments, t, {
       autoZoom,
-      drawW: cover.drawW,
-      drawH: cover.drawH,
+      drawW: base.drawW,
+      drawH: base.drawH,
     })
   );
   console.groupCollapsed(
-    `[export] camera snapshots (autoZoom=${autoZoom}, cover=${cover.drawW.toFixed(0)}×${cover.drawH.toFixed(0)})`
+    `[export] camera snapshots (autoZoom=${autoZoom}, place=${base.drawW.toFixed(0)}×${base.drawH.toFixed(0)})`
   );
   console.table(
     rows.map((r) => ({

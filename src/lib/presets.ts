@@ -112,6 +112,16 @@ export const BUILTIN_PRESETS: Preset[] = [
       pacing: "fast",
       targetPlatform: "tiktok",
       defaultExportFormat: "TikTok 9:16",
+      outputCanvas: {
+        aspectRatio: "9:16",
+        width: 1080,
+        height: 1920,
+        fitMode: "smart-fit",
+        scale: 1,
+        offsetX: 0,
+        offsetY: 0,
+        backgroundMode: "blur",
+      },
     }),
   },
   {
@@ -220,6 +230,16 @@ export const BUILTIN_PRESETS: Preset[] = [
       pacing: "fast",
       targetPlatform: "youtube",
       defaultExportFormat: "TikTok 9:16",
+      outputCanvas: {
+        aspectRatio: "9:16",
+        width: 1080,
+        height: 1920,
+        fitMode: "smart-fit",
+        scale: 1,
+        offsetX: 0,
+        offsetY: 0,
+        backgroundMode: "blur",
+      },
     }),
   },
   {

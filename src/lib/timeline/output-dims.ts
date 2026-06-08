@@ -36,7 +36,7 @@ export interface OutputDims {
 }
 
 /** Round to the nearest even integer ≥ 2 (H.264 needs even dimensions). */
-function even(n: number): number {
+export function even(n: number): number {
   const r = Math.round(n);
   return Math.max(2, r % 2 === 0 ? r : r + 1);
 }

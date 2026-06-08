@@ -27,10 +27,19 @@ import {
 import { clickHighlightGeometry } from "@/lib/timeline/click-highlight";
 import { coverFitDims } from "@/lib/timeline/cover";
 import { activeSpeedAt, DEFAULT_CROP } from "@/lib/timeline/crop-speed";
+import {
+  resolveOutputCanvas,
+  resolveCanvasDims,
+  resolveCanvasPlacement,
+  computeSmartFitOffset,
+  buildSmartSignals,
+} from "@/lib/timeline/canvas-layout";
 import { probeVideoBottomBand } from "@/lib/recording/health-check";
 import { FocalPathOverlay } from "./FocalPathOverlay";
 import type {
+  BackgroundMode,
   DetectedMoment,
+  FitMode,
   FocusRegion,
   VisualAnalysis,
 } from "@/lib/firebase/schema";
@@ -263,6 +272,7 @@ export function RealVideoPlayer() {
     setPreviewMode,
     cvDebug,
     updateMoment,
+    updateEffects,
   } = useEditorReal();
 
   // Dev-only CV debug overlay gate (?debug=1 / Ctrl+Shift+D).
@@ -271,6 +281,14 @@ export function RealVideoPlayer() {
   const containerRef = React.useRef<HTMLDivElement | null>(null);
   const aspectRef = React.useRef<HTMLDivElement | null>(null);
   const transformWrapRef = React.useRef<HTMLDivElement | null>(null);
+  // Canvas Fit layers: the offset layer (base-placement pan / manual drag),
+  // the stage (placed source box), the source frame (overlay coord space),
+  // and the blurred background video.
+  const offsetLayerRef = React.useRef<HTMLDivElement | null>(null);
+  const stageRef = React.useRef<HTMLDivElement | null>(null);
+  const sourceFrameRef = React.useRef<HTMLDivElement | null>(null);
+  const bgVideoRef = React.useRef<HTMLVideoElement | null>(null);
+  const dragOffsetRef = React.useRef<{ x: number; y: number } | null>(null);
   // Live camera transform, written each frame by the cinematic camera and
   // read by the opt-in debug overlay (?debugCamera=1).
   const cameraDebugRef = React.useRef<CameraDebugInfo>({
@@ -448,27 +466,167 @@ export function RealVideoPlayer() {
     cameraDebugRef
   );
 
-  // Vertical reframe — when the preset asks for 9:16, mask the player.
-  const verticalPreview = previewMode && project.effectsSettings.verticalExport;
   const va = project.visualAnalysis;
 
-  // Two independent decisions — keeping them separate is what fixes the
-  // fullscreen crop:
-  //
-  //   useContain      → object-fit. `contain` preserves the whole captured
-  //                     viewport (letterboxing as needed). True whenever we
-  //                     are NOT in the explicit 9:16 crop preset — and that
-  //                     INCLUDES fullscreen. (A previous version tied this
-  //                     to `!isFullscreen`, so fullscreen fell back to
-  //                     `object-cover` and zoom-cropped the recording.)
-  //   applySourceAspect → whether to size the *card* to the recording's
-  //                     aspect via an inline ratio. Only in WINDOWED source
-  //                     mode; in fullscreen the card fills the screen and
-  //                     the video `contain`s within it.
-  const verticalCropPreset = verticalPreview;
-  const useContain = !verticalCropPreset;
-  const applySourceAspect = useContain && !isFullscreen;
+  // ── Global output canvas (Canvas Fit / Resize) ───────────────────────────
+  // The chosen aspect / fit mode / background. Reflected in the preview
+  // ALWAYS (not gated on previewMode) so the user sees the true output frame;
+  // only the per-moment cinematic camera stays gated on previewMode (inside
+  // `useCinematicCamera`). `null` = full-frame source (legacy behaviour).
+  const oc = React.useMemo(
+    () => resolveOutputCanvas(project.effectsSettings),
+    [project.effectsSettings]
+  );
+
+  // Source dims as a ratio (absolute scale cancels in the placement math), so
+  // the SAME `canvas-layout` helpers the exporter uses drive the preview.
+  const srcAspectVal = sourceAspect ?? 16 / 9;
+  const previewPlacement = React.useMemo(() => {
+    if (!oc) return null;
+    const srcW = srcAspectVal * 1000;
+    const srcH = 1000;
+    const { canvasW, canvasH } = resolveCanvasDims(
+      srcW,
+      srcH,
+      oc.aspectRatio,
+      "1080p",
+      oc.aspectRatio === "custom" ? { width: oc.width, height: oc.height } : undefined
+    );
+    const smart =
+      oc.fitMode === "smart-fit"
+        ? computeSmartFitOffset(
+            srcW,
+            srcH,
+            canvasW,
+            canvasH,
+            buildSmartSignals(va, allMoments)
+          )
+        : undefined;
+    const place = resolveCanvasPlacement(srcW, srcH, canvasW, canvasH, oc, smart);
+    const fellBack = oc.fitMode === "smart-fit" && !!smart?.fallbackToBlur;
+    const effFit: FitMode = fellBack ? "fit" : oc.fitMode;
+    const bgMode: BackgroundMode = fellBack ? "blur" : oc.backgroundMode;
+    return {
+      canvasW,
+      canvasH,
+      place,
+      bgMode,
+      showBg: place.hasLetterbox && (effFit === "fit" || effFit === "manual"),
+      manual: oc.fitMode === "manual",
+      portrait: canvasH > canvasW,
+    };
+  }, [oc, srcAspectVal, va, allMoments]);
+
+  // Sizing + object-fit for the visible frame. The Canvas composite is
+  // disabled in fullscreen, which falls back to a source-contain view (a
+  // "watch the recording" affordance — the windowed preview is the WYSIWYG
+  // export preview). Outside the canvas path the video is letterboxed via
+  // `object-contain` exactly like before.
+  const canvasActive = !!previewPlacement && !isFullscreen;
+  const applySourceAspect = !canvasActive && !isFullscreen;
   const previewAspect = sourceAspect ?? 16 / 9;
+  const videoObjectFit = canvasActive ? "object-cover" : "object-contain";
+
+  const frameStyle: React.CSSProperties | undefined =
+    canvasActive && previewPlacement
+      ? { aspectRatio: `${previewPlacement.canvasW} / ${previewPlacement.canvasH}` }
+      : applySourceAspect
+        ? { aspectRatio: String(previewAspect) }
+        : undefined;
+  const frameSizeClass =
+    canvasActive && previewPlacement?.portrait
+      ? "max-h-[72vh]"
+      : "max-h-[56vh] max-w-[100vh]";
+
+  const place = canvasActive ? previewPlacement?.place : undefined;
+  const stageStyle: React.CSSProperties | undefined =
+    place && previewPlacement
+      ? {
+          width: `${(place.drawW / previewPlacement.canvasW) * 100}%`,
+          height: `${(place.drawH / previewPlacement.canvasH) * 100}%`,
+          left: "50%",
+          top: "50%",
+          transform: "translate(-50%, -50%)",
+        }
+      : undefined;
+  const offsetStyle: React.CSSProperties | undefined =
+    place && previewPlacement
+      ? {
+          transform: `translate(${(place.baseOffsetX / previewPlacement.canvasW) * 100}%, ${(place.baseOffsetY / previewPlacement.canvasH) * 100}%)`,
+        }
+      : undefined;
+  const showCanvasBg = canvasActive && !!previewPlacement?.showBg;
+  const canvasBgMode = previewPlacement?.bgMode ?? "blur";
+  const previewBgColor =
+    canvasBgMode === "solid"
+      ? oc?.backgroundColor || "#000000"
+      : canvasBgMode === "light"
+        ? "#f5f5f5"
+        : canvasBgMode === "dark"
+          ? "#0a0a0a"
+          : "#000000";
+
+  // Manual reposition — drag the whole video inside the canvas. Writes the
+  // offset layer's transform live (no re-render); commits once on release.
+  const beginCanvasDrag = (e: React.PointerEvent) => {
+    if (!oc || oc.fitMode !== "manual") return;
+    const frame = aspectRef.current;
+    if (!frame) return;
+    e.preventDefault();
+    const rect = frame.getBoundingClientRect();
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const origX = oc.offsetX || 0;
+    const origY = oc.offsetY || 0;
+    const onMove = (ev: PointerEvent) => {
+      const nx = clamp(origX + (ev.clientX - startX) / rect.width, -1, 1);
+      const ny = clamp(origY + (ev.clientY - startY) / rect.height, -1, 1);
+      const layer = offsetLayerRef.current;
+      if (layer) layer.style.transform = `translate(${nx * 100}%, ${ny * 100}%)`;
+      dragOffsetRef.current = { x: nx, y: ny };
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+      const d = dragOffsetRef.current;
+      dragOffsetRef.current = null;
+      if (d) {
+        updateEffects("outputCanvas", {
+          ...oc,
+          offsetX: round3(d.x),
+          offsetY: round3(d.y),
+        });
+      }
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+  };
+
+  const canvasManual = canvasActive && !!previewPlacement?.manual;
+
+  // Keep the blurred-background video roughly in step with the main one.
+  // Heavy blur tolerates loose sync, so we only correct on drift / play state.
+  const blurBgActive = showCanvasBg && canvasBgMode === "blur";
+  React.useEffect(() => {
+    if (!blurBgActive) return;
+    let raf = 0;
+    const tick = () => {
+      const main = videoRef.current;
+      const bg = bgVideoRef.current;
+      if (main && bg) {
+        if (Math.abs(bg.currentTime - main.currentTime) > 0.08) {
+          bg.currentTime = main.currentTime;
+        }
+        if (main.paused && !bg.paused) bg.pause();
+        else if (!main.paused && bg.paused) void bg.play().catch(() => {});
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [blurBgActive, videoRef]);
 
   return (
     <div
@@ -484,130 +642,152 @@ export function RealVideoPlayer() {
     >
       <div
         ref={aspectRef}
-        style={applySourceAspect ? { aspectRatio: String(previewAspect) } : undefined}
+        style={frameStyle}
         className={cn(
           "relative overflow-hidden bg-black shadow-cinematic",
           isFullscreen
             ? "h-full w-full rounded-none border-0"
-            : cn(
-                "w-full rounded-xl border border-white/[0.06]",
-                verticalPreview
-                  ? "mx-auto aspect-[9/16] max-h-[72vh]"
-                  // Source framing: aspect comes from the inline style above;
-                  // bound the height so a tall capture can't dominate the page.
-                  : "mx-auto max-h-[56vh] max-w-[100vh]"
-              )
+            : cn("w-full rounded-xl border border-white/[0.06] mx-auto", frameSizeClass)
         )}
       >
-        {/* The real <video>. The cinematic camera writes `transform` directly
-            onto this wrapper every frame (no React re-render, no CSS tween). */}
-        <div
-          ref={transformWrapRef}
-          className="absolute inset-0 origin-center will-change-transform"
-        >
-          <video
-            ref={videoRef}
-            src={project.originalVideoUrl || undefined}
-            className={cn(
-              "h-full w-full",
-              // `contain` preserves the full captured viewport (windowed AND
-              // fullscreen). Only the explicit 9:16 crop preset uses `cover`
-              // to fill + center-crop.
-              useContain ? "object-contain" : "object-cover"
-            )}
-            playsInline
-            crossOrigin="anonymous"
-            preload="metadata"
-          />
-          {!project.originalVideoUrl && (
-            <div className="pointer-events-none absolute inset-0 grid place-items-center text-sm text-fog">
-              No video loaded.
+        {/* ── Canvas Fit background — fills the empty space behind the (crisp)
+            video in Fit / Manual modes (or Smart-Fit's blur fallback). ── */}
+        {showCanvasBg &&
+          (canvasBgMode === "blur" ? (
+            <video
+              ref={bgVideoRef}
+              src={project.originalVideoUrl || undefined}
+              aria-hidden
+              muted
+              playsInline
+              preload="metadata"
+              className="pointer-events-none absolute inset-0 h-full w-full scale-110 object-cover blur-2xl brightness-[0.7]"
+            />
+          ) : (
+            <div
+              aria-hidden
+              className="pointer-events-none absolute inset-0"
+              style={{ background: previewBgColor }}
+            />
+          ))}
+
+        {/* ── Offset layer — base-placement pan (Smart-Fit / Manual drag /
+            centring). Full-canvas-sized so its % translate is a fraction of
+            the canvas, matching the exporter's `base.offsetX/Y` in px. ── */}
+        <div ref={offsetLayerRef} className="absolute inset-0" style={offsetStyle}>
+          {/* Stage — the placed source box (always source aspect). Overflows
+              the frame + is clipped by it in fill / cover modes. */}
+          <div
+            ref={stageRef}
+            className={cn("absolute", !place && "inset-0")}
+            style={stageStyle}
+          >
+            {/* Source frame — the coordinate space overlays map into (their
+                source-normalized %s track the placed source, not the canvas). */}
+            <div ref={sourceFrameRef} className="absolute inset-0">
+              {/* The real <video>. The cinematic camera writes `transform`
+                  directly onto this wrapper every frame. */}
+              <div
+                ref={transformWrapRef}
+                className="absolute inset-0 origin-center will-change-transform"
+              >
+                <video
+                  ref={videoRef}
+                  src={project.originalVideoUrl || undefined}
+                  className={cn("h-full w-full", videoObjectFit)}
+                  playsInline
+                  crossOrigin="anonymous"
+                  preload="metadata"
+                />
+                {!project.originalVideoUrl && (
+                  <div className="pointer-events-none absolute inset-0 grid place-items-center text-sm text-fog">
+                    No video loaded.
+                  </div>
+                )}
+
+                {/* CV debug: motion-hotspot centroid path, tracks with video. */}
+                {cvDebug && va && va.sampleCount > 0 && (
+                  <CentroidPath
+                    visualAnalysis={va}
+                    currentTime={currentTime}
+                    duration={duration > 0 ? duration : project.duration ?? 0}
+                  />
+                )}
+
+                {/* Dev-only visual-engine overlay (?debug=1). */}
+                {cvDebugOverlay && va && va.sampleCount > 0 && (
+                  <CvDebugOverlay
+                    visualAnalysis={va}
+                    moments={project.analysis?.detectedMoments ?? []}
+                    currentTime={currentTime}
+                  />
+                )}
+              </div>
+
+              {/* Source-space overlays — click highlights, focal path, crop
+                  guides, editable focus box. Nested in the source frame so
+                  their coords track the placed source under any fit mode. */}
+              {activeMoment && (
+                <OverlayLayer
+                  moment={activeMoment}
+                  currentTime={currentTime}
+                  clickHighlightStyle={project.effectsSettings.clickHighlightStyle}
+                  clickHighlightSize={project.effectsSettings.clickHighlightSize}
+                  clickHighlightsEnabled={project.effectsSettings.clickHighlights}
+                />
+              )}
+
+              {activeMoment && <FocalPathOverlay moment={activeMoment} />}
+
+              {activeMoment?.effectType === "crop" && previewMode && <CropGuides />}
+
+              {/* Speed moments don't frame a region — no box for them. */}
+              {activeMoment && activeMoment.effectType !== "speed-up" && (
+                <EditableFocusBox
+                  key={activeMoment.id}
+                  moment={activeMoment}
+                  aspectRef={sourceFrameRef}
+                  ghost={previewMode}
+                  onCommit={(focusRegion) => {
+                    // Stamp `targetRegionSource: "user"` so the balancer's
+                    // `refineMomentFocalRegion` pass leaves this region alone
+                    // on any subsequent re-analyze / reframe — user wins.
+                    const patch: Partial<DetectedMoment> = {
+                      focusRegion,
+                      targetRegionSource: "user",
+                    };
+                    // A manual box drag makes the crop position "custom".
+                    if (activeMoment.effectType === "crop") {
+                      patch.crop = {
+                        ...(activeMoment.crop ?? DEFAULT_CROP),
+                        position: "custom",
+                      };
+                    }
+                    updateMoment(activeMoment.id, patch);
+                  }}
+                />
+              )}
             </div>
-          )}
-
-          {/* CV debug: motion-hotspot centroid path, tracks with the video. */}
-          {cvDebug && va && va.sampleCount > 0 && (
-            <CentroidPath
-              visualAnalysis={va}
-              currentTime={currentTime}
-              duration={duration > 0 ? duration : project.duration ?? 0}
-            />
-          )}
-
-          {/* Dev-only visual-engine overlay (?debug=1): cursor track, inferred
-              click markers, focus boxes, scene badge, CV moment labels. */}
-          {cvDebugOverlay && va && va.sampleCount > 0 && (
-            <CvDebugOverlay
-              visualAnalysis={va}
-              moments={project.analysis?.detectedMoments ?? []}
-              currentTime={currentTime}
-            />
-          )}
+          </div>
         </div>
 
-        {/* Overlays — click highlights */}
-        {activeMoment && (
-          <OverlayLayer
-            moment={activeMoment}
-            currentTime={currentTime}
-            clickHighlightStyle={project.effectsSettings.clickHighlightStyle}
-            clickHighlightSize={project.effectsSettings.clickHighlightSize}
-            clickHighlightsEnabled={project.effectsSettings.clickHighlights}
+        {/* Manual reposition surface — drag the whole video inside the canvas.
+            Only in Manual fit mode; above the video, below the controls. */}
+        {canvasManual && (
+          <div
+            className="absolute inset-0 z-20 cursor-move"
+            onPointerDown={beginCanvasDrag}
+            title="Drag to reposition"
           />
         )}
 
-        {/* Camera path — thin polyline through the active moment's
-            keyframes. Lives between the focus box and the video so it
-            reads as the camera's trajectory. Only renders when there are
-            ≥ 2 keyframes (a single point isn't a path). */}
-        {activeMoment && <FocalPathOverlay moment={activeMoment} />}
-
-        {/* Opt-in camera debug overlay — ?debugCamera=1 or
-            localStorage['framevo:debugCamera']='1'. Shows the live camera
-            transform so a fullscreen crop can be diagnosed at a glance. */}
+        {/* Opt-in camera debug overlay — ?debugCamera=1 (canvas chrome). */}
         <CameraDebugOverlay
           debugRef={cameraDebugRef}
           videoRef={videoRef}
           aspectRef={aspectRef}
           isFullscreen={isFullscreen}
         />
-
-        {/* Editable focus region — drag/resize the zoom target directly on
-            the frame. Always rendered when a moment is selected; during
-            preview mode the box drops to ghost opacity so the cinematic
-            framing isn't visually obstructed but the user can still drag
-            (hover to bring it back to full opacity). */}
-        {/* Crop guides — title-safe inset + rule-of-thirds, shown while a
-            crop/reframe moment is active so the user can frame intentionally.
-            The draggable box below is the output framing itself. */}
-        {activeMoment?.effectType === "crop" && previewMode && <CropGuides />}
-
-        {/* Speed moments don't frame a region — no box for them. */}
-        {activeMoment && activeMoment.effectType !== "speed-up" && (
-          <EditableFocusBox
-            key={activeMoment.id}
-            moment={activeMoment}
-            aspectRef={aspectRef}
-            ghost={previewMode}
-            onCommit={(focusRegion) => {
-              // Stamp `targetRegionSource: "user"` so the balancer's
-              // `refineMomentFocalRegion` pass leaves this region alone on
-              // any subsequent re-analyze / reframe — user intent wins.
-              const patch: Partial<DetectedMoment> = {
-                focusRegion,
-                targetRegionSource: "user",
-              };
-              // A manual box drag makes the crop position "custom".
-              if (activeMoment.effectType === "crop") {
-                patch.crop = {
-                  ...(activeMoment.crop ?? DEFAULT_CROP),
-                  position: "custom",
-                };
-              }
-              updateMoment(activeMoment.id, patch);
-            }}
-          />
-        )}
 
         {/* AI tracking chip */}
         {project.status === "analyzed" && (
@@ -620,10 +800,11 @@ export function RealVideoPlayer() {
           </div>
         )}
 
-        {/* Preview toggle */}
+        {/* Preview toggle — z-40 so it stays clickable above the manual
+            reposition surface (z-20). */}
         <button
           onClick={() => setPreviewMode(!previewMode)}
-          className="absolute left-3 top-3 inline-flex items-center gap-1.5 rounded-full border border-white/15 bg-black/40 px-2.5 py-1 text-[10px] font-medium text-white/90 backdrop-blur-md transition-colors duration-200 hover:bg-black/60"
+          className="absolute left-3 top-3 z-40 inline-flex items-center gap-1.5 rounded-full border border-white/15 bg-black/40 px-2.5 py-1 text-[10px] font-medium text-white/90 backdrop-blur-md transition-colors duration-200 hover:bg-black/60"
         >
           {previewMode ? <Eye size={11} /> : <EyeOff size={11} />}
           {previewMode ? "Preview ON" : "Preview OFF"}

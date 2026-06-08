@@ -4,6 +4,7 @@ import * as React from "react";
 import {
   arrayRemove,
   arrayUnion,
+  deleteField,
   doc,
   serverTimestamp,
   setDoc,
@@ -60,6 +61,10 @@ interface EditorRealContextValue {
   inspectorOpen: boolean;
   openInspector: () => void;
   closeInspector: () => void;
+  /** Global "Canvas / Format" panel — opens from the header or the export summary. */
+  canvasOpen: boolean;
+  openCanvas: () => void;
+  closeCanvas: () => void;
   previewMode: boolean;
   setPreviewMode: (v: boolean) => void;
   /** Developer overlay: CV signal curves, scene markers, centroid path. */
@@ -83,6 +88,8 @@ interface EditorRealContextValue {
     key: K,
     value: EffectsSettings[K]
   ) => Promise<void>;
+  /** Reset the output canvas to "Source / full frame" (removes outputCanvas). */
+  clearOutputCanvas: () => Promise<void>;
   applyPreset: (preset: Preset) => Promise<void>;
   clearSelectedPreset: () => Promise<void>;
   startAnalyze: () => Promise<void>;
@@ -239,6 +246,9 @@ export function EditorRealProvider({
   const [inspectorOpen, setInspectorOpen] = React.useState(false);
   const openInspector = React.useCallback(() => setInspectorOpen(true), []);
   const closeInspector = React.useCallback(() => setInspectorOpen(false), []);
+  const [canvasOpen, setCanvasOpen] = React.useState(false);
+  const openCanvas = React.useCallback(() => setCanvasOpen(true), []);
+  const closeCanvas = React.useCallback(() => setCanvasOpen(false), []);
   const [previewMode, setPreviewMode] = React.useState(true);
   const [cvDebug, setCvDebug] = React.useState(false);
   const [analyzing, setAnalyzing] = React.useState(false);
@@ -644,6 +654,23 @@ export function EditorRealProvider({
     },
     [project.effectsSettings, projectRef]
   );
+
+  // Reset the global output canvas to "Source / full frame" by removing the
+  // field — `resolveOutputCanvas` then returns null and the export/preview use
+  // the source-aspect, no-crop path. `deleteField()` is the only safe way to
+  // drop a single nested key under a `{merge:true}` write.
+  const clearOutputCanvas: EditorRealContextValue["clearOutputCanvas"] =
+    React.useCallback(async () => {
+      await setDoc(
+        projectRef,
+        {
+          effectsSettings: { outputCanvas: deleteField() },
+          selectedPresetId: null,
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+    }, [projectRef]);
 
   const applyPreset: EditorRealContextValue["applyPreset"] = React.useCallback(
     async (preset) => {
@@ -1119,6 +1146,9 @@ export function EditorRealProvider({
     inspectorOpen,
     openInspector,
     closeInspector,
+    canvasOpen,
+    openCanvas,
+    closeCanvas,
     previewMode,
     setPreviewMode,
     cvDebug,
@@ -1133,6 +1163,7 @@ export function EditorRealProvider({
     acceptSuggestion,
     dismissSuggestion,
     updateEffects,
+    clearOutputCanvas,
     applyPreset,
     clearSelectedPreset,
     startAnalyze,

@@ -4,9 +4,6 @@ import * as React from "react";
 import Link from "next/link";
 import {
   Download,
-  Smartphone,
-  Monitor,
-  Maximize,
   AlertCircle,
   Loader2,
   ExternalLink,
@@ -16,6 +13,8 @@ import {
   Clock,
   Lock,
   Sparkles,
+  Frame,
+  Pencil,
 } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { cn } from "@/lib/cn";
@@ -28,7 +27,8 @@ import {
   pickedMimeExt,
   type ExportProgress,
 } from "./export";
-import type { ExportFormat } from "@/lib/firebase/schema";
+import { resolveOutputCanvas } from "@/lib/timeline/canvas-layout";
+import type { ExportFormat, FitMode } from "@/lib/firebase/schema";
 import { useStoragePlan } from "@/lib/usage/useStoragePlan";
 import { planMeetsMinimum } from "@/lib/usage/plan";
 import { useMonthlyUsage } from "@/lib/usage/useMonthlyUsage";
@@ -37,23 +37,36 @@ import { useNotifications } from "@/lib/notifications/store";
 
 const resolutions = ["1080p", "4K"] as const;
 const fpsOptions = [30, 60] as const;
-// "Source" is first AND the default — it preserves the full captured
-// viewport (no crop). The other two are explicit CROP presets that force a
-// fixed aspect and center-crop the source to fill it; their copy says so
-// outright so a crop is never a surprise.
-const formats: {
-  id: ExportFormat;
-  label: string;
-  desc: string;
-  Icon: typeof Smartphone;
-}[] = [
-  { id: "Source", label: "Source", desc: "Full frame", Icon: Maximize },
-  { id: "YouTube 16:9", label: "YouTube", desc: "16:9 · crops", Icon: Monitor },
-  { id: "TikTok 9:16", label: "TikTok", desc: "9:16 · crops", Icon: Smartphone },
-];
+
+const FIT_LABEL: Record<FitMode, string> = {
+  fit: "Fit",
+  fill: "Fill",
+  "smart-fit": "Smart Fit",
+  manual: "Manual",
+};
 
 export function RealExportPanel() {
-  const { project, uid, videoRef, duration, updateEffects } = useEditorReal();
+  const { project, uid, videoRef, duration, updateEffects, openCanvas } =
+    useEditorReal();
+
+  // Output aspect/fit now lives in the global Canvas panel — the export reads
+  // it via `resolveOutputCanvas`. `format` is derived purely for the billing
+  // permit + pre-flight label (the renderer honours `outputCanvas` directly).
+  const outputCanvas = resolveOutputCanvas(project.effectsSettings);
+  const format: ExportFormat = !outputCanvas
+    ? "Source"
+    : outputCanvas.aspectRatio === "9:16"
+      ? "TikTok 9:16"
+      : outputCanvas.aspectRatio === "16:9"
+        ? "YouTube 16:9"
+        : "Custom";
+  const canvasSummary = outputCanvas
+    ? `${outputCanvas.aspectRatio} · ${FIT_LABEL[outputCanvas.fitMode]}${
+        outputCanvas.fitMode === "fit" || outputCanvas.fitMode === "manual"
+          ? ` · ${outputCanvas.backgroundMode} bg`
+          : ""
+      }`
+    : "Source · full frame";
   const notifications = useNotifications();
   const { plan } = useStoragePlan();
   const usage = useMonthlyUsage();
@@ -67,7 +80,6 @@ export function RealExportPanel() {
 
   const [resolution, setResolution] = React.useState<"1080p" | "4K">("1080p");
   const [fps, setFps] = React.useState<30 | 60>(30);
-  const [format, setFormat] = React.useState<ExportFormat>("Source");
   const [progress, setProgress] = React.useState<ExportProgress | null>(null);
   const [error, setError] = React.useState<string | null>(null);
   const [downloadURL, setDownloadURL] = React.useState<string | null>(null);
@@ -175,6 +187,7 @@ export function RealExportPanel() {
         resolution,
         fps,
         format,
+        visualAnalysis: project.visualAnalysis,
         applyWatermark: !!applyWatermark,
         onProgress: (p) => setProgress(p),
         signal: controller.signal,
@@ -271,45 +284,35 @@ export function RealExportPanel() {
           renderLabel={(n) => `${n}fps`}
         />
 
+        {/* Output canvas — aspect ratio + fit + background now live in the
+            global Canvas panel (one source of truth for preview AND export).
+            This is a read-only summary with a shortcut to edit it. */}
         <div>
           <div className="mb-2 text-[10px] font-semibold uppercase tracking-[0.18em] text-fog">
-            Format
+            Canvas
           </div>
-          {/* "Custom" was an option here. It surfaced as a button but the
-              renderer in `export.ts` has no width/height/aspect/bitrate UI
-              wired up, so selecting it silently exported at YouTube 16:9
-              dimensions. Hidden until the Custom configuration panel ships
-              (per user direction). The `"Custom"` literal stays in the
-              `ExportFormat` union so any persisted defaults still
-              type-check; `resolveOutputDims` maps it to a safe 16:9 crop. */}
-          <div className="grid grid-cols-3 gap-1.5">
-            {formats.map((f) => {
-              const active = format === f.id;
-              return (
-                <button
-                  key={f.id}
-                  onClick={() => setFormat(f.id)}
-                  className={cn(
-                    "flex flex-col items-center gap-1 rounded-xl border p-4 text-center transition-colors duration-150",
-                    active
-                      ? "border-violet-400/40 bg-violet-500/15 text-violet-200"
-                      : "border-white/10 bg-white/[0.02] text-fog hover:border-white/20 hover:text-white"
-                  )}
-                >
-                  <f.Icon size={16} />
-                  <span className="text-[12px] font-medium">{f.label}</span>
-                  <span className="text-[10px] opacity-70">{f.desc}</span>
-                </button>
-              );
-            })}
-          </div>
-          {/* Honest copy about what each mode does to the frame. The
-              default ("Source") never crops; the presets always do. */}
-          <p className="mt-2 text-[10.5px] leading-relaxed text-fog/80">
-            {format === "Source"
-              ? "Source keeps your full recording frame — nothing is cropped off the edges."
-              : "This preset crops your recording to fit a fixed aspect. Pick Source to keep the whole frame."}
-          </p>
+          <button
+            onClick={openCanvas}
+            className="flex w-full items-center gap-3 rounded-xl border border-white/10 bg-white/[0.02] px-4 py-3 text-left transition-colors duration-150 hover:border-white/20"
+          >
+            <span className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-violet-400/20 bg-violet-500/10 text-violet-200">
+              <Frame size={15} />
+            </span>
+            <span className="min-w-0 flex-1">
+              <span className="block text-[12.5px] font-medium capitalize text-white">
+                {canvasSummary}
+              </span>
+              <span className="block text-[10.5px] leading-relaxed text-fog/80">
+                {outputCanvas
+                  ? "How your video fits the export frame — preview matches."
+                  : "Keeps your full recording frame. Nothing is cropped."}
+              </span>
+            </span>
+            <span className="inline-flex items-center gap-1 text-[11px] font-medium text-violet-300">
+              <Pencil size={12} />
+              Edit
+            </span>
+          </button>
         </div>
 
         {/* Cinematic vignette — opt-in. When on, BOTH preview and
@@ -397,7 +400,7 @@ export function RealExportPanel() {
             <PreFlightRow
               icon={<Film size={11} className="text-violet-300" />}
               label="Output"
-              value={`${format} · ${resolution} · ${fps}fps`}
+              value={`${canvasSummary} · ${resolution} · ${fps}fps`}
             />
             <PreFlightRow
               icon={<ZoomIn size={11} className="text-violet-300" />}

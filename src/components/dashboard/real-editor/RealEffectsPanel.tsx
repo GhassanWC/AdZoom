@@ -78,12 +78,6 @@ export function RealEffectsPanel() {
 
       <Section title="Toggles">
         <Toggle
-          label="Vertical Export"
-          description="Reframe to 9:16 for shorts."
-          checked={e.verticalExport}
-          onChange={(v) => updateEffects("verticalExport", v)}
-        />
-        <Toggle
           label="Click Highlights"
           description="Animated ring on each click event."
           checked={e.clickHighlights}
