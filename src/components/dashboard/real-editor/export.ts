@@ -6,7 +6,7 @@ import {
   doc,
   updateDoc,
 } from "firebase/firestore";
-import { getDownloadURL, ref as storageRef, uploadBytes } from "firebase/storage";
+import { getDownloadURL, ref as storageRef, uploadBytesResumable } from "firebase/storage";
 import { getFirebase } from "@/lib/firebase/client";
 import {
   resolveCameraFrame,
@@ -24,7 +24,7 @@ import {
   type CanvasPlacement,
   type SmartFitResult,
 } from "@/lib/timeline/canvas-layout";
-import { activeSpeedAt, outputDurationFor } from "@/lib/timeline/crop-speed";
+import { activeSpeedAt, outputDurationFor, DEFAULT_SPEED } from "@/lib/timeline/crop-speed";
 import { probeVideoBottomBand } from "@/lib/recording/health-check";
 import { drawClickHighlight } from "@/lib/timeline/click-highlight";
 import type {
@@ -33,6 +33,7 @@ import type {
   EffectsSettings,
   ExportFormat,
   FitMode,
+  SpeedSettings,
   VisualAnalysis,
 } from "@/lib/firebase/schema";
 
@@ -44,13 +45,27 @@ interface BasePlacement {
   offsetY: number;
 }
 
+// Ordered by preference. CRITICAL: every entry must be able to carry an AUDIO
+// track. A `codecs=` string that pins ONLY the video codec (e.g.
+// "video/mp4;codecs=avc1.42E01E") makes MediaRecorder encode video-only and
+// SILENTLY DROP the audio track — that was the "exported video has no audio"
+// bug (this list put that exact string first, and on Chrome/Edge MP4 recording
+// is supported, so it always won). Every entry below either names an audio
+// codec explicitly (mp4a.40.2 = AAC, opus) or is a bare container where the UA
+// negotiates audio+video. Do NOT add a video-only `codecs=` string here.
 const PREFERRED_MIMES = [
-  "video/mp4;codecs=avc1.42E01E",
-  "video/webm;codecs=vp9,opus",
-  "video/webm;codecs=vp9",
-  "video/webm;codecs=vp8,opus",
-  "video/webm",
+  "video/mp4;codecs=avc1.42E01E,mp4a.40.2", // H.264 + AAC
+  "video/mp4", // UA negotiates codecs — keeps audio
+  "video/webm;codecs=vp9,opus", // VP9 + Opus
+  "video/webm;codecs=vp8,opus", // VP8 + Opus
+  "video/webm", // UA negotiates codecs — keeps audio
 ];
+
+/** True when `mime` can carry an audio track (named audio codec or bare container). */
+function mimeCarriesAudio(mime: string): boolean {
+  if (!/codecs=/i.test(mime)) return true; // bare container — UA adds audio
+  return /\b(mp4a|aac|opus|vorbis)\b/i.test(mime);
+}
 
 function pickMime(): { mime: string; ext: string } | null {
   if (typeof MediaRecorder === "undefined") return null;
@@ -60,6 +75,244 @@ function pickMime(): { mime: string; ext: string } | null {
     }
   }
   return null;
+}
+
+// ── Export audio mixing ─────────────────────────────────────────────────────
+// canvas.captureStream() yields VIDEO ONLY. The source's audio has to be mixed
+// into the recorded stream separately, or the export is silent.
+//
+// IMPORTANT history: feeding the recorder the RAW HTMLMediaElement.captureStream()
+// audio track caused a mid-stream "MediaRecorder error" (~38% in). That raw track
+// is tied to the shared, actively-playing element, and its parent MediaStream was
+// discarded (only the track kept) — so it could be GC-orphaned and go `ended`,
+// which throws once the track is actually being ENCODED (it wasn't, under the old
+// video-only MIME — which is why the bug only appeared after we forced an audio
+// codec). The screen-recorder never hits this because it muxes a SYNTHETIC Web
+// Audio MediaStreamDestination track, which stays live for the AudioContext's life.
+//
+// So the strategy is:
+//   1. PRIMARY — tap the element's captureStream() audio, then RE-SYNTHESIZE it
+//      through Web Audio with createMediaStreamSource → MediaStreamDestination.
+//      The recorder gets a stable synthetic track (like the recorder), every node
+//      + the parent stream is retained (no GC orphan), and — crucially — this uses
+//      createMediaStreamSource, NOT createMediaElementSource, so the preview
+//      <video>'s native audio is NOT rerouted (zero preview-audio risk). The
+//      per-export AudioContext is closed in `cleanup` after recording stops.
+//      Section-mute = an export-only gain node (never touches `video.muted`).
+//   2. RAW — if no AudioContext exists, record the captured track directly but
+//      RETAIN its parent stream so it can't be GC-orphaned.
+//   3. ELEMENT-SOURCE FALLBACK — only when captureStream surfaces no audio at all
+//      (e.g. a browser without HTMLMediaElement.captureStream): createMediaElement
+//      Source → MediaStreamDestination. That reroutes the element (once per element
+//      for its lifetime, cached), so a monitor path (→ ctx.destination, mirroring
+//      muted/volume) keeps the preview audible.
+
+interface ElementAudioGraph {
+  ctx: AudioContext;
+  exportGain: GainNode;
+  dest: MediaStreamAudioDestinationNode;
+}
+
+const elementAudioGraphs = new WeakMap<HTMLMediaElement, ElementAudioGraph>();
+
+function getOrCreateAudioGraph(video: HTMLMediaElement): ElementAudioGraph | null {
+  const existing = elementAudioGraphs.get(video);
+  if (existing) return existing;
+  const Ctx =
+    window.AudioContext ||
+    (window as unknown as { webkitAudioContext?: typeof AudioContext })
+      .webkitAudioContext;
+  if (!Ctx) return null;
+  const ctx = new Ctx();
+  let source: MediaElementAudioSourceNode;
+  try {
+    // Throws if the element is cross-origin without CORS (ours is
+    // crossOrigin="anonymous", so a correctly-served source is fine) or if a
+    // source node already exists for it (can't happen here — we cache it).
+    source = ctx.createMediaElementSource(video);
+  } catch (err) {
+    void ctx.close();
+    throw err;
+  }
+  const monitorGain = ctx.createGain();
+  const exportGain = ctx.createGain();
+  const dest = ctx.createMediaStreamDestination();
+  source.connect(monitorGain);
+  monitorGain.connect(ctx.destination); // keep the preview audible post-reroute
+  source.connect(exportGain);
+  exportGain.connect(dest);
+  // Mirror the element's own mute/volume so the preview's mute button + volume
+  // slider keep working now that audio flows through us, not natively.
+  const syncMonitor = () => {
+    monitorGain.gain.value = video.muted ? 0 : video.volume;
+  };
+  syncMonitor();
+  video.addEventListener("volumechange", syncMonitor);
+  // The UA can suspend the context (e.g. tab hidden); every play() in this app
+  // follows a user gesture, so resume on play to avoid a silent preview.
+  video.addEventListener("play", () => {
+    if (ctx.state === "suspended") void ctx.resume();
+  });
+  const graph: ElementAudioGraph = { ctx, exportGain, dest };
+  elementAudioGraphs.set(video, graph);
+  return graph;
+}
+
+type AudioPath =
+  | "element-capture-webaudio"
+  | "element-capture-raw"
+  | "web-audio-element-source"
+  | "none";
+
+interface ExportAudio {
+  /** The audio track to mix into the export, or null if none was obtainable. */
+  track: MediaStreamTrack | null;
+  /** How it was obtained (diagnostics). */
+  path: AudioPath;
+  /** Mute ONLY the current section, leaving the rest of the export audible. */
+  setSectionMuted: (muted: boolean) => void;
+  /**
+   * Opaque references (nodes / parent streams) kept alive for the whole export
+   * so MediaRecorder's tracks can't be garbage-collected mid-record. The caller
+   * just has to keep the returned ExportAudio object reachable.
+   */
+  keepAlive?: unknown;
+  /** Release per-export resources (close the per-export AudioContext) — call AFTER recording stops. */
+  cleanup?: () => void;
+}
+
+function getAudioContextCtor(): typeof AudioContext | null {
+  if (typeof window === "undefined") return null;
+  return (
+    window.AudioContext ||
+    (window as unknown as { webkitAudioContext?: typeof AudioContext })
+      .webkitAudioContext ||
+    null
+  );
+}
+
+/**
+ * Obtain a stable audio track to mix into the export, plus a section-scoped mute
+ * control. See the strategy comment above `ElementAudioGraph`. Returns
+ * `{ track: null, path: "none" }` if no audio could be obtained at all.
+ */
+function acquireExportAudio(video: HTMLVideoElement): ExportAudio {
+  const AudioCtx = getAudioContextCtor();
+
+  // 1) PRIMARY — tap the element's captureStream audio, then re-synthesize it
+  //    through Web Audio (createMediaStreamSource, NOT createMediaElementSource)
+  //    so the recorder gets a stable synthetic track without rerouting the
+  //    preview element. All refs retained; section-mute via an export gain node.
+  try {
+    const captureStream = (
+      video as unknown as { captureStream?: () => MediaStream }
+    ).captureStream;
+    if (captureStream) {
+      const capStream = captureStream.call(video);
+      const rawTrack = capStream.getAudioTracks()[0] ?? null;
+      if (rawTrack && AudioCtx) {
+        const ctx = new AudioCtx();
+        const srcNode = ctx.createMediaStreamSource(new MediaStream([rawTrack]));
+        const gain = ctx.createGain();
+        const dest = ctx.createMediaStreamDestination();
+        srcNode.connect(gain);
+        gain.connect(dest);
+        if (ctx.state === "suspended") void ctx.resume();
+        const track = dest.stream.getAudioTracks()[0] ?? null;
+        if (track) {
+          return {
+            track,
+            path: "element-capture-webaudio",
+            setSectionMuted: (muted) => {
+              gain.gain.value = muted ? 0 : 1;
+            },
+            // Retain the whole graph + the parent capture stream against GC.
+            keepAlive: { ctx, srcNode, gain, dest, capStream },
+            cleanup: () => {
+              try {
+                void ctx.close();
+              } catch {
+                /* already closed — ignore */
+              }
+            },
+          };
+        }
+        try {
+          void ctx.close();
+        } catch {
+          /* ignore */
+        }
+      }
+      if (rawTrack) {
+        // No AudioContext — record the captured track directly, but RETAIN its
+        // parent stream so it can't be GC-orphaned mid-record. Section-mute then
+        // falls back to element mute (scoped to the section, applied live).
+        return {
+          track: rawTrack,
+          path: "element-capture-raw",
+          setSectionMuted: (muted) => {
+            if (video.muted !== muted) video.muted = muted;
+          },
+          keepAlive: { capStream },
+        };
+      }
+    }
+  } catch (err) {
+    console.warn("[export] element captureStream audio failed", err);
+  }
+
+  // 2) FALLBACK — the element exposed no audio via captureStream (browser without
+  //    HTMLMediaElement.captureStream). createMediaElementSource is then the only
+  //    way to recover audio; it reroutes the element, so the cached graph keeps a
+  //    monitor path to preserve preview audio.
+  try {
+    const graph = getOrCreateAudioGraph(video);
+    if (graph) {
+      if (graph.ctx.state === "suspended") void graph.ctx.resume();
+      graph.exportGain.gain.value = 1;
+      const track = graph.dest.stream.getAudioTracks()[0] ?? null;
+      if (track) {
+        // The element must stay UNMUTED so the source node receives signal;
+        // section-mute is done via the export gain, not element `muted`.
+        if (video.muted) video.muted = false;
+        return {
+          track,
+          path: "web-audio-element-source",
+          setSectionMuted: (muted) => {
+            graph.exportGain.gain.value = muted ? 0 : 1;
+          },
+        };
+      }
+    }
+  } catch (err) {
+    console.warn("[export] web-audio element-source fallback failed", err);
+  }
+
+  return { track: null, path: "none", setSectionMuted: () => {} };
+}
+
+/**
+ * Best-effort "does the source have an audio track?" probe. The standards are a
+ * mess across browsers, so this returns "unknown" rather than guessing wrong:
+ *  - Firefox: `mozHasAudio`.
+ *  - Chrome/WebKit: `webkitAudioDecodedByteCount` — only > 0 AFTER some audio
+ *    has decoded (i.e. after playback), so 0 here means "unknown", not "no".
+ *  - `audioTracks` exists only behind a flag in Chrome; trusted when present.
+ */
+function detectSourceHasAudio(video: HTMLVideoElement): boolean | "unknown" {
+  const v = video as HTMLVideoElement & {
+    mozHasAudio?: boolean;
+    webkitAudioDecodedByteCount?: number;
+    audioTracks?: { length: number };
+  };
+  if (typeof v.mozHasAudio === "boolean") return v.mozHasAudio;
+  if (v.audioTracks && typeof v.audioTracks.length === "number") {
+    return v.audioTracks.length > 0;
+  }
+  if (typeof v.webkitAudioDecodedByteCount === "number") {
+    return v.webkitAudioDecodedByteCount > 0 ? true : "unknown";
+  }
+  return "unknown";
 }
 
 /**
@@ -94,6 +347,12 @@ export interface ExportProgress {
   pct: number; // 0..1
   message?: string;
   downloadURL?: string;
+  /**
+   * Non-fatal heads-up surfaced to the user (e.g. "this export will have no
+   * audio"). The export still completes; the panel latches this so it stays
+   * visible for the whole render.
+   */
+  warning?: string;
 }
 
 interface RenderInput {
@@ -130,7 +389,10 @@ interface RenderInput {
  * and/or upload.
  *
  * Honest limits:
- * - Audio is included by piping the source video's MediaElement via captureStream.
+ * - Audio: the canvas stream is video-only, so the source's audio is mixed in
+ *   explicitly (`acquireExportAudio`) — preferring the element's own
+ *   captureStream(), falling back to a Web Audio graph. A visible warning is
+ *   surfaced via `onProgress` if neither yields a track.
  * - 4K is capped to 1920x1080 on the canvas to keep the browser stable.
  * - Some browsers don't support MediaRecorder of MP4 — we fall back to WebM.
  */
@@ -349,42 +611,15 @@ export async function renderProjectClientSide(
   ctx.fillStyle = "#000";
   ctx.fillRect(0, 0, canvasW, canvasH);
 
-  // Stream from canvas + audio from video element if possible
+  // canvas.captureStream() is VIDEO ONLY — the source audio is mixed in below.
   const canvasStream = canvas.captureStream(fps);
-  let audioTrack: MediaStreamTrack | null = null;
-  try {
-    // captureStream on HTMLMediaElement is non-standard but supported in Chromium.
-    type CaptureStream = () => MediaStream;
-    const captureStream = (video as unknown as { captureStream?: CaptureStream })
-      .captureStream;
-    if (captureStream) {
-      const stream = captureStream.call(video) as MediaStream;
-      const audioTracks = stream.getAudioTracks();
-      if (audioTracks.length) {
-        audioTrack = audioTracks[0];
-        canvasStream.addTrack(audioTrack);
-      }
-    }
-  } catch (err) {
-    console.warn("[export] audio capture failed", err);
-  }
 
-  const recorder = new MediaRecorder(canvasStream, {
-    mimeType: mime.mime,
-    videoBitsPerSecond: resolution === "4K" ? 12_000_000 : 6_000_000,
-  });
-
-  const chunks: Blob[] = [];
-  recorder.ondataavailable = (e) => {
-    if (e.data && e.data.size > 0) chunks.push(e.data);
-  };
-
-  const recordedPromise = new Promise<Blob>((resolve, reject) => {
-    recorder.onstop = () => resolve(new Blob(chunks, { type: mime.mime }));
-    recorder.onerror = () => reject(new Error("MediaRecorder error"));
-  });
-
-  // Rewind + play
+  // Rewind to the start and UNMUTE the element BEFORE we tap its audio, so the
+  // captured track isn't a leftover muted / mid-seek state. We remember the
+  // preview's prior mute + rate to restore them afterwards. (Per-section mute is
+  // re-applied during the draw loop, scoped to that section only.)
+  const prevMuted = video.muted;
+  const prevPlaybackRate = video.playbackRate;
   video.pause();
   video.currentTime = 0;
   video.muted = false;
@@ -394,6 +629,122 @@ export async function renderProjectClientSide(
       resolve();
     };
     video.addEventListener("seeked", onSeek);
+  });
+
+  // Mix the source audio into the recorded stream explicitly: one MediaStream
+  // built from the canvas VIDEO track + the source AUDIO track. This combine is
+  // what carries narration into the file — without it the canvas stream is mute.
+  const audio = acquireExportAudio(video);
+  const outputStream = new MediaStream([
+    ...canvasStream.getVideoTracks(),
+    ...(audio.track ? [audio.track] : []),
+  ]);
+
+  // ── Export audio diagnostics (req) ──────────────────────────────────────
+  // Answers "why is/isn't there audio?" from the console alone.
+  const sourceHasAudio = detectSourceHasAudio(video);
+  const speedMoments = moments.filter((m) => m.effectType === "speed-up");
+  const mutedSectionsCount = speedMoments.filter(
+    (m) => (m.speed?.audioMode ?? DEFAULT_SPEED.audioMode) === "mute"
+  ).length;
+  const speedAudioModes = Array.from(
+    new Set(speedMoments.map((m) => m.speed?.audioMode ?? DEFAULT_SPEED.audioMode))
+  );
+  const exportAudioTracksCount = outputStream.getAudioTracks().length;
+  const finalStreamHasAudio = exportAudioTracksCount > 0;
+  const mimeSupportsAudio = mimeCarriesAudio(mime.mime);
+  console.info("[export] audio diagnostics", {
+    sourceHasAudio,
+    exportAudioTracksCount,
+    audioMode: speedAudioModes.length ? speedAudioModes.join(",") : "source (unmodified)",
+    mutedSectionsCount,
+    finalStreamHasAudio,
+    audioPath: audio.path,
+    mime: mime.mime,
+    mimeSupportsAudio,
+  });
+
+  // Visible warning when the export will be silent (surfaced via onProgress;
+  // the panel latches it). Only warn when there's actually a problem — a track
+  // present means audio is carried (a genuinely-silent source gets a silent
+  // track, which is fine and shouldn't nag the user).
+  let audioWarning: string | undefined;
+  if (!finalStreamHasAudio) {
+    audioWarning =
+      sourceHasAudio === true
+        ? "Your recording has audio, but this browser couldn't capture it for export. Try Chrome or Edge."
+        : "This export has no audio track. If your recording has narration and this looks wrong, try Chrome or Edge.";
+  } else if (!mimeSupportsAudio) {
+    audioWarning =
+      "This browser's recording format can't store audio, so the export will be silent. Try Chrome or Edge.";
+  }
+
+  const videoBitsPerSecond = resolution === "4K" ? 12_000_000 : 6_000_000;
+  let recorder: MediaRecorder;
+  try {
+    recorder = new MediaRecorder(outputStream, {
+      mimeType: mime.mime,
+      videoBitsPerSecond,
+      audioBitsPerSecond: 128_000,
+    });
+  } catch (err) {
+    // Constructing with audio was rejected — degrade to a video-only file so the
+    // user still gets an export, and warn that it will be silent.
+    console.error(
+      "[export] MediaRecorder rejected the audio+video stream; recording video only",
+      err
+    );
+    for (const t of outputStream.getAudioTracks()) outputStream.removeTrack(t);
+    audio.cleanup?.();
+    audioWarning =
+      audioWarning ??
+      "Audio couldn't be added to this export in this browser, so it's video-only. Try Chrome or Edge.";
+    recorder = new MediaRecorder(outputStream, { mimeType: mime.mime, videoBitsPerSecond });
+  }
+
+  const chunks: Blob[] = [];
+  recorder.ondataavailable = (e) => {
+    if (e.data && e.data.size > 0) chunks.push(e.data);
+  };
+
+  const recordedPromise = new Promise<Blob>((resolve, reject) => {
+    recorder.onstop = () => resolve(new Blob(chunks, { type: mime.mime }));
+    recorder.onerror = (e) => {
+      // Surface the REAL DOMException (+ both track readyStates) instead of a
+      // generic string, so a recurrence is diagnosable from the console.
+      const domErr = (e as unknown as { error?: DOMException }).error;
+      console.error("[export] MediaRecorder error", {
+        name: domErr?.name,
+        message: domErr?.message,
+        audioPath: audio.path,
+        recorderState: recorder.state,
+        videoTrackState: outputStream.getVideoTracks()[0]?.readyState,
+        audioTrackState: outputStream.getAudioTracks()[0]?.readyState,
+        at: +video.currentTime.toFixed(2),
+        playbackRate: video.playbackRate,
+      });
+      reject(domErr ?? new Error("MediaRecorder error"));
+    };
+  });
+
+  // Mid-record track-death probe. A recorded track going `ended` WHILE recording
+  // is the failure mode behind the historical "MediaRecorder error" — log when /
+  // which so any recurrence is diagnosable. Guarded on recorder.state so the
+  // intentional track teardown during cleanup doesn't raise a false alarm.
+  audio.track?.addEventListener("ended", () => {
+    if (recorder.state === "recording") {
+      console.warn("[export] export audio track ENDED mid-record", {
+        at: +video.currentTime.toFixed(2),
+        path: audio.path,
+      });
+    }
+  });
+  outputStream.getVideoTracks()[0]?.addEventListener("ended", () => {
+    if (recorder.state === "recording") {
+      console.warn("[export] export VIDEO track ENDED mid-record", {
+        at: +video.currentTime.toFixed(2),
+      });
+    }
   });
 
   // `base` (the source placement: drawW/drawH + offsetX/offsetY) and `cover`
@@ -433,7 +784,7 @@ export async function renderProjectClientSide(
 
   recorder.start(500);
 
-  onProgress({ stage: "rendering", pct: 0 });
+  onProgress({ stage: "rendering", pct: 0, warning: audioWarning });
 
   // Drive a draw loop
   let stopped = false;
@@ -494,8 +845,10 @@ export async function renderProjectClientSide(
     if (stopped) return;
     // Speed sections: real-time capture at a higher playbackRate makes the
     // recorded output genuinely shorter for that span (not faked). Audio
-    // follows the section's mode (mute / keep-shifted / pitch-corrected).
-    applySpeedForFrame(video, moments);
+    // follows the section's mode — muted ONLY for that section via the audio
+    // mixer (never the whole export), kept/pitch-shifted otherwise.
+    const activeSpeed = applySpeedForFrame(video, moments);
+    audio.setSectionMuted(activeSpeed?.audioMode === "mute");
     ctx.fillStyle = "#000";
     ctx.fillRect(0, 0, canvasW, canvasH);
     // Canvas Fit background — fills the whole frame behind the (crisp) video
@@ -560,9 +913,13 @@ export async function renderProjectClientSide(
     clearTimeout(safety);
     signal?.removeEventListener("abort", abortHandler);
     video.pause();
-    // Restore normal playback so the editor preview isn't left sped/muted.
+    // Recording has stopped — safe to release the per-export AudioContext.
+    audio.cleanup?.();
+    // Restore the preview's pre-export audio + speed state so the editor isn't
+    // left muted or sped up after an export.
     try {
-      video.playbackRate = 1;
+      video.playbackRate = prevPlaybackRate;
+      video.muted = prevMuted;
     } catch {
       /* ignore */
     }
@@ -627,21 +984,24 @@ export async function renderProjectClientSide(
  * because layers 3 and 4 need fields from the same record.
  */
 /**
- * Set the source element's playbackRate (+ audio mode) for the speed section
- * under the current playhead. Real-time MediaRecorder capture then records
- * that span faster, shortening the output. Audio: "mute" silences the element
- * (its captured track goes quiet), "keep" lets pitch shift up, "pitch-correct"
- * time-stretches without pitch change. Reset to 1× / unmuted outside sections.
+ * Set the source element's playbackRate + pitch handling for the speed section
+ * under the current playhead, and RETURN that section (or null). Real-time
+ * MediaRecorder capture then records that span faster, shortening the output.
+ *
+ * Audio (un)muting is intentionally NOT done here — the caller applies it via
+ * the export audio mixer's `setSectionMuted`. Toggling `video.muted` would be
+ * wrong for the Web Audio path (a muted element feeds the source node silence,
+ * killing audio for the WHOLE export), so mute is scoped to the mixer instead.
+ * Pitch: "keep" lets pitch shift up with speed; "mute"/"pitch-correct" preserve
+ * pitch. Reset to 1× / pitch-preserved outside sections.
  */
 function applySpeedForFrame(
   video: HTMLVideoElement,
   moments: DetectedMoment[]
-): void {
+): SpeedSettings | null {
   const sp = activeSpeedAt(moments, video.currentTime);
   const rate = sp ? Math.max(0.0625, Math.min(16, sp.multiplier)) : 1;
   if (Math.abs(video.playbackRate - rate) > 0.001) video.playbackRate = rate;
-  const wantMute = !!(sp && sp.audioMode === "mute");
-  if (video.muted !== wantMute) video.muted = wantMute;
   try {
     (video as HTMLVideoElement & { preservesPitch?: boolean }).preservesPitch = sp
       ? sp.audioMode !== "keep"
@@ -649,6 +1009,7 @@ function applySpeedForFrame(
   } catch {
     /* not supported — ignore */
   }
+  return sp;
 }
 
 function applyCameraFrame(
@@ -1016,17 +1377,47 @@ export async function uploadExport({
   exportId,
   uploadPath,
   blob,
+  onProgress,
+  signal,
 }: {
   uid: string;
   projectId: string;
   exportId: string;
   uploadPath: string;
   blob: Blob;
+  /** Byte-level upload progress, 0..1. A 4K export is ~300+ MB, so a
+   *  feedback-less upload reads as a hang — the panel surfaces this %. */
+  onProgress?: (pct: number) => void;
+  signal?: AbortSignal;
 }): Promise<{ exportId: string; downloadURL: string }> {
   const { db, storage } = getFirebase();
 
   const sRef = storageRef(storage, uploadPath);
-  await uploadBytes(sRef, blob, { contentType: blob.type || "video/webm" });
+  // Resumable upload so we can report real progress (uploadBytes is one-shot
+  // and exposes none). Cancelling the export aborts the in-flight upload too.
+  await new Promise<void>((resolve, reject) => {
+    const task = uploadBytesResumable(sRef, blob, {
+      contentType: blob.type || "video/webm",
+    });
+    const onAbort = () => task.cancel();
+    signal?.addEventListener("abort", onAbort);
+    task.on(
+      "state_changed",
+      (snap) => {
+        if (snap.totalBytes > 0) {
+          onProgress?.(snap.bytesTransferred / snap.totalBytes);
+        }
+      },
+      (err) => {
+        signal?.removeEventListener("abort", onAbort);
+        reject(err);
+      },
+      () => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve();
+      }
+    );
+  });
   const downloadURL = await getDownloadURL(sRef);
 
   await setDoc(

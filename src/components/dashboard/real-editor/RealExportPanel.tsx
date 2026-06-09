@@ -46,7 +46,7 @@ const FIT_LABEL: Record<FitMode, string> = {
 };
 
 export function RealExportPanel() {
-  const { project, uid, videoRef, duration, updateEffects, openCanvas } =
+  const { project, uid, videoRef, duration, updateEffects, openCanvas, setExporting } =
     useEditorReal();
 
   // Output aspect/fit now lives in the global Canvas panel — the export reads
@@ -83,6 +83,10 @@ export function RealExportPanel() {
   const [progress, setProgress] = React.useState<ExportProgress | null>(null);
   const [error, setError] = React.useState<string | null>(null);
   const [downloadURL, setDownloadURL] = React.useState<string | null>(null);
+  // Latched audio warning — the renderer emits it once via onProgress; we keep
+  // it on screen for the whole export (and the finished state) so the user sees
+  // "this export will have no audio" rather than it flashing past.
+  const [audioWarning, setAudioWarning] = React.useState<string | null>(null);
   const cancelRef = React.useRef<AbortController | null>(null);
 
   // Defensive: if the user was on a paid plan at 4K and downgraded to free
@@ -107,6 +111,7 @@ export function RealExportPanel() {
   const start = async () => {
     setError(null);
     setDownloadURL(null);
+    setAudioWarning(null);
     const video = videoRef.current;
     if (!video) {
       setError("Video element not ready.");
@@ -176,6 +181,9 @@ export function RealExportPanel() {
       }
 
       // ── 2. Render ────────────────────────────────────────────────────
+      // Pause the editor preview's rAF loops while the exporter has the main
+      // thread (smoother 4K/60 capture; clears in `finally`).
+      setExporting(true);
       const blob = await renderProjectClientSide({
         uid,
         projectId: project.id,
@@ -189,19 +197,43 @@ export function RealExportPanel() {
         format,
         visualAnalysis: project.visualAnalysis,
         applyWatermark: !!applyWatermark,
-        onProgress: (p) => setProgress(p),
+        onProgress: (p) => {
+          setProgress(p);
+          if (p.warning) setAudioWarning(p.warning);
+        },
         signal: controller.signal,
       });
+      // Render's done — the upload is network-bound, so let the preview resume
+      // (the `finally` still clears this if the render threw).
+      setExporting(false);
 
-      // ── 3. Upload to the path the permit blessed ─────────────────────
-      setProgress({ stage: "uploading", pct: 0 });
+      // ── 3. Hand the user the file immediately ────────────────────────
+      // The blob is in memory; download it locally now so the user has the
+      // file without waiting on the (large, ~300+ MB at 4K) upload below.
       const ext = pickedMimeExt();
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `${project.title || "framevo-export"}.${ext}`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+
+      // ── 4. Upload to the path the permit blessed ─────────────────────
+      // Resumable upload reports real byte progress so the finish isn't a
+      // feedback-less hang.
+      setProgress({ stage: "uploading", pct: 0, message: `0 / ${mb(blob.size)}` });
       const { downloadURL } = await uploadExport({
         uid,
         projectId: project.id,
         exportId,
         uploadPath,
         blob,
+        signal: controller.signal,
+        onProgress: (pct) =>
+          setProgress({
+            stage: "uploading",
+            pct,
+            message: `${mb(pct * blob.size)} / ${mb(blob.size)}`,
+          }),
       });
       setProgress({ stage: "complete", pct: 1, downloadURL });
       setDownloadURL(downloadURL);
@@ -216,13 +248,6 @@ export function RealExportPanel() {
         body: `${project.title || "Untitled"} · ${format} · ${resolution}`,
         href: "/dashboard/exports",
       });
-
-      // Trigger local download too
-      const a = document.createElement("a");
-      a.href = URL.createObjectURL(blob);
-      a.download = `${project.title || "framevo-export"}.${ext}`;
-      a.click();
-      URL.revokeObjectURL(a.href);
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Export failed.";
       setProgress({ stage: "failed", pct: 0, message: msg });
@@ -236,6 +261,7 @@ export function RealExportPanel() {
       });
     } finally {
       cancelRef.current = null;
+      setExporting(false);
     }
   };
 
@@ -457,6 +483,16 @@ export function RealExportPanel() {
           </div>
         )}
 
+        {/* Audio warning — non-fatal. The export still completes; this tells the
+            user it will be silent (e.g. browser couldn't capture the source
+            audio) so a missing voiceover isn't a silent surprise. */}
+        {audioWarning && (
+          <div className="flex items-start gap-2 rounded-xl border border-amber-400/30 bg-amber-500/[0.06] px-4 py-3 text-xs text-amber-200">
+            <AlertCircle size={12} className="mt-0.5 shrink-0" />
+            <span>{audioWarning}</span>
+          </div>
+        )}
+
         {downloadURL && (
           <a
             href={downloadURL}
@@ -549,6 +585,11 @@ function fmtDuration(seconds: number): string {
   const r = s % 60;
   if (m === 0) return `${r}s`;
   return `${m}m ${String(r).padStart(2, "0")}s`;
+}
+
+/** Human file size for the upload progress line, e.g. "182 MB". */
+function mb(bytes: number): string {
+  return `${(Math.max(0, bytes) / (1024 * 1024)).toFixed(0)} MB`;
 }
 
 function stageLabel(p: ExportProgress): string {

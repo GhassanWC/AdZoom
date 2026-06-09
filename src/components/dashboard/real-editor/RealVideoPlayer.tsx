@@ -72,6 +72,8 @@ interface CameraDriverState {
   autoZoom: number;
   zoomSpeed: number;
   pacing: string;
+  /** When true, an export render is running — the preview camera loop yields. */
+  exporting: boolean;
 }
 
 /**
@@ -122,6 +124,15 @@ function useCinematicCamera(
       const dt = Math.min(0.05, (now - last) / 1000);
       last = now;
       const s = stateRef.current;
+
+      // While a render is running, yield the main thread to the exporter — it
+      // drives playback AND owns video.playbackRate (writing it here too is a
+      // two-writer race). Keep the rAF alive so the camera resumes the instant
+      // the export finishes.
+      if (s.exporting) {
+        raf = requestAnimationFrame(tick);
+        return;
+      }
 
       // Speed sections drive playbackRate — an approximate accelerated preview
       // (the export bakes the exact shorter duration). Outside a speed section,
@@ -265,6 +276,7 @@ export function RealVideoPlayer() {
     setCurrentTime,
     playing,
     setPlaying,
+    exporting,
     duration,
     setDuration,
     activeMoment,
@@ -462,6 +474,7 @@ export function RealVideoPlayer() {
       autoZoom: project.effectsSettings.autoZoom,
       zoomSpeed: project.effectsSettings.zoomSpeed,
       pacing: project.effectsSettings.pacing,
+      exporting,
     },
     cameraDebugRef
   );
@@ -610,7 +623,9 @@ export function RealVideoPlayer() {
   // Heavy blur tolerates loose sync, so we only correct on drift / play state.
   const blurBgActive = showCanvasBg && canvasBgMode === "blur";
   React.useEffect(() => {
-    if (!blurBgActive) return;
+    // Skip while exporting — this loop seeks bgVideo every frame, and the
+    // export doesn't capture the preview's blur background anyway.
+    if (!blurBgActive || exporting) return;
     let raf = 0;
     const tick = () => {
       const main = videoRef.current;
@@ -626,7 +641,7 @@ export function RealVideoPlayer() {
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [blurBgActive, videoRef]);
+  }, [blurBgActive, exporting, videoRef]);
 
   return (
     <div

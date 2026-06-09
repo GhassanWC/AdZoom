@@ -48,6 +48,10 @@ interface EditorRealContextValue {
   setCurrentTime: (t: number) => void;
   playing: boolean;
   setPlaying: (p: boolean) => void;
+  /** True while a client-side export render is running. The preview pauses its
+   *  rAF loops so it doesn't compete with the exporter for the main thread. */
+  exporting: boolean;
+  setExporting: (v: boolean) => void;
   duration: number;
   setDuration: (d: number) => void;
   selectedMomentId: string | null;
@@ -240,6 +244,7 @@ export function EditorRealProvider({
   const videoRef = React.useRef<HTMLVideoElement | null>(null);
   const [currentTime, setCurrentTime] = React.useState(0);
   const [playing, setPlaying] = React.useState(false);
+  const [exporting, setExporting] = React.useState(false);
   const [duration, setDuration] = React.useState(project.duration ?? 0);
   const [selectedMomentId, setSelectedMomentId] = React.useState<string | null>(null);
   const [multiSelectIds, setMultiSelectIds] = React.useState<string[]>([]);
@@ -1135,6 +1140,8 @@ export function EditorRealProvider({
     setCurrentTime,
     playing,
     setPlaying,
+    exporting,
+    setExporting,
     duration,
     setDuration,
     selectedMomentId,
