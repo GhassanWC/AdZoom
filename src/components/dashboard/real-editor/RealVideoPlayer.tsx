@@ -526,7 +526,6 @@ export function RealVideoPlayer() {
       bgMode,
       showBg: place.hasLetterbox && (effFit === "fit" || effFit === "manual"),
       manual: oc.fitMode === "manual",
-      portrait: canvasH > canvasW,
     };
   }, [oc, srcAspectVal, va, allMoments]);
 
@@ -546,10 +545,18 @@ export function RealVideoPlayer() {
       : applySourceAspect
         ? { aspectRatio: String(previewAspect) }
         : undefined;
-  const frameSizeClass =
-    canvasActive && previewPlacement?.portrait
-      ? "max-h-[72vh]"
-      : "max-h-[56vh] max-w-[100vh]";
+  // Tall/square canvases must be HEIGHT-driven. With `w-full` (width:100%) the
+  // tall `aspect-ratio` can't shrink the width, so the frame would render wide
+  // (full width, capped height) instead of tall. Drive the height instead and
+  // let `aspect-ratio` derive the narrower width. Wide canvases stay
+  // width-driven (the source/no-canvas preview is landscape too).
+  const tallCanvas =
+    canvasActive &&
+    !!previewPlacement &&
+    previewPlacement.canvasH >= previewPlacement.canvasW;
+  const frameSizeClass = tallCanvas
+    ? "h-[72vh] w-auto max-w-full"
+    : "w-full max-h-[56vh] max-w-[100vh]";
 
   const place = canvasActive ? previewPlacement?.place : undefined;
   const stageStyle: React.CSSProperties | undefined =
@@ -662,7 +669,7 @@ export function RealVideoPlayer() {
           "relative overflow-hidden bg-black shadow-cinematic",
           isFullscreen
             ? "h-full w-full rounded-none border-0"
-            : cn("w-full rounded-xl border border-white/[0.06] mx-auto", frameSizeClass)
+            : cn("rounded-xl border border-white/[0.06] mx-auto", frameSizeClass)
         )}
       >
         {/* ── Canvas Fit background — fills the empty space behind the (crisp)

@@ -23,7 +23,13 @@ import { attentionCurve } from "@/lib/attention/score";
 import { cursorIntent } from "@/lib/attention/cursor-intent";
 import { classifyClick, type ClickTier } from "@/lib/attention/click-classifier";
 import { canUseAiFeature } from "@/lib/usage/ai-features";
-import { canUsePreset } from "@/lib/usage/gating";
+import { canUsePreset, getUserPlan } from "@/lib/usage/gating";
+import {
+  exceedsUploadDuration,
+  FREE_UPLOAD_MAX_DURATION_SECONDS,
+  FREE_VIDEO_DURATION_LIMIT_CODE,
+  FREE_VIDEO_DURATION_LIMIT_MESSAGE,
+} from "@/lib/usage/plan";
 import type { Interaction } from "@/lib/recording/types";
 import {
   resolveScopeAndTrust,
@@ -400,6 +406,24 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
 
     if (!storagePath) {
       return NextResponse.json({ error: "Project has no video uploaded" }, { status: 400 });
+    }
+
+    // ── Plan gate: Free plan is capped at 3-minute videos. Server backstop for
+    // the client-side upload checks — catches a direct API call or a reanalyze
+    // of an old long project. Gates on the stored/probed `duration`; an unknown
+    // duration is not blocked here (the client paths probe a real one).
+    const plan = await getUserPlan(uid);
+    if (exceedsUploadDuration(plan, duration)) {
+      return NextResponse.json(
+        {
+          error: FREE_VIDEO_DURATION_LIMIT_MESSAGE,
+          kind: "duration_limit",
+          code: FREE_VIDEO_DURATION_LIMIT_CODE,
+          limit: FREE_UPLOAD_MAX_DURATION_SECONDS,
+          duration,
+        },
+        { status: 402 }
+      );
     }
 
     // ── Plan gate: refuse to analyze if the project has a premium preset
@@ -1255,6 +1279,18 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       importantDetected: editDiagnostics.importantDetected,
       timelineApplied: editDiagnostics.timelineApplied,
       suppressedDrops: editDiagnostics.suppressedDrops,
+    });
+
+    // Effect-type mix on the final timeline (friendly names). Reached by both
+    // the direct and the chunked-finalize paths, so every analyze logs it.
+    const effectDist = editDiagnostics.effectDistribution ?? {};
+    console.info("[cv-effect-distribution]", {
+      projectId,
+      zoom: effectDist.zoom ?? 0,
+      click: effectDist["click-highlight"] ?? 0,
+      focus: effectDist["cursor-focus"] ?? 0,
+      crop: effectDist.crop ?? 0,
+      speed: effectDist["speed-up"] ?? 0,
     });
 
     await ref.set(

@@ -4,6 +4,11 @@ import * as React from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/lib/firebase/AuthProvider";
 import { createProjectFromFile } from "@/lib/firebase/projects";
+import { usePlanTier } from "@/lib/usage/useStoragePlan";
+import {
+  exceedsUploadDuration,
+  FREE_VIDEO_DURATION_LIMIT_MESSAGE,
+} from "@/lib/usage/plan";
 import {
   createRecordingEngine,
   mimeToExtension,
@@ -65,6 +70,7 @@ const Ctx = React.createContext<RecordingContextValue | null>(null);
 export function RecordingProvider({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const { user } = useAuth();
+  const { tier } = usePlanTier();
   const notifications = useNotifications();
 
   const engineRef = React.useRef<RecordingEngine | null>(null);
@@ -194,6 +200,11 @@ export function RecordingProvider({ children }: { children: React.ReactNode }) {
 
   const useResult: RecordingContextValue["useResult"] = async () => {
     if (!result || !user) return;
+    // Free plan caps uploads at 3 minutes — block the take before any upload.
+    if (exceedsUploadDuration(tier, result.durationSeconds)) {
+      setError(FREE_VIDEO_DURATION_LIMIT_MESSAGE);
+      return;
+    }
     setUploading(true);
     setUploadPct(0);
     setError(null);

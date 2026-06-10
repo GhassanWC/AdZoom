@@ -24,7 +24,7 @@ export function ExportModal({
       icon={<Download size={17} />}
       maxWidth="max-w-2xl"
     >
-      <RealExportPanel />
+      <RealExportPanel onClose={onClose} />
     </EditorSheet>
   );
 }

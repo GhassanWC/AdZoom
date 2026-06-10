@@ -184,6 +184,26 @@ function DiagBody({ diag }: { diag: EditDiagnostics }) {
         <Stat label="CV moments" value={String(diag.cvMomentsEmitted ?? 0)} />
       </div>
 
+      {/* Effect-type mix on the final timeline (CV classifier output). */}
+      {diag.effectDistribution && (
+        <div className="grid grid-cols-3 gap-2 sm:grid-cols-5">
+          <Stat label="Zoom" value={String(diag.effectDistribution.zoom ?? 0)} />
+          <Stat
+            label="Click"
+            value={String(diag.effectDistribution["click-highlight"] ?? 0)}
+          />
+          <Stat
+            label="Focus"
+            value={String(diag.effectDistribution["cursor-focus"] ?? 0)}
+          />
+          <Stat label="Crop" value={String(diag.effectDistribution.crop ?? 0)} />
+          <Stat
+            label="Speed"
+            value={String(diag.effectDistribution["speed-up"] ?? 0)}
+          />
+        </div>
+      )}
+
       {/* Funnel bar */}
       <FunnelBar diag={diag} />
 

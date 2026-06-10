@@ -826,6 +826,13 @@ export interface EditDiagnostics {
   /** `applied / (important − intentionalDrops)` — the honest headline. */
   coverageAdjusted: number;
 
+  /**
+   * Effect-type mix on the final timeline — counts keyed by `EffectType`
+   * (absent key = 0). Surfaces how diverse the generated edits are
+   * (zoom vs click-highlight vs cursor-focus vs crop vs speed-up).
+   */
+  effectDistribution?: Partial<Record<EffectType, number>>;
+
   /** Drill-down rows (capped ~200), sorted by ts. */
   rows: EditDiagnosticRow[];
 }

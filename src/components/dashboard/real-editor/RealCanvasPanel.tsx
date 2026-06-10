@@ -6,6 +6,7 @@ import { Slider } from "@/components/ui/Slider";
 import { Button } from "@/components/ui/Button";
 import { cn } from "@/lib/cn";
 import { useEditorReal } from "./context";
+import { useDebugParam } from "./use-debug-param";
 import {
   resolveOutputCanvas,
   resolveCanvasDims,
@@ -58,6 +59,33 @@ export function RealCanvasPanel() {
   // The live canvas (or null = "Source / full frame").
   const current = resolveOutputCanvas(project.effectsSettings);
   const isSource = !current;
+
+  // Debug-only axis-mapping trace (Ctrl/Cmd+Shift+D or ?debug=1). Confirms the
+  // width/height → output mapping while the Canvas panel is open.
+  const debug = useDebugParam();
+  React.useEffect(() => {
+    if (!debug || !current) return;
+    const { canvasW, canvasH } = resolveCanvasDims(
+      srcW,
+      srcH,
+      current.aspectRatio,
+      "1080p",
+      current.aspectRatio === "custom"
+        ? { width: current.width, height: current.height }
+        : undefined
+    );
+    console.log("[canvas-layout]", {
+      width: current.width,
+      height: current.height,
+      aspect: +(current.width / current.height).toFixed(4),
+      fitMode: current.fitMode,
+      sourceWidth: srcW,
+      sourceHeight: srcH,
+      sourceAspect: +(srcW / srcH).toFixed(4),
+      outputWidth: canvasW,
+      outputHeight: canvasH,
+    });
+  }, [debug, current, srcW, srcH]);
 
   const canonicalDims = React.useCallback(
     (id: AspectRatioId): { width: number; height: number } => {

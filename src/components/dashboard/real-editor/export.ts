@@ -782,16 +782,82 @@ export async function renderProjectClientSide(
   if (vignetteOn) drawVignette(ctx, canvasW, canvasH);
   if (input.applyWatermark) drawWatermark(ctx, canvasW, canvasH);
 
+  // ── Lifecycle teardown: cancel / natural-end / error all funnel through one
+  // idempotent cleanup so the recorder, capture tracks, rAF and audio graph are
+  // fully released. Fixes "Cancel does nothing" + the CPU/audio leak that broke
+  // the NEXT export (the per-export AudioContext was never closed). ──
+  let rafId = 0;
+  let cleanedUp = false;
+  const trackCounts = () => ({
+    recorderState: recorder.state,
+    tracks: outputStream.getTracks().length,
+    videoTracks: outputStream.getVideoTracks().length,
+    audioTracks: outputStream.getAudioTracks().length,
+  });
+  const cleanup = () => {
+    if (cleanedUp) return;
+    cleanedUp = true;
+    if (rafId) cancelAnimationFrame(rafId);
+    try {
+      if (recorder.state !== "inactive") recorder.stop();
+    } catch {
+      /* already stopped */
+    }
+    // Stop EVERY capture track so the canvas + audio pipelines stop the CPU.
+    for (const t of outputStream.getTracks()) {
+      try {
+        t.stop();
+      } catch {
+        /* ignore */
+      }
+    }
+    for (const t of canvasStream.getTracks()) {
+      try {
+        t.stop();
+      } catch {
+        /* ignore */
+      }
+    }
+    try {
+      video.pause();
+    } catch {
+      /* ignore */
+    }
+    // Recording has stopped — safe to release the per-export AudioContext.
+    audio.cleanup?.();
+    // Restore the preview's pre-export audio + speed state.
+    try {
+      video.playbackRate = prevPlaybackRate;
+      video.muted = prevMuted;
+    } catch {
+      /* ignore */
+    }
+    console.info("[export] cleanup-complete", trackCounts());
+  };
+
   recorder.start(500);
+  console.info("[export] started", trackCounts());
 
   onProgress({ stage: "rendering", pct: 0, warning: audioWarning });
 
   // Drive a draw loop
   let stopped = false;
   let aborted = false;
+  let loggedDecile = -1;
   const abortHandler = () => {
     aborted = true;
     stopped = true;
+    console.info("[export] cancel-requested", {
+      at: +video.currentTime.toFixed(2),
+    });
+    if (rafId) cancelAnimationFrame(rafId);
+    // Stop the recorder so `onstop` fires and `recordedPromise` resolves —
+    // otherwise the await below hangs forever and cleanup never runs.
+    try {
+      if (recorder.state !== "inactive") recorder.stop();
+    } catch {
+      /* ignore */
+    }
   };
   signal?.addEventListener("abort", abortHandler);
 
@@ -880,7 +946,13 @@ export async function renderProjectClientSide(
 
     // progress
     if (input.duration > 0) {
-      onProgress({ stage: "rendering", pct: Math.min(0.99, video.currentTime / input.duration) });
+      const pct = Math.min(0.99, video.currentTime / input.duration);
+      onProgress({ stage: "rendering", pct });
+      const decile = Math.floor(pct * 10);
+      if (decile !== loggedDecile) {
+        loggedDecile = decile;
+        console.info("[export] progress", { pct: +pct.toFixed(2) });
+      }
     }
 
     if (video.ended || video.currentTime >= input.duration - 0.05) {
@@ -889,9 +961,9 @@ export async function renderProjectClientSide(
       return;
     }
 
-    requestAnimationFrame(draw);
+    rafId = requestAnimationFrame(draw);
   };
-  requestAnimationFrame(draw);
+  rafId = requestAnimationFrame(draw);
 
   // Safety stop
   const maxDurationMs = Math.max(1, input.duration + 5) * 1000;
@@ -912,20 +984,14 @@ export async function renderProjectClientSide(
   } finally {
     clearTimeout(safety);
     signal?.removeEventListener("abort", abortHandler);
-    video.pause();
-    // Recording has stopped — safe to release the per-export AudioContext.
-    audio.cleanup?.();
-    // Restore the preview's pre-export audio + speed state so the editor isn't
-    // left muted or sped up after an export.
-    try {
-      video.playbackRate = prevPlaybackRate;
-      video.muted = prevMuted;
-    } catch {
-      /* ignore */
-    }
+    cleanup();
   }
 
-  if (aborted) throw new Error("Export cancelled");
+  if (aborted) {
+    console.info("[export] canceled");
+    throw new Error("Export cancelled");
+  }
+  console.info("[export] completed", { size: blob.size });
   onProgress({ stage: "rendering", pct: 1 });
 
   return blob;

@@ -6,6 +6,7 @@ import type {
   EditDiagnosticRow,
   EditDiagnostics,
   EditDropClass,
+  EffectType,
   VisualAnalysis,
 } from "@/lib/firebase/schema";
 
@@ -203,6 +204,13 @@ export function buildEditDiagnostics(
   );
   const coverageAdjusted = importantApplied / adjustedDenom;
 
+  // Effect-type mix on the final timeline — how diverse the edits ended up.
+  const effectDistribution: Partial<Record<EffectType, number>> = {};
+  for (const m of appliedMoments) {
+    effectDistribution[m.effectType] =
+      (effectDistribution[m.effectType] ?? 0) + 1;
+  }
+
   return {
     schemaVersion: 1,
     computedAt,
@@ -239,6 +247,8 @@ export function buildEditDiagnostics(
 
     coverageRaw,
     coverageAdjusted,
+
+    effectDistribution,
 
     rows: rows.slice(0, ROWS_CAP),
   };

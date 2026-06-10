@@ -20,20 +20,17 @@ import { Button } from "@/components/ui/Button";
 import { cn } from "@/lib/cn";
 import { useEditorReal } from "./context";
 import { BUILTIN_PRESETS_BY_ID } from "@/lib/presets";
+import { pickedMimeAvailable } from "./export";
 import {
-  renderProjectClientSide,
-  uploadExport,
-  pickedMimeAvailable,
-  pickedMimeExt,
-  type ExportProgress,
-} from "./export";
+  useExport,
+  type ExportRenderParams,
+  type ExportStatusUI,
+} from "@/components/export/ExportProvider";
 import { resolveOutputCanvas } from "@/lib/timeline/canvas-layout";
 import type { ExportFormat, FitMode } from "@/lib/firebase/schema";
 import { useStoragePlan } from "@/lib/usage/useStoragePlan";
 import { planMeetsMinimum } from "@/lib/usage/plan";
 import { useMonthlyUsage } from "@/lib/usage/useMonthlyUsage";
-import { useAuth } from "@/lib/firebase/AuthProvider";
-import { useNotifications } from "@/lib/notifications/store";
 
 const resolutions = ["1080p", "4K"] as const;
 const fpsOptions = [30, 60] as const;
@@ -45,9 +42,8 @@ const FIT_LABEL: Record<FitMode, string> = {
   manual: "Manual",
 };
 
-export function RealExportPanel() {
-  const { project, uid, videoRef, duration, updateEffects, openCanvas, setExporting } =
-    useEditorReal();
+export function RealExportPanel({ onClose }: { onClose?: () => void }) {
+  const { project, duration, updateEffects, openCanvas } = useEditorReal();
 
   // Output aspect/fit now lives in the global Canvas panel — the export reads
   // it via `resolveOutputCanvas`. `format` is derived purely for the billing
@@ -67,10 +63,10 @@ export function RealExportPanel() {
           : ""
       }`
     : "Source · full frame";
-  const notifications = useNotifications();
   const { plan } = useStoragePlan();
   const usage = useMonthlyUsage();
-  const { getIdToken } = useAuth();
+  const { job, isExporting, startExport, cancelExport, downloadCurrent } =
+    useExport();
 
   // 4K requires a paid plan (Pro $19 and up). Free is capped at 1080p.
   const canExport4k = planMeetsMinimum(plan.tier, "pro");
@@ -80,14 +76,18 @@ export function RealExportPanel() {
 
   const [resolution, setResolution] = React.useState<"1080p" | "4K">("1080p");
   const [fps, setFps] = React.useState<30 | 60>(30);
-  const [progress, setProgress] = React.useState<ExportProgress | null>(null);
-  const [error, setError] = React.useState<string | null>(null);
-  const [downloadURL, setDownloadURL] = React.useState<string | null>(null);
-  // Latched audio warning — the renderer emits it once via onProgress; we keep
-  // it on screen for the whole export (and the finished state) so the user sees
-  // "this export will have no audio" rather than it flashing past.
-  const [audioWarning, setAudioWarning] = React.useState<string | null>(null);
-  const cancelRef = React.useRef<AbortController | null>(null);
+  const [blockedWarning, setBlockedWarning] = React.useState<string | null>(null);
+
+  // The export job is shown here ONLY when it belongs to this project — a
+  // background export for another project surfaces in the global pill instead.
+  const myJob = job && job.projectId === project.id ? job : null;
+  const exporting =
+    !!myJob &&
+    (myJob.status === "preparing" ||
+      myJob.status === "rendering" ||
+      myJob.status === "uploading");
+  // Another project's export is mid-flight — block starting a duplicate.
+  const otherExporting = isExporting && job?.projectId !== project.id;
 
   // Defensive: if the user was on a paid plan at 4K and downgraded to free
   // mid-session, snap them back to 1080p before they hit Export.
@@ -108,172 +108,40 @@ export function RealExportPanel() {
     ? BUILTIN_PRESETS_BY_ID[project.selectedPresetId]?.name ?? "Custom preset"
     : "No preset";
 
-  const start = async () => {
-    setError(null);
-    setDownloadURL(null);
-    setAudioWarning(null);
-    const video = videoRef.current;
-    if (!video) {
-      setError("Video element not ready.");
-      return;
-    }
+  // Hand the whole lifecycle to the session-level ExportProvider so it survives
+  // closing this modal AND navigating away (it renders on its own offscreen
+  // video). This panel just collects params + reflects the job state.
+  const start = () => {
+    setBlockedWarning(null);
     if (!project.originalVideoUrl) {
-      setError("Project has no source video.");
+      setBlockedWarning("Project has no source video.");
       return;
     }
     if (!supported) {
-      setError(
+      setBlockedWarning(
         "Client-side export isn't supported in this browser. Use Chrome or Edge."
       );
       return;
     }
-
-    const controller = new AbortController();
-    cancelRef.current = controller;
-    setProgress({ stage: "preparing", pct: 0 });
-
-    try {
-      // ── 1. Server-side permit ────────────────────────────────────────
-      // Validates plan + monthly cap + locks resolution/format/watermark
-      // server-side BEFORE we burn cycles rendering. Any failure here
-      // saves the user a 60s+ render they couldn't have uploaded anyway.
-      const token = await getIdToken();
-      if (!token) throw new Error("Sign in to export.");
-      const permitRes = await fetch("/api/billing/export-permit", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({
-          projectId: project.id,
-          projectTitle: project.title,
-          resolution,
-          format,
-          fps,
-        }),
-      });
-      const permitJson = (await permitRes.json()) as {
-        ok?: boolean;
-        exportId?: string;
-        uploadPath?: string;
-        applyWatermark?: boolean;
-        error?: string;
-        kind?: "plan_required" | "limit_reached";
-        used?: number;
-        limit?: number;
-      };
-      if (!permitRes.ok || !permitJson.ok) {
-        // Surface the server's clear message; the user knows what to do
-        // (upgrade) without guessing.
-        const friendly =
-          permitJson.kind === "plan_required"
-            ? "Pro plan required for 4K export. Upgrade in /pricing."
-            : permitJson.kind === "limit_reached"
-              ? `Export limit reached (${permitJson.used}/${permitJson.limit}). Upgrade to keep exporting.`
-              : permitJson.error || `Export blocked (${permitRes.status})`;
-        throw new Error(friendly);
-      }
-
-      const { exportId, uploadPath, applyWatermark } = permitJson;
-      if (!exportId || !uploadPath) {
-        throw new Error("Permit was missing exportId or uploadPath.");
-      }
-
-      // ── 2. Render ────────────────────────────────────────────────────
-      // Pause the editor preview's rAF loops while the exporter has the main
-      // thread (smoother 4K/60 capture; clears in `finally`).
-      setExporting(true);
-      const blob = await renderProjectClientSide({
-        uid,
-        projectId: project.id,
-        projectTitle: project.title,
-        video,
-        duration: duration || project.duration || 0,
-        moments: project.analysis?.detectedMoments ?? [],
-        effects: project.effectsSettings,
-        resolution,
-        fps,
-        format,
-        visualAnalysis: project.visualAnalysis,
-        applyWatermark: !!applyWatermark,
-        onProgress: (p) => {
-          setProgress(p);
-          if (p.warning) setAudioWarning(p.warning);
-        },
-        signal: controller.signal,
-      });
-      // Render's done — the upload is network-bound, so let the preview resume
-      // (the `finally` still clears this if the render threw).
-      setExporting(false);
-
-      // ── 3. Hand the user the file immediately ────────────────────────
-      // The blob is in memory; download it locally now so the user has the
-      // file without waiting on the (large, ~300+ MB at 4K) upload below.
-      const ext = pickedMimeExt();
-      const a = document.createElement("a");
-      a.href = URL.createObjectURL(blob);
-      a.download = `${project.title || "framevo-export"}.${ext}`;
-      a.click();
-      URL.revokeObjectURL(a.href);
-
-      // ── 4. Upload to the path the permit blessed ─────────────────────
-      // Resumable upload reports real byte progress so the finish isn't a
-      // feedback-less hang.
-      setProgress({ stage: "uploading", pct: 0, message: `0 / ${mb(blob.size)}` });
-      const { downloadURL } = await uploadExport({
-        uid,
-        projectId: project.id,
-        exportId,
-        uploadPath,
-        blob,
-        signal: controller.signal,
-        onProgress: (pct) =>
-          setProgress({
-            stage: "uploading",
-            pct,
-            message: `${mb(pct * blob.size)} / ${mb(blob.size)}`,
-          }),
-      });
-      setProgress({ stage: "complete", pct: 1, downloadURL });
-      setDownloadURL(downloadURL);
-
-      // Persistent notification — the user may have walked away from
-      // the export panel by the time it finishes. Dedupe id ties to
-      // the export id so a stray re-render can't queue it twice.
-      notifications.push({
-        id: `export-completed:${exportId}`,
-        kind: "export-completed",
-        title: "Export ready",
-        body: `${project.title || "Untitled"} · ${format} · ${resolution}`,
-        href: "/dashboard/exports",
-      });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : "Export failed.";
-      setProgress({ stage: "failed", pct: 0, message: msg });
-      setError(msg);
-      notifications.push({
-        id: `export-failed:${project.id}:${Date.now()}`,
-        kind: "export-failed",
-        title: "Export failed",
-        body: `${project.title || "Untitled"} — ${msg}`,
-        href: `/dashboard/projects/${project.id}`,
-      });
-    } finally {
-      cancelRef.current = null;
-      setExporting(false);
+    const params: ExportRenderParams = {
+      projectId: project.id,
+      projectTitle: project.title,
+      originalVideoUrl: project.originalVideoUrl,
+      duration: duration || project.duration || 0,
+      moments: project.analysis?.detectedMoments ?? [],
+      effects: project.effectsSettings,
+      visualAnalysis: project.visualAnalysis,
+      resolution,
+      fps,
+      format,
+      outputFormat: `${canvasSummary} · ${resolution} · ${fps}fps`,
+    };
+    if (!startExport(params)) {
+      setBlockedWarning(
+        "An export is already running. Cancel it or wait for it to finish."
+      );
     }
   };
-
-  const cancel = () => {
-    cancelRef.current?.abort();
-  };
-
-  const exporting =
-    progress &&
-    progress.stage !== "complete" &&
-    progress.stage !== "failed" &&
-    progress.stage !== "unsupported";
 
   return (
     <>
@@ -460,75 +328,111 @@ export function RealExportPanel() {
           </div>
         </div>
 
-        {progress && (
+        {exporting && myJob && (
           <div className="space-y-2 rounded-xl border border-white/10 bg-white/[0.02] px-4 py-3">
             <div className="flex items-center justify-between text-xs">
               <span className="inline-flex items-center gap-1.5 text-white/85">
-                {exporting && <Loader2 size={12} className="animate-spin text-violet-300" />}
-                {stageLabel(progress)}
+                <Loader2 size={12} className="animate-spin text-violet-300" />
+                {jobStageLabel(myJob.status)}
               </span>
               <span className="font-mono text-fog">
-                {Math.round((progress.pct ?? 0) * 100)}%
+                {Math.round((myJob.progress ?? 0) * 100)}%
               </span>
             </div>
             <div className="h-1 overflow-hidden rounded-full bg-white/[0.06]">
               <div
                 className="h-full rounded-full bg-gradient-to-r from-violet-500 to-cyan-400 transition-[width] duration-200"
-                style={{ width: `${(progress.pct ?? 0) * 100}%` }}
+                style={{ width: `${(myJob.progress ?? 0) * 100}%` }}
               />
             </div>
-            {progress.message && (
-              <p className="text-[11px] text-fog">{progress.message}</p>
-            )}
+            <p className="text-[11px] text-fog">
+              Runs in the background — you can keep editing or close this.
+            </p>
+          </div>
+        )}
+
+        {myJob?.status === "completed" && (
+          <div className="flex items-start gap-2 rounded-xl border border-emerald-400/30 bg-emerald-500/[0.06] px-4 py-3 text-xs text-emerald-200">
+            <Download size={12} className="mt-0.5 shrink-0" />
+            <span>
+              Export ready{myJob.downloadUrl ? "" : " in this browser session"}.
+            </span>
           </div>
         )}
 
         {/* Audio warning — non-fatal. The export still completes; this tells the
             user it will be silent (e.g. browser couldn't capture the source
             audio) so a missing voiceover isn't a silent surprise. */}
-        {audioWarning && (
+        {myJob?.warning && (
           <div className="flex items-start gap-2 rounded-xl border border-amber-400/30 bg-amber-500/[0.06] px-4 py-3 text-xs text-amber-200">
             <AlertCircle size={12} className="mt-0.5 shrink-0" />
-            <span>{audioWarning}</span>
+            <span>{myJob.warning}</span>
           </div>
         )}
 
-        {downloadURL && (
-          <a
-            href={downloadURL}
-            target="_blank"
-            rel="noreferrer"
-            className="inline-flex items-center gap-1.5 text-xs text-violet-300 underline-offset-4 hover:underline"
-          >
-            <ExternalLink size={12} />
-            Open uploaded export
-          </a>
-        )}
-
-        {error && (
+        {(blockedWarning || myJob?.status === "failed") && (
           <div className="flex items-start gap-2 rounded-xl border border-rose-400/30 bg-rose-500/[0.06] px-4 py-3 text-xs text-rose-200">
             <AlertCircle size={12} className="mt-0.5 shrink-0" />
-            <span>{error}</span>
+            <span>{blockedWarning || myJob?.error || "Export failed."}</span>
           </div>
         )}
 
         {/* Primary action — pinned to the bottom of the sheet body. */}
-        <div className="pt-1">
-          {!exporting ? (
+        <div className="space-y-2 pt-1">
+          {exporting ? (
+            <>
+              <Button
+                onClick={() => onClose?.()}
+                variant="primary"
+                size="lg"
+                className="w-full"
+              >
+                Continue in background
+              </Button>
+              <Button
+                onClick={cancelExport}
+                variant="ghost"
+                size="lg"
+                className="w-full"
+              >
+                Cancel export
+              </Button>
+            </>
+          ) : myJob?.status === "completed" ? (
+            <>
+              <Button
+                onClick={downloadCurrent}
+                variant="primary"
+                size="lg"
+                className="w-full"
+                leftIcon={<Download size={15} />}
+              >
+                Download export
+              </Button>
+              <Link
+                href="/dashboard/exports"
+                className="inline-flex w-full items-center justify-center gap-1.5 text-xs text-violet-300 underline-offset-4 hover:underline"
+              >
+                <ExternalLink size={12} />
+                View all exports
+              </Link>
+            </>
+          ) : (
             <Button
               onClick={start}
               variant="primary"
               size="lg"
               className="w-full"
               leftIcon={<Download size={15} />}
-              disabled={!supported}
+              disabled={!supported || otherExporting}
             >
               Export {resolution}
             </Button>
-          ) : (
-            <Button onClick={cancel} variant="ghost" size="lg" className="w-full">
-              Cancel
-            </Button>
+          )}
+          {otherExporting && (
+            <p className="text-center text-[11px] text-amber-200/80">
+              Another export is running in the background.
+            </p>
           )}
         </div>
 
@@ -587,25 +491,20 @@ function fmtDuration(seconds: number): string {
   return `${m}m ${String(r).padStart(2, "0")}s`;
 }
 
-/** Human file size for the upload progress line, e.g. "182 MB". */
-function mb(bytes: number): string {
-  return `${(Math.max(0, bytes) / (1024 * 1024)).toFixed(0)} MB`;
-}
-
-function stageLabel(p: ExportProgress): string {
-  switch (p.stage) {
+function jobStageLabel(status: ExportStatusUI): string {
+  switch (status) {
     case "preparing":
       return "Preparing…";
     case "rendering":
       return "Rendering frames…";
     case "uploading":
-      return "Uploading to Storage…";
-    case "complete":
+      return "Saving export…";
+    case "completed":
       return "Export complete";
     case "failed":
       return "Export failed";
-    case "unsupported":
-      return "Unsupported";
+    case "canceled":
+      return "Export canceled";
   }
 }
 

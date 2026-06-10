@@ -28,6 +28,41 @@ export interface StoragePlanState {
 }
 
 /**
+ * Just the plan tier — a lightweight `users/{uid}` listener with NO project
+ * subscription. Used by upload / recording / analyze gating where we only need
+ * the tier, not storage usage, so those flows don't drag in a full project
+ * scan. `loading` is true only while signed in and the first snapshot is
+ * pending; callers should avoid blocking the user until it resolves.
+ */
+export function usePlanTier(): { tier: PlanTier; loading: boolean } {
+  const { user } = useAuth();
+  const uid = user?.uid ?? null;
+  const [tier, setTier] = React.useState<PlanTier>("free");
+  const [loaded, setLoaded] = React.useState(false);
+
+  React.useEffect(() => {
+    if (!uid) {
+      setTier("free");
+      setLoaded(false);
+      return;
+    }
+    setLoaded(false);
+    const { db } = getFirebase();
+    const ref = doc(db, "users", uid);
+    return onSnapshot(
+      ref,
+      (snap) => {
+        setTier(normalizePlan(snap.data()?.plan));
+        setLoaded(true);
+      },
+      () => setLoaded(true)
+    );
+  }, [uid]);
+
+  return { tier, loading: !!uid && !loaded };
+}
+
+/**
  * Live storage + plan stats for the sidebar widget.
  *
  * Two subscriptions:

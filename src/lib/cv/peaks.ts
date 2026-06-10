@@ -12,6 +12,21 @@
 
 import type { DetectedMoment, VisualAnalysis } from "../firebase/schema";
 import { dequantize, dequantizeArray } from "./resample";
+import {
+  classifyCvEffect,
+  FOCUS_INTENSITY_SCALE,
+  type CvEffectType,
+  type CvMomentSignal,
+} from "./classify-effect";
+
+function clamp01(v: number): number {
+  return v < 0 ? 0 : v > 1 ? 1 : v;
+}
+
+/** UI-facing effect name (matches the timeline/inspector labels). */
+function effectName(effectType: CvEffectType): string {
+  return effectType === "cursor-focus" ? "Focus" : "Zoom";
+}
 
 /** A peak must exceed mean + K·std of the curve to count. */
 const PEAK_K = 1;
@@ -79,23 +94,44 @@ export function cvCandidateMoments(
     const x = Math.max(0, Math.min(1 - w, cx - w / 2));
     const y = Math.max(0, Math.min(1 - h, cy - h / 2));
 
+    // No grounded click here — classify zoom vs focus from motion/attention so
+    // the backstop adds variety instead of always punching in.
+    const motionStrength = dequantize(va.motion[idx] ?? 0);
+    const signal: CvMomentSignal = {
+      hasInferredClick: false,
+      uiChangeStrength: 0,
+      cursorConfidence: dequantize(va.cursorConf?.[idx] ?? 0),
+      regionArea: w * h,
+      motionStrength,
+      attentionScore: score,
+      sceneChangeNearby: (va.sceneChanges ?? []).some(
+        (e) => Math.abs(e.t - t) <= 0.5
+      ),
+    };
+    const { effectType, why } = classifyCvEffect(signal);
+    const recommendedIntensity =
+      effectType === "cursor-focus"
+        ? clamp01(score * FOCUS_INTENSITY_SCALE)
+        : score;
+
     return {
       id: `cv${i + 1}`,
       startTime,
       endTime,
-      label: "Visual activity peak",
+      label: `${effectName(effectType)} · activity peak`,
       reason: "Motion/visual activity peak detected on-device (CV).",
       focusRegion: { x, y, width: w, height: h },
-      effectType: "zoom",
+      effectType,
+      whyEffectType: why,
       attentionScore: score,
       attentionFactors: {
         changeMagnitude: dequantize(va.delta[idx] ?? 0),
-        motionIntensity: dequantize(va.motion[idx] ?? 0),
+        motionIntensity: motionStrength,
         semanticWeight: 0, // no Gemini input — purely CV-sourced
         viewerConfusionRisk: 0.5,
       },
       sceneChange: false,
-      recommendedIntensity: score,
+      recommendedIntensity,
     } satisfies DetectedMoment;
   });
 }

@@ -74,6 +74,47 @@ export function planMeetsMinimum(actual: PlanTier, minimum: PlanTier): boolean {
   return planRank(actual) >= planRank(minimum);
 }
 
+// ── Upload duration limits ─────────────────────────────────────────────────
+// Free is capped at 3 minutes to push longer-video workloads onto the paid
+// tiers; both paid tiers are uncapped. Enforced client-side at every upload
+// entry point and backstopped server-side in the analyze route. All call sites
+// go through `exceedsUploadDuration` so the rule lives in exactly one place.
+
+/** Free-plan max upload duration in seconds (3 minutes). */
+export const FREE_UPLOAD_MAX_DURATION_SECONDS = 180;
+
+/** Per-tier max upload duration in seconds; `null` = no limit. */
+export const UPLOAD_DURATION_LIMITS: Record<PlanTier, number | null> = {
+  free: FREE_UPLOAD_MAX_DURATION_SECONDS,
+  pro: null,
+  creator: null,
+};
+
+/**
+ * True when `plan` forbids a video of the given (known) duration. An unknown
+ * duration (undefined / null / non-finite) is never blocked here — the caller
+ * decides what to do when it can't measure the clip.
+ */
+export function exceedsUploadDuration(
+  plan: PlanTier,
+  durationSeconds: number | null | undefined
+): boolean {
+  const limit = UPLOAD_DURATION_LIMITS[plan];
+  if (limit == null) return false;
+  return (
+    typeof durationSeconds === "number" &&
+    Number.isFinite(durationSeconds) &&
+    durationSeconds > limit
+  );
+}
+
+/** Exact user-facing copy shown when a Free upload exceeds the duration cap. */
+export const FREE_VIDEO_DURATION_LIMIT_MESSAGE =
+  "Free plan supports videos up to 3 minutes. Upgrade to upload longer videos.";
+
+/** Stable server error code returned by the analyze route when the cap is hit. */
+export const FREE_VIDEO_DURATION_LIMIT_CODE = "FREE_VIDEO_DURATION_LIMIT_EXCEEDED";
+
 /** Human-readable byte formatter — picks GB / MB / KB automatically. */
 export function fmtBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes < 0) return "0 GB";

@@ -18,6 +18,7 @@ import { useAuth } from "@/lib/firebase/AuthProvider";
 import { subscribeProject, updateProject } from "@/lib/firebase/projects";
 import { cn } from "@/lib/cn";
 import type { ProjectDoc } from "@/lib/firebase/schema";
+import { FREE_VIDEO_DURATION_LIMIT_MESSAGE } from "@/lib/usage/plan";
 import { Button } from "@/components/ui/Button";
 import { EditorRealProvider, useEditorReal } from "./context";
 import { RealVideoPlayer } from "./RealVideoPlayer";
@@ -272,9 +273,17 @@ function Body() {
       <WorkflowStepper current={currentStep} />
 
       {analyzeError && (
-        <div className="flex items-start gap-2 rounded-xl border border-rose-400/30 bg-rose-500/[0.06] px-4 py-3 text-sm text-rose-200">
-          <AlertCircle size={14} className="mt-0.5 shrink-0" />
-          <span>{analyzeError}</span>
+        <div className="flex items-center gap-2 rounded-xl border border-rose-400/30 bg-rose-500/[0.06] px-4 py-3 text-sm text-rose-200">
+          <AlertCircle size={14} className="shrink-0" />
+          <span className="flex-1">{analyzeError}</span>
+          {analyzeError === FREE_VIDEO_DURATION_LIMIT_MESSAGE && (
+            <Link
+              href="/pricing"
+              className="shrink-0 rounded-md border border-rose-300/40 bg-rose-400/15 px-2.5 py-1 text-[12px] font-semibold text-rose-50 transition-colors hover:bg-rose-400/25"
+            >
+              Upgrade
+            </Link>
+          )}
         </div>
       )}
 

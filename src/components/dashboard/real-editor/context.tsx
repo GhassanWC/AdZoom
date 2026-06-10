@@ -23,7 +23,13 @@ import { applyPresetToSettings } from "@/lib/presets";
 import { useInteractions } from "./useInteractions";
 import type { Interaction } from "@/lib/recording/types";
 import { getDoc } from "firebase/firestore";
-import { normalizePlan, planMeetsMinimum } from "@/lib/usage/plan";
+import {
+  normalizePlan,
+  planMeetsMinimum,
+  exceedsUploadDuration,
+  FREE_VIDEO_DURATION_LIMIT_MESSAGE,
+} from "@/lib/usage/plan";
+import { usePlanTier } from "@/lib/usage/useStoragePlan";
 import {
   runVisualAnalysis,
   CvAbortError,
@@ -242,6 +248,7 @@ export function EditorRealProvider({
   children: React.ReactNode;
 }) {
   const videoRef = React.useRef<HTMLVideoElement | null>(null);
+  const { tier: planTier } = usePlanTier();
   const [currentTime, setCurrentTime] = React.useState(0);
   const [playing, setPlaying] = React.useState(false);
   const [exporting, setExporting] = React.useState(false);
@@ -735,6 +742,15 @@ export function EditorRealProvider({
     }, [projectRef]);
 
   const startAnalyze = React.useCallback(async () => {
+    // Free-plan duration gate — block (re)analysis of >3-min videos before any
+    // state change or on-device CV work. `resolveReliableDuration` probes the
+    // real <video>, so a stale/missing `project.duration` on an old project
+    // can't slip past; an unknown duration (0) is never blocked here.
+    const gateDuration = await resolveReliableDuration(videoRef.current, project);
+    if (exceedsUploadDuration(planTier, gateDuration)) {
+      setAnalyzeError(FREE_VIDEO_DURATION_LIMIT_MESSAGE);
+      return;
+    }
     setAnalyzeError(null);
     setAnalyzing(true);
     setProcessingMinimized(false); // fresh run → show overlay
@@ -953,7 +969,7 @@ export function EditorRealProvider({
       setCvProgress(null);
       setAnalyzing(false);
     }
-  }, [idTokenGetter, uid, project, projectRef, videoRef, interactions]);
+  }, [idTokenGetter, uid, project, projectRef, videoRef, interactions, planTier]);
 
   // ── Resume an in-flight chunked job after a refresh ─────────────────────
   // Completed chunks already wrote their moments to the project doc, so the

@@ -13,6 +13,12 @@ import { PageHeader } from "@/components/dashboard/PageHeader";
 import { Button } from "@/components/ui/Button";
 import { useAuth } from "@/lib/firebase/AuthProvider";
 import { createProjectFromFile, isVideoAccepted } from "@/lib/firebase/projects";
+import { usePlanTier } from "@/lib/usage/useStoragePlan";
+import {
+  exceedsUploadDuration,
+  FREE_VIDEO_DURATION_LIMIT_MESSAGE,
+} from "@/lib/usage/plan";
+import { useConfirm } from "@/components/ui/ConfirmDialog";
 import { cn } from "@/lib/cn";
 
 const formats = ["MP4", "MOV", "WebM", "MKV"];
@@ -50,6 +56,8 @@ async function probeVideoMeta(file: File): Promise<VideoMeta> {
 export default function UploadPage() {
   const router = useRouter();
   const { user } = useAuth();
+  const { tier, loading: planLoading } = usePlanTier();
+  const confirm = useConfirm();
   const inputRef = React.useRef<HTMLInputElement | null>(null);
   const [dragOver, setDragOver] = React.useState(false);
   const [file, setFile] = React.useState<File | null>(null);
@@ -59,6 +67,12 @@ export default function UploadPage() {
   const [error, setError] = React.useState<string | null>(null);
   const [submitting, setSubmitting] = React.useState(false);
 
+  // Free plan caps uploads at 3 minutes. `meta.duration` is probed below before
+  // any upload starts, so we can block over-length clips up front. Unknown
+  // duration (probe failed) is not blocked here — the server backstops it.
+  const durationBlocked =
+    !planLoading && exceedsUploadDuration(tier, meta.duration);
+
   React.useEffect(() => {
     if (!file) return;
     const url = URL.createObjectURL(file);
@@ -66,6 +80,41 @@ export default function UploadPage() {
     probeVideoMeta(file).then(setMeta);
     return () => URL.revokeObjectURL(url);
   }, [file]);
+
+  // When a Free user picks a clip over the 3-minute cap, surface the upgrade
+  // prompt as a modal popup (fires once per over-length selection). "Upgrade"
+  // routes to pricing; dismissing clears the selection back to the dropzone.
+  const blockPromptedRef = React.useRef(false);
+  React.useEffect(() => {
+    if (!durationBlocked) {
+      blockPromptedRef.current = false;
+      return;
+    }
+    if (blockPromptedRef.current) return;
+    blockPromptedRef.current = true;
+    let active = true;
+    (async () => {
+      const upgrade = await confirm({
+        title: "Video too long for Free plan",
+        message: FREE_VIDEO_DURATION_LIMIT_MESSAGE,
+        confirmLabel: "Upgrade",
+        cancelLabel: "Pick another video",
+        tone: "danger",
+      });
+      if (!active) return;
+      if (upgrade) {
+        router.push("/pricing");
+      } else {
+        setFile(null);
+        setPreviewURL(null);
+        setMeta({});
+        setProgress(null);
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [durationBlocked, confirm, router]);
 
   const onPick = (f: File | undefined | null) => {
     setError(null);
@@ -84,6 +133,7 @@ export default function UploadPage() {
 
   const onSubmit = async () => {
     if (!file || !user) return;
+    if (durationBlocked) return; // the upgrade popup already handles this case
     setError(null);
     setSubmitting(true);
     setProgress(0);
@@ -237,7 +287,7 @@ export default function UploadPage() {
               variant="primary"
               size="md"
               onClick={onSubmit}
-              disabled={submitting || !user}
+              disabled={submitting || !user || durationBlocked}
               leftIcon={
                 submitting ? (
                   <Loader2 size={14} className="animate-spin" />

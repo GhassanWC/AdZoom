@@ -17,6 +17,12 @@ import {
   cropBottomBand,
   type GreenBandReport,
 } from "@/lib/recording";
+import Link from "next/link";
+import { usePlanTier } from "@/lib/usage/useStoragePlan";
+import {
+  exceedsUploadDuration,
+  FREE_VIDEO_DURATION_LIMIT_MESSAGE,
+} from "@/lib/usage/plan";
 
 /**
  * Confidence threshold at/above which a detected green sharing-bar is
@@ -72,6 +78,11 @@ export function RecordingPreview({
   uploadPct: number | null;
   error: string | null;
 }) {
+  // Free plan caps uploads at 3 minutes — disable "Use this take" for longer
+  // takes and surface an upgrade path. The provider also hard-blocks the upload.
+  const { tier } = usePlanTier();
+  const durationBlocked = exceedsUploadDuration(tier, durationSeconds);
+
   const [url, setUrl] = React.useState<string | null>(null);
 
   React.useEffect(() => {
@@ -458,6 +469,20 @@ export function RecordingPreview({
         </div>
       )}
 
+      {durationBlocked && (
+        <div className="mx-auto flex max-w-md items-center gap-3 rounded-xl border border-rose-400/30 bg-rose-500/[0.06] px-4 py-3 text-sm text-rose-200">
+          <span className="flex-1 text-left">
+            {FREE_VIDEO_DURATION_LIMIT_MESSAGE}
+          </span>
+          <Link
+            href="/pricing"
+            className="shrink-0 rounded-md border border-rose-300/40 bg-rose-400/15 px-2.5 py-1 text-[12px] font-semibold text-rose-50 transition-colors hover:bg-rose-400/25"
+          >
+            Upgrade
+          </Link>
+        </div>
+      )}
+
       <div className="flex flex-wrap items-center justify-center gap-3">
         <button
           type="button"
@@ -471,7 +496,7 @@ export function RecordingPreview({
         <button
           type="button"
           onClick={onUse}
-          disabled={uploading || cropping}
+          disabled={uploading || cropping || durationBlocked}
           className="inline-flex h-12 items-center gap-2 rounded-full bg-gradient-to-r from-violet-500 to-violet-600 px-7 text-sm font-semibold text-white shadow-[0_18px_40px_-16px_rgba(139,92,246,0.65)] transition-all duration-200 hover:from-violet-500 hover:to-violet-500 disabled:opacity-70"
         >
           {uploading ? (
