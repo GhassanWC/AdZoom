@@ -235,12 +235,14 @@ function debugForceDirect(): boolean {
 
 /**
  * Single source of truth for the analysis architecture. Chunked progressive
- * analysis is the DEFAULT for every video (short or long, new or old) — it runs
- * the CV/zoom/crop/speed engines on-device per 30s window, streams results
- * immediately, and finalizes with Gemini in the background. The legacy direct
- * (whole-video → Gemini) flow is reserved for an explicit debug fallback; the
- * other emergency fallback (chunked failed at runtime / no resolvable duration)
- * is decided in `startAnalyze`, not here. Duration is NOT a routing factor.
+ * analysis is the ONLY normal path for every video (short or long, new or old)
+ * — it runs the CV/zoom/crop/speed engines on-device per 30s window, streams
+ * results immediately, and finalizes with Gemini in the background. The legacy
+ * direct (whole-video → Gemini) flow is reserved EXCLUSIVELY for an explicit
+ * debug escape hatch (`?debug=direct` / localStorage `framevo:forceDirect`).
+ * There is NO automatic fallback to direct: if chunked fails at runtime or no
+ * duration is resolvable, `startAnalyze` HARD FAILS with the exact reason
+ * (it never silently runs direct). Duration is NOT a routing factor.
  */
 function selectAnalysisMode(
   _project: ProjectDoc,
