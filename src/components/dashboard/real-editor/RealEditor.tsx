@@ -27,6 +27,8 @@ import { MomentInspectorModal } from "./MomentInspectorModal";
 import { EffectsModal } from "./EffectsModal";
 import { ExportModal } from "./ExportModal";
 import { CanvasModal } from "./CanvasModal";
+import { AnalysisOptionsModal } from "./AnalysisOptionsModal";
+import { useWorkspaceSettings } from "@/lib/firebase/workspace-settings";
 import { RealProcessingOverlay } from "./RealProcessingOverlay";
 import { PresetsRail } from "./PresetsRail";
 import { RecommendedPresets } from "./RecommendedPresets";
@@ -140,6 +142,8 @@ function Body() {
   const canAnalyze = !isAnalyzingNow && !!project.originalVideoUrl;
   const [effectsOpen, setEffectsOpen] = React.useState(false);
   const [exportOpen, setExportOpen] = React.useState(false);
+  const [analysisOptionsOpen, setAnalysisOptionsOpen] = React.useState(false);
+  const { settings, save } = useWorkspaceSettings();
 
   const currentStep: WorkflowStep = !hasAnalysis
     ? "analyze"
@@ -168,7 +172,7 @@ function Body() {
           <div className="flex flex-wrap items-center gap-2">
             {!hasAnalysis ? (
               <Button
-                onClick={startAnalyze}
+                onClick={() => setAnalysisOptionsOpen(true)}
                 variant="primary"
                 size="sm"
                 leftIcon={
@@ -191,7 +195,7 @@ function Body() {
               </Button>
             ) : (
               <Button
-                onClick={startAnalyze}
+                onClick={() => setAnalysisOptionsOpen(true)}
                 variant="ghost"
                 size="sm"
                 leftIcon={
@@ -321,6 +325,20 @@ function Body() {
       <PresetsRail />
 
       {/* ── 6. Sheets: Effects + Export are now modal dialogs ──────────────── */}
+      <AnalysisOptionsModal
+        open={analysisOptionsOpen}
+        onClose={() => setAnalysisOptionsOpen(false)}
+        hasExistingEdits={hasAnalysis}
+        initialEnginePrefs={settings.analysisEngines}
+        onPersistEnginePrefs={(prefs) => void save({ analysisEngines: prefs })}
+        videoDuration={project.duration ?? 0}
+        initialDetail={settings.analysisDetail}
+        onPersistDetail={(detail) => void save({ analysisDetail: detail })}
+        onConfirm={(opts) => {
+          setAnalysisOptionsOpen(false);
+          void startAnalyze(opts);
+        }}
+      />
       <EffectsModal open={effectsOpen} onClose={() => setEffectsOpen(false)} />
       <ExportModal open={exportOpen} onClose={() => setExportOpen(false)} />
       <CanvasModal open={canvasOpen} onClose={closeCanvas} />

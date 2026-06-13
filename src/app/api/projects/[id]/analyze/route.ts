@@ -3,6 +3,14 @@ import { FieldValue, type DocumentReference } from "firebase-admin/firestore";
 import { getAdmin } from "@/lib/firebase/admin";
 import { stripUndefined } from "@/lib/firebase/sanitize";
 import {
+  type AnalysisOptions,
+  type EngineLayer,
+  aiLayersPresent,
+  DEFAULT_ANALYSIS_OPTIONS,
+  layerForMoment,
+  shouldRunLayer,
+} from "@/lib/analysis/engine-layers";
+import {
   classifyVideoSections,
   labelMoments,
   proposeGapFills,
@@ -241,9 +249,10 @@ function dropAiOverlappingUser(
 }
 
 /**
- * Finalize crop + speed sections WITHOUT dropping data: merge adjacent same-type
- * AI sections (a boring run / stable region split across chunk boundaries) and
- * let user sections always win. Camera moments are returned untouched.
+ * Finalize cut + crop + speed sections WITHOUT dropping data: merge adjacent
+ * same-type AI sections (a dead run / boring run / stable region split across
+ * chunk boundaries) and let user sections always win. Camera moments are
+ * returned untouched.
  */
 function mergeCropSpeedSections(moments: DetectedMoment[]): {
   moments: DetectedMoment[];
@@ -252,11 +261,16 @@ function mergeCropSpeedSections(moments: DetectedMoment[]): {
   cropAfter: number;
   speedBefore: number;
   speedAfter: number;
+  cutBefore: number;
+  cutAfter: number;
 } {
   const GAP = 1.0; // seconds — sections within this gap (or overlapping) merge.
   const merged: Array<{ id: string; reason: string }> = [];
   const camera = moments.filter(
-    (m) => m.effectType !== "crop" && m.effectType !== "speed-up"
+    (m) =>
+      m.effectType !== "crop" &&
+      m.effectType !== "speed-up" &&
+      m.effectType !== "cut"
   );
   const crops = dropAiOverlappingUser(
     moments.filter((m) => m.effectType === "crop"),
@@ -264,6 +278,10 @@ function mergeCropSpeedSections(moments: DetectedMoment[]): {
   ).sort((a, b) => a.startTime - b.startTime);
   const speeds = dropAiOverlappingUser(
     moments.filter((m) => m.effectType === "speed-up"),
+    merged
+  ).sort((a, b) => a.startTime - b.startTime);
+  const cuts = dropAiOverlappingUser(
+    moments.filter((m) => m.effectType === "cut"),
     merged
   ).sort((a, b) => a.startTime - b.startTime);
 
@@ -311,8 +329,25 @@ function mergeCropSpeedSections(moments: DetectedMoment[]): {
     }
   );
 
+  const mergedCuts = mergeRun(
+    cuts,
+    (prev, cur) =>
+      prev.source !== "user" &&
+      cur.source !== "user" &&
+      prev.cut?.active !== false &&
+      cur.cut?.active !== false &&
+      cur.startTime - prev.endTime <= GAP,
+    (prev, cur) => {
+      merged.push({ id: cur.id, reason: "merged-adjacent-cut" });
+      return {
+        ...prev,
+        endTime: Math.max(prev.endTime, cur.endTime),
+      };
+    }
+  );
+
   return {
-    moments: [...camera, ...mergedCrops, ...mergedSpeeds].sort(
+    moments: [...camera, ...mergedCuts, ...mergedCrops, ...mergedSpeeds].sort(
       (a, b) => a.startTime - b.startTime
     ),
     merged,
@@ -320,6 +355,8 @@ function mergeCropSpeedSections(moments: DetectedMoment[]): {
     cropAfter: mergedCrops.length,
     speedBefore: speeds.length,
     speedAfter: mergedSpeeds.length,
+    cutBefore: cuts.length,
+    cutAfter: mergedCuts.length,
   };
 }
 
@@ -376,10 +413,17 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     // and refresh chapter/preset metadata — never prune the timeline down to a
     // fresh whole-video balance. Direct runs send no body (a parse failure →
     // the normal flow), so all of this is gated on `isFinalize`.
-    const reqBody = (await req
-      .json()
-      .catch(() => null)) as { mode?: string; chunkCount?: number; progressiveCount?: number } | null;
+    const reqBody = (await req.json().catch(() => null)) as {
+      mode?: string;
+      chunkCount?: number;
+      progressiveCount?: number;
+      analysisOptions?: AnalysisOptions;
+      carryOver?: DetectedMoment[];
+    } | null;
     const isFinalize = reqBody?.mode === "finalize";
+    // Engine selection. A legacy no-body call → all-on default + empty
+    // carry-over, i.e. exactly today's "clear and regenerate everything".
+    const analysisOptions = reqBody?.analysisOptions ?? DEFAULT_ANALYSIS_OPTIONS;
     const finalizeChunkCount =
       typeof reqBody?.chunkCount === "number" ? reqBody.chunkCount : undefined;
     const progressiveMoments =
@@ -388,7 +432,25 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     const dedup = isFinalize
       ? dedupeBoundaryDuplicates(progressiveMoments)
       : { kept: [] as DetectedMoment[], merged: [] as Array<{ id: string; reason: string }> };
-    const preservedMoments: DetectedMoment[] = isFinalize ? dedup.kept : [];
+    // Moments the balancer must keep verbatim:
+    //  - finalize: the progressive timeline (source of truth).
+    //  - direct: the carry-over set the client computed from `existingEditMode`
+    //    (user edits + non-selected AI layers). The balancer regenerates the
+    //    selected layers AROUND these (it bypasses spacing for preserved), so a
+    //    direct re-analyze no longer wipes preserved edits.
+    const carryOver = reqBody?.carryOver ?? [];
+    const preservedMoments: DetectedMoment[] = isFinalize ? dedup.kept : carryOver;
+    // Layers whose engine actually ran this analysis — mirrors the orchestrator
+    // per-chunk gate (`shouldRunLayer`) so "keep = add missing" holds on the
+    // server too. Used by the post-balance layer filter below.
+    const ranLayers = ((): Set<EngineLayer> => {
+      const existingAiLayers = aiLayersPresent(preservedMoments);
+      return new Set(
+        (["camera", "crop", "speed"] as EngineLayer[]).filter((l) =>
+          shouldRunLayer(l, analysisOptions, existingAiLayers)
+        )
+      );
+    })();
 
     if (isFinalize) {
       const perChunk =
@@ -460,8 +522,15 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
           status: "analyzing",
           stage: isFinalize ? "Finalizing timeline" : "Preparing analysis",
           // Finalize keeps the progressively-streamed moments on screen while
-          // the AI pass runs; a direct run clears them for a fresh timeline.
-          ...(isFinalize ? {} : { detectedMoments: [] }),
+          // the AI pass runs; a direct run seeds the carry-over set (per the
+          // chosen existingEditMode) instead of a blanket clear, so preserved
+          // edits survive. `lastRunOptions` records the engine selection.
+          ...(isFinalize
+            ? {}
+            : {
+                detectedMoments: stripUndefined(reqBody?.carryOver ?? []),
+                lastRunOptions: analysisOptions,
+              }),
           boringSections: [],
           recommendedPresetIds: [],
           activity: [],
@@ -1223,6 +1292,28 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       );
     }
 
+    // ── Layer guard (req: finalize must not re-add disabled layers) ──────────
+    // Keep a moment only if its layer actually ran this analysis OR it was a
+    // deliberately-preserved carry-over moment. This strips Gemini gap-fills /
+    // visual moments that landed in a layer the user turned off (or, in "keep"
+    // mode, a layer that already had edits). Runs AFTER the 20%-drop "Finalize
+    // protection" guard above and never removes a preserved id, so it can't
+    // false-trip that guard. Covers both finalize and direct paths.
+    const preservedIds = new Set(preservedMoments.map((m) => m.id));
+    const beforeLayerFilter = finalMoments.length;
+    finalMoments = finalMoments.filter(
+      (m) => ranLayers.has(layerForMoment(m)) || preservedIds.has(m.id)
+    );
+    const droppedDisabled = beforeLayerFilter - finalMoments.length;
+    if (droppedDisabled > 0) {
+      console.info("[analyze] layer filter", {
+        projectId,
+        ranLayers: [...ranLayers],
+        existingEditMode: analysisOptions.existingEditMode,
+        dropped: droppedDisabled,
+      });
+    }
+
     const cleanMoments = stripUndefined(finalMoments);
     const cleanRawPool = stripUndefined(rawPool);
     const cleanRejectedPool = stripUndefined(balanced.rejectedPool);
@@ -1289,6 +1380,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       zoom: effectDist.zoom ?? 0,
       click: effectDist["click-highlight"] ?? 0,
       focus: effectDist["cursor-focus"] ?? 0,
+      cut: effectDist.cut ?? 0,
       crop: effectDist.crop ?? 0,
       speed: effectDist["speed-up"] ?? 0,
     });
@@ -1313,6 +1405,10 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
           editDiagnostics: stripUndefined(editDiagnostics),
           completedAt: Date.now(),
           cancelRequested: false,
+          // Re-assert the engine selection on the terminal write (the reset
+          // value could otherwise be raced); powers the timeline's "Disabled
+          // for this analysis" labels.
+          lastRunOptions: analysisOptions,
         },
         updatedAt: FieldValue.serverTimestamp(),
       },

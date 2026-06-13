@@ -1,12 +1,16 @@
+import type { Metadata } from "next";
 import Link from "next/link";
 import { Check, Sparkles, Crown, Users } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { CheckoutButton } from "@/components/billing/CheckoutButton";
+import { buildMetadata } from "@/lib/seo";
 
-export const metadata = {
+export const metadata: Metadata = buildMetadata({
   title: "Pricing — Framevo",
-  description: "Pick a plan to unlock cinematic AI editing, HD/4K exports, and premium presets.",
-};
+  description:
+    "Framevo pricing — start free with the full AI editor. Upgrade for longer videos, 4K, no watermark, and advanced exports for YouTube, TikTok, Reels, and Shorts.",
+  path: "/pricing",
+});
 
 const FREE_FEATURES = [
   "5 exports per month",

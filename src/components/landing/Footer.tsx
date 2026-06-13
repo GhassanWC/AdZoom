@@ -14,6 +14,10 @@ import { Logo } from "./Logo";
  */
 
 const INLINE_LINKS: { label: string; href: string }[] = [
+  { label: "Features", href: "/features" },
+  { label: "Use cases", href: "/use-cases" },
+  { label: "Screen recording editor", href: "/screen-recording-editor" },
+  { label: "Pricing", href: "/pricing" },
   { label: "Docs", href: "/docs" },
   { label: "Tutorials", href: "/tutorials" },
   { label: "Templates", href: "/templates" },
@@ -21,7 +25,6 @@ const INLINE_LINKS: { label: string; href: string }[] = [
   { label: "About", href: "/about" },
   { label: "Blog", href: "/blog" },
   { label: "Careers", href: "/careers" },
-  { label: "Pricing", href: "/pricing" },
   { label: "Changelog", href: "/changelog" },
   { label: "Privacy", href: "/privacy" },
   { label: "Terms", href: "/terms" },
@@ -38,8 +41,8 @@ export function Footer() {
         <div>
           <Logo />
           <p className="mt-3 max-w-xs text-[13px] leading-relaxed text-fog">
-            Cinematic screen recordings, automatically. Built for
-            creators who ship.
+            The AI video editor for demos, tutorials, walkthroughs, and social
+            clips. Auto cuts, zooms, speed-ups, and format-ready exports.
           </p>
         </div>
 

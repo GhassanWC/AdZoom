@@ -5,7 +5,7 @@ import {
   Sparkles,
   MousePointer2,
   FastForward,
-  Crop,
+  Scissors,
   AlertTriangle,
   Trash2,
   Check,
@@ -18,8 +18,10 @@ import {
 import { useEditorReal } from "../context";
 import { cn } from "@/lib/cn";
 import { distributionScore } from "@/lib/timeline-balancer";
+import { buildTimelineMap } from "@/lib/timeline/crop-speed";
 import { CvSignalTracks } from "../CvSignalTracks";
 import type { DetectedMoment } from "@/lib/firebase/schema";
+import type { AnalysisOptions, EngineLayer } from "@/lib/analysis/engine-layers";
 import {
   EFFECT_TONES,
   GUTTER_WIDTH,
@@ -48,7 +50,7 @@ import type { TimelineTrackDescriptor } from "./trackModel";
 /**
  * Track-based timeline orchestrator. Owns drag math, snap math, multi-select
  * state, and keyboard shortcuts. The visual surface is a stack of DAW-style
- * track rows (Edits, Crop / Reframe, Speed, and Cursor / Focus when real
+ * track rows (Edits, Cuts, Speed, and Cursor / Focus when real
  * cursor data exists) built from an ordered `TimelineTrackDescriptor[]`, so new
  * track types are config, not a render-tree rewrite. Analytics chrome
  * (attention waveform, narrative chapters, density) stays behind the Insights
@@ -80,6 +82,8 @@ export function RealTimeline() {
     canRedo,
     interactions,
     interactionsLoading,
+    startAnalyze,
+    analyzing,
   } = useEditorReal();
 
   const moments = project.analysis?.detectedMoments ?? [];
@@ -88,24 +92,63 @@ export function RealTimeline() {
   const narrativeSegments = project.analysis?.narrativeStructure ?? [];
   const attentionCurve = project.analysis?.attentionCurve;
 
-  // Crop and Speed each live on their OWN track (any source). The unified
+  // Cut and Speed each live on their OWN track (any source). The unified
   // "Edits" track holds ALL camera/click effects — AI-generated AND manual —
   // so there's no redundant empty "Your edits" row (manual zoom/focus edits
   // appear here alongside AI ones, distinguished by their provenance colour).
-  const isSpeedCrop = (m: DetectedMoment) =>
-    m.effectType === "crop" || m.effectType === "speed-up";
-  const cropMoments = React.useMemo(
-    () => moments.filter((m) => m.effectType === "crop"),
+  // Crop is demoted: any legacy crop moments are excluded from Edits but have
+  // no dedicated track.
+  const isOwnTrack = (m: DetectedMoment) =>
+    m.effectType === "crop" || m.effectType === "speed-up" || m.effectType === "cut";
+  const cutMoments = React.useMemo(
+    () => moments.filter((m) => m.effectType === "cut"),
     [moments]
+  );
+  // Cut summary for the track header — "{active} active · {removed}s removed".
+  const cutMap = React.useMemo(
+    () => buildTimelineMap(moments, total),
+    [moments, total]
   );
   const speedMoments = React.useMemo(
     () => moments.filter((m) => m.effectType === "speed-up"),
     [moments]
   );
   const editMoments = React.useMemo(
-    () => moments.filter((m) => !isSpeedCrop(m)),
+    () => moments.filter((m) => !isOwnTrack(m)),
     [moments]
   );
+
+  // Engine selection from the most recent analysis — drives the "Disabled for
+  // this analysis" gutter note and the one-click "Run this layer" affordance on
+  // empty lanes. A targeted run enables only that layer in "keep" mode, so it
+  // adds the missing layer without touching anything else on the timeline.
+  const lastRun = project.analysis?.lastRunOptions;
+  const layerDisabled = React.useCallback(
+    (layer: EngineLayer): boolean => {
+      if (!lastRun) return false;
+      if (layer === "camera") return !lastRun.generateCameraEdits;
+      if (layer === "cut") return !lastRun.generateCut;
+      return !lastRun.generateSpeed;
+    },
+    [lastRun]
+  );
+  const runLayer = React.useCallback(
+    (layer: EngineLayer) => {
+      if (analyzing) return;
+      const options: AnalysisOptions = {
+        generateCameraEdits: layer === "camera",
+        generateCut: layer === "cut",
+        generateSpeed: layer === "speed",
+        existingEditMode: "keep",
+        // Reuse the granularity from the last run so a targeted top-up matches.
+        chunkMode: lastRun?.chunkMode ?? "balanced",
+        chunkSizeSeconds: lastRun?.chunkSizeSeconds ?? 30,
+      };
+      void startAnalyze(options);
+    },
+    [analyzing, startAnalyze, lastRun]
+  );
+
   const provenanceCounts = React.useMemo(() => {
     const counts = { event: 0, cv: 0, ai: 0, user: 0 };
     for (const m of moments) {
@@ -507,6 +550,8 @@ export function RealTimeline() {
       tone: "violet",
       interactive: true,
       count: editCount,
+      note: layerDisabled("camera") ? "Disabled for this analysis" : undefined,
+      emptyAction: { label: "Run Camera edits", onRun: () => runLayer("camera") },
       renderLane: () => (
         <>
           {insightsOpen && attentionCurve && attentionCurve.length > 0 && (
@@ -536,17 +581,23 @@ export function RealTimeline() {
       ),
     },
     {
-      id: "crop",
-      kind: "crop",
-      label: "Crop / Reframe",
-      Icon: Crop,
+      id: "cut",
+      kind: "cut",
+      label: "Cuts",
+      Icon: Scissors,
       height: TRACK_HEIGHTS.user,
-      tone: "teal",
+      tone: "rose",
       interactive: true,
-      count: cropMoments.length,
+      count: cutMoments.length,
+      note: layerDisabled("cut")
+        ? "Disabled for this analysis"
+        : cutMap.activeCuts > 0
+          ? `${cutMap.activeCuts} active · ${Math.round(cutMap.totalRemoved)}s removed`
+          : undefined,
+      emptyAction: { label: "Run Cuts", onRun: () => runLayer("cut") },
       renderLane: () => (
         <MomentLane
-          moments={cropMoments}
+          moments={cutMoments}
           total={total}
           selectedMomentId={selectedMomentId}
           multiSelectIds={multiSelectIds}
@@ -568,6 +619,8 @@ export function RealTimeline() {
       tone: "amber",
       interactive: true,
       count: speedMoments.length,
+      note: layerDisabled("speed") ? "Disabled for this analysis" : undefined,
+      emptyAction: { label: "Run Speed", onRun: () => runLayer("speed") },
       renderLane: () => (
         <MomentLane
           moments={speedMoments}
@@ -736,6 +789,7 @@ export function RealTimeline() {
                 height={t.height}
                 tone={t.tone}
                 comingSoon={t.comingSoon}
+                note={t.note}
               />
             ))}
           </div>
@@ -759,16 +813,32 @@ export function RealTimeline() {
                     panel is closed we keep the surface clean. */}
                 {insightsOpen && <GapIndicator ranges={emptyRanges} />}
 
-                {tracks.map((t) => (
-                  <TimelineTrack
-                    key={t.id}
-                    ariaLabel={`${t.label} track`}
-                    height={t.height}
-                    dimmed={!t.interactive}
-                  >
-                    {t.renderLane({ total, pxPerSec, zoom })}
-                  </TimelineTrack>
-                ))}
+                {tracks.map((t) => {
+                  // Show the one-click "Run this layer" affordance on an empty
+                  // lane when other tracks already have content (this layer is
+                  // conspicuously empty) or it was explicitly disabled last run.
+                  const showEmptyAction =
+                    (t.count ?? 0) === 0 &&
+                    !!t.emptyAction &&
+                    (hasMoments || !!t.note);
+                  return (
+                    <TimelineTrack
+                      key={t.id}
+                      ariaLabel={`${t.label} track`}
+                      height={t.height}
+                      dimmed={!t.interactive}
+                    >
+                      {t.renderLane({ total, pxPerSec, zoom })}
+                      {showEmptyAction && (
+                        <TrackEmptyAction
+                          label={t.emptyAction!.label}
+                          onRun={t.emptyAction!.onRun}
+                          disabled={analyzing}
+                        />
+                      )}
+                    </TimelineTrack>
+                  );
+                })}
 
                 {snapGuide !== null && total > 0 && (
                   <span
@@ -1031,6 +1101,40 @@ function ToggleChip({
  * track structure) so users always see the editing surface and a clear path to
  * populate it — via the toolbar's Add menu or AI analysis.
  */
+/**
+ * Centered "Run this layer" affordance shown in an empty lane. One click
+ * regenerates just that engine (in "keep" mode), leaving the rest of the
+ * timeline untouched. `stopPropagation` keeps the lane's deselect-on-click from
+ * firing underneath it.
+ */
+function TrackEmptyAction({
+  label,
+  onRun,
+  disabled,
+}: {
+  label: string;
+  onRun: () => void;
+  disabled?: boolean;
+}) {
+  return (
+    <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center">
+      <button
+        type="button"
+        disabled={disabled}
+        onPointerDown={(e) => e.stopPropagation()}
+        onClick={(e) => {
+          e.stopPropagation();
+          onRun();
+        }}
+        className="pointer-events-auto inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-white/[0.03] px-3 py-1 text-[11px] font-medium text-fog transition-colors duration-150 hover:border-violet-400/40 hover:bg-violet-500/10 hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
+      >
+        <Sparkles size={11} className="text-violet-300" />
+        {label}
+      </button>
+    </div>
+  );
+}
+
 function EmptyTimelineHint({ analyzed }: { analyzed: boolean }) {
   return (
     <div className="relative mt-3 grid place-items-center rounded-2xl border border-white/[0.06] bg-white/[0.015] px-6 py-7 text-center">

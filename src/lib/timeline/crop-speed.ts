@@ -10,6 +10,7 @@ import type {
   CropAspect,
   CropPosition,
   CropSettings,
+  CutSettings,
   DetectedMoment,
   FocusRegion,
   SpeedSettings,
@@ -26,6 +27,11 @@ export const DEFAULT_SPEED: SpeedSettings = {
   multiplier: 2,
   audioMode: "mute",
   transition: "cut",
+};
+
+/** A new cut is active (applied) by default; "restore" flips this to false. */
+export const DEFAULT_CUT: CutSettings = {
+  active: true,
 };
 
 /** Crop scale beyond which reframes would over-upscale the source. */
@@ -132,25 +138,197 @@ export function activeSpeedAt(
   return pick ? pick.speed ?? DEFAULT_SPEED : null;
 }
 
+/** True when a cut moment is active (applied → removes its range). */
+function isActiveCut(m: DetectedMoment): boolean {
+  return m.effectType === "cut" && m.cut?.active !== false;
+}
+
 /**
- * Output duration after speed sections compress source time:
- * `source − Σ(sectionDur − sectionDur/multiplier)`. Assumes speed sections
- * don't overlap (the editor doesn't create overlapping ones); slight
- * inaccuracy if they do.
+ * The ACTIVE cut covering time `t`, or null. An active cut removes its range —
+ * preview skips it, export excludes it. Restored cuts (`active:false`) return
+ * null so they play/export normally.
+ */
+export function activeCutAt(
+  moments: DetectedMoment[] | null | undefined,
+  t: number
+): DetectedMoment | null {
+  if (!moments) return null;
+  let pick: DetectedMoment | null = null;
+  for (const m of moments) {
+    if (!isActiveCut(m)) continue;
+    if (t < m.startTime || t >= m.endTime) continue;
+    // Latest end wins so a seek lands past the furthest overlapping cut.
+    if (!pick || m.endTime > pick.endTime) pick = m;
+  }
+  return pick;
+}
+
+/**
+ * If `t` falls inside an active cut, return the time just past it (the cut's
+ * end, chained through any adjacent/overlapping cuts); otherwise `t`. Used to
+ * snap seeks out of removed ranges to the nearest valid time.
+ */
+export function snapOutOfActiveCut(
+  moments: DetectedMoment[] | null | undefined,
+  t: number
+): number {
+  let cur = t;
+  // Chain through back-to-back cuts (the end of one may sit inside the next).
+  for (let i = 0; i < 64; i++) {
+    const cut = activeCutAt(moments, cur);
+    if (!cut) return cur;
+    cur = cut.endTime;
+  }
+  return cur;
+}
+
+/** Merge overlapping/adjacent ranges (sorted by start). */
+function mergeRanges(ranges: Array<{ start: number; end: number }>): Array<{ start: number; end: number }> {
+  const sorted = [...ranges].sort((a, b) => a.start - b.start);
+  const out: Array<{ start: number; end: number }> = [];
+  for (const r of sorted) {
+    const last = out[out.length - 1];
+    if (last && r.start <= last.end) last.end = Math.max(last.end, r.end);
+    else out.push({ ...r });
+  }
+  return out;
+}
+
+/** One contiguous span of source time that survives to the output. */
+export interface TimelineSegment {
+  sourceStart: number;
+  sourceEnd: number;
+  outputStart: number;
+  outputEnd: number;
+  speedMultiplier: number;
+}
+
+/** The full source→output mapping for a set of moments. */
+export interface TimelineMap {
+  segments: TimelineSegment[];
+  sourceDuration: number;
+  outputDuration: number;
+  /** Source seconds removed by active cuts (does NOT count speed compression). */
+  totalRemoved: number;
+  activeCuts: number;
+  inactiveCuts: number;
+}
+
+/**
+ * Build the source→output timeline mapping — the single source of truth for cut
+ * removal + speed compression, shared by preview, export, and the UI summaries.
+ *
+ * 1. Active cuts are removed (cut wins over everything).
+ * 2. The surviving (included) ranges are split at speed-section boundaries.
+ * 3. Each sub-segment's output length is `sourceLen / speedMultiplier`.
+ *
+ * Because speed is only applied WITHIN included ranges, a speed section that
+ * overlaps a cut contributes nothing on the removed part — cut wins automatically.
+ */
+export function buildTimelineMap(
+  moments: DetectedMoment[] | null | undefined,
+  sourceDuration: number
+): TimelineMap {
+  const dur = Math.max(0, sourceDuration);
+  const list = moments ?? [];
+  const activeCuts = list.filter(isActiveCut).length;
+  const inactiveCuts = list.filter(
+    (m) => m.effectType === "cut" && m.cut?.active === false
+  ).length;
+
+  if (dur <= 0) {
+    return { segments: [], sourceDuration: dur, outputDuration: 0, totalRemoved: 0, activeCuts, inactiveCuts };
+  }
+
+  // 1. Active cut ranges (clamped + merged).
+  const cutRanges = mergeRanges(
+    list
+      .filter(isActiveCut)
+      .map((m) => ({
+        start: Math.max(0, Math.min(dur, m.startTime)),
+        end: Math.max(0, Math.min(dur, m.endTime)),
+      }))
+      .filter((r) => r.end > r.start)
+  );
+  const totalRemoved = cutRanges.reduce((a, r) => a + (r.end - r.start), 0);
+
+  // 2. Included ranges = complement of the cut ranges within [0, dur].
+  const included: Array<{ start: number; end: number }> = [];
+  let cursor = 0;
+  for (const r of cutRanges) {
+    if (r.start > cursor) included.push({ start: cursor, end: r.start });
+    cursor = Math.max(cursor, r.end);
+  }
+  if (cursor < dur) included.push({ start: cursor, end: dur });
+
+  // 3. Speed-section boundaries (start/end times) for splitting included ranges.
+  const speeds = list
+    .filter((m) => m.effectType === "speed-up")
+    .map((m) => ({
+      start: Math.max(0, Math.min(dur, m.startTime)),
+      end: Math.max(0, Math.min(dur, m.endTime)),
+      mult: Math.max(1, m.speed?.multiplier ?? DEFAULT_SPEED.multiplier),
+    }))
+    .filter((s) => s.end > s.start)
+    .sort((a, b) => a.start - b.start);
+  const speedAt = (t: number): number => {
+    // Latest-start speed section covering the midpoint wins.
+    let mult = 1;
+    let bestStart = -Infinity;
+    for (const s of speeds) {
+      if (t >= s.start && t < s.end && s.start > bestStart) {
+        mult = s.mult;
+        bestStart = s.start;
+      }
+    }
+    return mult;
+  };
+
+  const segments: TimelineSegment[] = [];
+  let outAcc = 0;
+  for (const inc of included) {
+    // Boundaries that fall strictly inside this included range.
+    const bounds = new Set<number>([inc.start, inc.end]);
+    for (const s of speeds) {
+      if (s.start > inc.start && s.start < inc.end) bounds.add(s.start);
+      if (s.end > inc.start && s.end < inc.end) bounds.add(s.end);
+    }
+    const sorted = [...bounds].sort((a, b) => a - b);
+    for (let i = 0; i < sorted.length - 1; i++) {
+      const sStart = sorted[i];
+      const sEnd = sorted[i + 1];
+      if (sEnd <= sStart) continue;
+      const mult = speedAt((sStart + sEnd) / 2);
+      const outLen = (sEnd - sStart) / mult;
+      segments.push({
+        sourceStart: sStart,
+        sourceEnd: sEnd,
+        outputStart: outAcc,
+        outputEnd: outAcc + outLen,
+        speedMultiplier: mult,
+      });
+      outAcc += outLen;
+    }
+  }
+
+  return {
+    segments,
+    sourceDuration: dur,
+    outputDuration: outAcc,
+    totalRemoved,
+    activeCuts,
+    inactiveCuts,
+  };
+}
+
+/**
+ * Output duration after active cuts are removed AND speed sections compress the
+ * survivors. Single source of truth via {@link buildTimelineMap}.
  */
 export function outputDurationFor(
   moments: DetectedMoment[] | null | undefined,
   sourceDuration: number
 ): number {
-  if (!moments || sourceDuration <= 0) return Math.max(0, sourceDuration);
-  let reduction = 0;
-  for (const m of moments) {
-    if (m.effectType !== "speed-up") continue;
-    const mult = Math.max(1, m.speed?.multiplier ?? DEFAULT_SPEED.multiplier);
-    const start = Math.max(0, Math.min(sourceDuration, m.startTime));
-    const end = Math.max(0, Math.min(sourceDuration, m.endTime));
-    const dur = Math.max(0, end - start);
-    reduction += dur - dur / mult;
-  }
-  return Math.max(0, sourceDuration - reduction);
+  if (sourceDuration <= 0) return Math.max(0, sourceDuration);
+  return buildTimelineMap(moments, sourceDuration).outputDuration;
 }

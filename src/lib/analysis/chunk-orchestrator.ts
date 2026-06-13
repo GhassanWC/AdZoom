@@ -27,10 +27,18 @@ import {
   CHUNK_MAX_ATTEMPTS,
   CHUNK_PROGRESS_WRITE_MS,
   CHUNK_SIZE_S,
+  type ChunkWindow,
   chunkWindows,
+  clampChunkSize,
 } from "./chunk-config";
-import { cropSectionsForChunk } from "./crop-engine";
+import { cutSectionsForChunk } from "./cut-engine";
 import { speedSectionsForChunk } from "./speed-engine";
+import {
+  type AnalysisOptions,
+  aiLayersPresent,
+  DEFAULT_ANALYSIS_OPTIONS,
+  shouldRunLayer,
+} from "./engine-layers";
 import {
   createAnalysisJob,
   createChunks,
@@ -67,6 +75,13 @@ export interface ChunkedRunArgs {
    * a fresh user-initiated run that recreates chunks and clears the timeline.
    */
   resume?: boolean;
+  /** Which engines to run + how to treat existing edits (from the dialog). */
+  options: AnalysisOptions;
+  /**
+   * Moments to PRESERVE on a fresh run — seeds the reset write instead of
+   * clearing to []. Ignored on resume (the reset is skipped).
+   */
+  carryOver?: DetectedMoment[];
 }
 
 /**
@@ -84,13 +99,25 @@ export interface ChunkedRunArgs {
 export async function runChunkedAnalysis(args: ChunkedRunArgs): Promise<void> {
   const { uid, project, interactions, idTokenGetter, signal, onJob } = args;
   const resume = args.resume === true;
+  const options = args.options ?? DEFAULT_ANALYSIS_OPTIONS;
+  const chunkSize = clampChunkSize(options.chunkSizeSeconds ?? CHUNK_SIZE_S);
+  const carryOver = args.carryOver ?? [];
+  // Which layers already hold AI edits — drives "keep" mode (only fill empty
+  // layers). In "keep" mode carryOver is the full current timeline; otherwise
+  // it has had the regenerated layers stripped, so fall back to the live doc.
+  const existingAiLayers = aiLayersPresent(
+    carryOver.length ? carryOver : project.analysis?.detectedMoments ?? []
+  );
+  const runCamera = shouldRunLayer("camera", options, existingAiLayers);
+  const runCut = shouldRunLayer("cut", options, existingAiLayers);
+  const runSpeed = shouldRunLayer("speed", options, existingAiLayers);
   const { db } = getFirebase();
   const pid = project.id;
   const projectRef = doc(db, "users", uid, "projects", pid);
   const duration = project.duration ?? 0;
   if (duration <= 0) throw new Error("Unknown duration — cannot chunk.");
 
-  const windows = chunkWindows(duration);
+  const windows = chunkWindows(duration, chunkSize);
   const jobId = `job_${project.id}`;
 
   // Every Firestore write for this project (moment appends, chunk/job status,
@@ -141,7 +168,8 @@ export async function runChunkedAnalysis(args: ChunkedRunArgs): Promise<void> {
     status: "running",
     engine: engineRef.current.kind,
     duration,
-    chunkSize: CHUNK_SIZE_S,
+    chunkSize,
+    chunkMode: options.chunkMode,
     chunkCount: windows.length,
     queuedCount: windows.length,
     processingCount: 0,
@@ -170,7 +198,10 @@ export async function runChunkedAnalysis(args: ChunkedRunArgs): Promise<void> {
       updatedAt: Date.now(),
     }));
     await qWrite("create-chunks", () => createChunks(uid, jobId, chunkDocs));
-    // Fresh run → clear any prior timeline so progressive appends accumulate.
+    // Fresh run → seed the timeline with the carry-over set (per the chosen
+    // existingEditMode) so progressive appends accumulate ON TOP of preserved
+    // edits. `appendMoments` concats onto this, so disabled/non-selected layers
+    // and all user edits survive the run.
     await qWrite("project-reset", () =>
       setDoc(
         projectRef,
@@ -179,7 +210,8 @@ export async function runChunkedAnalysis(args: ChunkedRunArgs): Promise<void> {
           analysis: {
             status: "analyzing",
             stage: "Analyzing in chunks",
-            detectedMoments: [],
+            detectedMoments: stripUndefined(carryOver),
+            lastRunOptions: options,
             startedAt: Date.now(),
             cancelRequested: false,
             errorKind: null,
@@ -240,7 +272,7 @@ export async function runChunkedAnalysis(args: ChunkedRunArgs): Promise<void> {
   // `probe` makes engine errors propagate (instead of marking the chunk
   // failed) so the caller can hot-swap engines on the first chunk.
   const processChunk = async (
-    w: { index: number; startTime: number; endTime: number },
+    w: ChunkWindow,
     probe = false
   ): Promise<void> => {
     const chunkId = `c${w.index}`;
@@ -279,19 +311,32 @@ export async function runChunkedAnalysis(args: ChunkedRunArgs): Promise<void> {
           },
         });
 
-        // Three engines per chunk: zoom/focus (existing) + crop + speed. Crop
-        // and speed are DetectedMoments (effectType "crop"/"speed-up") that
-        // ride the same append + track-routing + export path. Speed runs last
-        // so it can carve protective buffers around the zoom moments.
-        const zoom = deterministicChunkMoments(w, va, interactions, project);
-        const primaryEnd = Math.min(duration, w.startTime + CHUNK_SIZE_S);
-        const cropRes = cropSectionsForChunk(va, w, project, primaryEnd);
-        const speedRes = speedSectionsForChunk(va, w, project, zoom, primaryEnd);
-        const moments = [...zoom, ...cropRes.sections, ...speedRes.sections];
+        // Three engines per chunk: zoom/focus (camera) + cut + speed. Each is
+        // gated on the user's selection (`runCamera/runCut/runSpeed`); a
+        // disabled engine is skipped entirely (no empty moments). The VA above
+        // always runs — it's needed for the whole-video merge + finalize.
+        // Order matters: camera → cut → speed. Cut claims the deadest ranges and
+        // is fed to speed so a range is never both cut AND sped. Both cut and
+        // speed carve protective buffers around the camera edits.
+        const zoom = runCamera
+          ? deterministicChunkMoments(w, va, interactions, project)
+          : [];
+        const primaryEnd = w.primaryEnd;
+        const cutRes = runCut
+          ? cutSectionsForChunk(va, w, project, zoom, primaryEnd)
+          : { sections: [] as DetectedMoment[], diag: undefined };
+        const speedRes = runSpeed
+          ? speedSectionsForChunk(va, w, project, zoom, cutRes.sections, primaryEnd)
+          : { sections: [] as DetectedMoment[], diag: undefined };
+        const moments = [...zoom, ...cutRes.sections, ...speedRes.sections];
         if (process.env.NODE_ENV !== "production") {
+          const cell = (run: boolean, n: number) => (run ? String(n) : "skipped");
           console.info(
-            `[chunk ${w.index}] zoom ${zoom.length}, crop ${cropRes.sections.length}, speed ${speedRes.sections.length}`,
-            { crop: cropRes.diag, speed: speedRes.diag }
+            `[chunk ${w.index}] camera: ${cell(runCamera, zoom.length)} | cut: ${cell(
+              runCut,
+              cutRes.sections.length
+            )} | speed: ${cell(runSpeed, speedRes.sections.length)}`,
+            { cut: cutRes.diag, speed: speedRes.diag }
           );
         }
 
@@ -407,7 +452,7 @@ export async function runChunkedAnalysis(args: ChunkedRunArgs): Promise<void> {
 
     // Merge window VAs → whole-video VA, persist, then the single AI pass.
     if (vaChunks.length > 0) {
-      const mergedVa: VisualAnalysis = mergeVisualAnalysis(vaChunks, duration);
+      const mergedVa: VisualAnalysis = mergeVisualAnalysis(vaChunks, duration, chunkSize);
       await qWrite("project-va", () =>
         setDoc(
           projectRef,
@@ -425,6 +470,7 @@ export async function runChunkedAnalysis(args: ChunkedRunArgs): Promise<void> {
     await finalizeWithAi(project.id, idTokenGetter, {
       chunkCount: windows.length,
       progressiveCount: counters.momentsSoFar,
+      options,
     });
 
     // Authoritative terminal write. The finalize route already writes
@@ -472,7 +518,7 @@ export async function runChunkedAnalysis(args: ChunkedRunArgs): Promise<void> {
 
 // ── Deterministic per-chunk moments (event + CV) ───────────────────────────
 function deterministicChunkMoments(
-  w: { index: number; startTime: number; endTime: number },
+  w: ChunkWindow,
   windowVa: VisualAnalysis,
   interactions: Interaction[] | null,
   project: ProjectDoc
@@ -480,7 +526,7 @@ function deterministicChunkMoments(
   const duration = project.duration ?? 0;
   // Ownership: only emit moments inside this chunk's PRIMARY span so the 2s
   // overlap doesn't double-emit a boundary click (mirrors the VA merge).
-  const primaryEnd = Math.min(duration, w.startTime + CHUNK_SIZE_S);
+  const primaryEnd = w.primaryEnd;
 
   // 1. Event moments (trusted tab coords only) — already absolute time.
   const trusted =
@@ -592,7 +638,7 @@ async function markCancelled(
 async function finalizeWithAi(
   projectId: string,
   idTokenGetter: () => Promise<string | null>,
-  diag: { chunkCount: number; progressiveCount: number }
+  diag: { chunkCount: number; progressiveCount: number; options: AnalysisOptions }
 ): Promise<void> {
   const token = await idTokenGetter();
   if (!token) throw new Error("Not signed in.");
@@ -606,6 +652,8 @@ async function finalizeWithAi(
       mode: "finalize",
       chunkCount: diag.chunkCount,
       progressiveCount: diag.progressiveCount,
+      // So the finalize pass can't re-introduce a disabled layer via gap-fill.
+      analysisOptions: diag.options,
     }),
   });
   if (!res.ok) {

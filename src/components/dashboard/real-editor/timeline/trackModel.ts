@@ -15,8 +15,9 @@ export type TimelineTrackKind =
   | "ai"
   | "user"
   | "interactions"
-  // ── Prepared-but-not-implemented (placeholder lanes / future descriptors) ──
   | "speed"
+  | "cut"
+  // ── Prepared-but-not-implemented (placeholder lanes / future descriptors) ──
   | "crop"
   | "captions"
   | "audio"
@@ -32,7 +33,7 @@ export interface TimelineLaneContext {
   zoom: number;
 }
 
-export type TimelineTrackTone = "violet" | "cyan" | "fog" | "amber" | "teal";
+export type TimelineTrackTone = "violet" | "cyan" | "fog" | "amber" | "teal" | "rose";
 
 export interface TimelineTrackDescriptor {
   id: string;
@@ -49,6 +50,16 @@ export interface TimelineTrackDescriptor {
   comingSoon?: boolean;
   /** Optional count shown under the gutter label. */
   count?: number;
+  /**
+   * Subtle note shown under the gutter label in place of the count — e.g.
+   * "Disabled for this analysis" for a layer the user turned off last run.
+   */
+  note?: string;
+  /**
+   * One-click action shown centered in an EMPTY lane (count 0) — e.g. a
+   * "Run Speed" button that generates just this layer.
+   */
+  emptyAction?: { label: string; onRun: () => void };
   /** Lane body. Returns absolutely-positioned children (pills / markers). */
   renderLane: (ctx: TimelineLaneContext) => React.ReactNode;
 }

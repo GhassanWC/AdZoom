@@ -47,6 +47,7 @@ const TONE_TINT: Record<TimelineTrackTone, string> = {
   cyan: "text-cyan-200",
   amber: "text-amber-200",
   teal: "text-teal-200",
+  rose: "text-rose-200",
   fog: "text-fog",
 };
 
@@ -63,6 +64,7 @@ export function TrackLabel({
   height,
   tone = "violet",
   comingSoon,
+  note,
 }: {
   Icon: LucideIcon;
   label: string;
@@ -70,6 +72,8 @@ export function TrackLabel({
   height: number;
   tone?: TimelineTrackTone;
   comingSoon?: boolean;
+  /** Subtle line shown in place of the count (e.g. "Disabled for this analysis"). */
+  note?: string;
 }) {
   const tint = comingSoon ? "text-fog/55" : TONE_TINT[tone];
   return (
@@ -98,6 +102,13 @@ export function TrackLabel({
         {comingSoon ? (
           <div className="text-[9.5px] font-medium uppercase tracking-[0.12em] leading-tight text-fog/45">
             Soon
+          </div>
+        ) : note ? (
+          <div
+            title={note}
+            className="truncate text-[9.5px] font-medium leading-tight text-fog/55"
+          >
+            {note}
           </div>
         ) : (
           typeof count === "number" && (

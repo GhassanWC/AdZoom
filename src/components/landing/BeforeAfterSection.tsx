@@ -4,15 +4,15 @@ import { BeforeAfter } from "./BeforeAfter";
 export function BeforeAfterSection() {
   return (
     <Section
-      id="product"
-      eyebrow="Raw vs guided"
+      id="before-after"
+      eyebrow="Before / after"
       title={
         <>
-          Same recording.{" "}
-          <span className="text-gradient-violet">Two stories.</span>
+          Long and flat{" "}
+          <span className="text-gradient-violet">becomes export-ready.</span>
         </>
       }
-      subtitle="The raw capture leaves the viewer to find what matters. Framevo directs their attention — click by click, beat by beat — without changing what you said."
+      subtitle="Before: a long, flat, raw recording. After: cut, paced, zoomed, and formatted — a finished video, without changing what you said."
     >
       <div className="mx-auto max-w-5xl">
         <BeforeAfter />

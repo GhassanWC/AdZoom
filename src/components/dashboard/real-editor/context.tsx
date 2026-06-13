@@ -36,13 +36,24 @@ import {
   CvTaintedError,
 } from "@/lib/cv/pipeline";
 import { runChunkedAnalysis } from "@/lib/analysis/chunk-orchestrator";
+import {
+  type AnalysisOptions,
+  computeCarryOver,
+  DEFAULT_ANALYSIS_OPTIONS,
+} from "@/lib/analysis/engine-layers";
 import { getActiveJobForProject } from "@/lib/firebase/analysis-jobs";
 import {
   enqueueProjectWrite,
   isAnalysisActive,
 } from "@/lib/firebase/project-writer";
 import { isProcessing } from "@/lib/analysis-stages";
-import { cropBoxFor, DEFAULT_CROP, DEFAULT_SPEED } from "@/lib/timeline/crop-speed";
+import {
+  cropBoxFor,
+  snapOutOfActiveCut,
+  DEFAULT_CROP,
+  DEFAULT_CUT,
+  DEFAULT_SPEED,
+} from "@/lib/timeline/crop-speed";
 import type { AnalysisJob } from "@/lib/firebase/schema";
 import { useNotifications } from "@/lib/notifications/store";
 
@@ -102,7 +113,7 @@ interface EditorRealContextValue {
   clearOutputCanvas: () => Promise<void>;
   applyPreset: (preset: Preset) => Promise<void>;
   clearSelectedPreset: () => Promise<void>;
-  startAnalyze: () => Promise<void>;
+  startAnalyze: (options: AnalysisOptions) => Promise<void>;
   cancelAnalyze: () => Promise<void>;
   /**
    * Re-derive `focusRegion` for every non-user-positioned moment from the
@@ -170,6 +181,7 @@ const DEFAULT_EFFECT_LABEL: Record<EffectType, string> = {
   "click-highlight": "Click emphasis",
   "cursor-focus": "Focus",
   "speed-up": "Speed",
+  cut: "Cut",
   crop: "Crop / Reframe",
 };
 
@@ -336,7 +348,10 @@ export function EditorRealProvider({
   const seek = React.useCallback((t: number) => {
     const v = videoRef.current;
     if (!v) return;
-    v.currentTime = Math.max(0, Math.min(v.duration || t, t));
+    // Snap seeks out of active cuts (removed ranges) so the playhead can't land
+    // inside removed time. Covers timeline clicks + moment click-to-seek.
+    const snapped = snapOutOfActiveCut(momentsRef.current, t);
+    v.currentTime = Math.max(0, Math.min(v.duration || snapped, snapped));
     setCurrentTime(v.currentTime);
   }, []);
 
@@ -541,7 +556,8 @@ export function EditorRealProvider({
       async (effectType) => {
         const isCrop = effectType === "crop";
         const isSpeed = effectType === "speed-up";
-        const span = isSpeed ? 2.6 : isCrop ? 3 : 1.8;
+        const isCut = effectType === "cut";
+        const span = isSpeed ? 2.6 : isCrop ? 3 : isCut ? 2 : 1.8;
         const total = duration || project.duration || 0;
         const start = total > 0 ? Math.min(currentTime, Math.max(0, total - span)) : currentTime;
         // Source aspect drives the initial crop box shape.
@@ -579,6 +595,7 @@ export function EditorRealProvider({
           // Manual-effect settings (only the matching one is attached).
           ...(isCrop ? { crop: { ...DEFAULT_CROP } } : {}),
           ...(isSpeed ? { speed: { ...DEFAULT_SPEED } } : {}),
+          ...(isCut ? { cut: { ...DEFAULT_CUT } } : {}),
         };
         const next = [...momentsRef.current, m].sort(
           (a, b) => a.startTime - b.startTime
@@ -741,7 +758,7 @@ export function EditorRealProvider({
       );
     }, [projectRef]);
 
-  const startAnalyze = React.useCallback(async () => {
+  const startAnalyze = React.useCallback(async (options: AnalysisOptions) => {
     // Free-plan duration gate — block (re)analysis of >3-min videos before any
     // state change or on-device CV work. `resolveReliableDuration` probes the
     // real <video>, so a stale/missing `project.duration` on an old project
@@ -751,6 +768,13 @@ export function EditorRealProvider({
       setAnalyzeError(FREE_VIDEO_DURATION_LIMIT_MESSAGE);
       return;
     }
+    // What survives this run (per `existingEditMode`). `project` is the
+    // live-subscribed prop, so `detectedMoments` is the current timeline. The
+    // selected engines re-append their fresh output on top of this set.
+    const carryOver = computeCarryOver(
+      project.analysis?.detectedMoments ?? [],
+      options
+    );
     setAnalyzeError(null);
     setAnalyzing(true);
     setProcessingMinimized(false); // fresh run → show overlay
@@ -822,6 +846,8 @@ export function EditorRealProvider({
             idTokenGetter,
             signal: abort.signal,
             onJob: setChunkedJob,
+            options,
+            carryOver,
           });
           return;
         } catch (chunkErr) {
@@ -955,7 +981,18 @@ export function EditorRealProvider({
       if (!token) throw new Error("Not signed in.");
       const res = await fetch(`/api/projects/${project.id}/analyze`, {
         method: "POST",
-        headers: { authorization: `Bearer ${token}` },
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+        // Direct fallback: the route seeds the carry-over (instead of clearing
+        // to []) and applies the same disabled-layer filter the finalize pass
+        // uses, so the user's engine selection is honored here too.
+        body: JSON.stringify({
+          mode: "direct",
+          analysisOptions: options,
+          carryOver: stripUndefined(carryOver),
+        }),
       });
       if (!res.ok) {
         const j = await res.json().catch(() => ({ error: "Analysis failed" }));
@@ -997,6 +1034,12 @@ export function EditorRealProvider({
           signal: abort.signal,
           onJob: setChunkedJob,
           resume: true,
+          // Resume skips the reset (no carry-over needed) but the per-chunk
+          // gating still needs the original run's engine selection. A legacy
+          // in-flight job with no snapshot falls back to all-on.
+          options:
+            (project.analysis?.lastRunOptions as AnalysisOptions | undefined) ??
+            DEFAULT_ANALYSIS_OPTIONS,
         });
       } catch (err) {
         if (!(err instanceof CvAbortError) && !(err instanceof CvTaintedError)) {

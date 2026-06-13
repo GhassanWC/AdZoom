@@ -30,7 +30,8 @@ export interface VaChunk {
 
 export function mergeVisualAnalysis(
   chunks: VaChunk[],
-  duration: number
+  duration: number,
+  chunkSize: number = CHUNK_SIZE_S
 ): VisualAnalysis {
   const sorted = [...chunks].sort((a, b) => a.startTime - b.startTime);
   const sampleRate = sorted[0]?.va.sampleRate ?? sampleRateFor(duration);
@@ -59,7 +60,7 @@ export function mergeVisualAnalysis(
     computeMs += va.computeMs ?? 0;
     if (va.version === 3) version = 3;
     const baseBucket = Math.round(startTime * sampleRate);
-    const primaryEnd = Math.min(duration, startTime + CHUNK_SIZE_S);
+    const primaryEnd = Math.min(duration, startTime + chunkSize);
     const owns = (localT: number) => localT + startTime < primaryEnd + 1e-6;
 
     for (let b = 0; b < va.sampleCount; b++) {

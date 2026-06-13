@@ -26,7 +26,12 @@ import {
 } from "@/lib/timeline/camera";
 import { clickHighlightGeometry } from "@/lib/timeline/click-highlight";
 import { coverFitDims } from "@/lib/timeline/cover";
-import { activeSpeedAt, DEFAULT_CROP } from "@/lib/timeline/crop-speed";
+import {
+  activeSpeedAt,
+  activeCutAt,
+  snapOutOfActiveCut,
+  DEFAULT_CROP,
+} from "@/lib/timeline/crop-speed";
 import {
   resolveOutputCanvas,
   resolveCanvasDims,
@@ -134,10 +139,27 @@ function useCinematicCamera(
         return;
       }
 
+      // Active cuts remove time: during playback, jump past a cut the instant
+      // the playhead enters it (the `!seeking` guard prevents a re-seek storm).
+      // Runs regardless of `previewMode` — a cut is a timeline edit, not a
+      // camera-preview affordance — so preview always matches the export.
+      const vEl = videoRef.current;
+      if (vEl && !vEl.paused && !vEl.seeking) {
+        const cut = activeCutAt(s.moments, vEl.currentTime);
+        if (cut) {
+          if (process.env.NODE_ENV !== "production") {
+            console.info("[preview-cut]", {
+              jumpedFrom: +vEl.currentTime.toFixed(2),
+              jumpedTo: +cut.endTime.toFixed(2),
+            });
+          }
+          vEl.currentTime = cut.endTime;
+        }
+      }
+
       // Speed sections drive playbackRate — an approximate accelerated preview
       // (the export bakes the exact shorter duration). Outside a speed section,
       // or with preview off, playback runs at 1×.
-      const vEl = videoRef.current;
       if (vEl) {
         const sp = s.previewMode ? activeSpeedAt(s.moments, vEl.currentTime) : null;
         const rate = sp ? Math.max(0.0625, Math.min(16, sp.multiplier)) : 1;
@@ -427,7 +449,11 @@ export function RealVideoPlayer() {
   const onScrub = (e: React.ChangeEvent<HTMLInputElement>) => {
     const v = videoRef.current;
     if (!v) return;
-    const t = Number(e.target.value);
+    // Seeking into an active cut snaps to the cut's end (nearest valid time).
+    const t = snapOutOfActiveCut(
+      project.analysis?.detectedMoments ?? [],
+      Number(e.target.value)
+    );
     v.currentTime = t;
     setCurrentTime(t);
   };

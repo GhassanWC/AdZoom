@@ -43,20 +43,21 @@ export function FinalCTA() {
           <h2
             className="mx-auto max-w-[1000px] font-display text-[clamp(2.5rem,7.5vw,5.5rem)] font-semibold leading-[1] tracking-[-0.04em] text-[#fff]"
           >
-            Your recording deserves{" "}
+            Make your next video{" "}
             <em className="font-serif font-normal italic text-[#fff]">
-              to be cinematic
+              look finished
             </em>
           </h2>
 
           <p className="mx-auto mt-7 max-w-xl text-[15.5px] leading-relaxed text-[rgba(255,255,255,0.78)] sm:text-[16.5px]">
-            Upload your screen recording. Framevo reads the pixels, builds
-            the timeline, and hands you a first-draft cut you can ship.
+            Upload a video or record your screen, and Framevo drafts the cuts,
+            speed-ups, and camera edits. Review the timeline and export for any
+            platform.
           </p>
 
           <div className="mt-12">
             <Button href="/dashboard/upload" variant="primary" size="lg">
-              Upload your first recording
+              Start editing free
             </Button>
           </div>
         </div>

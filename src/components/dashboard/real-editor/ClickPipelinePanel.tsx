@@ -39,6 +39,7 @@ import { useAuth } from "@/lib/firebase/AuthProvider";
 import { getFirebase } from "@/lib/firebase/client";
 import { doc, serverTimestamp, setDoc } from "firebase/firestore";
 import { useEditorReal } from "./context";
+import { DEFAULT_ANALYSIS_OPTIONS } from "@/lib/analysis/engine-layers";
 import { useDebugParam } from "./use-debug-param";
 import { Stat, Field, Stage } from "./diag-bits";
 import type { ClickPipelineDiagnostics } from "@/lib/firebase/schema";
@@ -181,7 +182,9 @@ export function ClickPipelinePanel() {
         },
         { merge: true }
       );
-      await startAnalyze();
+      // Debug "force re-analyze": the doc was just cleared above, so a full
+      // all-engines run regenerates everything from scratch.
+      await startAnalyze(DEFAULT_ANALYSIS_OPTIONS);
     } catch (err) {
       toast.error("Force re-analyze failed", err instanceof Error ? err.message : String(err));
     } finally {

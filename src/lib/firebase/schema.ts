@@ -48,6 +48,7 @@ export type EffectType =
   | "click-highlight"
   | "cursor-focus"
   | "speed-up"
+  | "cut"
   | "crop";
 
 // ── Manual Crop/Reframe + Speed settings (additive) ─────────────────────────
@@ -83,6 +84,19 @@ export interface SpeedSettings {
   multiplier: number;
   audioMode: SpeedAudioMode;
   transition: SpeedTransition;
+}
+
+/**
+ * A Cut is a removed time range (effectType "cut"). Detected by the cut engine
+ * (dead / idle / loading / long-pause sections) or added by the user. `active`
+ * false = "restored" — the range is kept in the output and the cut stays on the
+ * timeline (dimmed) so it can be re-applied. NOTE: this iteration is
+ * timeline-only — cuts are reviewable but do NOT yet remove time from
+ * preview/export (that's a follow-up).
+ */
+export interface CutSettings {
+  /** True = the range is cut (removed). False = restored (kept). */
+  active: boolean;
 }
 
 export type UIContext =
@@ -273,6 +287,11 @@ export interface DetectedMoment {
    * `playbackRate` in preview + real-time export (shortening output duration).
    */
   speed?: SpeedSettings;
+  /**
+   * Cut settings — present when `effectType === "cut"`. The removed range is
+   * the moment's `[startTime, endTime]`; `cut.active` toggles applied/restored.
+   */
+  cut?: CutSettings;
 
   // ── Attention-aware fields (Gemini-supplied, post-processed by balancer) ──
   /** Composite priority (0..1) — replaces importance going forward. */
@@ -552,6 +571,22 @@ export interface Analysis {
   completedAt?: number;
   /** Set by the client when the user clicks Cancel. */
   cancelRequested?: boolean;
+  /**
+   * Snapshot of the engine selection used for the most recent (re)analysis, so
+   * the timeline can show "Disabled for this analysis" on a layer the user
+   * turned off. Structurally identical to `AnalysisOptions` in
+   * `src/lib/analysis/engine-layers.ts` (kept inline so this schema stays
+   * import-free).
+   */
+  lastRunOptions?: {
+    generateCameraEdits: boolean;
+    generateCut: boolean;
+    generateSpeed: boolean;
+    existingEditMode: "keep" | "replace-selected" | "clear-all";
+    chunkMode?: "fast" | "balanced" | "detailed" | "very-detailed" | "custom";
+    chunkSizeSeconds?: number;
+    chunkCount?: number;
+  };
 
   // ── Hybrid pipeline (V2) ──
   /**
@@ -621,8 +656,12 @@ export interface AnalysisJob {
   engine: CvEngineKind;
   /** Whole-video duration in seconds. */
   duration: number;
-  /** Target chunk length in seconds (CHUNK_SIZE_S). */
+  /** Target chunk length in seconds (the resolved analysis-detail size). */
   chunkSize: number;
+  /** Analysis-detail preset that produced `chunkSize` — drives the processing
+   *  UI label (e.g. "custom 10s chunks"). Inline union to keep schema.ts
+   *  import-free; matches `ChunkMode` in lib/analysis/chunk-config.ts. */
+  chunkMode?: "fast" | "balanced" | "detailed" | "very-detailed" | "custom";
   chunkCount: number;
   // Denormalized chunk counters so the Jobs page renders without a sub-read.
   queuedCount: number;
@@ -1080,6 +1119,21 @@ export interface WorkspaceSettings {
   defaultExportFormat?: ExportFormat;
   /** Per-channel notification preferences. */
   notifications?: NotificationPreferences;
+  /**
+   * Remembered defaults for the three analysis engines, shown pre-toggled in
+   * the "Analysis options" dialog. The `existingEditMode` is intentionally NOT
+   * persisted — it's a per-run safety choice that always re-defaults.
+   */
+  analysisEngines?: {
+    generateCameraEdits?: boolean;
+    generateCut?: boolean;
+    generateSpeed?: boolean;
+  };
+  /** Remembered analysis-detail (chunk-granularity) choice for the dialog. */
+  analysisDetail?: {
+    chunkMode?: "fast" | "balanced" | "detailed" | "very-detailed" | "custom";
+    chunkSizeSeconds?: number;
+  };
   updatedAt?: number;
 }
 
@@ -1101,6 +1155,15 @@ export const DEFAULT_WORKSPACE_SETTINGS: Required<
     renderComplete: true,
     weeklyDigest: false,
     productNews: true,
+  },
+  analysisEngines: {
+    generateCameraEdits: true,
+    generateCut: true,
+    generateSpeed: true,
+  },
+  analysisDetail: {
+    chunkMode: "balanced",
+    chunkSizeSeconds: 30,
   },
 };
 

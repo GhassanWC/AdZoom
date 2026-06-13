@@ -72,6 +72,7 @@ export function speedSectionsForChunk(
   window: ChunkWindow,
   project: ProjectDoc,
   zoomMoments: DetectedMoment[],
+  cutMoments: DetectedMoment[],
   primaryEnd: number
 ): { sections: DetectedMoment[]; diag: SpeedDiagnostics } {
   void project;
@@ -102,6 +103,13 @@ export function speedSectionsForChunk(
     const zs = z.startTime - window.startTime;
     const ze = z.endTime - window.startTime;
     blockAround((zs + ze) / 2, (ze - zs) / 2 + BUFFER_S);
+  }
+  // Cuts run first and claim the deadest ranges — block them so a section is
+  // never both cut AND sped (the cut owns it).
+  for (const c of cutMoments) {
+    const cs = c.startTime - window.startTime;
+    const ce = c.endTime - window.startTime;
+    blockAround((cs + ce) / 2, (ce - cs) / 2);
   }
 
   const isBoring = (i: number): boolean => {

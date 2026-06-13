@@ -18,7 +18,6 @@ import {
   MousePointer2,
   Target,
   FastForward,
-  Crop,
   type LucideIcon,
 } from "lucide-react";
 import { cn } from "@/lib/cn";
@@ -250,7 +249,7 @@ const ADD_EFFECTS: { id: EffectType; label: string; Icon: LucideIcon; hint: stri
   { id: "zoom", label: "Zoom", Icon: Zap, hint: "Cinematic zoom into a region" },
   { id: "cursor-focus", label: "Focus", Icon: MousePointer2, hint: "Soft focus / cursor follow" },
   { id: "click-highlight", label: "Click", Icon: Target, hint: "Click highlight" },
-  { id: "crop", label: "Crop / Reframe", Icon: Crop, hint: "Frame a region (e.g. 9:16)" },
+  { id: "cut", label: "Cut", Icon: Scissors, hint: "Mark a dead section to remove" },
   { id: "speed-up", label: "Speed", Icon: FastForward, hint: "Speed up a slow stretch" },
 ];
 

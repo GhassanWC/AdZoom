@@ -1,13 +1,17 @@
+import type { Metadata } from "next";
 import Link from "next/link";
 import { ArrowLeft, Mail, History } from "lucide-react";
 import { Navbar } from "@/components/landing/Navbar";
 import { Footer } from "@/components/landing/Footer";
 import { Button } from "@/components/ui/Button";
+import { buildMetadata } from "@/lib/seo";
 
-export const metadata = {
+export const metadata: Metadata = buildMetadata({
   title: "Changelog — Framevo",
-  description: "What's new in Framevo — features shipped, fixes landed, improvements rolled out.",
-};
+  description:
+    "What's new in Framevo — features shipped, fixes landed, improvements rolled out.",
+  path: "/changelog",
+});
 
 type Tag = "feature" | "improvement" | "fix";
 

@@ -15,6 +15,7 @@ import {
   Sparkles,
   Frame,
   Pencil,
+  Scissors,
 } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { cn } from "@/lib/cn";
@@ -27,6 +28,7 @@ import {
   type ExportStatusUI,
 } from "@/components/export/ExportProvider";
 import { resolveOutputCanvas } from "@/lib/timeline/canvas-layout";
+import { buildTimelineMap } from "@/lib/timeline/crop-speed";
 import type { ExportFormat, FitMode } from "@/lib/firebase/schema";
 import { useStoragePlan } from "@/lib/usage/useStoragePlan";
 import { planMeetsMinimum } from "@/lib/usage/plan";
@@ -100,7 +102,10 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
   // ── Pre-flight summary — what's about to be rendered ──────────────────────
   const moments = project.analysis?.detectedMoments ?? [];
   const zoomCount = moments.filter((m) => m.effectType === "zoom").length;
-  const exportDuration = duration || project.duration || 0;
+  const sourceDuration = duration || project.duration || 0;
+  // Active cuts remove time + speed compresses it → the real exported length.
+  const cutMap = buildTimelineMap(moments, sourceDuration);
+  const exportDuration = cutMap.outputDuration;
   // Client export renders at real-time speed + a little encode/upload overhead.
   const estRenderSeconds =
     exportDuration > 0 ? Math.ceil(exportDuration + 8) : 0;
@@ -302,6 +307,19 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
               value={`${zoomCount} zoom${zoomCount === 1 ? "" : "s"} · ${
                 moments.length
               } total`}
+            />
+            <PreFlightRow
+              icon={<Scissors size={11} className="text-rose-300" />}
+              label="Duration"
+              value={
+                cutMap.totalRemoved > 0
+                  ? `${fmtDuration(Math.round(exportDuration))} · −${Math.round(
+                      cutMap.totalRemoved
+                    )}s from ${cutMap.activeCuts} cut${
+                      cutMap.activeCuts === 1 ? "" : "s"
+                    }`
+                  : fmtDuration(Math.round(exportDuration))
+              }
             />
             <PreFlightRow
               icon={<Clock size={11} className="text-violet-300" />}

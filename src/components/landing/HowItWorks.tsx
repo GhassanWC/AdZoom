@@ -1,6 +1,6 @@
 import {
   Upload,
-  BrainCircuit,
+  SlidersHorizontal,
   Wand2,
   Download,
   type LucideIcon,
@@ -19,26 +19,26 @@ const steps: Step[] = [
   {
     n: "01",
     Icon: Upload,
-    title: "Upload",
-    body: "Drop in any screen recording (MP4, MOV, WebM, MKV). No browser extension, no plugin — your existing footage is all Framevo needs.",
+    title: "Upload or record a video",
+    body: "Drop in an existing video or screen recording (MP4, MOV, WebM), or capture a new one right in the browser. No extension, no plugin.",
   },
   {
     n: "02",
-    Icon: BrainCircuit,
-    title: "Analyze",
-    body: "Framevo's visual engine reads the pixels — tracking the cursor, clicks, and scene changes — and turns each meaningful moment into a camera move. Works even with no click data; Gemini adds extra polish.",
+    Icon: SlidersHorizontal,
+    title: "Choose what to generate",
+    body: "Pick which edits Framevo should make — camera edits, cuts, speed-ups — and how detailed the analysis should be.",
   },
   {
     n: "03",
     Icon: Wand2,
-    title: "Refine",
-    body: "Open the timeline. Drag pills, tune focus regions, pick a preset, adjust keyframes. The AI gave you a draft — you keep the final cut.",
+    title: "AI creates the edits",
+    body: "Cuts on the dead sections, speed-ups on the slow parts, and camera edits — zooms, click highlights, focus — on the moments that matter.",
   },
   {
     n: "04",
     Icon: Download,
-    title: "Export",
-    body: "Render in 1080p or 4K. Switch to vertical for Shorts and Reels. Watermark-free on paid plans.",
+    title: "Review & export",
+    body: "Adjust anything on the timeline, pick your format with Canvas Fit, and export — rendered in your browser, preview matching the file.",
   },
 ];
 
@@ -49,11 +49,11 @@ export function HowItWorks() {
       eyebrow="How it works"
       title={
         <>
-          From raw recording to{" "}
+          From raw video to{" "}
           <span className="text-gradient-violet">finished edit.</span>
         </>
       }
-      subtitle="Four stages. The first three happen automatically — you join at the refine step."
+      subtitle="Four steps. You pick what to generate and review the result — Framevo does the editing in between, and you stay in control."
     >
       <div className="relative">
         <div

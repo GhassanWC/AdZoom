@@ -4,6 +4,7 @@ import { PAGE_TITLE } from "@/lib/branding";
 
 export const metadata = {
   title: PAGE_TITLE.login,
+  robots: { index: false, follow: false },
 };
 
 export default function LoginPage() {

@@ -370,10 +370,21 @@ function pickActiveMoment(
   moments: DetectedMoment[],
   t: number
 ): DetectedMoment | null {
+  // Active cut ranges (removed time). A camera edit fully inside one is hidden
+  // from preview + export, so it's never picked. A straddling edit still
+  // applies on its visible part.
+  const activeCuts = moments.filter(
+    (m) => m.effectType === "cut" && m.cut?.active !== false
+  );
+  const insideActiveCut = (m: DetectedMoment): boolean =>
+    activeCuts.some((c) => m.startTime >= c.startTime && m.endTime <= c.endTime);
+
   let pick: DetectedMoment | null = null;
   let pickPri = -1;
   for (const m of moments) {
-    if (m.effectType === "speed-up") continue;
+    // Speed + Cut moments never move the camera (timing-only effects).
+    if (m.effectType === "speed-up" || m.effectType === "cut") continue;
+    if (insideActiveCut(m)) continue;
     if (t < m.startTime || t > m.endTime) continue;
     const pri = cameraPriority(m);
     if (!pick || pri > pickPri || (pri === pickPri && m.startTime > pick.startTime)) {

@@ -76,8 +76,12 @@ export function ProcessingMiniPill() {
     chunkedJob && (chunkedJob.status === "running" || chunkedJob.status === "queued")
       ? chunkedJob
       : null;
+  const chunkSizeSuffix =
+    job && job.chunkSize > 0
+      ? ` · ${job.chunkMode === "custom" ? "custom " : ""}${job.chunkSize}s chunks`
+      : "";
   const stageText = job
-    ? `Chunk ${Math.min(job.completedCount + 1, job.chunkCount)} of ${job.chunkCount}`
+    ? `Chunk ${Math.min(job.completedCount + 1, job.chunkCount)} of ${job.chunkCount}${chunkSizeSuffix}`
     : project.analysis?.stage ?? "Analyzing";
   const pctFinal = job ? Math.max(0.02, job.progress) : pct;
   const subtitle = job

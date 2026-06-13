@@ -162,6 +162,7 @@ function materializeJob(id: string, data: Record<string, unknown>): AnalysisJob 
     engine: (data.engine as CvEngineKind) ?? "hidden-video",
     duration: num(data.duration),
     chunkSize: num(data.chunkSize),
+    chunkMode: data.chunkMode as AnalysisJob["chunkMode"],
     chunkCount: num(data.chunkCount),
     queuedCount: num(data.queuedCount),
     processingCount: num(data.processingCount),

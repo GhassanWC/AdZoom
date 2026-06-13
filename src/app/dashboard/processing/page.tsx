@@ -20,6 +20,7 @@ import {
   updateChunk,
 } from "@/lib/firebase/analysis-jobs";
 import type { AnalysisJob } from "@/lib/firebase/schema";
+import { chunkModeLabel } from "@/lib/analysis/chunk-config";
 import { PageHeader } from "@/components/dashboard/PageHeader";
 import { Button } from "@/components/ui/Button";
 import { cn } from "@/lib/cn";
@@ -185,7 +186,9 @@ function JobCard({ uid, job }: { uid: string; job: AnalysisJob }) {
             </span>
           </div>
           <p className="mt-1 font-mono text-[11px] text-fog">
-            {fmtDuration(job.duration)} · {job.chunkCount} chunks ·{" "}
+            {fmtDuration(job.duration)} · {job.chunkCount} chunks
+            {job.chunkSize > 0 ? ` · ${job.chunkSize}s` : ""}
+            {job.chunkMode ? ` · ${chunkModeLabel(job.chunkMode)}` : ""} ·{" "}
             {job.engine === "webcodecs" ? "WebCodecs" : "compat"} engine
           </p>
         </div>

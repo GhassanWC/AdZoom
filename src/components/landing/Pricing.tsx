@@ -13,10 +13,10 @@ export function Pricing() {
       title={
         <>
           Simple plans.{" "}
-          <span className="text-gradient-violet">Cinematic output.</span>
+          <span className="text-gradient-violet">Polished output.</span>
         </>
       }
-      subtitle="Start free. Upgrade when you're ready to ship watermark-free and 4K."
+      subtitle="Start free. Upgrade when you need longer videos, advanced exports, and watermark-free 4K."
     >
       <div className="mx-auto grid max-w-5xl grid-cols-1 gap-5 lg:grid-cols-3">
         {pricingTiers.map((t, i) => (

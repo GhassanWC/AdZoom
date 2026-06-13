@@ -16,16 +16,19 @@ import {
   Zap,
   MoreHorizontal,
   Copy,
+  Scissors,
 } from "lucide-react";
 import { useEditorReal } from "./context";
 import { DirectionalPresetRow } from "./DirectionalPresetRow";
 import { Slider } from "@/components/ui/Slider";
+import { Toggle } from "@/components/ui/Toggle";
 import { cn } from "@/lib/cn";
 import { seedKeyframes } from "@/lib/timeline/camera";
 import {
   cropBoxFor,
   outputDurationFor,
   DEFAULT_CROP,
+  DEFAULT_CUT,
   DEFAULT_SPEED,
 } from "@/lib/timeline/crop-speed";
 import type {
@@ -121,6 +124,7 @@ const EFFECTS: EffectSpec[] = [
   { id: "zoom", label: "Zoom", Icon: Zap, accent: "text-violet-300" },
   { id: "click-highlight", label: "Click", Icon: Target, accent: "text-fuchsia-300" },
   { id: "cursor-focus", label: "Focus", Icon: MousePointer2, accent: "text-indigo-300" },
+  { id: "cut", label: "Cut", Icon: Scissors, accent: "text-rose-300" },
   { id: "crop", label: "Crop", Icon: Crop, accent: "text-teal-300" },
   { id: "speed-up", label: "Speed", Icon: FastForward, accent: "text-amber-300" },
 ];
@@ -139,6 +143,7 @@ const EFFECT_FULL_NAME: Record<EffectType, string> = {
   zoom: "Zoom",
   "click-highlight": "Click",
   "cursor-focus": "Focus",
+  cut: "Cut",
   crop: "Crop / Reframe",
   "speed-up": "Speed",
 };
@@ -158,6 +163,7 @@ const ADVANCED_RELEVANCE: Record<
   "click-highlight": { keyframes: false, cursor: true },
   "cursor-focus": { keyframes: true, cursor: true },
   "speed-up": { keyframes: false, cursor: false },
+  cut: { keyframes: false, cursor: false },
   crop: { keyframes: false, cursor: false },
 };
 
@@ -202,9 +208,10 @@ export function MomentInspector() {
     moment.effectType === "zoom" || moment.effectType === "cursor-focus";
   const isCrop = moment.effectType === "crop";
   const isSpeed = moment.effectType === "speed-up";
-  // Crop frames a box; speed only retimes — neither uses the zoom-intensity
-  // slider (they have their own controls below).
-  const showIntensity = !isCrop && !isSpeed;
+  const isCut = moment.effectType === "cut";
+  // Crop frames a box; speed only retimes; cut removes a range — none use the
+  // zoom-intensity slider (they have their own controls below).
+  const showIntensity = !isCrop && !isSpeed && !isCut;
   const momentDuration = moment.endTime - moment.startTime;
 
   // Switching effect type seeds the matching settings so the new controls have
@@ -245,7 +252,7 @@ export function MomentInspector() {
             click). Crop + Speed have their own tracks/tools, so the dialog
             shows their settings directly instead of a 5-tab row that overflows. */}
         <section className="space-y-3">
-          {!isCrop && !isSpeed && (
+          {!isCrop && !isSpeed && !isCut && (
             <SegmentedEffect value={moment.effectType} onChange={onEffectChange} />
           )}
           {showCameraPresets && (
@@ -282,6 +289,14 @@ export function MomentInspector() {
             moment={moment}
             allMoments={moments}
             sourceDuration={sourceDuration}
+            onUpdate={(patch) => updateMoment(moment.id, patch)}
+          />
+        )}
+
+        {/* Cut controls — only for cut moments. */}
+        {isCut && (
+          <CutControls
+            moment={moment}
             onUpdate={(patch) => updateMoment(moment.id, patch)}
           />
         )}
@@ -1029,6 +1044,60 @@ function SpeedControls({
       <p className="text-[10.5px] leading-relaxed text-fog/70">
         Speed changes preview playback and the exported video duration. AI
         speed suggestions coming soon.
+      </p>
+    </section>
+  );
+}
+
+/**
+ * Cut controls — a removed time range. The user can Restore (keep the range,
+ * dim the cut) or re-apply it; adjust the range via the timeline drag handles;
+ * Delete it from the overflow menu. NOTE: cuts are timeline-only suggestions in
+ * this iteration — they don't yet shorten preview/export.
+ */
+function CutControls({
+  moment,
+  onUpdate,
+}: {
+  moment: DetectedMoment;
+  onUpdate: (patch: Partial<DetectedMoment>) => void;
+}) {
+  const active = moment.cut?.active !== false;
+  const removed = Math.max(0, moment.endTime - moment.startTime);
+  return (
+    <section className="space-y-3 rounded-xl border border-rose-400/15 bg-rose-500/[0.04] p-3">
+      <div className="flex items-center justify-between">
+        <span className="text-[11px] font-semibold uppercase tracking-[0.14em] text-rose-200">
+          Cut
+        </span>
+        <span
+          className={cn(
+            "text-[11px] font-medium",
+            active ? "text-rose-200" : "text-fog"
+          )}
+        >
+          {active ? "Removed" : "Restored (kept)"}
+        </span>
+      </div>
+      <Toggle
+        label="Cut active"
+        description={
+          active
+            ? "Removed from preview + export — output is shorter."
+            : "Restored — the range plays and exports normally."
+        }
+        checked={active}
+        onChange={(v) => onUpdate({ cut: { active: v } })}
+      />
+      <div className="flex items-center justify-between rounded-lg bg-black/20 p-2.5 text-[11.5px]">
+        <span className="text-fog">{active ? "Removes" : "Would remove"}</span>
+        <span className="font-mono tabular-nums text-white">
+          {removed.toFixed(removed < 10 ? 1 : 0)}s
+        </span>
+      </div>
+      <p className="text-[10.5px] leading-relaxed text-fog/70">
+        {moment.reason || "Suggested cut."} Drag the handles to adjust the range,
+        or delete it from the ⋯ menu above.
       </p>
     </section>
   );

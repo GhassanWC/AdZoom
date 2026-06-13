@@ -24,7 +24,12 @@ import {
   type CanvasPlacement,
   type SmartFitResult,
 } from "@/lib/timeline/canvas-layout";
-import { activeSpeedAt, outputDurationFor, DEFAULT_SPEED } from "@/lib/timeline/crop-speed";
+import {
+  activeSpeedAt,
+  activeCutAt,
+  buildTimelineMap,
+  DEFAULT_SPEED,
+} from "@/lib/timeline/crop-speed";
 import { probeVideoBottomBand } from "@/lib/recording/health-check";
 import { drawClickHighlight } from "@/lib/timeline/click-highlight";
 import type {
@@ -891,24 +896,75 @@ export async function renderProjectClientSide(
     logExportCameraSnapshots(moments, effects.autoZoom, base);
   }
 
-  // Crop/Speed export diagnostics (req): counts, source vs output duration,
-  // and the timing strategy. We use real-time playbackRate (no offline timing
-  // map), reported honestly so "did speed/crop apply?" is answerable.
+  // Cut/Speed export diagnostics (req): the source→output map. Active cuts are
+  // removed by pausing the recorder while we seek past them (real-time capture,
+  // so the paused span is genuinely absent from the file); speed uses
+  // playbackRate. Reported honestly so "did cuts/speed apply?" is answerable.
   {
-    const cropSections = moments.filter((m) => m.effectType === "crop").length;
+    const map = buildTimelineMap(moments, input.duration);
     const speedSections = moments.filter((m) => m.effectType === "speed-up").length;
-    console.info("[export] crop/speed", {
-      cropSections,
+    console.info("[cut-map]", {
+      sourceDuration: +map.sourceDuration.toFixed(2),
+      activeCuts: map.activeCuts,
+      inactiveCuts: map.inactiveCuts,
+      totalRemoved: +map.totalRemoved.toFixed(2),
+      outputDuration: +map.outputDuration.toFixed(2),
       speedSections,
-      sourceDuration: +input.duration.toFixed(2),
-      outputDuration: +outputDurationFor(moments, input.duration).toFixed(2),
-      timingMode: "realtime-playbackRate",
-      timingMapGenerated: false,
+      segments: map.segments.map((s) => ({
+        src: [+s.sourceStart.toFixed(2), +s.sourceEnd.toFixed(2)],
+        out: [+s.outputStart.toFixed(2), +s.outputEnd.toFixed(2)],
+        x: s.speedMultiplier,
+      })),
+      timingMode: "realtime-playbackRate + recorder-pause-on-cut",
     });
   }
 
+  // Cut removal: while seeking past an active cut, the recorder is PAUSED so
+  // the skipped span is never captured (a plain seek would record a frozen
+  // frame). Resumed on `seeked`. This makes the file genuinely shorter.
+  let seekingPastCut = false;
+
   const draw = () => {
     if (stopped) return;
+    // Idle while a cut-seek is in flight — recorder is paused, capture nothing.
+    if (seekingPastCut) {
+      rafId = requestAnimationFrame(draw);
+      return;
+    }
+    // Active cut under the playhead → pause, seek past it, resume on seeked.
+    const cut = activeCutAt(moments, video.currentTime);
+    if (cut) {
+      seekingPastCut = true;
+      try {
+        if (recorder.state === "recording") recorder.pause();
+      } catch {
+        /* ignore */
+      }
+      const from = video.currentTime;
+      const to = Math.min(input.duration, cut.endTime + 1e-3);
+      console.info("[export-cut]", {
+        skippedRange: [+cut.startTime.toFixed(2), +cut.endTime.toFixed(2)],
+        from: +from.toFixed(2),
+        to: +to.toFixed(2),
+      });
+      const onSeeked = () => {
+        video.removeEventListener("seeked", onSeeked);
+        seekingPastCut = false;
+        try {
+          if (recorder.state === "paused") recorder.resume();
+        } catch {
+          /* ignore */
+        }
+      };
+      video.addEventListener("seeked", onSeeked);
+      try {
+        video.currentTime = to;
+      } catch {
+        /* ignore */
+      }
+      rafId = requestAnimationFrame(draw);
+      return;
+    }
     // Speed sections: real-time capture at a higher playbackRate makes the
     // recorded output genuinely shorter for that span (not faked). Audio
     // follows the section's mode — muted ONLY for that section via the audio

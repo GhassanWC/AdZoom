@@ -202,8 +202,8 @@ export const exportsHistory: ExportRow[] = [
 ];
 
 export const navLinks = [
-  { label: "Product", href: "/#product" },
-  { label: "Features", href: "/#features" },
+  { label: "Features", href: "/features" },
+  { label: "Use cases", href: "/use-cases" },
   { label: "Pricing", href: "/pricing" },
   { label: "Changelog", href: "/changelog" },
 ];

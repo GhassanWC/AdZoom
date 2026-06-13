@@ -11,6 +11,7 @@ import {
   Pointer,
   RefreshCcw,
   Crop,
+  Scissors,
   type LucideIcon,
 } from "lucide-react";
 import type {
@@ -24,6 +25,7 @@ export const EFFECT_ICONS: Record<EffectType, LucideIcon> = {
   "click-highlight": Target,
   "cursor-focus": MousePointer2,
   "speed-up": FastForward,
+  cut: Scissors,
   crop: Crop,
 };
 
@@ -119,6 +121,14 @@ export const EFFECT_TONES: Record<
     label: "Speed",
     glow: "shadow-[0_8px_36px_-12px_rgba(251,191,36,0.85)]",
     hoverGlow: "hover:shadow-[0_8px_36px_-12px_rgba(251,191,36,0.85)]",
+  },
+  cut: {
+    ai: "from-rose-500/85 via-rose-500/55 to-red-600/40 border-rose-300/45",
+    user: "from-rose-500/85 via-rose-500/55 to-red-600/40 border-rose-300/50",
+    dot: "bg-rose-300",
+    label: "Cut",
+    glow: "shadow-[0_8px_36px_-12px_rgba(244,63,94,0.9)]",
+    hoverGlow: "hover:shadow-[0_8px_36px_-12px_rgba(244,63,94,0.9)]",
   },
   crop: {
     ai: "from-teal-400/85 via-teal-500/55 to-emerald-600/40 border-teal-200/40",

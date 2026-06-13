@@ -131,23 +131,32 @@ export function MomentPill({
     m.intensity ?? m.recommendedIntensity ?? attention ?? 0.5;
   const prov = provenanceOf(m);
   const provInfo = PROVENANCE_PRESENTATION[prov];
-  // Crop shows its target aspect (9:16); speed shows its multiplier (2×).
+  // A restored cut is inactive (range kept) — render it dimmed.
+  const cutRestored = m.effectType === "cut" && m.cut?.active === false;
+  // Crop shows its target aspect (9:16); speed shows its multiplier (2×); a cut
+  // shows how much it removes (or "Restored" when inactive).
   const badge =
     m.effectType === "speed-up"
       ? `${m.speed?.multiplier ?? 2}×`
       : m.effectType === "crop"
         ? cropAspectLabel(m.crop?.aspectRatio)
-        : null;
-  // Source chip for crop/speed: who generated it — you, AI (Gemini), or the
+        : m.effectType === "cut"
+          ? cutRestored
+            ? "Restored"
+            : `−${duration.toFixed(duration < 10 ? 1 : 0)}s`
+          : null;
+  // Source chip for cut/crop/speed: who generated it — you, AI (Gemini), or the
   // deterministic engine.
   const provBadge =
-    m.effectType === "crop" || m.effectType === "speed-up"
+    m.effectType === "crop" || m.effectType === "speed-up" || m.effectType === "cut"
       ? isUser
         ? "You"
         : prov === "ai"
           ? m.effectType === "crop"
             ? "AI Reframe"
-            : "AI pacing"
+            : m.effectType === "cut"
+              ? "Suggested"
+              : "AI pacing"
           : "Engine"
       : null;
   const confidence = m.confidenceScore ?? attention;
@@ -192,7 +201,9 @@ export function MomentPill({
     <div
       className={cn(
         "group absolute touch-none transition-[opacity,filter] duration-200",
-        dragging ? "z-40" : selected ? "z-30" : "hover:z-20"
+        dragging ? "z-40" : selected ? "z-30" : "hover:z-20",
+        // A restored cut is inactive — desaturate it so it reads as "kept".
+        cutRestored && "saturate-[0.4]"
       )}
       style={{
         left: `${left}%`,
@@ -202,7 +213,7 @@ export function MomentPill({
         minWidth: `${MIN_PILL_PX}px`,
         top: insetY,
         bottom: insetY,
-        opacity: bodyOpacity,
+        opacity: cutRestored ? bodyOpacity * 0.5 : bodyOpacity,
       }}
     >
       {/* ── Floating action toolbar ─────────────────────────────────── */}

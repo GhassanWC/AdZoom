@@ -31,6 +31,8 @@ export interface ResolvedWorkspaceSettings {
   defaultPresetId: string;
   defaultExportFormat: WorkspaceSettings["defaultExportFormat"] & string;
   notifications: Required<NotificationPreferences>;
+  analysisEngines: Required<NonNullable<WorkspaceSettings["analysisEngines"]>>;
+  analysisDetail: Required<NonNullable<WorkspaceSettings["analysisDetail"]>>;
   updatedAt?: number;
 }
 
@@ -120,7 +122,30 @@ function mergeWithDefaults(
     defaultExportFormat:
       raw?.defaultExportFormat ?? DEFAULT_WORKSPACE_SETTINGS.defaultExportFormat,
     notifications: mergeNotifications(raw?.notifications),
+    analysisEngines: mergeAnalysisEngines(raw?.analysisEngines),
+    analysisDetail: mergeAnalysisDetail(raw?.analysisDetail),
     updatedAt: raw?.updatedAt,
+  };
+}
+
+function mergeAnalysisDetail(
+  raw: WorkspaceSettings["analysisDetail"]
+): Required<NonNullable<WorkspaceSettings["analysisDetail"]>> {
+  const d = DEFAULT_WORKSPACE_SETTINGS.analysisDetail;
+  return {
+    chunkMode: raw?.chunkMode ?? d.chunkMode ?? "balanced",
+    chunkSizeSeconds: raw?.chunkSizeSeconds ?? d.chunkSizeSeconds ?? 30,
+  };
+}
+
+function mergeAnalysisEngines(
+  raw: WorkspaceSettings["analysisEngines"]
+): Required<NonNullable<WorkspaceSettings["analysisEngines"]>> {
+  const d = DEFAULT_WORKSPACE_SETTINGS.analysisEngines;
+  return {
+    generateCameraEdits: raw?.generateCameraEdits ?? d.generateCameraEdits ?? true,
+    generateCut: raw?.generateCut ?? d.generateCut ?? true,
+    generateSpeed: raw?.generateSpeed ?? d.generateSpeed ?? true,
   };
 }
 

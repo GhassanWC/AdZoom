@@ -1,11 +1,10 @@
 import {
   MousePointerClick,
-  BookMarked,
-  Crosshair,
-  Compass,
-  Camera,
-  Layers,
+  Scissors,
+  FastForward,
+  Frame,
   SlidersHorizontal,
+  Download,
   type LucideIcon,
 } from "lucide-react";
 import { Section } from "@/components/ui/Section";
@@ -18,48 +17,40 @@ interface FeatureCard {
   description: string;
 }
 
-const features: FeatureCard[] = [
+export const FEATURE_CARDS: FeatureCard[] = [
   {
     Icon: MousePointerClick,
-    title: "Click-aware zooms",
+    title: "AI Camera Edits",
     description:
-      "Every click is classified — primary CTA, icon, nav, form, or background — and gets a camera move sized to match.",
+      "Automatically add zooms, click highlights, and focus moments when something important happens on screen.",
   },
   {
-    Icon: BookMarked,
-    title: "AI chapters",
+    Icon: Scissors,
+    title: "AI Cuts",
     description:
-      "Gemini segments the recording into narrative beats. Intro, action, result — labelled and laid out above the timeline.",
+      "Remove boring, idle, or dead sections so the final video feels tighter.",
   },
   {
-    Icon: Compass,
-    title: "Follow cursor",
-    description:
-      "Cursor smoothing plus a focus mode that holds the camera on the cursor while you talk through what's on screen.",
+    Icon: FastForward,
+    title: "Smart Speed-ups",
+    description: "Speed up slow parts without cutting them completely.",
   },
   {
-    Icon: Crosshair,
-    title: "Focus regions",
+    Icon: Frame,
+    title: "Canvas Fit",
     description:
-      "Directional framing onto the element you actually clicked. No more zooms that frame the whole tab.",
-  },
-  {
-    Icon: Camera,
-    title: "Smart camera framing",
-    description:
-      "Pan + zoom keyframes, scene-aware nudges, vignette and vertical reframing. Built for shipped video, not preview.",
-  },
-  {
-    Icon: Layers,
-    title: "Presets",
-    description:
-      "Pacing, cursor styling, click effects, motion behaviour — bundled per format. Pick MrBeast, Cinematic, Tutorial.",
+      "Prepare videos for YouTube, TikTok, Reels, Shorts, square, or portrait formats.",
   },
   {
     Icon: SlidersHorizontal,
-    title: "Timeline editor",
+    title: "Manual Timeline",
     description:
-      "Drag pills. Open the inspector. Tune intensity. Add manual keyframes. The AI gave you the draft — you ship the cut.",
+      "Drag, resize, delete, restore, and fine-tune every AI edit.",
+  },
+  {
+    Icon: Download,
+    title: "Background Export",
+    description: "Keep working while Framevo renders your video.",
   },
 ];
 
@@ -70,19 +61,17 @@ export function Features() {
       eyebrow="Features"
       title={
         <>
-          Built for{" "}
-          <span className="text-gradient-violet">guided attention.</span>
+          Everything an{" "}
+          <span className="text-gradient-violet">AI video editor</span> should
+          do.
         </>
       }
-      subtitle="Seven systems working together. Each is exposed in the editor, none are required to ship a good edit."
+      subtitle="Six systems work together to turn your video into a finished edit — each one editable, none of them required."
     >
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
-        {features.map((f, i) => (
+        {FEATURE_CARDS.map((f, i) => (
           <RevealOnView key={f.title} delay={i * 0.04}>
-            <GlassCard
-              spotlight
-              className="group relative h-full overflow-hidden p-6"
-            >
+            <GlassCard spotlight className="group relative h-full overflow-hidden p-6">
               <div className="mb-5 inline-flex size-10 items-center justify-center rounded-xl border border-violet-500/30 bg-violet-500/10 text-violet-300 shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]">
                 <f.Icon size={18} />
               </div>

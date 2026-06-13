@@ -1,4 +1,4 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { Inter, Sora } from "next/font/google";
 import "./globals.css";
 import { NoiseOverlay } from "@/components/ui/NoiseOverlay";
@@ -7,7 +7,8 @@ import { ToastProvider } from "@/components/ui/Toast";
 import { ConfirmProvider } from "@/components/ui/ConfirmDialog";
 import { ThemeProvider, themeInitScript } from "@/lib/theme";
 import { ChatWidget } from "@/components/chat/ChatWidget";
-import { BRAND, PAGE_TITLE } from "@/lib/branding";
+import { BRAND } from "@/lib/branding";
+import { SITE } from "@/lib/seo";
 
 const inter = Inter({
   variable: "--font-inter",
@@ -23,14 +24,37 @@ const sora = Sora({
 });
 
 export const metadata: Metadata = {
-  title: PAGE_TITLE.landing,
-  description: `${BRAND.longTagline} Auto-zoom, cursor focus, click highlights, motion tracking, vertical reframing — instantly.`,
-  metadataBase: new URL(BRAND.url),
+  metadataBase: new URL(SITE.url),
+  // Plain default title (no `template`): every public page already sets a full
+  // "<Page> — Framevo" title, so a template would double the suffix. Per-page
+  // canonical is set by each page via `buildMetadata` (not inherited here, which
+  // would point every page at "/").
+  title: SITE.title,
+  description: SITE.description,
+  applicationName: BRAND.name,
+  keywords: [...SITE.keywords],
+  robots: { index: true, follow: true },
+  icons: { icon: "/icon.svg" },
   openGraph: {
-    title: PAGE_TITLE.landing,
-    description: "Upload a screen recording. Framevo edits it with AI.",
+    title: SITE.title,
+    description: SITE.description,
+    url: SITE.url,
+    siteName: BRAND.name,
     type: "website",
+    locale: "en_US",
   },
+  twitter: {
+    card: "summary_large_image",
+    title: SITE.title,
+    description: SITE.description,
+    site: SITE.twitter,
+    creator: SITE.twitter,
+  },
+};
+
+export const viewport: Viewport = {
+  themeColor: BRAND.colors.themeColor,
+  colorScheme: "dark",
 };
 
 export default function RootLayout({

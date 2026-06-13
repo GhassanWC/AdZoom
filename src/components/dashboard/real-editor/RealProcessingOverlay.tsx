@@ -19,6 +19,10 @@ import {
 } from "lucide-react";
 import { useEditorReal } from "./context";
 import {
+  type AnalysisOptions,
+  DEFAULT_ANALYSIS_OPTIONS,
+} from "@/lib/analysis/engine-layers";
+import {
   ANALYSIS_STAGES,
   ERROR_RECOVERY,
   fmtElapsed,
@@ -129,7 +133,12 @@ export function RealProcessingOverlay() {
   };
   const onRetry = async () => {
     setDismissedTerminal(null);
-    await startAnalyze();
+    // Retry with the engine selection from the run that failed, so a disabled
+    // layer stays disabled. Falls back to all-on for an older project.
+    await startAnalyze(
+      (analysis?.lastRunOptions as AnalysisOptions | undefined) ??
+        DEFAULT_ANALYSIS_OPTIONS
+    );
   };
 
   const stage = analysis?.stage ?? "Preparing analysis";
@@ -319,6 +328,13 @@ function ActiveBody({
                 <span className="font-semibold text-violet-100">
                   Chunk {Math.min(job.completedCount + 1, job.chunkCount)} of{" "}
                   {job.chunkCount}
+                  {job.chunkSize > 0 && (
+                    <span className="font-normal text-violet-200/70">
+                      {" · "}
+                      {job.chunkMode === "custom" ? "custom " : ""}
+                      {job.chunkSize}s chunks
+                    </span>
+                  )}
                 </span>
                 <span className="font-mono tabular-nums text-violet-200/80">
                   {Math.round(job.progress * 100)}%
