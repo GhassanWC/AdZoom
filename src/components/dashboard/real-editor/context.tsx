@@ -9,10 +9,12 @@ import {
   serverTimestamp,
   setDoc,
 } from "firebase/firestore";
+import type { DocumentReference } from "firebase/firestore";
 import { getFirebase } from "@/lib/firebase/client";
 import type {
   AiSuggestion,
   Analysis,
+  AnalysisErrorKind,
   DetectedMoment,
   EffectsSettings,
   EffectType,
@@ -246,6 +248,37 @@ function selectAnalysisMode(
 ): { mode: AnalysisMode; reason: string } {
   if (debugForceDirect()) return { mode: "direct", reason: "debug-fallback" };
   return { mode: "chunked", reason: "default" };
+}
+
+/**
+ * Write a terminal "failed" state for a chunked run. Mirrors the analyze
+ * route's `bail()` shape so the overlay's existing `status: "failed"` handling
+ * renders `errorMessage` verbatim — no schema change needed. This is used
+ * INSTEAD of silently dropping to the legacy direct path: a chunked failure
+ * must be loud + attributed in production, persisted where it's inspectable
+ * (Firestore `analysis.errorMessage` + `activity[]`) without devtools.
+ */
+async function writeChunkFailure(
+  projectRef: DocumentReference,
+  { errorKind, errorMessage }: { errorKind: AnalysisErrorKind; errorMessage: string }
+): Promise<void> {
+  await setDoc(
+    projectRef,
+    {
+      status: "failed",
+      analysis: {
+        status: "failed",
+        stage: "Chunked analysis failed",
+        errorKind,
+        errorMessage,
+        cancelRequested: false,
+        completedAt: Date.now(),
+        activity: arrayUnion({ ts: Date.now(), kind: "error", text: errorMessage }),
+      },
+      updatedAt: serverTimestamp(),
+    },
+    { merge: true }
+  ).catch(() => {});
 }
 
 export function EditorRealProvider({
@@ -795,6 +828,9 @@ export function EditorRealProvider({
       const decision = selectAnalysisMode(project, videoRef.current);
       const wantChunked = decision.mode === "chunked" && resolvedDuration > 0;
       const selectedMode: AnalysisMode = wantChunked ? "chunked" : "direct";
+      // Production-safe diagnostics (console.* is NOT stripped — next.config.ts
+      // has no `compiler.removeConsole`). These ship to framevo.app so the
+      // chosen path + the reason are always inspectable in prod devtools.
       console.info("[analysis-mode]", {
         projectId: project.id,
         duration: resolvedDuration,
@@ -805,14 +841,28 @@ export function EditorRealProvider({
             : resolvedDuration > 0
               ? "default"
               : "unknown-duration",
+        debugForceDirect: decision.reason === "debug-fallback",
+        storedDuration: project.duration ?? null,
+        videoReadyState: videoRef.current?.readyState ?? null,
+      });
+      console.info("[analysis-options]", {
+        projectId: project.id,
+        generateCameraEdits: options.generateCameraEdits,
+        generateCut: options.generateCut,
+        generateSpeed: options.generateSpeed,
+        existingEditMode: options.existingEditMode,
+        chunkMode: options.chunkMode,
+        chunkSizeSeconds: options.chunkSizeSeconds,
+        chunkCount: options.chunkCount ?? null,
       });
 
-      // ── Progressive chunked path — the normal path for ALL videos ──────
+      // ── Progressive chunked path — the ONLY normal path for ALL videos ──
       // CV/zoom/crop/speed engines run per 30s window (a short video is one
       // chunk), streaming onto the timeline as each chunk finishes, with the
       // Gemini finalize in the background. If chunked can't run on-device
-      // (canvas taint, no readable frames, engine unsupported), we fall back to
-      // the legacy direct flow below.
+      // (canvas taint, no readable frames, engine unsupported), we HARD FAIL
+      // with the exact reason — we never silently drop to the legacy direct
+      // flow (doing so is what hid the prod CORS/stale-build regression).
       if (wantChunked) {
         // Single-flight: ignore a re-trigger while a chunked run is in flight.
         if (chunkRunningRef.current) return;
@@ -851,40 +901,70 @@ export function EditorRealProvider({
           });
           return;
         } catch (chunkErr) {
-          // User cancelled mid-run — not a failure, don't fall back.
+          // User cancelled mid-run — not a failure (the orchestrator wrote its
+          // own `markCancelled`). Stop here, no failed state.
           if (abort.signal.aborted) return;
-          // EMERGENCY FALLBACK: chunked failed on-device (canvas taint, no
-          // readable frames, engine unsupported, …). Drop to the legacy direct
-          // flow below so the user still gets a result. Logged loudly + noted
-          // in the activity feed so this exceptional path is visible.
-          console.warn(
-            "[analysis-mode] chunked failed → direct fallback",
-            chunkErr
-          );
-          await setDoc(
-            projectRef,
-            {
-              analysis: {
-                activity: arrayUnion({
-                  ts: Date.now(),
-                  kind: "warn",
-                  text: "Chunked analysis unavailable — using server fallback.",
-                }),
-              },
-              updatedAt: serverTimestamp(),
-            },
-            { merge: true }
-          ).catch(() => {});
-          // fall through to the direct whole-video flow below
+          // HARD FAIL — chunked is the ONLY normal path. We do NOT silently
+          // drop to the legacy direct flow (that masked prod CORS/build issues).
+          // Surface the exact reason loudly: console.error for prod devtools,
+          // plus a terminal `failed` state persisted to Firestore (errorMessage
+          // + activity) so the cause is inspectable without devtools. `name`
+          // distinguishes e.g. CvTaintedError (→ prod-bucket CORS).
+          const reason =
+            chunkErr instanceof Error ? chunkErr.message : String(chunkErr);
+          console.error("[analysis-mode] chunked failed to start", {
+            projectId: project.id,
+            name: chunkErr instanceof Error ? chunkErr.name : "Unknown",
+            message: reason,
+          });
+          await writeChunkFailure(projectRef, {
+            errorKind: "unknown",
+            errorMessage: `Chunked analysis failed to start: ${reason}`,
+          });
+          setAnalyzeError(`Chunked analysis failed to start: ${reason}`);
+          return; // never fall through to the legacy direct path
         } finally {
           chunkRunningRef.current = false;
         }
       }
 
-      // ── Phase 0: client-side computer-vision pass ──────────────────────
-      // Runs in the browser (the server route has no pixels). The result is
-      // persisted top-level so the route's `analysis` reset can't clobber it,
-      // then the route reads it back and fuses it in the balancer.
+      // ── Reaching here means chunked was NOT run (wantChunked === false) ────
+      // Two cases:
+      //   1. decision.mode === "direct" — the explicit debug escape hatch
+      //      (`?debug=direct` / localStorage `framevo:forceDirect=1`). This is
+      //      the ONLY route to the legacy direct flow below.
+      //   2. decision.mode === "chunked" but resolvedDuration <= 0 — chunking is
+      //      impossible without a duration. Do NOT silently run direct; hard
+      //      fail loudly so the (usually CORS/load-related) cause is surfaced.
+      if (decision.mode !== "direct") {
+        console.error("[analysis-mode] duration unresolved → hard fail", {
+          projectId: project.id,
+          storedDuration: project.duration ?? null,
+          videoDuration: Number.isFinite(videoRef.current?.duration ?? NaN)
+            ? videoRef.current?.duration
+            : null,
+          videoReadyState: videoRef.current?.readyState ?? null,
+        });
+        await writeChunkFailure(projectRef, {
+          errorKind: "unknown",
+          errorMessage:
+            "Chunked analysis failed to start: could not resolve the video's duration.",
+        });
+        setAnalyzeError(
+          "Chunked analysis failed to start: could not resolve the video's duration."
+        );
+        return;
+      }
+
+      // ── Legacy DIRECT flow (debug escape hatch only) ───────────────────
+      // Only reachable via `?debug=direct` / localStorage `framevo:forceDirect`
+      // (decision.mode === "direct"). Kept for debugging the old whole-video →
+      // Gemini path; it is NOT part of normal production routing.
+      //
+      // Phase 0: client-side computer-vision pass. Runs in the browser (the
+      // server route has no pixels). The result is persisted top-level so the
+      // route's `analysis` reset can't clobber it, then the route reads it back
+      // and fuses it in the balancer.
       const video = videoRef.current;
       const cvDuration = resolvedDuration;
       if (video && cvDuration > 0) {
@@ -1042,9 +1122,24 @@ export function EditorRealProvider({
             DEFAULT_ANALYSIS_OPTIONS,
         });
       } catch (err) {
-        if (!(err instanceof CvAbortError) && !(err instanceof CvTaintedError)) {
-          setAnalyzeError(err instanceof Error ? err.message : "Resume failed.");
-        }
+        // Aborted (unmount / user cancel) — not a failure.
+        if (err instanceof CvAbortError || abort.signal.aborted) return;
+        // Any other failure (incl. CvTaintedError) is a HARD FAIL — mirror the
+        // fresh-run path: persist a terminal `failed` state so the project is
+        // never left stuck "analyzing", and surface the exact reason. (The
+        // orchestrator's own throw marks the JOB doc; this marks the PROJECT
+        // doc the overlay reads — two idempotent writers, last-write-wins.)
+        const reason = err instanceof Error ? err.message : "Resume failed.";
+        console.error("[analysis-mode] chunked failed to resume", {
+          projectId: project.id,
+          name: err instanceof Error ? err.name : "Unknown",
+          message: reason,
+        });
+        await writeChunkFailure(projectRef, {
+          errorKind: "unknown",
+          errorMessage: `Chunked analysis failed to resume: ${reason}`,
+        });
+        setAnalyzeError(`Chunked analysis failed to resume: ${reason}`);
       } finally {
         chunkRunningRef.current = false;
         cvAbortRef.current = null;

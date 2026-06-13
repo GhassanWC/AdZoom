@@ -120,6 +120,20 @@ export async function runChunkedAnalysis(args: ChunkedRunArgs): Promise<void> {
   const windows = chunkWindows(duration, chunkSize);
   const jobId = `job_${project.id}`;
 
+  // Production-safe diagnostics (console.* ships to prod). The resolved chunk
+  // config makes a mis-routed run obvious end-to-end without devtools setup.
+  console.info("[chunk-config]", {
+    projectId: project.id,
+    duration,
+    chunkSize,
+    chunkMode: options.chunkMode,
+    chunkCount: windows.length,
+    resume,
+    runCamera,
+    runCut,
+    runSpeed,
+  });
+
   // Every Firestore write for this project (moment appends, chunk/job status,
   // VA + terminal writes) funnels through one serialized queue so concurrent
   // commits can't trigger "Another write batch or compaction is already
@@ -139,6 +153,9 @@ export async function runChunkedAnalysis(args: ChunkedRunArgs): Promise<void> {
       active.status === "running" &&
       Date.now() - active.updatedAt < ACTIVE_JOB_HEARTBEAT_MS
     ) {
+      // Another tab is already driving this job — mirror its state, don't start
+      // a competing run. Logged so this isn't mistaken for a real start.
+      console.info("[chunk-mirror]", { projectId: project.id, jobId: active.id });
       onJob?.(active);
       return;
     }
@@ -184,6 +201,18 @@ export async function runChunkedAnalysis(args: ChunkedRunArgs): Promise<void> {
   };
   await qWrite("create-job", () => createAnalysisJob(uid, job));
   onJob?.(job);
+
+  // The run has truly started (job doc created, engine resolved, not a mirror).
+  console.info("[chunk-start]", {
+    projectId: project.id,
+    jobId,
+    engine: job.engine,
+    chunkSize: job.chunkSize,
+    chunkMode: job.chunkMode,
+    chunkCount: job.chunkCount,
+    duration: job.duration,
+    resume: resuming,
+  });
 
   if (!resuming) {
     const chunkDocs: AnalysisChunk[] = windows.map((w) => ({
@@ -260,6 +289,10 @@ export async function runChunkedAnalysis(args: ChunkedRunArgs): Promise<void> {
     failed: 0,
     processing: 0,
     momentsSoFar: job.momentsSoFar,
+    // Per-layer totals for the one-line [chunk-summary] (prod-safe diagnostics).
+    cameraMoments: 0,
+    cutMoments: 0,
+    speedMoments: 0,
   };
   const chunkTimes: number[] = [];
 
@@ -358,6 +391,9 @@ export async function runChunkedAnalysis(args: ChunkedRunArgs): Promise<void> {
         counters.processing--;
         counters.completed++;
         counters.momentsSoFar += moments.length;
+        counters.cameraMoments += zoom.length;
+        counters.cutMoments += cutRes.sections.length;
+        counters.speedMoments += speedRes.sections.length;
         chunkTimes.push(Date.now() - t0);
         await writeJob({
           processingCount: counters.processing,
@@ -435,6 +471,14 @@ export async function runChunkedAnalysis(args: ChunkedRunArgs): Promise<void> {
         }
         engineRef.current = new HiddenVideoCvEngine(source);
         await writeJob({ engine: "hidden-video" });
+        // Legitimate, silent degrade (NOT a failure): the probe couldn't drive
+        // WebCodecs for this codec/browser, so we fall back to the proven
+        // hidden-video engine and keep going. Logged for visibility only.
+        console.info("[chunk-engine-swap] webcodecs → hidden-video", {
+          projectId: project.id,
+          jobId,
+          reason: probeErr instanceof Error ? probeErr.message : String(probeErr),
+        });
         // reset the probe chunk so it re-runs on the fallback engine
         counters.processing = Math.max(0, counters.processing - 1);
         await qWrite("chunk-requeue", () =>
@@ -444,6 +488,23 @@ export async function runChunkedAnalysis(args: ChunkedRunArgs): Promise<void> {
     }
 
     await runPool(pending, cvConcurrencyFor(engineRef.current.kind), processChunk);
+
+    // One prod-safe summary line per run (engine actually used, per-layer
+    // totals, wall time) — replaces the dev-only per-chunk log for prod.
+    console.info("[chunk-summary]", {
+      projectId: project.id,
+      jobId,
+      engine: engineRef.current.kind,
+      chunkCount: windows.length,
+      completed: counters.completed,
+      failed: counters.failed,
+      momentsTotal: counters.momentsSoFar,
+      camera: counters.cameraMoments,
+      cut: counters.cutMoments,
+      speed: counters.speedMoments,
+      durationMs: chunkTimes.reduce((a, b) => a + b, 0),
+      aborted: ac.signal.aborted,
+    });
 
     if (ac.signal.aborted) {
       await qWrite("cancel", () => markCancelled(uid, jobId, projectRef));
