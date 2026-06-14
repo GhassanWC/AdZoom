@@ -27,7 +27,7 @@ export function RecordingChrome() {
     cancel,
     discardResult,
     useResult,
-    replaceResultBlob,
+    setSourceCrop,
     uploading,
     uploadPct,
     error,
@@ -90,9 +90,10 @@ export function RecordingChrome() {
                     width={result.width}
                     height={result.height}
                     displaySurface={result.displaySurface}
+                    sourceCrop={result.sourceCrop}
+                    onSetSourceCrop={setSourceCrop}
                     onDiscard={discardResult}
                     onUse={useResult}
-                    onReplaceBlob={replaceResultBlob}
                     uploading={uploading}
                     uploadPct={uploadPct}
                     error={error}

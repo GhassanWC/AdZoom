@@ -40,6 +40,8 @@ import {
   buildSmartSignals,
 } from "@/lib/timeline/canvas-layout";
 import { probeVideoBottomBand } from "@/lib/recording/health-check";
+import { resolveSourceRect } from "@/lib/timeline/source-crop";
+import { CropEditorOverlay } from "./CropEditorOverlay";
 import { FocalPathOverlay } from "./FocalPathOverlay";
 import type {
   BackgroundMode,
@@ -79,6 +81,8 @@ interface CameraDriverState {
   pacing: string;
   /** When true, an export render is running — the preview camera loop yields. */
   exporting: boolean;
+  /** When true, the crop editor owns the preview — the camera stays at identity. */
+  cropEditing: boolean;
 }
 
 /**
@@ -135,6 +139,17 @@ function useCinematicCamera(
       // two-writer race). Keep the rAF alive so the camera resumes the instant
       // the export finishes.
       if (s.exporting) {
+        raf = requestAnimationFrame(tick);
+        return;
+      }
+
+      // While the crop editor is open, the preview shows the FULL frame with a
+      // draggable crop box — pin the camera to identity so a moment under the
+      // playhead can't animate/zoom the frame the user is trying to crop.
+      if (s.cropEditing) {
+        const el = wrapRef.current;
+        if (el) el.style.transform = "translate(0%, 0%) scale(1)";
+        currentRef.current = { scale: 1, tx: 0, ty: 0 };
         raf = requestAnimationFrame(tick);
         return;
       }
@@ -307,6 +322,10 @@ export function RealVideoPlayer() {
     cvDebug,
     updateMoment,
     updateEffects,
+    cropEditing,
+    closeCropEditor,
+    setSourceCrop,
+    clearSourceCrop,
   } = useEditorReal();
 
   // Dev-only CV debug overlay gate (?debug=1 / Ctrl+Shift+D).
@@ -334,10 +353,14 @@ export function RealVideoPlayer() {
   const [muted, setMuted] = React.useState(false);
   const [volume, setVolume] = React.useState(1);
   const [isFullscreen, setIsFullscreen] = React.useState(false);
-  // Intrinsic aspect of the loaded recording. Drives the preview frame so
-  // the default ("Source") export — which keeps the full captured viewport
-  // — is shown WYSIWYG instead of being cropped into a fixed 16:9 box.
-  const [sourceAspect, setSourceAspect] = React.useState<number | null>(null);
+  // Intrinsic (full) size of the loaded recording. The EFFECTIVE source aspect
+  // (the Frame Crop sub-rectangle) is derived from this + the project's
+  // `sourceCrop` below, so the preview frame is shown WYSIWYG with the export
+  // instead of being cropped into a fixed 16:9 box.
+  const [naturalSize, setNaturalSize] = React.useState<{
+    w: number;
+    h: number;
+  } | null>(null);
 
   // Track fullscreen state so we can swap the layout from "aspect-locked
   // card centered in the page" to "fill the viewport, letterboxed by the
@@ -396,7 +419,7 @@ export function RealVideoPlayer() {
     const onLoaded = () => {
       if (Number.isFinite(v.duration)) setDuration(v.duration);
       if (v.videoWidth > 0 && v.videoHeight > 0) {
-        setSourceAspect(v.videoWidth / v.videoHeight);
+        setNaturalSize({ w: v.videoWidth, h: v.videoHeight });
       }
     };
     const onPlay = () => setPlaying(true);
@@ -501,11 +524,58 @@ export function RealVideoPlayer() {
       zoomSpeed: project.effectsSettings.zoomSpeed,
       pacing: project.effectsSettings.pacing,
       exporting,
+      cropEditing,
     },
     cameraDebugRef
   );
 
   const va = project.visualAnalysis;
+
+  // ── Global Frame Crop ────────────────────────────────────────────────────
+  // The EFFECTIVE source rect (the crop sub-rectangle of the full frame). The
+  // same `resolveSourceRect` the exporter + CV use, so the preview frame, the
+  // export, and the analysis all agree on what "the source" is. Full frame
+  // (no-op) unless the project carries an enabled `sourceCrop`.
+  const srcRect = React.useMemo(
+    () =>
+      naturalSize
+        ? resolveSourceRect(naturalSize.w, naturalSize.h, project.sourceCrop)
+        : null,
+    [naturalSize, project.sourceCrop]
+  );
+  // Effective source aspect drives the preview frame + all canvas-layout math.
+  // While editing the crop we show the FULL frame (so the box can cover the
+  // whole source), so use the natural aspect in that mode.
+  const fullAspect =
+    naturalSize && naturalSize.h > 0 ? naturalSize.w / naturalSize.h : null;
+  const sourceAspect = cropEditing
+    ? fullAspect
+    : srcRect && srcRect.sHeight > 0
+      ? srcRect.sWidth / srcRect.sHeight
+      : null;
+  // When a crop is applied, the <video> is scaled up (1/cropW × 1/cropH) and
+  // offset inside an overflow-clipped wrapper so only the crop rect shows. The
+  // stage/frame box is the effective crop aspect → the scaled video's element
+  // box ends up at the FULL source aspect, so `object-fill` fills it without
+  // distortion, matching the exporter's source-rect draw. Suppressed while
+  // editing (the editor shows the full frame with the draggable crop box) and
+  // in native fullscreen (a non-WYSIWYG "watch" affordance whose box is
+  // viewport-aspect, where the sprite-fill would distort — show the raw frame).
+  const cropActive =
+    !cropEditing &&
+    !isFullscreen &&
+    !!srcRect &&
+    srcRect.cropActive &&
+    !!naturalSize;
+  const cropRectPct =
+    cropActive && naturalSize
+      ? {
+          w: srcRect!.sWidth / naturalSize.w,
+          h: srcRect!.sHeight / naturalSize.h,
+          x: srcRect!.sx / naturalSize.w,
+          y: srcRect!.sy / naturalSize.h,
+        }
+      : null;
 
   // ── Global output canvas (Canvas Fit / Resize) ───────────────────────────
   // The chosen aspect / fit mode / background. Reflected in the preview
@@ -560,7 +630,9 @@ export function RealVideoPlayer() {
   // "watch the recording" affordance — the windowed preview is the WYSIWYG
   // export preview). Outside the canvas path the video is letterboxed via
   // `object-contain` exactly like before.
-  const canvasActive = !!previewPlacement && !isFullscreen;
+  // While editing the crop, bypass the Canvas-Fit composite and show the full
+  // source frame (object-contain at natural aspect) with the crop box on top.
+  const canvasActive = !!previewPlacement && !isFullscreen && !cropEditing;
   const applySourceAspect = !canvasActive && !isFullscreen;
   const previewAspect = sourceAspect ?? 16 / 9;
   const videoObjectFit = canvasActive ? "object-cover" : "object-contain";
@@ -699,7 +771,13 @@ export function RealVideoPlayer() {
         )}
       >
         {/* ── Canvas Fit background — fills the empty space behind the (crisp)
-            video in Fit / Manual modes (or Smart-Fit's blur fallback). ── */}
+            video in Fit / Manual modes (or Smart-Fit's blur fallback). ──
+            NB: when a sharing bar is being removed the foreground video is
+            cropped (above) and the export's blur backdrop is cropped too, but
+            this decorative layer is left full-frame: it's blurred 40px + dimmed
+            + overscaled and only peeks in the letterbox margins, so the bar is
+            an indistinct wash; cropping it would risk uncovering frame edges
+            for no perceptible gain. */}
         {showCanvasBg &&
           (canvasBgMode === "blur" ? (
             <video
@@ -734,15 +812,37 @@ export function RealVideoPlayer() {
                 source-normalized %s track the placed source, not the canvas). */}
             <div ref={sourceFrameRef} className="absolute inset-0">
               {/* The real <video>. The cinematic camera writes `transform`
-                  directly onto this wrapper every frame. */}
+                  directly onto this wrapper every frame. When a Frame Crop is
+                  applied, this wrapper clips and the video is scaled up
+                  (1/cropW × 1/cropH) and offset so only the crop rect shows —
+                  matching the exporter's source-rect draw exactly. */}
               <div
                 ref={transformWrapRef}
-                className="absolute inset-0 origin-center will-change-transform"
+                className={cn(
+                  "absolute inset-0 origin-center will-change-transform",
+                  cropActive && "overflow-hidden"
+                )}
               >
                 <video
                   ref={videoRef}
                   src={project.originalVideoUrl || undefined}
-                  className={cn("h-full w-full", videoObjectFit)}
+                  className={cn(
+                    "w-full",
+                    // With a crop the element box no longer has the source
+                    // aspect (we scale W/H independently), so object-fill is
+                    // required — cover/contain would re-crop/letterbox.
+                    cropActive ? "absolute object-fill" : cn("h-full", videoObjectFit)
+                  )}
+                  style={
+                    cropActive && cropRectPct
+                      ? {
+                          width: `${(100 / cropRectPct.w).toFixed(4)}%`,
+                          height: `${(100 / cropRectPct.h).toFixed(4)}%`,
+                          left: `${(-(cropRectPct.x / cropRectPct.w) * 100).toFixed(4)}%`,
+                          top: `${(-(cropRectPct.y / cropRectPct.h) * 100).toFixed(4)}%`,
+                        }
+                      : undefined
+                  }
                   playsInline
                   crossOrigin="anonymous"
                   preload="metadata"
@@ -774,8 +874,9 @@ export function RealVideoPlayer() {
 
               {/* Source-space overlays — click highlights, focal path, crop
                   guides, editable focus box. Nested in the source frame so
-                  their coords track the placed source under any fit mode. */}
-              {activeMoment && (
+                  their coords track the placed source under any fit mode.
+                  Hidden while editing the global crop. */}
+              {!cropEditing && activeMoment && (
                 <OverlayLayer
                   moment={activeMoment}
                   currentTime={currentTime}
@@ -785,12 +886,14 @@ export function RealVideoPlayer() {
                 />
               )}
 
-              {activeMoment && <FocalPathOverlay moment={activeMoment} />}
+              {!cropEditing && activeMoment && <FocalPathOverlay moment={activeMoment} />}
 
-              {activeMoment?.effectType === "crop" && previewMode && <CropGuides />}
+              {!cropEditing && activeMoment?.effectType === "crop" && previewMode && (
+                <CropGuides />
+              )}
 
               {/* Speed moments don't frame a region — no box for them. */}
-              {activeMoment && activeMoment.effectType !== "speed-up" && (
+              {!cropEditing && activeMoment && activeMoment.effectType !== "speed-up" && (
                 <EditableFocusBox
                   key={activeMoment.id}
                   moment={activeMoment}
@@ -870,8 +973,33 @@ export function RealVideoPlayer() {
           />
         )}
 
-        {/* Controls */}
-        <div className="absolute inset-x-0 bottom-0 z-40 bg-gradient-to-t from-black/85 via-black/40 to-transparent px-4 pb-3 pt-10">
+        {/* Crop editor — rendered at the FRAME level (same overlay root as the
+            controls) so its z-50 layer sits ABOVE the z-40 controls; nesting it
+            inside the transformed source-frame subtree trapped it below. While
+            editing the frame box equals the full-frame display area, so
+            `aspectRef` is the correct coordinate container. */}
+        {cropEditing && naturalSize && (
+          <CropEditorOverlay
+            aspectRef={aspectRef}
+            initial={project.sourceCrop}
+            naturalAspect={fullAspect ?? 16 / 9}
+            onApply={(crop) => {
+              void setSourceCrop(crop);
+              closeCropEditor();
+            }}
+            onReset={() => void clearSourceCrop()}
+            onCancel={closeCropEditor}
+          />
+        )}
+
+        {/* Controls — faded + non-interactive while cropping so they can't
+            cover or steal clicks from the crop toolbar (which sits at z-50). */}
+        <div
+          className={cn(
+            "absolute inset-x-0 bottom-0 z-40 bg-gradient-to-t from-black/85 via-black/40 to-transparent px-4 pb-3 pt-10 transition-opacity duration-200",
+            cropEditing && "pointer-events-none opacity-30"
+          )}
+        >
           {/* scrubber row */}
           <div className="mb-2 flex items-center gap-3">
             <span className="font-mono text-[11px] tabular-nums text-fog">

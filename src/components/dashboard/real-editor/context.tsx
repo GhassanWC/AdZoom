@@ -56,8 +56,89 @@ import {
   DEFAULT_CUT,
   DEFAULT_SPEED,
 } from "@/lib/timeline/crop-speed";
-import type { AnalysisJob } from "@/lib/firebase/schema";
+import {
+  resolveSourceRect,
+  remapRegion,
+  croppedToSource,
+  sourceToCropped,
+} from "@/lib/timeline/source-crop";
+import { quantize, dequantize } from "@/lib/cv/resample";
+import type {
+  AnalysisJob,
+  SourceCrop,
+  VisualAnalysis,
+} from "@/lib/firebase/schema";
 import { useNotifications } from "@/lib/notifications/store";
+
+// ── Frame-crop coordinate remap (best-effort) ────────────────────────────────
+// Downstream coords (focusRegion, keyframes, CV cursor/centroid) are normalized
+// to the EFFECTIVE (cropped) frame. When the crop changes, re-express existing
+// coords from the OLD crop space into the NEW one so auto-generated edits keep
+// pointing at the same real content. `undefined`/disabled = full frame.
+
+/** True when the two crops describe a materially different effective rect. */
+function cropChanged(a?: SourceCrop, b?: SourceCrop): boolean {
+  const ea = a?.enabled ? a : null;
+  const eb = b?.enabled ? b : null;
+  if (!ea && !eb) return false;
+  if (!ea || !eb) return true;
+  const eps = 0.001;
+  return (
+    Math.abs(ea.x - eb.x) > eps ||
+    Math.abs(ea.y - eb.y) > eps ||
+    Math.abs(ea.width - eb.width) > eps ||
+    Math.abs(ea.height - eb.height) > eps
+  );
+}
+
+function remapMomentForCrop(
+  m: DetectedMoment,
+  oldCrop: SourceCrop | undefined,
+  newCrop: SourceCrop | undefined
+): DetectedMoment {
+  const focusRegion = remapRegion(m.focusRegion, oldCrop, newCrop);
+  const next: DetectedMoment = { ...m, focusRegion };
+  if (m.keyframes && m.keyframes.length > 0) {
+    next.keyframes = m.keyframes.map((k) => {
+      const nc = sourceToCropped(
+        croppedToSource({ x: k.x, y: k.y }, oldCrop),
+        newCrop
+      );
+      return { ...k, x: nc.x, y: nc.y };
+    });
+  }
+  return next;
+}
+
+function remapVisualAnalysisForCrop(
+  va: VisualAnalysis,
+  oldCrop: SourceCrop | undefined,
+  newCrop: SourceCrop | undefined
+): VisualAnalysis {
+  const remapPair = (xs?: number[], ys?: number[]) => {
+    if (!xs || !ys) return null;
+    const nx = xs.slice();
+    const ny = ys.slice();
+    const n = Math.min(nx.length, ny.length);
+    for (let i = 0; i < n; i++) {
+      const full = croppedToSource(
+        { x: dequantize(xs[i]), y: dequantize(ys[i]) },
+        oldCrop
+      );
+      const nc = sourceToCropped(full, newCrop);
+      nx[i] = quantize(nc.x);
+      ny[i] = quantize(nc.y);
+    }
+    return { x: nx, y: ny };
+  };
+  const cur = remapPair(va.cursorX, va.cursorY);
+  const cen = remapPair(va.centroidX, va.centroidY);
+  return {
+    ...va,
+    ...(cur ? { cursorX: cur.x, cursorY: cur.y } : {}),
+    ...(cen ? { centroidX: cen.x, centroidY: cen.y } : {}),
+  };
+}
 
 interface EditorRealContextValue {
   project: ProjectDoc;
@@ -88,6 +169,14 @@ interface EditorRealContextValue {
   canvasOpen: boolean;
   openCanvas: () => void;
   closeCanvas: () => void;
+  /**
+   * Global "Frame Crop" editing mode. When true the preview shows the FULL
+   * source frame with a draggable crop rectangle (camera + Canvas Fit + the
+   * applied crop are bypassed) and a floating control bar.
+   */
+  cropEditing: boolean;
+  openCropEditor: () => void;
+  closeCropEditor: () => void;
   previewMode: boolean;
   setPreviewMode: (v: boolean) => void;
   /** Developer overlay: CV signal curves, scene markers, centroid path. */
@@ -113,6 +202,21 @@ interface EditorRealContextValue {
   ) => Promise<void>;
   /** Reset the output canvas to "Source / full frame" (removes outputCanvas). */
   clearOutputCanvas: () => Promise<void>;
+  /**
+   * Set (or update) the global source-frame crop. Instant + non-destructive —
+   * the source bytes are untouched. If `visualAnalysis` exists and the crop
+   * changed, existing moment focus regions/keyframes + CV cursor/centroid
+   * coords are remapped from the old crop space into the new one.
+   */
+  setSourceCrop: (crop: SourceCrop) => Promise<void>;
+  /** Remove the global source crop entirely (full frame). */
+  clearSourceCrop: () => Promise<void>;
+  /**
+   * Toggle the browser-tab sharing-bar removal on/off (flips
+   * `sourceCrop.enabled`, only when `reason === "browser-bar-cleanup"`).
+   * Instant + non-destructive. No-op when the project has no such crop.
+   */
+  setRemoveSharingBar: (remove: boolean) => Promise<void>;
   applyPreset: (preset: Preset) => Promise<void>;
   clearSelectedPreset: () => Promise<void>;
   startAnalyze: (options: AnalysisOptions) => Promise<void>;
@@ -308,6 +412,10 @@ export function EditorRealProvider({
   const [canvasOpen, setCanvasOpen] = React.useState(false);
   const openCanvas = React.useCallback(() => setCanvasOpen(true), []);
   const closeCanvas = React.useCallback(() => setCanvasOpen(false), []);
+
+  const [cropEditing, setCropEditing] = React.useState(false);
+  const openCropEditor = React.useCallback(() => setCropEditing(true), []);
+  const closeCropEditor = React.useCallback(() => setCropEditing(false), []);
   const [previewMode, setPreviewMode] = React.useState(true);
   const [cvDebug, setCvDebug] = React.useState(false);
   const [analyzing, setAnalyzing] = React.useState(false);
@@ -595,13 +703,16 @@ export function EditorRealProvider({
         const span = isSpeed ? 2.6 : isCrop ? 3 : isCut ? 2 : 1.8;
         const total = duration || project.duration || 0;
         const start = total > 0 ? Math.min(currentTime, Math.max(0, total - span)) : currentTime;
-        // Source aspect drives the initial crop box shape.
+        // Source aspect drives the initial crop box shape — use the EFFECTIVE
+        // (Frame Crop) dims so a manual crop box starts at the same aspect the
+        // preview + export frame the source at.
+        const rawW =
+          project.width || videoRef.current?.videoWidth || 0;
+        const rawH =
+          project.height || videoRef.current?.videoHeight || 0;
+        const sc = resolveSourceRect(rawW, rawH, project.sourceCrop);
         const sourceAspect =
-          project.width && project.height
-            ? project.width / project.height
-            : videoRef.current?.videoWidth && videoRef.current?.videoHeight
-              ? videoRef.current.videoWidth / videoRef.current.videoHeight
-              : 16 / 9;
+          sc.sWidth > 0 && sc.sHeight > 0 ? sc.sWidth / sc.sHeight : 16 / 9;
         const focusRegion = isCrop
           ? cropBoxFor(
               DEFAULT_CROP.aspectRatio,
@@ -735,6 +846,87 @@ export function EditorRealProvider({
         { merge: true }
       );
     }, [projectRef]);
+
+  // Persist a global source crop. Writes the top-level `sourceCrop` field (a
+  // property of the source bytes — NOT an effects setting, so it must not touch
+  // `effectsSettings` / `selectedPresetId`). When `visualAnalysis` exists and
+  // the crop actually changed, remap existing moment focus regions/keyframes +
+  // CV cursor/centroid coords from the OLD crop space into the new one so
+  // auto-generated edits keep pointing at the same content (best-effort).
+  const setSourceCrop: EditorRealContextValue["setSourceCrop"] =
+    React.useCallback(
+      async (crop) => {
+        const oldCrop = project.sourceCrop;
+        const patch: Record<string, unknown> = {
+          sourceCrop: crop,
+          updatedAt: serverTimestamp(),
+        };
+        if (
+          project.visualAnalysis &&
+          cropChanged(oldCrop, crop)
+        ) {
+          const moments = project.analysis?.detectedMoments;
+          if (moments && moments.length > 0) {
+            patch["analysis"] = {
+              ...(project.analysis ?? {}),
+              detectedMoments: moments.map((m) =>
+                remapMomentForCrop(m, oldCrop, crop)
+              ),
+            };
+          }
+          patch["visualAnalysis"] = remapVisualAnalysisForCrop(
+            project.visualAnalysis,
+            oldCrop,
+            crop
+          );
+        }
+        await setDoc(projectRef, patch, { merge: true });
+      },
+      [projectRef, project.sourceCrop, project.visualAnalysis, project.analysis]
+    );
+
+  const clearSourceCrop: EditorRealContextValue["clearSourceCrop"] =
+    React.useCallback(async () => {
+      // A disabled full-frame crop is equivalent to "no crop"; persist that so
+      // the (now full-frame) → (old crop) remap below still has an old crop to
+      // map FROM if the user re-enables. We DELETE rather than disable so the
+      // doc stays clean. Remap moments back to full-frame first.
+      const oldCrop = project.sourceCrop;
+      const patch: Record<string, unknown> = {
+        sourceCrop: deleteField(),
+        updatedAt: serverTimestamp(),
+      };
+      if (project.visualAnalysis && cropChanged(oldCrop, undefined)) {
+        const moments = project.analysis?.detectedMoments;
+        if (moments && moments.length > 0) {
+          patch["analysis"] = {
+            ...(project.analysis ?? {}),
+            detectedMoments: moments.map((m) =>
+              remapMomentForCrop(m, oldCrop, undefined)
+            ),
+          };
+        }
+        patch["visualAnalysis"] = remapVisualAnalysisForCrop(
+          project.visualAnalysis,
+          oldCrop,
+          undefined
+        );
+      }
+      await setDoc(projectRef, patch, { merge: true });
+    }, [projectRef, project.sourceCrop, project.visualAnalysis, project.analysis]);
+
+  // Flip the browser-tab sharing-bar removal — a convenience for the
+  // auto-detected crop. Only acts on a `browser-bar-cleanup` crop so it can't
+  // stomp a manual Frame Crop. No-op when nothing was detected.
+  const setRemoveSharingBar: EditorRealContextValue["setRemoveSharingBar"] =
+    React.useCallback(
+      async (remove) => {
+        const existing = project.sourceCrop;
+        if (!existing || existing.reason !== "browser-bar-cleanup") return;
+        await setSourceCrop({ ...existing, enabled: remove });
+      },
+      [project.sourceCrop, setSourceCrop]
+    );
 
   const applyPreset: EditorRealContextValue["applyPreset"] = React.useCallback(
     async (preset) => {
@@ -998,6 +1190,7 @@ export function EditorRealProvider({
           const va = await runVisualAnalysis(video, {
             duration: cvDuration,
             signal: abort.signal,
+            sourceCrop: project.sourceCrop,
             onProgress: (p) => setCvProgress(p.done),
           });
           await setDoc(
@@ -1312,6 +1505,9 @@ export function EditorRealProvider({
     canvasOpen,
     openCanvas,
     closeCanvas,
+    cropEditing,
+    openCropEditor,
+    closeCropEditor,
     previewMode,
     setPreviewMode,
     cvDebug,
@@ -1327,6 +1523,9 @@ export function EditorRealProvider({
     dismissSuggestion,
     updateEffects,
     clearOutputCanvas,
+    setSourceCrop,
+    clearSourceCrop,
+    setRemoveSharingBar,
     applyPreset,
     clearSelectedPreset,
     startAnalyze,

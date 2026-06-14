@@ -11,6 +11,7 @@ import {
   Download,
   SlidersHorizontal,
   Frame,
+  Crop,
   Pencil,
 } from "lucide-react";
 import { useToast } from "@/components/ui/Toast";
@@ -129,6 +130,9 @@ function Body() {
     canvasOpen,
     openCanvas,
     closeCanvas,
+    cropEditing,
+    openCropEditor,
+    closeCropEditor,
   } = useEditorReal();
   const hasAnalysis = (project.analysis?.detectedMoments?.length ?? 0) > 0;
   const isFailed = project.analysis?.status === "failed";
@@ -210,6 +214,15 @@ function Body() {
                 Re-analyze
               </Button>
             )}
+            <Button
+              onClick={cropEditing ? closeCropEditor : openCropEditor}
+              variant="ghost"
+              size="sm"
+              leftIcon={<Crop size={14} />}
+              title="Crop the source frame (applies to the whole video)"
+            >
+              {cropEditing ? "Done cropping" : "Crop Frame"}
+            </Button>
             <Button
               onClick={openCanvas}
               variant="ghost"

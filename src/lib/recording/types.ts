@@ -32,6 +32,34 @@ export interface RecordingOptions {
   systemAudio: boolean;
 }
 
+/**
+ * Global source-frame crop — the CapCut-style "Frame Crop". A normalized
+ * rectangle of the source video that is kept; everything outside it is removed
+ * from preview, AI/CV analysis, and export (a source-rect `drawImage`, not a
+ * re-encode — the original blob is untouched). Applied to the WHOLE video,
+ * BEFORE Canvas Fit. Distinct from per-moment Crop/Reframe (`CropSettings`,
+ * time-based) and from Canvas Fit (output canvas).
+ *
+ * Coords are normalized 0..1 of the FULL source frame. The browser-tab green
+ * sharing-bar cleanup is just a `sourceCrop` with `reason:"browser-bar-cleanup"`
+ * (a bottom-only rect). Absent / `enabled:false` ⇒ full frame (no crop).
+ */
+export interface SourceCrop {
+  /** When false (or absent), the full source frame is used (no crop). */
+  enabled: boolean;
+  /** Crop rectangle, normalized 0..1 of the full source frame. */
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  /** Resize constraint while editing; "free"/"source" = unconstrained. */
+  aspectLock?: "free" | "16:9" | "9:16" | "1:1" | "4:5" | "source";
+  /** Provenance — drives UI affordances (e.g. the sharing-bar toggle). */
+  reason?: "manual" | "browser-bar-cleanup" | "auto-detected";
+  /** Detector confidence 0..1 when `reason === "browser-bar-cleanup"`. */
+  confidence?: number;
+}
+
 export interface RecordingResult {
   blob: Blob;
   mimeType: string;
@@ -65,6 +93,14 @@ export interface RecordingResult {
    * re-validate scope instead of blindly trusting the capture-time call.
    */
   captureDimensions?: CaptureDimensions;
+  /**
+   * Global source-frame crop. Seeded at record time when the green-band
+   * detector fires on a `displaySurface === "browser"` take (a bottom-only rect
+   * with `reason:"browser-bar-cleanup"`); the user can also draw one manually
+   * in the editor. Persisted on the project doc and applied at every
+   * render/analysis path. Absent ⇒ full frame.
+   */
+  sourceCrop?: SourceCrop;
 }
 
 /**

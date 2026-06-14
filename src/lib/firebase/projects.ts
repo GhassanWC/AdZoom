@@ -22,7 +22,7 @@ import {
   uploadBytesResumable,
   type UploadTaskSnapshot,
 } from "firebase/storage";
-import type { Interaction } from "@/lib/recording/types";
+import type { Interaction, SourceCrop } from "@/lib/recording/types";
 import { assessCoordinateTrust } from "@/lib/recording/interaction-trust";
 import type { CaptureDimensions } from "@/lib/recording/scope-detect";
 import { getFirebase } from "./client";
@@ -65,6 +65,8 @@ interface CreateProjectInput {
   interactionScope?: "tab" | "external";
   /** Capture geometry, persisted so the analyzer can re-validate scope. */
   captureDimensions?: CaptureDimensions;
+  /** Global source-frame crop, seeded when the green-band detector fires. */
+  sourceCrop?: SourceCrop;
 }
 
 /**
@@ -120,6 +122,7 @@ export async function createProjectFromFile({
   interactions,
   interactionScope,
   captureDimensions,
+  sourceCrop,
 }: CreateProjectInput): Promise<UploadResult> {
   if (!isVideoAccepted(file)) {
     throw new Error(`Unsupported file type: ${file.type || file.name}`);
@@ -213,6 +216,7 @@ export async function createProjectFromFile({
     interactionScope: scope,
     ...(interactionsPath ? { interactionsPath } : {}),
     ...(captureDimensions ? { captureDimensions } : {}),
+    ...(sourceCrop ? { sourceCrop } : {}),
     updatedAt: serverTimestamp(),
   });
 
@@ -322,9 +326,51 @@ function materializeProject(id: string, data: Record<string, unknown>): ProjectD
     interactionScope: (data.interactionScope as ProjectDoc["interactionScope"]) ?? undefined,
     interactionsPath: (data.interactionsPath as string) ?? undefined,
     captureDimensions: (data.captureDimensions as ProjectDoc["captureDimensions"]) ?? undefined,
+    sourceCrop: materializeSourceCrop(data),
     createdAt: tsMs(data.createdAt) ?? Date.now(),
     updatedAt: tsMs(data.updatedAt) ?? Date.now(),
   };
+}
+
+/**
+ * Read the global `sourceCrop`, with a back-compat shim for projects saved
+ * under the earlier bottom-only `recordingCleanup` model: synthesize an
+ * equivalent bottom-only crop rect so they keep removing the sharing bar.
+ */
+function materializeSourceCrop(
+  data: Record<string, unknown>
+): SourceCrop | undefined {
+  const direct = data.sourceCrop as SourceCrop | undefined;
+  if (direct) return direct;
+  const legacy = data.recordingCleanup as
+    | {
+        removeBottomCaptureBar?: boolean;
+        bottomCropPx?: number;
+        sourceHeight?: number;
+        confidence?: number;
+      }
+    | undefined;
+  if (
+    legacy &&
+    legacy.removeBottomCaptureBar &&
+    (legacy.bottomCropPx ?? 0) > 0 &&
+    (legacy.sourceHeight ?? 0) > 0
+  ) {
+    const height = Math.max(
+      0,
+      Math.min(1, (legacy.sourceHeight! - legacy.bottomCropPx!) / legacy.sourceHeight!)
+    );
+    return {
+      enabled: true,
+      x: 0,
+      y: 0,
+      width: 1,
+      height,
+      reason: "browser-bar-cleanup",
+      confidence: legacy.confidence,
+    };
+  }
+  return undefined;
 }
 
 function tsNum(v: unknown): number | undefined {

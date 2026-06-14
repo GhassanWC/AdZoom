@@ -13,6 +13,7 @@ import {
   createRecordingEngine,
   mimeToExtension,
   RecordingError,
+  type SourceCrop,
   type RecordingEngine,
   type RecordingOptions,
   type RecordingResult,
@@ -58,11 +59,12 @@ interface RecordingContextValue {
   discardResult: () => void;
   useResult: () => Promise<void>;
   /**
-   * Replace the current result blob (e.g. after the user accepts a crop fix
-   * in the preview). The original interactions / scope / mimeType stay; we
-   * only swap the blob + width/height so the upload uses the corrected file.
+   * Attach (or clear) the global source-frame crop on the current take. Set by
+   * the preview's green-band detector (a bottom-only `browser-bar-cleanup`
+   * rect); persisted on the project doc by `useResult`. Non-destructive — the
+   * blob is never modified.
    */
-  replaceResultBlob: (next: Blob, info: { width: number; height: number }) => void;
+  setSourceCrop: (crop: SourceCrop | undefined) => void;
 }
 
 const Ctx = React.createContext<RecordingContextValue | null>(null);
@@ -181,21 +183,8 @@ export function RecordingProvider({ children }: { children: React.ReactNode }) {
     setUploadPct(null);
   };
 
-  const replaceResultBlob: RecordingContextValue["replaceResultBlob"] = (
-    next,
-    info
-  ) => {
-    setResult((prev) =>
-      prev
-        ? {
-            ...prev,
-            blob: next,
-            mimeType: next.type || prev.mimeType,
-            width: info.width,
-            height: info.height,
-          }
-        : prev
-    );
+  const setSourceCrop: RecordingContextValue["setSourceCrop"] = (crop) => {
+    setResult((prev) => (prev ? { ...prev, sourceCrop: crop } : prev));
   };
 
   const useResult: RecordingContextValue["useResult"] = async () => {
@@ -225,6 +214,7 @@ export function RecordingProvider({ children }: { children: React.ReactNode }) {
         interactions: result.interactions,
         interactionScope: result.interactionScope,
         captureDimensions: result.captureDimensions,
+        sourceCrop: result.sourceCrop,
       });
       // Persistent notification — the navbar bell carries the take
       // forward even if the user navigates away mid-upload. The id is
@@ -268,7 +258,7 @@ export function RecordingProvider({ children }: { children: React.ReactNode }) {
     cancel,
     discardResult,
     useResult,
-    replaceResultBlob,
+    setSourceCrop,
   };
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

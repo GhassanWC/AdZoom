@@ -44,6 +44,18 @@ type ExtendedDisplayMediaOptions = DisplayMediaStreamOptions & {
   monitorTypeSurfaces?: "include" | "exclude";
 };
 
+/** Coarse browser family for the `[recording-surface]` diagnostic. */
+function detectBrowserName(): string {
+  if (typeof navigator === "undefined") return "unknown";
+  const ua = navigator.userAgent;
+  if (/Edg\//.test(ua)) return "edge";
+  if (/OPR\//.test(ua)) return "opera";
+  if (/Firefox\//.test(ua)) return "firefox";
+  if (/Chrome\//.test(ua)) return "chrome";
+  if (/Safari\//.test(ua)) return "safari";
+  return "unknown";
+}
+
 interface InternalState {
   state: RecordingState;
   screen: MediaStream | null;
@@ -388,6 +400,21 @@ export function createRecordingEngine(
         reason: scopeDecision.reason,
       });
     }
+
+    // Production-safe surface diagnostic. Pairs with `[tab-capture-cleanup-detect]`
+    // (run in the take preview) and `[export] dimension audit` to trace the full
+    // capture → cleanup → export chain from a user's console. A `browser`
+    // displaySurface is the only source of the green sharing-bar artifact, so the
+    // preview runs the cleanup detector exactly in that case.
+    console.info("[recording-surface]", {
+      displaySurface: settings.displaySurface ?? "unknown",
+      logicalSurface:
+        (settings as { logicalSurface?: string }).logicalSurface ?? "unknown",
+      trackWidth: trackW,
+      trackHeight: trackH,
+      browser: detectBrowserName(),
+      recordingMode: scopeDecision.scope,
+    });
 
     // If the user clicks the browser's "Stop sharing" button, we get an
     // `ended` event on the video track. Fold that into the normal stop path

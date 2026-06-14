@@ -189,13 +189,13 @@ export function MomentPill({
     // Sample at startTime + 5% of the moment so we don't always show a
     // transition frame — usually the first frame is mid-cut.
     const sampleAt = m.startTime + (m.endTime - m.startTime) * 0.05;
-    void captureFrame(videoUrl, sampleAt).then((d) => {
+    void captureFrame(videoUrl, sampleAt, project.sourceCrop).then((d) => {
       if (!cancelled && d) setThumb(d);
     });
     return () => {
       cancelled = true;
     };
-  }, [videoUrl, m.startTime, m.endTime, tier]);
+  }, [videoUrl, m.startTime, m.endTime, tier, project.sourceCrop]);
 
   return (
     <div

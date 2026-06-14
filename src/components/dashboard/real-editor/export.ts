@@ -31,6 +31,7 @@ import {
   DEFAULT_SPEED,
 } from "@/lib/timeline/crop-speed";
 import { probeVideoBottomBand } from "@/lib/recording/health-check";
+import { resolveSourceRect } from "@/lib/timeline/source-crop";
 import { drawClickHighlight } from "@/lib/timeline/click-highlight";
 import type {
   BackgroundMode,
@@ -38,6 +39,7 @@ import type {
   EffectsSettings,
   ExportFormat,
   FitMode,
+  SourceCrop,
   SpeedSettings,
   VisualAnalysis,
 } from "@/lib/firebase/schema";
@@ -376,6 +378,12 @@ interface RenderInput {
    * on older projects (Smart-Fit then falls back to a blurred fit).
    */
   visualAnalysis?: VisualAnalysis;
+  /**
+   * Global source-frame crop. When enabled, the exporter samples only the crop
+   * sub-rectangle of the SOURCE so cropped-out areas never reach the rendered
+   * file. Absent / disabled → full frame (no crop).
+   */
+  sourceCrop?: SourceCrop;
   onProgress: (p: ExportProgress) => void;
   signal?: AbortSignal;
   /**
@@ -429,8 +437,16 @@ export async function renderProjectClientSide(
   onProgress({ stage: "preparing", pct: 0 });
 
   // Source video dims — used by drawCover. Default to 16:9 if not yet known.
-  const sourceW = video.videoWidth || 1920;
-  const sourceH = video.videoHeight || 1080;
+  // `resolveSourceRect` skips any cropped-out areas (Frame Crop / sharing bar)
+  // so the EFFECTIVE crop rect feeds every layout helper below; cropped-out
+  // pixels never reach the canvas. No crop → full frame (zero regression).
+  const fullSourceW = video.videoWidth || 1920;
+  const fullSourceH = video.videoHeight || 1080;
+  const srcRect = resolveSourceRect(fullSourceW, fullSourceH, input.sourceCrop);
+  const sourceX = srcRect.sx;
+  const sourceY = srcRect.sy;
+  const sourceW = srcRect.sWidth;
+  const sourceH = srcRect.sHeight;
 
   // Output size — resolved by the SHARED `resolveOutputDims` helper so the
   // editor preview and this renderer always agree on framing. The default
@@ -557,7 +573,7 @@ export async function renderProjectClientSide(
       exportHeight: canvasH,
       exportAspect: outAspect.toFixed(4),
       willCrop: outCropped,
-      drawImageSourceRect: { sx: 0, sy: 0, sw: sourceW, sh: sourceH },
+      drawImageSourceRect: { sx: sourceX, sy: sourceY, sw: sourceW, sh: sourceH },
       drawImageDestRect: {
         dx: +destX.toFixed(1),
         dy: +destY.toFixed(1),
@@ -594,7 +610,7 @@ export async function renderProjectClientSide(
     if (probe) {
       const verdict =
         probe.bandHeightPx >= 3
-          ? `GREEN BAND IN SOURCE (${probe.bandHeightPx}px, bottom-row ${(probe.bottomRowGreenRatio * 100).toFixed(0)}% green) — baked in at capture, NOT a render bug. Crop it (cropBottomBand) to remove.`
+          ? `GREEN BAND IN SOURCE (${probe.bandHeightPx}px, bottom-row ${(probe.bottomRowGreenRatio * 100).toFixed(0)}% green) — baked in at capture, NOT a render bug. Removed via sourceCrop (source-rect crop) when active; this probe reads the raw source.`
           : `source bottom is clean (bottom-row ${(probe.bottomRowGreenRatio * 100).toFixed(0)}% green) — any band in the export would be renderer-introduced.`;
       console.info("[export] source bottom-band probe", { ...probe, verdict });
     } else {
@@ -765,7 +781,7 @@ export async function renderProjectClientSide(
   ctx.fillStyle = "#000";
   ctx.fillRect(0, 0, canvasW, canvasH);
   if (bgActive) {
-    drawCanvasBackground(ctx, video, bgMode, oc?.backgroundColor, canvasW, canvasH, sourceW, sourceH);
+    drawCanvasBackground(ctx, video, bgMode, oc?.backgroundColor, canvasW, canvasH, sourceX, sourceY, sourceW, sourceH);
   }
   applyCameraFrame(
     ctx,
@@ -776,6 +792,10 @@ export async function renderProjectClientSide(
     canvasW,
     canvasH,
     base,
+    sourceX,
+    sourceY,
+    sourceW,
+    sourceH,
     debugBorders
   );
   if (debugBorders) drawDebugCanvasBorder(ctx, canvasW, canvasH);
@@ -977,7 +997,7 @@ export async function renderProjectClientSide(
     // when the placement leaves empty space. Drawn OUTSIDE the camera, before
     // the source, so the foreground paints over it.
     if (bgActive) {
-      drawCanvasBackground(ctx, video, bgMode, oc?.backgroundColor, canvasW, canvasH, sourceW, sourceH);
+      drawCanvasBackground(ctx, video, bgMode, oc?.backgroundColor, canvasW, canvasH, sourceX, sourceY, sourceW, sourceH);
     }
     applyCameraFrame(
       ctx,
@@ -988,6 +1008,10 @@ export async function renderProjectClientSide(
       canvasW,
       canvasH,
       base,
+      sourceX,
+      sourceY,
+      sourceW,
+      sourceH,
       debugBorders
     );
     if (debugBorders) drawDebugCanvasBorder(ctx, canvasW, canvasH);
@@ -1143,6 +1167,11 @@ function applyCameraFrame(
   canvasW: number,
   canvasH: number,
   base: BasePlacement,
+  /** Effective source rect (Frame Crop sub-rectangle of the full frame). */
+  sourceX: number,
+  sourceY: number,
+  sourceW: number,
+  sourceH: number,
   debugBorders = false
 ): void {
   // Single source of truth — same call the preview makes. Returns the
@@ -1159,7 +1188,19 @@ function applyCameraFrame(
   ctx.translate(canvasW / 2 + base.offsetX, canvasH / 2 + base.offsetY);
   ctx.scale(camera.scale, camera.scale);
   ctx.translate(tx, ty);
-  ctx.drawImage(video, -base.drawW / 2, -base.drawH / 2, base.drawW, base.drawH);
+  // 9-arg source rect: only the Frame Crop sub-rectangle is sampled, so
+  // cropped-out areas never reach the canvas.
+  ctx.drawImage(
+    video,
+    sourceX,
+    sourceY,
+    sourceW,
+    sourceH,
+    -base.drawW / 2,
+    -base.drawH / 2,
+    base.drawW,
+    base.drawH
+  );
 
   // DEBUG: RED border = the video's drawImage destination bounds. Line
   // width is divided by scale so it renders ~4px regardless of zoom.
@@ -1217,6 +1258,8 @@ function drawCanvasBackground(
   backgroundColor: string | undefined,
   canvasW: number,
   canvasH: number,
+  sourceX: number,
+  sourceY: number,
   sourceW: number,
   sourceH: number
 ): void {
@@ -1225,8 +1268,14 @@ function drawCanvasBackground(
     const k = 1.08; // overscale to hide the blur kernel's transparent edge
     ctx.save();
     ctx.filter = "blur(40px) brightness(0.7)";
+    // 9-arg source rect — crop the blurred backdrop to the same sub-rectangle so
+    // cropped-out areas can't smear into the letterbox area.
     ctx.drawImage(
       video,
+      sourceX,
+      sourceY,
+      sourceW,
+      sourceH,
       canvasW / 2 - (bg.drawW * k) / 2,
       canvasH / 2 - (bg.drawH * k) / 2,
       bg.drawW * k,

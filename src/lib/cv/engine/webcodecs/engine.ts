@@ -126,6 +126,8 @@ export class WebCodecsCvEngine implements CvChunkEngine {
           startTime: req.startTime,
           endTime: req.endTime,
           duration: req.duration,
+          // Crop every decoded frame to the source-crop rect in-worker.
+          sourceCrop: this.source.sourceCrop,
         },
         transfer
       );

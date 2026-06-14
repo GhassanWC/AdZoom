@@ -166,6 +166,7 @@ export async function runChunkedAnalysis(args: ChunkedRunArgs): Promise<void> {
   const source: CvSource = {
     url: project.originalVideoUrl,
     mimeType: project.mimeType,
+    sourceCrop: project.sourceCrop,
   };
   const engineRef: { current: CvChunkEngine } = {
     current: await selectCvEngine(source),

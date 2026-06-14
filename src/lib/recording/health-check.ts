@@ -8,16 +8,14 @@
  *    deliberately conservative: better to miss a faint band than to nag the
  *    user about a clean recording.
  *
- *  - `cropBottomBand` re-encodes the blob with the detected band sliced off.
- *    It uses canvas captureStream + MediaRecorder, the same pattern as the
- *    editor's export pipeline, so the cropped take stays a self-contained
- *    video file (mp4 or webm, matching the source's MIME).
+ *  - `probeVideoBottomBand` is a synchronous diagnostic against a live
+ *    `<video>` element — proves whether a green strip is baked into the
+ *    captured pixels rather than introduced by our rendering.
  *
- * Both functions only run on demand from `RecordingPreview` — nothing here
- * mutates the original blob, and nothing runs unless the preview asks.
+ * Detection is NON-DESTRUCTIVE: the result becomes a `sourceCrop` (a bottom-only
+ * `browser-bar-cleanup` rect) that every render/analysis path honors via
+ * `resolveSourceRect`. Nothing here mutates the original blob.
  */
-
-import { pickRecordingMime } from "./types";
 
 export interface GreenBandReport {
   /** True when a strong green band was found at the bottom of the frame. */
@@ -60,52 +58,115 @@ function isGreenPixel(r: number, g: number, b: number): boolean {
 }
 
 /**
- * Fraction of green pixels in one image row, sampled every `step` pixels
- * horizontally. `step > 1` keeps the cost low on 4K recordings.
+ * Returns true for a clearly saturated, non-grey pixel of ANY hue. The
+ * secondary "strongly tinted band" signal — Chrome's sharing strip is not
+ * always the same green (themes / channels shift it toward blue-grey), but it
+ * stays a solid, saturated, full-width band. Deliberately stricter on
+ * saturation than `isGreenPixel` because it isn't anchored to a hue, so it must
+ * not fire on near-grey video content. Only consulted for browser-tab takes.
  */
+function isTintedPixel(r: number, g: number, b: number): boolean {
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  if (max < 60) return false; // near-black
+  const sat = max === 0 ? 0 : (max - min) / max;
+  return sat >= 0.35;
+}
+
+/**
+ * Fraction of pixels in one image row matching `pred`, sampled every `step`
+ * pixels horizontally. `step > 1` keeps the cost low on 4K recordings.
+ */
+function rowMatchRatio(
+  data: Uint8ClampedArray,
+  y: number,
+  width: number,
+  step: number,
+  pred: (r: number, g: number, b: number) => boolean
+): number {
+  let hit = 0;
+  let total = 0;
+  const base = y * width * 4;
+  for (let x = 0; x < width; x += step) {
+    const i = base + x * 4;
+    if (pred(data[i], data[i + 1], data[i + 2])) hit++;
+    total++;
+  }
+  return total === 0 ? 0 : hit / total;
+}
+
 function rowGreenRatio(
   data: Uint8ClampedArray,
   y: number,
   width: number,
   step: number
 ): number {
-  let green = 0;
-  let total = 0;
-  const base = y * width * 4;
-  for (let x = 0; x < width; x += step) {
-    const i = base + x * 4;
-    if (isGreenPixel(data[i], data[i + 1], data[i + 2])) green++;
-    total++;
-  }
-  return total === 0 ? 0 : green / total;
+  return rowMatchRatio(data, y, width, step, isGreenPixel);
 }
 
 /**
- * Find the height of a contiguous green band sitting flush against the
- * bottom edge of `imgData`. Returns 0 when the bottom row isn't green or
- * the run is too short to be a real toolbar.
+ * Find the height of the browser sharing-bar band flush against the bottom
+ * edge of `imgData`. Returns 0 when no band is found or it's too thin to be a
+ * real toolbar.
+ *
+ * Two robustness upgrades over a naive "bottom row must be green" check:
+ *  1. SCAN-UP past control chrome. Chrome can render its playback scrubber /
+ *     controls *below* the green strip, so the very bottom rows aren't green.
+ *     We allow a small budget of non-band rows at the very bottom, find the
+ *     green run above them, and crop from the run's TOP down to the bottom edge
+ *     (the chrome below is also baked-in artifact and must go).
+ *  2. STRONGLY-TINTED fallback (browser surface only). When the strip isn't the
+ *     expected green hue, a solid saturated full-width band still qualifies.
+ *     Gated on `surface === "browser"` so window/monitor/upload takes can never
+ *     trip it.
  */
 function measureBottomBand(
   data: Uint8ClampedArray,
   width: number,
-  height: number
+  height: number,
+  surface?: string
 ): number {
-  // Sample budget: 1 in every ~24 source pixels horizontally is enough.
   const step = Math.max(1, Math.floor(width / 80));
-  // Bottom row must be solidly green or this isn't a toolbar; saves us
-  // from chasing logos / icons higher up the frame.
-  if (rowGreenRatio(data, height - 1, width, step) < 0.85) return 0;
+  const allowTinted = surface === "browser";
 
-  // Walk upward until a row isn't predominantly green. A toolbar can't be
-  // taller than ~12% of the frame in any sane UI; cap there so a fully
-  // green captured surface (someone's wallpaper) doesn't crop everything.
-  const maxBand = Math.min(height - 4, Math.floor(height * 0.12));
-  let bandHeight = 1;
-  for (let dy = 2; dy <= maxBand; dy++) {
+  // A row is "band start" if it's solidly the green hue, or (browser only) a
+  // near-uniform saturated band.
+  const isBandStart = (y: number): boolean =>
+    rowGreenRatio(data, y, width, step) >= 0.85 ||
+    (allowTinted && rowMatchRatio(data, y, width, step, isTintedPixel) >= 0.95);
+  // A row "continues" the band on the looser 0.7 threshold while walking up.
+  const continuesBand = (y: number): boolean =>
+    rowGreenRatio(data, y, width, step) >= 0.7 ||
+    (allowTinted && rowMatchRatio(data, y, width, step, isTintedPixel) >= 0.9);
+
+  // Non-band chrome allowed at the very bottom (scrubber / controls strip).
+  const chromeBudget = Math.max(2, Math.floor(height * 0.04));
+  // Toolbar + chrome can't be taller than ~15% of the frame in any sane UI;
+  // cap there so a mostly-green captured surface doesn't crop everything.
+  const maxBand = Math.min(height - 4, Math.floor(height * 0.15));
+
+  // 1. Find the lowest band row, skipping up to `chromeBudget` chrome rows.
+  let bandBottom = -1;
+  for (let dy = 1; dy <= chromeBudget + 1 && dy <= maxBand; dy++) {
     const y = height - dy;
-    if (rowGreenRatio(data, y, width, step) < 0.7) break;
-    bandHeight = dy;
+    if (y < 0) break;
+    if (isBandStart(y)) {
+      bandBottom = y;
+      break;
+    }
   }
+  if (bandBottom === -1) return 0;
+
+  // 2. Walk upward to the top of the contiguous band.
+  let bandTop = bandBottom;
+  const limit = Math.max(0, height - maxBand);
+  for (let y = bandBottom - 1; y >= limit; y--) {
+    if (!continuesBand(y)) break;
+    bandTop = y;
+  }
+
+  // Crop from the band's top down to the bottom edge (includes chrome below).
+  const bandHeight = height - bandTop;
   // Anything thinner than 3px is just colour noise on the edge.
   if (bandHeight < 3) return 0;
   return bandHeight;
@@ -162,7 +223,11 @@ function loadBlob(blob: Blob): Promise<HTMLVideoElement> {
  * strip is rock-stable across the whole take, so consistency is the signal
  * we lean on for the "this is real" confidence number.
  */
-export async function detectGreenBottomBand(blob: Blob): Promise<GreenBandReport> {
+export async function detectGreenBottomBand(
+  blob: Blob,
+  opts: { surface?: "monitor" | "window" | "browser" | null } = {}
+): Promise<GreenBandReport> {
+  const { surface } = opts;
   const video = await loadBlob(blob);
   try {
     const w = video.videoWidth || 0;
@@ -212,15 +277,24 @@ export async function detectGreenBottomBand(blob: Blob): Promise<GreenBandReport
         continue;
       }
       ctx.drawImage(video, 0, 0, w, h);
-      // Only read the bottom 15% — cheaper than the whole frame.
-      const stripeH = Math.max(16, Math.floor(h * 0.15));
+      // Only read the bottom 20% — cheaper than the whole frame, and wide
+      // enough to contain a green strip plus its control chrome.
+      const stripeH = Math.max(16, Math.floor(h * 0.2));
       const stripe = ctx.getImageData(0, h - stripeH, w, stripeH);
-      const band = measureBottomBand(stripe.data, w, stripeH);
+      const band = measureBottomBand(stripe.data, w, stripeH, surface ?? undefined);
       bands.push(band);
     }
 
     const nonZero = bands.filter((b) => b > 0);
     if (nonZero.length === 0) {
+      logDetect({
+        detected: false,
+        bottomCropPx: 0,
+        confidence: 0,
+        frameWidth: w,
+        frameHeight: h,
+        sampleCount: probes.length,
+      });
       return {
         detected: false,
         bandHeightPx: 0,
@@ -244,9 +318,19 @@ export async function detectGreenBottomBand(blob: Blob): Promise<GreenBandReport
         : 0;
     const tightness = spread <= 2 ? 1 : spread <= 6 ? 0.8 : 0.5;
     const confidence = Math.min(1, agreement * tightness);
+    const detected = confidence >= 0.5 && bandHeightPx >= 3;
+
+    logDetect({
+      detected,
+      bottomCropPx: bandHeightPx,
+      confidence: +confidence.toFixed(3),
+      frameWidth: w,
+      frameHeight: h,
+      sampleCount: probes.length,
+    });
 
     return {
-      detected: confidence >= 0.5 && bandHeightPx >= 3,
+      detected,
       bandHeightPx,
       bandStartY: h - bandHeightPx,
       videoWidth: w,
@@ -256,6 +340,18 @@ export async function detectGreenBottomBand(blob: Blob): Promise<GreenBandReport
   } finally {
     URL.revokeObjectURL(video.src);
   }
+}
+
+/** Structured detection log — shipped to prod for support diagnostics. */
+function logDetect(info: {
+  detected: boolean;
+  bottomCropPx: number;
+  confidence: number;
+  frameWidth: number;
+  frameHeight: number;
+  sampleCount: number;
+}): void {
+  console.info("[tab-capture-cleanup-detect]", info);
 }
 
 /**
@@ -312,199 +408,4 @@ export function probeVideoBottomBand(
     bottomRowGreenRatio: rowGreenRatio(data, stripeH - 1, w, step),
     bandHeightPx: measureBottomBand(data, w, stripeH),
   };
-}
-
-export interface CropProgress {
-  /** 0..1 — `currentTime / duration`. */
-  pct: number;
-}
-
-export interface CropResult {
-  /** The re-encoded, cropped video. Original input blob is untouched. */
-  blob: Blob;
-  /**
-   * Whether the cropped output contains an audio track. `false` means either
-   * the source had no audio, OR `HTMLMediaElement.captureStream()` wasn't
-   * available / failed to expose the source's audio track. We can't reliably
-   * distinguish "no audio in source" from "audio passthrough failed" in every
-   * browser, so the UI should warn whenever this is `false` and the user
-   * cared about audio (e.g., mic was enabled).
-   */
-  audioPreserved: boolean;
-}
-
-/**
- * Re-encode `blob` with the bottom `bandHeightPx` pixels chopped off.
- * Returns a fresh Blob, leaving the input untouched. Output dimensions are
- * `videoWidth × (videoHeight - bandHeightPx)`. Audio is passed through via
- * the source video's `captureStream()` when the browser supports it.
- *
- * NB: this is a real-time re-encode — duration matches the original because
- * we play the source at 1x. For long recordings that's slow but predictable;
- * we surface progress via the callback so the UI can keep the user informed.
- */
-export async function cropBottomBand(
-  blob: Blob,
-  bandHeightPx: number,
-  onProgress?: (p: CropProgress) => void
-): Promise<CropResult> {
-  if (bandHeightPx <= 0) return { blob, audioPreserved: true };
-  if (typeof MediaRecorder === "undefined") {
-    throw new Error("MediaRecorder is not available in this browser.");
-  }
-
-  const video = await loadBlob(blob);
-  const srcW = video.videoWidth;
-  const srcH = video.videoHeight;
-  if (!srcW || !srcH || bandHeightPx >= srcH) {
-    URL.revokeObjectURL(video.src);
-    throw new Error("Invalid crop dimensions.");
-  }
-
-  const outW = srcW;
-  const outH = srcH - bandHeightPx;
-
-  const canvas = document.createElement("canvas");
-  canvas.width = outW;
-  canvas.height = outH;
-  const ctx = canvas.getContext("2d", { alpha: false });
-  if (!ctx) {
-    URL.revokeObjectURL(video.src);
-    throw new Error("Could not get 2D context for crop.");
-  }
-  ctx.fillStyle = "#000";
-  ctx.fillRect(0, 0, outW, outH);
-
-  // Best-effort audio passthrough. `captureStream` on HTMLMediaElement is
-  // non-standard but ships in Chromium. If it isn't there, we drop audio
-  // rather than failing the whole crop — but we DO surface that fact via
-  // `audioPreserved` in the return value, so the UI can warn the user
-  // instead of silently shipping a muted re-encode.
-  let audioTrack: MediaStreamTrack | null = null;
-  try {
-    type CaptureStream = () => MediaStream;
-    const captureStream = (video as unknown as { captureStream?: CaptureStream })
-      .captureStream;
-    if (captureStream) {
-      const stream = captureStream.call(video);
-      const audio = stream.getAudioTracks();
-      if (audio.length) audioTrack = audio[0];
-    }
-  } catch {
-    // captureStream blew up — leave audioTrack null and report it as dropped
-  }
-
-  const fps = 30;
-  const canvasStream = canvas.captureStream(fps);
-  if (audioTrack) canvasStream.addTrack(audioTrack);
-  const audioPreserved = canvasStream.getAudioTracks().length > 0;
-
-  // Match the source's container family when possible so the cropped file
-  // is interchangeable with the original (.mp4 ↔ .mp4, .webm ↔ .webm).
-  const sourceIsMp4 = blob.type.startsWith("video/mp4");
-  const preferred = sourceIsMp4
-    ? "video/mp4;codecs=avc1.42E01E,mp4a.40.2"
-    : "";
-  const mime =
-    preferred && MediaRecorder.isTypeSupported(preferred)
-      ? preferred
-      : pickRecordingMime();
-
-  const recorder = new MediaRecorder(canvasStream, {
-    mimeType: mime,
-    videoBitsPerSecond: 6_000_000,
-    audioBitsPerSecond: 128_000,
-  });
-
-  const chunks: Blob[] = [];
-  const recorded = new Promise<Blob>((resolve, reject) => {
-    recorder.ondataavailable = (e) => {
-      if (e.data && e.data.size > 0) chunks.push(e.data);
-    };
-    recorder.onstop = () => resolve(new Blob(chunks, { type: mime }));
-    recorder.onerror = () => reject(new Error("Crop recorder failed."));
-  });
-
-  video.currentTime = 0;
-  // Wait for the seek to settle so the first painted frame is real video.
-  await new Promise<void>((resolve) => {
-    const handler = () => {
-      video.removeEventListener("seeked", handler);
-      resolve();
-    };
-    video.addEventListener("seeked", handler);
-  });
-
-  recorder.start(500);
-
-  let stopped = false;
-  const duration =
-    isFinite(video.duration) && video.duration > 0 ? video.duration : 0;
-
-  const draw = () => {
-    if (stopped) return;
-    // Source rect: full width, top srcH-bandHeightPx pixels.
-    // Destination: full canvas. `drawImage` with 9-arg form does the crop.
-    try {
-      ctx.drawImage(video, 0, 0, srcW, outH, 0, 0, outW, outH);
-    } catch {
-      // tainted-canvas or similar — bail out cleanly
-      stopped = true;
-      try {
-        recorder.stop();
-      } catch {
-        /* ignore */
-      }
-      return;
-    }
-    if (duration > 0 && onProgress) {
-      onProgress({ pct: Math.min(0.99, video.currentTime / duration) });
-    }
-    if (video.ended || (duration > 0 && video.currentTime >= duration - 0.05)) {
-      stopped = true;
-      try {
-        recorder.stop();
-      } catch {
-        /* ignore */
-      }
-      return;
-    }
-    requestAnimationFrame(draw);
-  };
-
-  try {
-    await video.play();
-  } catch (err) {
-    if (!(err instanceof DOMException) || err.name !== "AbortError") {
-      URL.revokeObjectURL(video.src);
-      throw err;
-    }
-  }
-  requestAnimationFrame(draw);
-
-  // Safety stop in case `ended` never fires (some browsers misbehave on
-  // very short blobs). 5 second padding past the nominal duration.
-  const safety = setTimeout(
-    () => {
-      if (!stopped) {
-        stopped = true;
-        try {
-          recorder.stop();
-        } catch {
-          /* ignore */
-        }
-      }
-    },
-    Math.max(2_000, (duration + 5) * 1000)
-  );
-
-  try {
-    const out = await recorded;
-    if (onProgress) onProgress({ pct: 1 });
-    return { blob: out, audioPreserved };
-  } finally {
-    clearTimeout(safety);
-    video.pause();
-    URL.revokeObjectURL(video.src);
-  }
 }

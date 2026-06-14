@@ -17,7 +17,9 @@ import {
   type ExtractedFrame,
 } from "../../frame-extractor";
 import { DETECT_W, DETECT_H } from "../../types";
+import { resolveSourceRect } from "../../../timeline/source-crop";
 import type { VisualAnalysis } from "../../../firebase/schema";
+import type { SourceCrop } from "../../../recording/types";
 
 interface AnalyzeMsg {
   type: "analyze";
@@ -32,6 +34,7 @@ interface AnalyzeMsg {
   startTime: number;
   endTime: number;
   duration: number;
+  sourceCrop?: SourceCrop;
 }
 
 const ctx = self as unknown as DedicatedWorkerGlobalScope;
@@ -52,7 +55,7 @@ ctx.onmessage = async (ev: MessageEvent<AnalyzeMsg>) => {
 };
 
 async function decodeAndAnalyze(msg: AnalyzeMsg): Promise<VisualAnalysis> {
-  const { config, samples, startTime, endTime, duration } = msg;
+  const { config, samples, startTime, endTime, duration, sourceCrop } = msg;
   const fps = sampleFpsFor(duration);
   const stepUs = 1e6 / fps;
   const startUs = startTime * 1e6;
@@ -73,7 +76,28 @@ async function decodeAndAnalyze(msg: AnalyzeMsg): Promise<VisualAnalysis> {
         if (ts < startUs - stepUs || ts > endUs + stepUs) return;
         if (ts + 1 < nextSampleUs) return; // not yet at the next sample point
         nextSampleUs = ts + stepUs;
-        c2d.drawImage(frame, 0, 0, DETECT_W, DETECT_H);
+        // Sample only the source-crop sub-rectangle of the decoded frame, so
+        // cropped-out areas never reach the CV pass.
+        const rect = resolveSourceRect(
+          frame.displayWidth,
+          frame.displayHeight,
+          sourceCrop
+        );
+        if (rect.cropActive) {
+          c2d.drawImage(
+            frame,
+            rect.sx,
+            rect.sy,
+            rect.sWidth,
+            rect.sHeight,
+            0,
+            0,
+            DETECT_W,
+            DETECT_H
+          );
+        } else {
+          c2d.drawImage(frame, 0, 0, DETECT_W, DETECT_H);
+        }
         const img = c2d.getImageData(0, 0, DETECT_W, DETECT_H);
         const detectFrame = toGrayscale(img.data, DETECT_W, DETECT_H);
         frames.push({

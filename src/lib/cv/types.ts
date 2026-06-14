@@ -87,6 +87,11 @@ export interface RunVisualAnalysisOptions {
   endTime?: number;
   onProgress?: (p: CvProgress) => void;
   signal?: AbortSignal;
+  /**
+   * Global source-frame crop, forwarded to `extractFrames` so the CV pass
+   * analyzes the same cropped frame the preview + export render.
+   */
+  sourceCrop?: import("@/lib/recording/types").SourceCrop;
 }
 
 /** Thrown when the pipeline is aborted via an AbortSignal. */

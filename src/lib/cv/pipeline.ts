@@ -220,6 +220,7 @@ export async function runVisualAnalysis(
     signal: opts.signal,
     startTime,
     endTime,
+    sourceCrop: opts.sourceCrop,
   });
 
   return analyzeFrameStream(frames, {

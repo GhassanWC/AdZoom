@@ -136,6 +136,7 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
       moments: project.analysis?.detectedMoments ?? [],
       effects: project.effectsSettings,
       visualAnalysis: project.visualAnalysis,
+      sourceCrop: project.sourceCrop,
       resolution,
       fps,
       format,

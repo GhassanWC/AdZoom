@@ -12,6 +12,7 @@ import type {
   DetectedMoment,
   EffectsSettings,
   ExportFormat,
+  SourceCrop,
   VisualAnalysis,
 } from "@/lib/firebase/schema";
 
@@ -64,6 +65,8 @@ export interface ExportRenderParams {
   moments: DetectedMoment[];
   effects: EffectsSettings;
   visualAnalysis?: VisualAnalysis;
+  /** Global source-frame crop — sampled off the source rect at render. */
+  sourceCrop?: SourceCrop;
   resolution: "1080p" | "4K";
   fps: 30 | 60;
   format: ExportFormat;
@@ -234,6 +237,7 @@ export function ExportProvider({ children }: { children: React.ReactNode }) {
           fps: params.fps,
           format: params.format,
           visualAnalysis: params.visualAnalysis,
+          sourceCrop: params.sourceCrop,
           applyWatermark: !!applyWatermark,
           onProgress: (p) =>
             setJob((j) =>

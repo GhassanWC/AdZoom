@@ -3,6 +3,7 @@ export {
   RecordingError,
   pickRecordingMime,
   mimeToExtension,
+  type SourceCrop,
   type RecordingEvent,
   type RecordingOptions,
   type RecordingResult,
@@ -11,10 +12,7 @@ export {
 } from "./types";
 export {
   detectGreenBottomBand,
-  cropBottomBand,
   probeVideoBottomBand,
   type GreenBandReport,
   type BottomBandProbe,
-  type CropProgress,
-  type CropResult,
 } from "./health-check";

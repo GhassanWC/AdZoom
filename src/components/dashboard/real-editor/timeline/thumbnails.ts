@@ -13,15 +13,24 @@
  * wasted memory.
  */
 
+import { resolveSourceRect } from "@/lib/timeline/source-crop";
+import type { SourceCrop } from "@/lib/recording/types";
+
 interface VideoSlot {
   video: HTMLVideoElement;
   canvas: HTMLCanvasElement;
   ctx: CanvasRenderingContext2D | null;
   ready: Promise<void>;
-  /** Width:height ratio derived from the decoded video. */
+  /** Width:height ratio derived from the decoded (EFFECTIVE) video frame. */
   aspect: number;
   width: number;
   height: number;
+  /** Source rect to sample (Frame Crop sub-rectangle); cropActive=false = full frame. */
+  cropActive: boolean;
+  cropSrcX: number;
+  cropSrcY: number;
+  cropSrcW: number;
+  cropSrcH: number;
 }
 
 const TARGET_WIDTH = 160;
@@ -29,7 +38,7 @@ const slots = new Map<string, VideoSlot>();
 const cache = new Map<string, string>();
 const inflight = new Map<string, Promise<string | null>>();
 
-function ensureSlot(url: string): VideoSlot {
+function ensureSlot(url: string, crop?: SourceCrop): VideoSlot {
   const existing = slots.get(url);
   if (existing) return existing;
 
@@ -51,9 +60,12 @@ function ensureSlot(url: string): VideoSlot {
 
   const ready = new Promise<void>((resolve, reject) => {
     const onMeta = () => {
-      const aspect = video.videoWidth > 0 && video.videoHeight > 0
-        ? video.videoWidth / video.videoHeight
-        : 16 / 9;
+      // Sample only the Frame Crop sub-rectangle so the thumbnail aspect +
+      // sampled rect match the editor + export (effective source frame).
+      const rect = resolveSourceRect(video.videoWidth, video.videoHeight, crop);
+      const effW = rect.sWidth || video.videoWidth;
+      const effH = rect.sHeight || video.videoHeight;
+      const aspect = effW > 0 && effH > 0 ? effW / effH : 16 / 9;
       const w = TARGET_WIDTH;
       const h = Math.round(w / aspect);
       canvas.width = w;
@@ -63,6 +75,11 @@ function ensureSlot(url: string): VideoSlot {
         slot.aspect = aspect;
         slot.width = w;
         slot.height = h;
+        slot.cropActive = rect.cropActive;
+        slot.cropSrcX = rect.sx;
+        slot.cropSrcY = rect.sy;
+        slot.cropSrcW = rect.sWidth;
+        slot.cropSrcH = rect.sHeight;
       }
       video.removeEventListener("loadedmetadata", onMeta);
       video.removeEventListener("error", onErr);
@@ -85,6 +102,11 @@ function ensureSlot(url: string): VideoSlot {
     aspect: 16 / 9,
     width: TARGET_WIDTH,
     height: Math.round(TARGET_WIDTH * (9 / 16)),
+    cropActive: false,
+    cropSrcX: 0,
+    cropSrcY: 0,
+    cropSrcW: 0,
+    cropSrcH: 0,
   };
   slots.set(url, slot);
   return slot;
@@ -97,7 +119,8 @@ function ensureSlot(url: string): VideoSlot {
  */
 export async function captureFrame(
   url: string,
-  time: number
+  time: number,
+  crop?: SourceCrop
 ): Promise<string | null> {
   if (typeof window === "undefined") return null;
   const key = `${url}::${time.toFixed(2)}`;
@@ -108,7 +131,7 @@ export async function captureFrame(
 
   const promise = (async () => {
     try {
-      const slot = ensureSlot(url);
+      const slot = ensureSlot(url, crop);
       await slot.ready;
       if (!slot.ctx) return null;
 
@@ -133,7 +156,22 @@ export async function captureFrame(
         }
       });
 
-      slot.ctx.drawImage(slot.video, 0, 0, slot.width, slot.height);
+      if (slot.cropActive) {
+        // 9-arg: sample only the Frame Crop sub-rectangle.
+        slot.ctx.drawImage(
+          slot.video,
+          slot.cropSrcX,
+          slot.cropSrcY,
+          slot.cropSrcW,
+          slot.cropSrcH,
+          0,
+          0,
+          slot.width,
+          slot.height
+        );
+      } else {
+        slot.ctx.drawImage(slot.video, 0, 0, slot.width, slot.height);
+      }
       const data = slot.canvas.toDataURL("image/jpeg", 0.72);
       cache.set(key, data);
       return data;

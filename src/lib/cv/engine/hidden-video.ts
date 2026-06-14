@@ -60,6 +60,7 @@ export class HiddenVideoCvEngine implements CvChunkEngine {
       startTime: req.startTime,
       endTime: req.endTime,
       signal: req.signal,
+      sourceCrop: this.source.sourceCrop,
       onProgress: req.onProgress ? (p) => req.onProgress!(p.done) : undefined,
     });
   }

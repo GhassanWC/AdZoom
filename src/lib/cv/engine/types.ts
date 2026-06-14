@@ -1,4 +1,5 @@
 import type { VisualAnalysis } from "../../firebase/schema";
+import type { SourceCrop } from "../../recording/types";
 
 /**
  * The CV engine abstraction. Both the WebCodecs engine (primary) and the
@@ -17,6 +18,13 @@ export interface CvSource {
   /** Original video URL (used by the hidden-video engine and as a byte source). */
   url: string;
   mimeType?: string;
+  /**
+   * Global source-frame crop for this source, if any. Both engines sample only
+   * the crop sub-rectangle of every analyzed frame so the CV pass never sees
+   * cropped-out areas (coords stay in the same effective space as preview +
+   * export).
+   */
+  sourceCrop?: SourceCrop;
 }
 
 export interface CvChunkRequest {

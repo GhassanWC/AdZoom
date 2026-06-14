@@ -13,8 +13,14 @@ const styles = ["ring", "pulse", "burst"] as const;
  * the header/chrome, so this component is intentionally chrome-less.
  */
 export function RealEffectsPanel() {
-  const { project, updateEffects } = useEditorReal();
+  const { project, updateEffects, setRemoveSharingBar } = useEditorReal();
   const e = project.effectsSettings;
+  // Convenience toggle only for the auto-detected sharing-bar crop. A manual
+  // Frame Crop is managed from the Crop Frame tool, not here.
+  const barCrop =
+    project.sourceCrop?.reason === "browser-bar-cleanup"
+      ? project.sourceCrop
+      : undefined;
 
   return (
     <div className="space-y-7 px-6 py-6">
@@ -90,6 +96,17 @@ export function RealEffectsPanel() {
           onChange={(v) => updateEffects("motionTracking", v)}
         />
       </Section>
+
+      {barCrop && (
+        <Section title="Recording">
+          <Toggle
+            label="Remove browser sharing bar"
+            description="Framevo detected a browser tab sharing bar and is removing it from preview and export. Turn off to use the original captured frame."
+            checked={barCrop.enabled}
+            onChange={(v) => void setRemoveSharingBar(v)}
+          />
+        </Section>
+      )}
     </div>
   );
 }

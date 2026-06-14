@@ -1,6 +1,9 @@
 // Shared types for Firestore documents — used on both client and server.
 
 import type { CaptureDimensions } from "@/lib/recording/scope-detect";
+import type { SourceCrop } from "@/lib/recording/types";
+
+export type { SourceCrop };
 
 export type ProjectStatus =
   | "uploading"
@@ -1083,6 +1086,14 @@ export interface ProjectDoc {
    * capture-time call. Absent on plain uploads and pre-existing recordings.
    */
   captureDimensions?: CaptureDimensions;
+  /**
+   * Global source-frame crop (the "Frame Crop" tool). Seeded at project
+   * creation when the green-band detector fires on a `displaySurface ===
+   * "browser"` recording (a bottom-only rect, `reason:"browser-bar-cleanup"`),
+   * or drawn manually in the editor. Read by every render/analysis path via
+   * `resolveSourceRect`. Absent / disabled ⇒ full frame (no crop).
+   */
+  sourceCrop?: SourceCrop;
   createdAt: number;
   updatedAt: number;
 }

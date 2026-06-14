@@ -27,6 +27,8 @@ import {
   CvTaintedError,
   type GrayFrame,
 } from "./types";
+import { resolveSourceRect } from "@/lib/timeline/source-crop";
+import type { SourceCrop } from "@/lib/recording/types";
 
 export interface ExtractedFrame {
   /** Actual video.currentTime after the seek settled (seconds). */
@@ -108,7 +110,18 @@ function seekTo(video: HTMLVideoElement, t: number, signal?: AbortSignal): Promi
 export async function* extractFrames(
   video: HTMLVideoElement,
   duration: number,
-  opts: { signal?: AbortSignal; startTime?: number; endTime?: number } = {}
+  opts: {
+    signal?: AbortSignal;
+    startTime?: number;
+    endTime?: number;
+    /**
+     * Global source-frame crop. When present + enabled, only the crop
+     * sub-rectangle is sampled, so the CV pass never sees cropped-out areas
+     * (green bar / chrome) and cursor/region coords stay normalized to the same
+     * (effective) frame the preview + export use.
+     */
+    sourceCrop?: SourceCrop;
+  } = {}
 ): AsyncGenerator<ExtractedFrame, void, void> {
   if (duration <= 0 || !Number.isFinite(duration)) return;
 
@@ -133,6 +146,14 @@ export async function* extractFrames(
   video.muted = true;
   if (!prevPaused) video.pause();
 
+  // Effective source rect — skips any cropped-out areas. Falls back to the
+  // full frame when there's no crop or dims aren't known yet.
+  const rect = resolveSourceRect(
+    video.videoWidth,
+    video.videoHeight,
+    opts.sourceCrop
+  );
+
   try {
     for (let t = from; t < to; t += step) {
       if (signal?.aborted) throw new CvAbortError();
@@ -140,7 +161,22 @@ export async function* extractFrames(
       await seekTo(video, Math.min(t, Math.max(0, duration - 0.05)), signal);
       await rafSettle();
 
-      ctx.drawImage(video, 0, 0, DETECT_W, DETECT_H);
+      if (rect.cropActive) {
+        // 9-arg: sample only the crop sub-rectangle of the source frame.
+        ctx.drawImage(
+          video,
+          rect.sx,
+          rect.sy,
+          rect.sWidth,
+          rect.sHeight,
+          0,
+          0,
+          DETECT_W,
+          DETECT_H
+        );
+      } else {
+        ctx.drawImage(video, 0, 0, DETECT_W, DETECT_H);
+      }
 
       let pixels: ImageData;
       try {
