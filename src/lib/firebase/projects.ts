@@ -32,6 +32,8 @@ import {
   type ProjectStatus,
 } from "./schema";
 import { BUILTIN_PRESETS_BY_ID } from "@/lib/presets";
+import { trackEvent } from "@/lib/analytics/trackEvent";
+import { EVENTS } from "@/lib/analytics/events";
 
 const ACCEPTED_MIME = ["video/mp4", "video/quicktime", "video/webm", "video/x-matroska"];
 
@@ -149,6 +151,11 @@ export async function createProjectFromFile({
     updatedAt: serverTimestamp(),
   });
   const projectId = created.id;
+  void trackEvent(
+    EVENTS.PROJECT_CREATED,
+    { source: interactionScope === "tab" ? "recording" : "upload", fileSize: file.size },
+    { projectId }
+  );
 
   // 2. Upload to Storage at the canonical path.
   const safeName = file.name.replace(/[^\w.\-]+/g, "_");
@@ -220,6 +227,17 @@ export async function createProjectFromFile({
     updatedAt: serverTimestamp(),
   });
 
+  void trackEvent(
+    EVENTS.VIDEO_UPLOADED,
+    {
+      source: scope === "tab" ? "recording" : "upload",
+      fileSize: file.size,
+      duration: duration ?? null,
+      mimeType: file.type || "video/mp4",
+    },
+    { projectId }
+  );
+
   return { projectId, storagePath: path, downloadURL };
 }
 
@@ -286,6 +304,7 @@ export async function deleteProject(uid: string, projectId: string, storagePath?
     }
   }
   await deleteDoc(doc(db, "users", uid, "projects", projectId));
+  void trackEvent(EVENTS.PROJECT_DELETED, {}, { projectId });
 }
 
 export async function setAnalysisStage(

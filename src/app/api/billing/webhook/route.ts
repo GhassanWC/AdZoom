@@ -10,6 +10,8 @@ import {
 } from "@/lib/lemonsqueezy/webhook";
 import { assertBillingEnv } from "@/lib/lemonsqueezy/env";
 import { stripUndefined } from "@/lib/firebase/sanitize";
+import { recordEvent } from "@/lib/analytics/recordEvent";
+import { EVENTS } from "@/lib/analytics/events";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -124,6 +126,7 @@ export async function POST(req: NextRequest) {
         { lastPaymentAt: now, updatedAt: now },
         { merge: true }
       );
+      void recordEvent(EVENTS.PAYMENT_SUCCESS, { userId: uid });
     } else {
       const { patch, effectivePlan } = reduceSubscription(eventName, payload);
 
@@ -154,6 +157,16 @@ export async function POST(req: NextRequest) {
           { merge: true }
         );
       });
+
+      // Surface the lifecycle transition to product analytics.
+      const cancelled =
+        eventName === "subscription_cancelled" ||
+        eventName === "subscription_expired" ||
+        effectivePlan === "free";
+      void recordEvent(
+        cancelled ? EVENTS.SUBSCRIPTION_CANCELLED : EVENTS.SUBSCRIPTION_ACTIVATED,
+        { userId: uid, plan: effectivePlan, metadata: { eventName } }
+      );
     }
 
     // Idempotency marker — `create` throws if it already exists, which we

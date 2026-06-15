@@ -1,6 +1,8 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { FieldValue, type DocumentReference } from "firebase-admin/firestore";
 import { getAdmin } from "@/lib/firebase/admin";
+import { recordEvent } from "@/lib/analytics/recordEvent";
+import { EVENTS } from "@/lib/analytics/events";
 import { stripUndefined } from "@/lib/firebase/sanitize";
 import {
   type AnalysisOptions,
@@ -402,6 +404,13 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       | CaptureDimensions
       | undefined;
     const selectedPresetId = project.selectedPresetId as string | undefined;
+
+    void recordEvent(EVENTS.ANALYSIS_STARTED, {
+      userId: uid,
+      userEmail: decoded.email ?? null,
+      projectId,
+      metadata: { duration: duration ?? null, interactionScope: interactionScope ?? null },
+    });
 
     // Finalize mode (progressive chunked path): the client orchestrator already
     // streamed the timeline (progressive CV/event moments) + a merged
@@ -1434,6 +1443,13 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       }${provenanceBits.length > 0 ? ` (${provenanceBits.join(", ")})` : ""}`
     );
 
+    void recordEvent(EVENTS.ANALYSIS_COMPLETED, {
+      userId: uid,
+      userEmail: decoded.email ?? null,
+      projectId,
+      metadata: { momentCount: balanced.moments.length },
+    });
+
     return NextResponse.json({
       ok: true,
       momentCount: balanced.moments.length,
@@ -1442,9 +1458,12 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       provenanceCounts: pc,
     });
   } catch (err) {
+    // uid is block-scoped to the try; recover it from the project doc ref.
+    const errUid = ref?.parent.parent?.id ?? "";
     if (err instanceof CancelledError || err instanceof GeminiCancelled) {
       console.log("[analyze] cancelled by user");
       if (ref) await markCancelled(ref);
+      void recordEvent(EVENTS.ANALYSIS_CANCELLED, { userId: errUid, projectId });
       return NextResponse.json({ ok: false, cancelled: true }, { status: 200 });
     }
 
@@ -1456,6 +1475,11 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       await bail(ref, kind, msg);
       await emitActivity(ref, "error", `Failed: ${msg.slice(0, 200)}`);
     }
+    void recordEvent(EVENTS.ANALYSIS_FAILED, {
+      userId: errUid,
+      projectId,
+      metadata: { kind, message: msg.slice(0, 200) },
+    });
     return NextResponse.json({ error: msg, kind }, { status: 500 });
   }
 }

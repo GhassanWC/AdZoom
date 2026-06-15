@@ -2,9 +2,10 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { Menu, LogOut, Video, Sun, Moon } from "lucide-react";
+import { Menu, LogOut, Video, Sun, Moon, ShieldCheck } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { useAuth } from "@/lib/firebase/AuthProvider";
+import { isAdminUser } from "@/lib/admin/isAdminUser";
 import { useTheme } from "@/lib/theme";
 import { NavbarSearch } from "./NavbarSearch";
 import { NavbarNotifications } from "./NavbarNotifications";
@@ -67,6 +68,16 @@ export function Topbar({ onOpenSidebar, className }: TopbarProps) {
         <span className="hidden sm:inline">Record</span>
         <Video size={14} className="sm:hidden" />
       </Link>
+
+      {isAdminUser(user) && (
+        <Link
+          href="/admin"
+          title="Admin dashboard"
+          className="inline-flex size-9 items-center justify-center rounded-lg border border-white/10 bg-white/[0.02] text-fog transition-colors duration-200 hover:text-violet-300"
+        >
+          <ShieldCheck size={15} />
+        </Link>
+      )}
 
       <button
         type="button"

@@ -9,6 +9,8 @@ import {
 } from "firebase/auth";
 import { doc, getDoc, serverTimestamp, setDoc } from "firebase/firestore";
 import { getFirebase, googleProvider, isFirebaseConfigured } from "./client";
+import { trackEvent } from "@/lib/analytics/trackEvent";
+import { EVENTS } from "@/lib/analytics/events";
 
 interface AuthContextValue {
   user: User | null;
@@ -50,10 +52,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const signInWithGoogle = React.useCallback(async () => {
     const { auth } = getFirebase();
     await signInWithPopup(auth, googleProvider);
+    void trackEvent(EVENTS.SIGN_IN, { provider: "google" });
   }, []);
 
   const signOut = React.useCallback(async () => {
     const { auth } = getFirebase();
+    // Track before sign-out so currentUser is still set for attribution.
+    void trackEvent(EVENTS.SIGN_OUT);
     await fbSignOut(auth);
   }, []);
 
@@ -93,6 +98,8 @@ async function ensureUserDoc(user: User) {
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
     });
+    // First time we've seen this user → a sign-up.
+    void trackEvent(EVENTS.USER_CREATED, { provider: "google" });
   } else {
     await setDoc(
       ref,

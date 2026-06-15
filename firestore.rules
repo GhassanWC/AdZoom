@@ -160,6 +160,31 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
+    // ── App-owned analytics events ─────────────────────────────────────
+    // Product-analytics stream for the admin dashboard. Clients may APPEND
+    // their own events (trackEvent) but never read/list/modify — the admin
+    // dashboard reads these via the Admin SDK only, so a normal user can't
+    // enumerate other users' activity.
+    //
+    // The create guard:
+    //   • userId must equal the caller's uid  → no attribution spoofing
+    //   • timestamp must equal request.time    → forces serverTimestamp(),
+    //                                             blocks backdating
+    //   • eventName is a string ≤ 64 chars      → bounds the field
+    //   • only the known keys may be present    → bounds the doc shape
+    // Server-originated events (recordEvent, Admin SDK) bypass these rules.
+    match /analyticsEvents/{eventId} {
+      allow create: if isSignedIn()
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.eventName is string
+        && request.resource.data.eventName.size() <= 64
+        && request.resource.data.timestamp == request.time
+        && request.resource.data.keys().hasOnly(
+            ['eventName', 'userId', 'userEmail', 'projectId', 'plan',
+             'metadata', 'environment', 'timestamp']);
+      allow read, update, delete: if false;
+    }
+
     // ── Default deny ───────────────────────────────────────────────────
     match /{document=**} {
       allow read, write: if false;

@@ -15,6 +15,8 @@ import type {
   SourceCrop,
   VisualAnalysis,
 } from "@/lib/firebase/schema";
+import { trackEvent } from "@/lib/analytics/trackEvent";
+import { EVENTS } from "@/lib/analytics/events";
 
 /**
  * Session-level export lifecycle owner.
@@ -284,6 +286,11 @@ export function ExportProvider({ children }: { children: React.ReactNode }) {
             : j
         );
         console.info("[export] completed", { exportId });
+        void trackEvent(
+          EVENTS.EXPORT_COMPLETED,
+          { exportId, format: params.outputFormat },
+          { projectId: params.projectId }
+        );
         notifications.push({
           id: `export-completed:${exportId}`,
           kind: "export-completed",
@@ -299,6 +306,11 @@ export function ExportProvider({ children }: { children: React.ReactNode }) {
           const msg = err instanceof Error ? err.message : "Export failed.";
           console.info("[export] failed", { projectId: params.projectId, msg });
           setJob((j) => (j ? { ...j, status: "failed", error: msg } : j));
+          void trackEvent(
+            EVENTS.EXPORT_FAILED,
+            { format: params.outputFormat, message: msg.slice(0, 200) },
+            { projectId: params.projectId }
+          );
           notifications.push({
             id: `export-failed:${params.projectId}:${Date.now()}`,
             kind: "export-failed",

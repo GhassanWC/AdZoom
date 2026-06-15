@@ -2,6 +2,8 @@ import { NextResponse, type NextRequest } from "next/server";
 import { getAdmin } from "@/lib/firebase/admin";
 import { createCheckout, planToVariantId } from "@/lib/lemonsqueezy/client";
 import { assertBillingEnv } from "@/lib/lemonsqueezy/env";
+import { recordEvent } from "@/lib/analytics/recordEvent";
+import { EVENTS } from "@/lib/analytics/events";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -77,6 +79,13 @@ export async function POST(req: NextRequest) {
       userId: uid,
       email,
       redirectUrl,
+    });
+
+    void recordEvent(EVENTS.CHECKOUT_STARTED, {
+      userId: uid,
+      userEmail: email,
+      plan,
+      metadata: { variantId },
     });
 
     return NextResponse.json({ ok: true, url });

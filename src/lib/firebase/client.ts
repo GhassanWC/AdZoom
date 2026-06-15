@@ -12,6 +12,9 @@ const firebaseConfig = {
   storageBucket: process.env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET,
   messagingSenderId: process.env.NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID,
   appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID,
+  // Optional — enables Firebase Analytics (GA4). When absent, analytics
+  // cleanly no-ops (see src/lib/analytics/firebaseAnalytics.ts).
+  measurementId: process.env.NEXT_PUBLIC_FIREBASE_MEASUREMENT_ID,
 };
 
 let app: FirebaseApp | null = null;
