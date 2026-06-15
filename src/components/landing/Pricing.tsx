@@ -1,9 +1,10 @@
 import { Check, Sparkles } from "lucide-react";
 import { Section } from "@/components/ui/Section";
-import { Button } from "@/components/ui/Button";
 import { RevealOnView } from "@/components/ui/RevealOnView";
 import { pricingTiers } from "@/lib/mockData";
 import { cn } from "@/lib/cn";
+import { TrackedCtaButton } from "@/components/analytics/TrackedCtaButton";
+import { EVENTS } from "@/lib/analytics/events";
 
 export function Pricing() {
   return (
@@ -69,14 +70,16 @@ export function Pricing() {
               </ul>
 
               <div className="mt-8">
-                <Button
+                <TrackedCtaButton
                   href="/dashboard"
                   variant={t.highlighted ? "primary" : "ghost"}
                   size="md"
                   className="w-full"
+                  event={EVENTS.LANDING_CTA_CLICK}
+                  eventParams={{ cta: `landing_pricing_${t.name.toLowerCase()}` }}
                 >
                   {t.cta}
-                </Button>
+                </TrackedCtaButton>
               </div>
             </div>
           </RevealOnView>

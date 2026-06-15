@@ -3,6 +3,8 @@ import Link from "next/link";
 import { Check, Sparkles, Crown, Users } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { CheckoutButton } from "@/components/billing/CheckoutButton";
+import { TrackView } from "@/components/analytics/TrackView";
+import { EVENTS } from "@/lib/analytics/events";
 import { buildMetadata } from "@/lib/seo";
 
 export const metadata: Metadata = buildMetadata({
@@ -41,6 +43,7 @@ const CREATOR_FEATURES = [
 export default function PricingPage() {
   return (
     <main className="relative min-h-screen px-4 pb-24 pt-20 sm:pt-28">
+      <TrackView event={EVENTS.PRICING_VIEWED} />
       <div
         aria-hidden
         className="pointer-events-none absolute left-1/2 top-0 -z-10 h-[520px] w-[1100px] -translate-x-1/2 bg-[radial-gradient(ellipse_at_center,rgba(139,92,246,0.22),transparent_65%)] blur-3xl"

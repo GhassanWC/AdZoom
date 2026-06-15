@@ -6,6 +6,8 @@ import { Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { useAuth } from "@/lib/firebase/AuthProvider";
 import { cn } from "@/lib/cn";
+import { logFramevoEvent } from "@/lib/firebase/analytics";
+import { EVENTS } from "@/lib/analytics/events";
 
 interface Props {
   plan: "creator" | "pro";
@@ -42,6 +44,7 @@ export function CheckoutButton({
 
   const onClick = async () => {
     setError(null);
+    logFramevoEvent(EVENTS.UPGRADE_CLICKED, { plan, signedIn: Boolean(user) });
     if (!user) {
       const next = typeof window !== "undefined" ? window.location.pathname : "/pricing";
       router.push(

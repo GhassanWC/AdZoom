@@ -6,6 +6,7 @@ import { AuthProvider } from "@/lib/firebase/AuthProvider";
 import { ToastProvider } from "@/components/ui/Toast";
 import { ConfirmProvider } from "@/components/ui/ConfirmDialog";
 import { ThemeProvider, themeInitScript } from "@/lib/theme";
+import { AnalyticsProvider } from "@/components/analytics/AnalyticsProvider";
 import { ChatWidget } from "@/components/chat/ChatWidget";
 import { BRAND } from "@/lib/branding";
 import { SITE } from "@/lib/seo";
@@ -81,12 +82,14 @@ export default function RootLayout({
         </a>
         <ThemeProvider>
           <AuthProvider>
-            <ToastProvider>
-              <ConfirmProvider>
-                {children}
-                <ChatWidget />
-              </ConfirmProvider>
-            </ToastProvider>
+            <AnalyticsProvider>
+              <ToastProvider>
+                <ConfirmProvider>
+                  {children}
+                  <ChatWidget />
+                </ConfirmProvider>
+              </ToastProvider>
+            </AnalyticsProvider>
           </AuthProvider>
         </ThemeProvider>
       </body>

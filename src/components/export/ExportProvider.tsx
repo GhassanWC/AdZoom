@@ -172,6 +172,11 @@ export function ExportProvider({ children }: { children: React.ReactNode }) {
         projectId: params.projectId,
         outputFormat: params.outputFormat,
       });
+      void trackEvent(
+        EVENTS.EXPORT_STARTED,
+        { format: params.outputFormat },
+        { projectId: params.projectId }
+      );
 
       try {
         if (!uid) throw new Error("Sign in to export.");
@@ -302,6 +307,11 @@ export function ExportProvider({ children }: { children: React.ReactNode }) {
         if (controller.signal.aborted) {
           console.info("[export] canceled", { projectId: params.projectId });
           setJob((j) => (j ? { ...j, status: "canceled" } : j));
+          void trackEvent(
+            EVENTS.EXPORT_CANCELLED,
+            { format: params.outputFormat },
+            { projectId: params.projectId }
+          );
         } else {
           const msg = err instanceof Error ? err.message : "Export failed.";
           console.info("[export] failed", { projectId: params.projectId, msg });
@@ -361,7 +371,12 @@ export function ExportProvider({ children }: { children: React.ReactNode }) {
       a.rel = "noreferrer";
     }
     a.click();
-  }, [job?.downloadUrl, job?.projectTitle]);
+    void trackEvent(
+      EVENTS.EXPORT_DOWNLOADED,
+      { format: job?.outputFormat, source: localUrl ? "local" : "storage" },
+      { projectId: job?.projectId }
+    );
+  }, [job?.downloadUrl, job?.projectTitle, job?.outputFormat, job?.projectId]);
 
   // Warn before leaving while a render/upload is in flight (mirrors recording).
   React.useEffect(() => {

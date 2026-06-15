@@ -164,7 +164,7 @@ export async function POST(req: NextRequest) {
         eventName === "subscription_expired" ||
         effectivePlan === "free";
       void recordEvent(
-        cancelled ? EVENTS.SUBSCRIPTION_CANCELLED : EVENTS.SUBSCRIPTION_ACTIVATED,
+        cancelled ? EVENTS.SUBSCRIPTION_CANCELLED : EVENTS.SUBSCRIPTION_CREATED,
         { userId: uid, plan: effectivePlan, metadata: { eventName } }
       );
     }

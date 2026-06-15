@@ -11,6 +11,8 @@ import { subscribeSubscription } from "@/lib/firebase/subscriptions";
 import { CheckoutButton } from "@/components/billing/CheckoutButton";
 import { ManageSubscriptionButton } from "@/components/billing/ManageSubscriptionButton";
 import { cn } from "@/lib/cn";
+import { logFramevoEvent } from "@/lib/firebase/analytics";
+import { EVENTS } from "@/lib/analytics/events";
 import type { Subscription } from "@/lib/firebase/schema";
 
 interface PlanCopy {
@@ -75,6 +77,17 @@ export default function BillingPage() {
   const usage = useMonthlyUsage();
   const tier = storage.plan.tier;
   const copy = PLAN_COPY[tier];
+
+  // Lemon Squeezy redirects back here with ?checkout=success after a paid
+  // checkout — the client-observable "purchase" signal for GA4 (a conversion).
+  // The webhook remains the source of truth for the subscription itself.
+  React.useEffect(() => {
+    if (typeof window === "undefined") return;
+    const sp = new URLSearchParams(window.location.search);
+    if (sp.get("checkout") === "success") {
+      logFramevoEvent(EVENTS.CHECKOUT_COMPLETED, { plan: sp.get("plan") ?? undefined });
+    }
+  }, []);
 
   // Live subscription doc — present once the LS webhook has fired at least once.
   const [sub, setSub] = React.useState<Subscription | null>(null);

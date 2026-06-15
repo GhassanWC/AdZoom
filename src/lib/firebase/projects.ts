@@ -151,9 +151,11 @@ export async function createProjectFromFile({
     updatedAt: serverTimestamp(),
   });
   const projectId = created.id;
+  const source = (interactionScope ?? "external") === "tab" ? "recording" : "upload";
+  void trackEvent(EVENTS.PROJECT_CREATED, { source, fileSize: file.size }, { projectId });
   void trackEvent(
-    EVENTS.PROJECT_CREATED,
-    { source: interactionScope === "tab" ? "recording" : "upload", fileSize: file.size },
+    EVENTS.VIDEO_UPLOAD_STARTED,
+    { source, fileSize: file.size, mimeType: file.type || "video/mp4" },
     { projectId }
   );
 
@@ -228,7 +230,7 @@ export async function createProjectFromFile({
   });
 
   void trackEvent(
-    EVENTS.VIDEO_UPLOADED,
+    EVENTS.VIDEO_UPLOAD_COMPLETED,
     {
       source: scope === "tab" ? "recording" : "upload",
       fileSize: file.size,

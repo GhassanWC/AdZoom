@@ -21,6 +21,8 @@ import {
   clampChunkSize,
   resolveChunkSize,
 } from "@/lib/analysis/chunk-config";
+import { logFramevoEvent } from "@/lib/firebase/analytics";
+import { EVENTS } from "@/lib/analytics/events";
 
 const EXISTING_EDIT_OPTIONS: SegmentOption<ExistingEditMode>[] = [
   {
@@ -151,6 +153,14 @@ export function AnalysisOptionsModal({
 
   const handleConfirm = () => {
     if (allOff) return;
+    // Record which engines the user enabled for this run + the chunk size.
+    if (engines.generateCameraEdits) logFramevoEvent(EVENTS.CAMERA_EDITS_ENABLED);
+    if (engines.generateCut) logFramevoEvent(EVENTS.CUTS_ENABLED);
+    if (engines.generateSpeed) logFramevoEvent(EVENTS.SPEED_ENABLED);
+    logFramevoEvent(EVENTS.CHUNK_SIZE_SELECTED, {
+      chunkMode,
+      chunkSizeSeconds: resolvedSize,
+    });
     onPersistEnginePrefs(engines);
     onPersistDetail({ chunkMode, chunkSizeSeconds: resolvedSize });
     onConfirm({

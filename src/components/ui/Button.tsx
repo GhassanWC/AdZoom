@@ -40,6 +40,8 @@ type LinkProps = BaseProps & {
   href: string;
   target?: string;
   rel?: string;
+  /** Optional click handler (e.g. analytics) — fired alongside navigation. */
+  onClick?: React.MouseEventHandler<HTMLAnchorElement>;
 };
 
 const baseStyles =
@@ -72,9 +74,9 @@ export function Button(props: ButtonProps | LinkProps) {
   );
 
   if ("href" in rest && rest.href) {
-    const { href, target, rel } = rest;
+    const { href, target, rel, onClick } = rest;
     return (
-      <Link href={href} target={target} rel={rel} className={classes}>
+      <Link href={href} target={target} rel={rel} onClick={onClick} className={classes}>
         {content}
       </Link>
     );

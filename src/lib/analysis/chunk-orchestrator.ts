@@ -53,6 +53,8 @@ import {
   flushProjectWrites,
   setAnalysisActive,
 } from "../firebase/project-writer";
+import { logFramevoEvent } from "../firebase/analytics";
+import { EVENTS } from "../analytics/events";
 
 /** A job updated within this window is treated as "actively driven" elsewhere. */
 const ACTIVE_JOB_HEARTBEAT_MS = 45_000;
@@ -212,6 +214,14 @@ export async function runChunkedAnalysis(args: ChunkedRunArgs): Promise<void> {
     chunkMode: job.chunkMode,
     chunkCount: job.chunkCount,
     duration: job.duration,
+    resume: resuming,
+  });
+  logFramevoEvent(EVENTS.CHUNKED_ANALYSIS_STARTED, {
+    engine: job.engine,
+    chunkMode: job.chunkMode ?? null,
+    chunkSize: job.chunkSize,
+    chunkCount: job.chunkCount,
+    duration: Math.round(job.duration),
     resume: resuming,
   });
 
@@ -555,6 +565,11 @@ export async function runChunkedAnalysis(args: ChunkedRunArgs): Promise<void> {
       )
     );
     await writeJob({ status: "complete", completedAt: Date.now(), progress: 1 });
+    logFramevoEvent(EVENTS.CHUNKED_ANALYSIS_COMPLETED, {
+      chunkCount: job.chunkCount,
+      chunkMode: job.chunkMode ?? null,
+      duration: Math.round(job.duration),
+    });
   } catch (err) {
     if (ac.signal.aborted) {
       await qWrite("cancel", () => markCancelled(uid, jobId, projectRef));

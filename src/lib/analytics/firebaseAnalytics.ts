@@ -54,6 +54,10 @@ export async function logAnalytics(
   name: string,
   params?: Record<string, unknown>
 ): Promise<void> {
+  // Debug mode: echo every event in development, never in production.
+  if (ANALYTICS_ENV !== "production" && typeof window !== "undefined") {
+    console.log("[analytics]", name, params ?? {});
+  }
   try {
     const analytics = await getFirebaseAnalytics();
     if (analytics) {

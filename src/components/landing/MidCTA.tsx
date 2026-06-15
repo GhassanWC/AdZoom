@@ -1,6 +1,7 @@
 import { ArrowRight, Play } from "lucide-react";
-import { Button } from "@/components/ui/Button";
 import { Container } from "@/components/ui/Container";
+import { TrackedCtaButton } from "@/components/analytics/TrackedCtaButton";
+import { EVENTS } from "@/lib/analytics/events";
 
 /**
  * Thin gradient strip between the showcase grid and the idea selector
@@ -29,14 +30,16 @@ export function MidCTA() {
             move where it matters. Free to start.
           </p>
           <div className="mt-7">
-            <Button
+            <TrackedCtaButton
               href="/dashboard"
               variant="primary"
               size="lg"
               rightIcon={<ArrowRight size={15} />}
+              event={EVENTS.LANDING_CTA_CLICK}
+              eventParams={{ cta: "mid_cta_start_building" }}
             >
               Start Building
-            </Button>
+            </TrackedCtaButton>
           </div>
         </div>
       </Container>

@@ -1,42 +1,61 @@
 /**
- * Canonical product-analytics event names.
+ * Canonical product-analytics event names — the SINGLE vocabulary used for
+ * both Google Analytics 4 (via `logFramevoEvent` / `trackEvent`) and the
+ * internal admin dashboard (Firestore `analyticsEvents`).
  *
- * Using a typed const map (rather than bare strings at call sites) prevents
- * typos that would silently fragment the analytics data. Both the client
- * `trackEvent` and the server `recordEvent` accept an `EventName`.
+ * Names follow GA4 conventions: `login` and `sign_up` are GA4 *recommended*
+ * events (they unlock built-in reports), the rest are custom events. Using a
+ * typed const map prevents typos that would silently fragment the data.
  *
- * This is the "core" set instrumented today. Adding a new event is a one-line
- * addition here plus the `trackEvent(...)` call — the helper, Firestore rules,
- * and admin Events page handle arbitrary names automatically.
+ * Adding an event = one line here + the `trackEvent`/`logFramevoEvent` call.
  */
 
 export const EVENTS = {
+  // ── Page / marketing (GA4-only via logFramevoEvent) ──────────────────
+  PAGE_VIEW: "page_view",
+  LANDING_CTA_CLICK: "landing_cta_click",
+  PRICING_VIEWED: "pricing_viewed",
+  DEMO_CLICKED: "demo_clicked",
+
   // ── Auth / user ──────────────────────────────────────────────────────
-  SIGN_IN: "sign_in",
+  SIGN_UP: "sign_up", // GA4 recommended event
+  LOGIN: "login", // GA4 recommended event
   SIGN_OUT: "sign_out",
-  USER_CREATED: "user_created",
 
   // ── Project / video ──────────────────────────────────────────────────
-  VIDEO_UPLOADED: "video_uploaded",
   PROJECT_CREATED: "project_created",
   PROJECT_DELETED: "project_deleted",
+  VIDEO_UPLOAD_STARTED: "video_upload_started",
+  VIDEO_UPLOAD_COMPLETED: "video_upload_completed",
   RECORDING_STARTED: "recording_started",
-  RECORDING_SAVED: "recording_saved",
+  RECORDING_COMPLETED: "recording_completed",
 
   // ── Analysis ─────────────────────────────────────────────────────────
   ANALYSIS_STARTED: "analysis_started",
   ANALYSIS_COMPLETED: "analysis_completed",
   ANALYSIS_FAILED: "analysis_failed",
   ANALYSIS_CANCELLED: "analysis_cancelled",
+  CHUNKED_ANALYSIS_STARTED: "chunked_analysis_started",
+  CHUNKED_ANALYSIS_COMPLETED: "chunked_analysis_completed",
+
+  // ── Engine options ───────────────────────────────────────────────────
+  CAMERA_EDITS_ENABLED: "camera_edits_enabled",
+  CUTS_ENABLED: "cuts_enabled",
+  SPEED_ENABLED: "speed_enabled",
+  CHUNK_SIZE_SELECTED: "chunk_size_selected",
 
   // ── Export ───────────────────────────────────────────────────────────
-  EXPORT_REQUESTED: "export_requested",
+  EXPORT_STARTED: "export_started",
   EXPORT_COMPLETED: "export_completed",
   EXPORT_FAILED: "export_failed",
+  EXPORT_DOWNLOADED: "export_downloaded",
+  EXPORT_CANCELLED: "export_cancelled",
 
   // ── Billing ──────────────────────────────────────────────────────────
+  UPGRADE_CLICKED: "upgrade_clicked",
   CHECKOUT_STARTED: "checkout_started",
-  SUBSCRIPTION_ACTIVATED: "subscription_activated",
+  CHECKOUT_COMPLETED: "checkout_completed",
+  SUBSCRIPTION_CREATED: "subscription_created",
   SUBSCRIPTION_CANCELLED: "subscription_cancelled",
   PAYMENT_SUCCESS: "payment_success",
 

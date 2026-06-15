@@ -6,10 +6,11 @@ import {
   Frame,
   SlidersHorizontal,
 } from "lucide-react";
-import { Button } from "@/components/ui/Button";
 import { Container } from "@/components/ui/Container";
 import { HeroMockup } from "./HeroMockup";
 import { BRAND } from "@/lib/branding";
+import { TrackedCtaButton } from "@/components/analytics/TrackedCtaButton";
+import { EVENTS } from "@/lib/analytics/events";
 
 const PROOF = [
   { Icon: UploadCloud, label: "Upload or record" },
@@ -57,17 +58,25 @@ export function Hero() {
           </p>
 
           <div className="mt-10 flex flex-wrap items-center justify-center gap-3">
-            <Button
+            <TrackedCtaButton
               href="/dashboard/upload"
               variant="primary"
               size="lg"
               rightIcon={<ArrowRight size={15} />}
+              event={EVENTS.LANDING_CTA_CLICK}
+              eventParams={{ cta: "hero_start_editing_free" }}
             >
               Start editing free
-            </Button>
-            <Button href="#demo" variant="glass" size="lg">
+            </TrackedCtaButton>
+            <TrackedCtaButton
+              href="#demo"
+              variant="glass"
+              size="lg"
+              event={EVENTS.DEMO_CLICKED}
+              eventParams={{ location: "hero" }}
+            >
               Watch demo
-            </Button>
+            </TrackedCtaButton>
           </div>
 
           {/* Hero proof points */}

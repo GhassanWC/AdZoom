@@ -31,6 +31,8 @@ import {
   decideInteractionScope,
   type CaptureDimensions,
 } from "./scope-detect";
+import { logFramevoEvent } from "@/lib/firebase/analytics";
+import { EVENTS } from "@/lib/analytics/events";
 
 /**
  * `getDisplayMedia` options that aren't in the stock `lib.dom.d.ts` yet.
@@ -524,6 +526,11 @@ export function createRecordingEngine(
     s.recorder!.start(1000);
     startTicker();
     setState("recording");
+    logFramevoEvent(EVENTS.RECORDING_STARTED, {
+      displaySurface: s.displaySurface ?? null,
+      width: s.width,
+      height: s.height,
+    });
   };
 
   const pause: RecordingEngine["pause"] = () => {
@@ -586,6 +593,11 @@ export function createRecordingEngine(
         };
         teardown();
         setState("stopped");
+        logFramevoEvent(EVENTS.RECORDING_COMPLETED, {
+          durationSeconds: Math.round(durationSeconds),
+          interactionScope: interactionScope ?? null,
+          displaySurface: displaySurface ?? null,
+        });
         // Fire the event so any subscriber (the global provider) can pick the
         // result up — even when nobody awaited the returned promise (e.g. the
         // browser's own "Stop sharing" path).

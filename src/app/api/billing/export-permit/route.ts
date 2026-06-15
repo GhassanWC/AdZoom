@@ -11,8 +11,6 @@ import {
 import { currentMonthKey } from "@/lib/usage/usage";
 import { normalizePlan, planMeetsMinimum, type PlanTier } from "@/lib/usage/plan";
 import type { ExportFormat, MonthlyUsage } from "@/lib/firebase/schema";
-import { recordEvent } from "@/lib/analytics/recordEvent";
-import { EVENTS } from "@/lib/analytics/events";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -196,13 +194,6 @@ export async function POST(req: NextRequest) {
     const uploadPath =
       (finalSnap.data() as { expectedStoragePath?: string } | undefined)
         ?.expectedStoragePath ?? "";
-
-    void recordEvent(EVENTS.EXPORT_REQUESTED, {
-      userId: uid,
-      plan: planAtPermit,
-      projectId,
-      metadata: { resolution, format, fps, applyWatermark, exportId },
-    });
 
     return NextResponse.json({
       ok: true,

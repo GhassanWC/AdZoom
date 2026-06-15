@@ -3,7 +3,7 @@
 /**
  * Central client-side analytics helper.
  *
- *   trackEvent(EVENTS.VIDEO_UPLOADED, { fileSize, duration }, { projectId });
+ *   trackEvent(EVENTS.VIDEO_UPLOAD_COMPLETED, { fileSize, duration }, { projectId });
  *
  * Two layers, both best-effort:
  *   1. Firebase Analytics (GA4) — high-level product funnel in Google's console.

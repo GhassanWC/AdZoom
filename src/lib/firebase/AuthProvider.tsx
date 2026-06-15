@@ -52,7 +52,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const signInWithGoogle = React.useCallback(async () => {
     const { auth } = getFirebase();
     await signInWithPopup(auth, googleProvider);
-    void trackEvent(EVENTS.SIGN_IN, { provider: "google" });
+    void trackEvent(EVENTS.LOGIN, { method: "google" });
   }, []);
 
   const signOut = React.useCallback(async () => {
@@ -99,7 +99,7 @@ async function ensureUserDoc(user: User) {
       updatedAt: serverTimestamp(),
     });
     // First time we've seen this user → a sign-up.
-    void trackEvent(EVENTS.USER_CREATED, { provider: "google" });
+    void trackEvent(EVENTS.SIGN_UP, { method: "google" });
   } else {
     await setDoc(
       ref,

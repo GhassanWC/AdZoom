@@ -1,5 +1,6 @@
-import { Button } from "@/components/ui/Button";
 import { Container } from "@/components/ui/Container";
+import { TrackedCtaButton } from "@/components/analytics/TrackedCtaButton";
+import { EVENTS } from "@/lib/analytics/events";
 
 /**
  * Closing CTA panel — adapted from Shipper's "Your idea deserves to
@@ -56,9 +57,15 @@ export function FinalCTA() {
           </p>
 
           <div className="mt-12">
-            <Button href="/dashboard/upload" variant="primary" size="lg">
+            <TrackedCtaButton
+              href="/dashboard/upload"
+              variant="primary"
+              size="lg"
+              event={EVENTS.LANDING_CTA_CLICK}
+              eventParams={{ cta: "final_cta_start_editing_free" }}
+            >
               Start editing free
-            </Button>
+            </TrackedCtaButton>
           </div>
         </div>
       </Container>
