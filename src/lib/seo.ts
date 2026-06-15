@@ -81,7 +81,8 @@ export function organizationLd() {
     "@type": "Organization",
     name: SITE.name,
     url: SITE.url,
-    logo: `${SITE.url}/icon.svg`,
+    // Crawlable raster logo (Google's logo guidelines prefer PNG/JPG, ≥112px).
+    logo: `${SITE.url}/icon.png`,
   };
 }
 

@@ -35,7 +35,20 @@ export const metadata: Metadata = {
   applicationName: BRAND.name,
   keywords: [...SITE.keywords],
   robots: { index: true, follow: true },
-  icons: { icon: "/icon.svg" },
+  // Framevo icons served from /public (see scripts/gen-icons.mjs). Listed
+  // explicitly so the rendered <head> points crawlers at the Framevo mark —
+  // .ico for legacy/Google search, .svg for modern browsers, .png fallback,
+  // apple-icon for iOS. (The old create-next-app default favicon.ico was
+  // removed from src/app to stop Google showing the wrong logo.)
+  icons: {
+    icon: [
+      { url: "/favicon.ico", sizes: "any" },
+      { url: "/icon.svg", type: "image/svg+xml" },
+      { url: "/icon.png", type: "image/png", sizes: "512x512" },
+    ],
+    apple: [{ url: "/apple-icon.png", sizes: "180x180", type: "image/png" }],
+    shortcut: ["/favicon.ico"],
+  },
   openGraph: {
     title: SITE.title,
     description: SITE.description,
