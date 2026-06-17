@@ -102,7 +102,7 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
       resolution === "4K"
         ? { width: 3840, height: 2160 }
         : { width: 1920, height: 1080 };
-    void canEncodeMp4({ ...dims, fps }).then((ok) => {
+    void canEncodeMp4({ ...dims, fps, resolution }).then((ok) => {
       if (alive) setMp4Supported(ok);
     });
     return () => {
@@ -228,7 +228,9 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
           </div>
           <div className="grid grid-cols-2 gap-1 rounded-lg border border-white/10 bg-white/[0.02] p-1">
             {(["webm", "mp4"] as const).map((c) => {
-              const mp4Disabled = c === "mp4" && mp4Supported === false;
+              // Treat the in-flight probe (null) as not-yet-available so the
+              // button doesn't briefly appear selectable then disable.
+              const mp4Disabled = c === "mp4" && mp4Supported !== true;
               const selected = container === c;
               return (
                 <button

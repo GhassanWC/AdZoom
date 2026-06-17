@@ -26,12 +26,22 @@ const TrackProcessor = (
  * tracks come from one MediaStream clock, A/V stay in sync
  * (`firstTimestampBehavior: "cross-track-offset"`).
  *
+ * VIDEO IS DECOUPLED FROM AUDIO. The VideoEncoder is configured immediately and
+ * encodes from frame 0; its encoded chunks are BUFFERED until the muxer is
+ * built. `mp4-muxer` must declare the audio track (with its real sampleRate/
+ * channels) at construction, and those are only known from the first `AudioData`
+ * — so the muxer is built either (a) on the first AudioData (with audio) or
+ * (b) by a short watchdog that commits to a VIDEO-ONLY MP4 if no audio ever
+ * arrives (a suspended AudioContext during a backgrounded export). Either way no
+ * video is lost and the export never hard-fails just because audio stalled.
+ *
  * Cuts: the render loop calls `pause()` while seeking past a cut. While paused
- * we drop frames and accumulate the gap (`droppedUs`); each kept frame is muxed
+ * we drop frames and accumulate the gap (`droppedUs`); each kept chunk is muxed
  * at `originalTs - droppedUs` (via `addVideoChunk`'s timestamp override, so no
  * frame/audio reconstruction), making the skipped span genuinely absent — parity
- * with `MediaRecorder.pause()`. Speed needs no special handling: `playbackRate`
- * already compresses realtime capture, so frame timestamps already reflect it.
+ * with `MediaRecorder.pause()`. The first frame after a cut is forced to a
+ * keyframe. Speed needs no special handling: `playbackRate` already compresses
+ * realtime capture, so frame timestamps already reflect it.
  *
  * Runs on the main thread for v1 (parity with MediaRecorder; the encoders are
  * GPU/thread-offloaded internally). Moving the encode to a worker is a future
@@ -44,8 +54,15 @@ export interface Mp4SinkOptions {
   fps: 30 | 60;
   videoBitrate: number;
   audioBitrate: number;
+  /** Source playhead getter — for encode-error diagnostics. */
   currentTime?: () => number;
+  /** Surfaced when the sink degrades to video-only (audio never arrived). */
+  onWarning?: (message: string) => void;
 }
+
+/** How long to wait for the first AudioData before committing to a video-only
+ *  MP4. Video frames are BUFFERED (not dropped) during this window. */
+const AUDIO_WAIT_MS = 2500;
 
 export function createMp4Sink(opts: Mp4SinkOptions): ExportSink {
   const { outputStream, width, height, fps, videoBitrate, audioBitrate } = opts;
@@ -55,27 +72,38 @@ export function createMp4Sink(opts: Mp4SinkOptions): ExportSink {
   }
   const audioTrack = outputStream.getAudioTracks()[0] ?? null;
   const avcCodec = avcCodecFor(width, height);
+  const at = () => opts.currentTime?.();
 
   let muxer: Muxer<ArrayBufferTarget> | null = null;
+  let muxerReady = false;
   let videoEncoder: VideoEncoder | null = null;
   let audioEncoder: AudioEncoder | null = null;
   let videoReader: ReadableStreamDefaultReader<VideoFrame> | null = null;
   let audioReader: ReadableStreamDefaultReader<AudioData> | null = null;
+  let watchdog: ReturnType<typeof setTimeout> | undefined;
 
-  let ready = false; // muxer + encoders configured
   let stopping = false;
   let disposed = false;
   let finalized = false;
   let paused = false;
   let forceKeyNext = false; // force a keyframe on the first frame after a cut
+  let audioGivenUp = false; // committed to video-only — drop any later audio
   let gapStartUs: number | null = null; // capture ts where the current cut began
   let droppedUs = 0; // total cut time removed so far (capture-clock µs)
   let frameCount = 0;
   let lastVideoOutUs = -1;
   let droppedForBackpressure = 0;
 
-  // Adjusted (gap-removed) timestamps, keyed by the ORIGINAL chunk timestamp,
-  // so the muxer gets continuous timestamps without rebuilding frames/audio.
+  // Encoded video chunks produced before the muxer exists (we don't know the
+  // audio params yet). Drained into the muxer once it's built. EncodedVideoChunks
+  // are immutable value objects (no close() needed), so buffering is cheap.
+  const pendingVideo: Array<{
+    chunk: EncodedVideoChunk;
+    meta?: EncodedVideoChunkMetadata;
+    ts: number;
+  }> = [];
+  // Adjusted (gap-removed) timestamps keyed by ORIGINAL chunk timestamp, so the
+  // muxer gets continuous timestamps without rebuilding frames/audio.
   const videoTsAdjust = new Map<number, number>();
   const audioTsAdjust = new Map<number, number>();
 
@@ -101,7 +129,7 @@ export function createMp4Sink(opts: Mp4SinkOptions): ExportSink {
   const fail = (err: unknown) => {
     if (settled) return;
     const d = describeError(err);
-    console.error("[export-render-loop] MP4 encode error", d);
+    console.error("[export-render-loop] MP4 encode error", { ...d, at: at() });
     rejectDone(
       err instanceof ExportError
         ? err
@@ -114,9 +142,55 @@ export function createMp4Sink(opts: Mp4SinkOptions): ExportSink {
     hardTeardown();
   };
 
-  function initPipeline(
+  function onVideoChunk(chunk: EncodedVideoChunk, meta?: EncodedVideoChunkMetadata) {
+    if (finalized) return;
+    const t = videoTsAdjust.get(chunk.timestamp);
+    if (t !== undefined) videoTsAdjust.delete(chunk.timestamp);
+    const ts = t ?? chunk.timestamp;
+    if (muxer && muxerReady) {
+      try {
+        muxer.addVideoChunk(chunk, meta, ts);
+      } catch (e) {
+        fail(e);
+      }
+    } else {
+      pendingVideo.push({ chunk, meta, ts });
+    }
+  }
+
+  function onAudioChunk(chunk: EncodedAudioChunk, meta?: EncodedAudioChunkMetadata) {
+    if (finalized || !muxer) return;
+    const t = audioTsAdjust.get(chunk.timestamp);
+    if (t !== undefined) audioTsAdjust.delete(chunk.timestamp);
+    try {
+      muxer.addAudioChunk(chunk, meta, t ?? chunk.timestamp);
+    } catch (e) {
+      fail(e);
+    }
+  }
+
+  function configureVideoEncoder(): void {
+    videoEncoder = new VideoEncoder({ output: onVideoChunk, error: (e) => fail(e) });
+    videoEncoder.configure({
+      codec: avcCodec,
+      width,
+      height,
+      bitrate: videoBitrate,
+      framerate: fps,
+      latencyMode: "realtime", // no B-frames → in-order output, low latency
+    });
+  }
+
+  /** Build the muxer (and audio encoder, if audioParams) and drain buffered
+   *  video. Idempotent — the first of {first AudioData, watchdog, stop} wins. */
+  function buildMuxer(
     audioParams: { sampleRate: number; numberOfChannels: number } | null
   ): void {
+    if (muxerReady || disposed) return;
+    if (watchdog) {
+      clearTimeout(watchdog);
+      watchdog = undefined;
+    }
     muxer = new Muxer({
       target: new ArrayBufferTarget(),
       fastStart: "in-memory", // moov at the front → seekable/streamable playback
@@ -132,55 +206,31 @@ export function createMp4Sink(opts: Mp4SinkOptions): ExportSink {
           }
         : {}),
     });
-
-    videoEncoder = new VideoEncoder({
-      output: (chunk, meta) => {
-        if (!muxer || finalized) return;
-        const t = videoTsAdjust.get(chunk.timestamp);
-        if (t !== undefined) videoTsAdjust.delete(chunk.timestamp);
-        try {
-          muxer.addVideoChunk(chunk, meta, t ?? chunk.timestamp);
-        } catch (e) {
-          fail(e);
-        }
-      },
-      error: (e) => fail(e),
-    });
-    videoEncoder.configure({
-      codec: avcCodec,
-      width,
-      height,
-      bitrate: videoBitrate,
-      framerate: fps,
-      latencyMode: "realtime", // no B-frames → in-order output, low latency
-    });
-
     if (audioParams) {
-      audioEncoder = new AudioEncoder({
-        output: (chunk, meta) => {
-          if (!muxer || finalized) return;
-          const t = audioTsAdjust.get(chunk.timestamp);
-          if (t !== undefined) audioTsAdjust.delete(chunk.timestamp);
-          try {
-            muxer.addAudioChunk(chunk, meta, t ?? chunk.timestamp);
-          } catch (e) {
-            fail(e);
-          }
-        },
-        error: (e) => fail(e),
-      });
+      audioEncoder = new AudioEncoder({ output: onAudioChunk, error: (e) => fail(e) });
       audioEncoder.configure({
         codec: AAC_CODEC,
         numberOfChannels: audioParams.numberOfChannels,
         sampleRate: audioParams.sampleRate,
         bitrate: audioBitrate,
       });
+    } else {
+      audioGivenUp = true;
     }
-    ready = true;
+    muxerReady = true;
+    // Flush video chunks encoded before the muxer existed.
+    for (const p of pendingVideo) {
+      try {
+        muxer.addVideoChunk(p.chunk, p.meta, p.ts);
+      } catch (e) {
+        fail(e);
+      }
+    }
+    pendingVideo.length = 0;
   }
 
   function handleVideoFrame(frame: VideoFrame): void {
-    if (disposed || stopping || !ready || !videoEncoder) {
+    if (disposed || stopping || !videoEncoder) {
       frame.close();
       return;
     }
@@ -200,8 +250,7 @@ export function createMp4Sink(opts: Mp4SinkOptions): ExportSink {
       return;
     }
     // Soft backpressure: if the encoder falls behind (e.g. software 4K60), drop
-    // this frame rather than grow the queue unbounded. Realtime capture tolerates
-    // an occasional dropped frame.
+    // this frame rather than grow the queue unbounded.
     if (videoEncoder.encodeQueueSize > 30) {
       droppedForBackpressure++;
       frame.close();
@@ -228,7 +277,7 @@ export function createMp4Sink(opts: Mp4SinkOptions): ExportSink {
     if (
       disposed ||
       stopping ||
-      !ready ||
+      audioGivenUp ||
       !audioEncoder ||
       paused ||
       gapStartUs !== null
@@ -272,10 +321,14 @@ export function createMp4Sink(opts: Mp4SinkOptions): ExportSink {
         const { value, done: rdone } = await audioReader.read();
         if (rdone) break;
         if (!value) continue;
-        if (!ready) {
+        if (audioGivenUp) {
+          value.close(); // watchdog already committed to video-only
+          continue;
+        }
+        if (!muxerReady) {
           // First AudioData defines the real sampleRate/channels — build the
-          // muxer + encoders now so they agree with the data being fed in.
-          initPipeline({
+          // muxer + audio encoder now so they agree with the data fed in.
+          buildMuxer({
             sampleRate: value.sampleRate,
             numberOfChannels: value.numberOfChannels,
           });
@@ -291,6 +344,10 @@ export function createMp4Sink(opts: Mp4SinkOptions): ExportSink {
     if (disposed) return;
     disposed = true;
     stopping = true;
+    if (watchdog) {
+      clearTimeout(watchdog);
+      watchdog = undefined;
+    }
     try {
       void videoReader?.cancel();
     } catch {
@@ -319,11 +376,26 @@ export function createMp4Sink(opts: Mp4SinkOptions): ExportSink {
     videoCodec: avcCodec,
     done,
     start() {
-      // Audio-gated init: WITH audio the pipeline is built on the first AudioData
-      // (so the muxer/encoder get the true sampleRate/channels); the few video
-      // frames before that are dropped (handleVideoFrame !ready). WITHOUT audio,
-      // build immediately so video encodes from frame 0.
-      if (!audioTrack) initPipeline(null);
+      configureVideoEncoder(); // encode video from frame 0, independent of audio
+      if (!audioTrack) {
+        buildMuxer(null);
+      } else {
+        // Wait briefly for the first AudioData; if it never comes (suspended
+        // AudioContext / backgrounded export), commit to a video-only MP4 so a
+        // perfectly good video never hard-fails. Video frames are BUFFERED, not
+        // dropped, until the muxer is built — no video is lost.
+        watchdog = setTimeout(() => {
+          if (!muxerReady) {
+            console.warn(
+              "[export-recorder] MP4: no audio after wait — encoding video-only"
+            );
+            buildMuxer(null);
+            opts.onWarning?.(
+              "The audio couldn't be captured for this MP4, so it's video-only. Try Chrome or Edge."
+            );
+          }
+        }, AUDIO_WAIT_MS);
+      }
       void pumpVideo();
       void pumpAudio();
     },
@@ -339,6 +411,10 @@ export function createMp4Sink(opts: Mp4SinkOptions): ExportSink {
       stopping = true;
       void (async () => {
         try {
+          if (watchdog) {
+            clearTimeout(watchdog);
+            watchdog = undefined;
+          }
           try {
             await videoReader?.cancel();
           } catch {
@@ -352,6 +428,9 @@ export function createMp4Sink(opts: Mp4SinkOptions): ExportSink {
           if (videoEncoder && videoEncoder.state === "configured") {
             await videoEncoder.flush();
           }
+          // Ensure a muxer exists (e.g. stopped before any AudioData / watchdog)
+          // so buffered video is drained into a video-only file.
+          if (!muxerReady) buildMuxer(null);
           if (audioEncoder && audioEncoder.state === "configured") {
             await audioEncoder.flush();
           }

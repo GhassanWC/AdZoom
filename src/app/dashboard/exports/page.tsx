@@ -43,6 +43,18 @@ function fmtBytes(bytes?: number) {
   return `${mb.toFixed(1)} MB`;
 }
 
+/**
+ * Format/container label. Prefer the ACTUAL stored file's extension
+ * (`storagePath`) over the requested `container` — on a rare MP4→WebM fallback
+ * the doc keeps `container:"mp4"` (the completion patch can't rewrite it), so the
+ * real `.webm` extension is the source of truth for what the user downloads.
+ */
+function containerLabel(row: ExportDoc): string {
+  const ext = row.storagePath?.split(".").pop()?.toLowerCase();
+  if (ext === "mp4" || ext === "webm") return ext.toUpperCase();
+  return row.container ? row.container.toUpperCase() : "";
+}
+
 export default function ExportsPage() {
   const { user } = useAuth();
   const { job, isExporting, cancelExport, downloadCurrent, clearJob } =
@@ -208,7 +220,7 @@ export default function ExportsPage() {
               </Link>
               <div className="text-fog">
                 {row.format} · {row.resolution} · {row.fps}fps
-                {row.container ? ` · ${row.container.toUpperCase()}` : ""}
+                {containerLabel(row) ? ` · ${containerLabel(row)}` : ""}
               </div>
               <div className="font-mono text-xs tabular-nums text-fog">
                 {fmtBytes(row.fileSize)}

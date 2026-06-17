@@ -935,59 +935,79 @@ export async function renderProjectClientSide(
   const videoBitsPerSecond = videoBitrateFor(resolution, fps);
   const mp4Capable =
     requestedContainer === "mp4"
-      ? await canEncodeMp4({ width: canvasW, height: canvasH, fps })
+      ? await canEncodeMp4({ width: canvasW, height: canvasH, fps, resolution })
       : false;
 
+  // Build the sink inside a guard: sink construction (and the no-recorder throw)
+  // happens AFTER acquireExportAudio() created the per-export AudioContext, and
+  // BEFORE the `cleanup` machinery below exists — so any throw here would orphan
+  // that AudioContext (which the project notes BREAKS the next export). On
+  // failure, release the audio graph + both capture-track sets before rethrowing.
   let sink: ExportSink;
-  if (requestedContainer === "mp4" && mp4Capable) {
-    sink = createMp4Sink({
-      outputStream,
-      width: canvasW,
-      height: canvasH,
-      fps,
-      videoBitrate: videoBitsPerSecond,
-      audioBitrate: AUDIO_BITRATE_AAC,
-      currentTime: () => video.currentTime,
-    });
-  } else {
-    if (requestedContainer === "mp4") {
-      audioWarning =
-        audioWarning ??
-        "MP4 isn't supported in this browser, so the export was rendered as WebM.";
-    }
-    if (!webmMime) {
-      onProgress({
-        stage: "unsupported",
-        pct: 0,
-        message: "Your browser does not support video export. Try Chrome or Edge.",
+  try {
+    if (requestedContainer === "mp4" && mp4Capable) {
+      sink = createMp4Sink({
+        outputStream,
+        width: canvasW,
+        height: canvasH,
+        fps,
+        videoBitrate: videoBitsPerSecond,
+        audioBitrate: AUDIO_BITRATE_AAC,
+        currentTime: () => video.currentTime,
+        onWarning: (msg) => {
+          audioWarning = audioWarning ?? msg;
+        },
       });
-      for (const t of outputStream.getTracks()) {
-        try {
-          t.stop();
-        } catch {
-          /* ignore */
-        }
-      }
-      throw new ExportError(
-        "recorder",
-        "This browser can't export video (no supported recorder). Try Chrome or Edge.",
-        { detail: { supported: supportedMimes() } }
-      );
-    }
-    sink = createWebmSink({
-      outputStream,
-      mimeType: webmMime.mime,
-      videoBitsPerSecond,
-      audioBitsPerSecond: AUDIO_BITRATE_OPUS,
-      onAudioDropped: () => {
-        audio.cleanup?.();
+    } else {
+      if (requestedContainer === "mp4") {
         audioWarning =
           audioWarning ??
-          "Audio couldn't be added to this export in this browser, so it's video-only. Try Chrome or Edge.";
-      },
-      currentTime: () => video.currentTime,
-      audioPath: audio.path,
-    });
+          "MP4 isn't supported in this browser, so the export was rendered as WebM.";
+      }
+      if (!webmMime) {
+        onProgress({
+          stage: "unsupported",
+          pct: 0,
+          message: "Your browser does not support video export. Try Chrome or Edge.",
+        });
+        throw new ExportError(
+          "recorder",
+          "This browser can't export video (no supported recorder). Try Chrome or Edge.",
+          { detail: { supported: supportedMimes() } }
+        );
+      }
+      sink = createWebmSink({
+        outputStream,
+        mimeType: webmMime.mime,
+        videoBitsPerSecond,
+        audioBitsPerSecond: AUDIO_BITRATE_OPUS,
+        onAudioDropped: () => {
+          audio.cleanup?.();
+          audioWarning =
+            audioWarning ??
+            "Audio couldn't be added to this export in this browser, so it's video-only. Try Chrome or Edge.";
+        },
+        currentTime: () => video.currentTime,
+        audioPath: audio.path,
+      });
+    }
+  } catch (err) {
+    audio.cleanup?.();
+    for (const t of outputStream.getTracks()) {
+      try {
+        t.stop();
+      } catch {
+        /* ignore */
+      }
+    }
+    for (const t of canvasStream.getTracks()) {
+      try {
+        t.stop();
+      } catch {
+        /* ignore */
+      }
+    }
+    throw err;
   }
   const actualContainer = sink.container;
   // The sink resolves this with the encoded blob (or rejects with an ExportError).
@@ -1281,7 +1301,13 @@ export async function renderProjectClientSide(
     frame++;
     if (input.duration > 0) {
       const pct = Math.min(0.99, video.currentTime / input.duration);
-      onProgress({ stage: "rendering", pct });
+      // Re-send the latched warning each tick so a LATE warning (e.g. the MP4
+      // sink's video-only watchdog firing mid-render) reaches the panel.
+      onProgress({
+        stage: "rendering",
+        pct,
+        ...(audioWarning ? { warning: audioWarning } : {}),
+      });
       const decile = Math.floor(pct * 10);
       if (decile !== loggedDecile) {
         loggedDecile = decile;

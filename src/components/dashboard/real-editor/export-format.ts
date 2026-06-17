@@ -95,6 +95,9 @@ export async function canEncodeMp4(opts: {
   width: number;
   height: number;
   fps: 30 | 60;
+  /** Probe with the bitrate the encoder will ACTUALLY use, so the gate predicts
+   *  the real configure() (4K uses a much higher bitrate than 1080p). */
+  resolution: "1080p" | "4K";
 }): Promise<boolean> {
   if (typeof window === "undefined") return false;
   if (typeof VideoEncoder === "undefined" || typeof AudioEncoder === "undefined") {
@@ -113,7 +116,7 @@ export async function canEncodeMp4(opts: {
       codec: avcCodecFor(opts.width, opts.height),
       width: opts.width,
       height: opts.height,
-      bitrate: videoBitrateFor("1080p", opts.fps),
+      bitrate: videoBitrateFor(opts.resolution, opts.fps),
       framerate: opts.fps,
     });
     const a = await AudioEncoder.isConfigSupported({
