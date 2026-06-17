@@ -21,6 +21,8 @@ interface PermitBody {
   resolution?: "1080p" | "4K";
   format?: ExportFormat;
   fps?: 30 | 60;
+  /** Output container — drives the upload extension. Defaults to "webm". */
+  container?: "webm" | "mp4";
 }
 
 /**
@@ -72,6 +74,9 @@ export async function POST(req: NextRequest) {
 
     const body = (await req.json().catch(() => ({}))) as PermitBody;
     const { projectId, projectTitle, resolution, format, fps } = body;
+    // Container is optional + defaulted (older clients omit it). Anything other
+    // than "mp4" → "webm".
+    const container: "webm" | "mp4" = body.container === "mp4" ? "mp4" : "webm";
     if (
       typeof projectId !== "string" ||
       typeof projectTitle !== "string" ||
@@ -146,7 +151,8 @@ export async function POST(req: NextRequest) {
         };
         tx.set(usageRef, nextUsage, { merge: true });
 
-        const expectedStoragePath = `users/${uid}/projects/${projectId}/exports/${exportId}.webm`;
+        const ext = container === "mp4" ? "mp4" : "webm";
+        const expectedStoragePath = `users/${uid}/projects/${projectId}/exports/${exportId}.${ext}`;
 
         tx.set(exportRef, {
           projectId,
@@ -154,6 +160,7 @@ export async function POST(req: NextRequest) {
           format,
           resolution,
           fps,
+          container,
           status: "permitted",
           applyWatermark,
           expectedStoragePath,

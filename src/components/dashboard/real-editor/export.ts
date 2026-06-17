@@ -38,6 +38,16 @@ import {
   describeError,
   friendlyStorageMessage,
 } from "./export-error";
+import {
+  type ExportContainer,
+  AUDIO_BITRATE_OPUS,
+  AUDIO_BITRATE_AAC,
+  canEncodeMp4,
+  videoBitrateFor,
+} from "./export-format";
+import type { ExportSink } from "./sinks/types";
+import { createWebmSink } from "./sinks/webm-sink";
+import { createMp4Sink } from "./sinks/mp4-sink";
 import type {
   BackgroundMode,
   DetectedMoment,
@@ -57,27 +67,18 @@ interface BasePlacement {
   offsetY: number;
 }
 
-// Ordered by preference. CRITICAL: every entry must be able to carry an AUDIO
-// track. A `codecs=` string that pins ONLY the video codec (e.g.
-// "video/mp4;codecs=avc1.42E01E") makes MediaRecorder encode video-only and
-// SILENTLY DROP the audio track — that was the "exported video has no audio"
-// bug (this list put that exact string first, and on Chrome/Edge MP4 recording
-// is supported, so it always won). Every entry below either names an audio
-// codec explicitly (mp4a.40.2 = AAC, opus) or is a bare container where the UA
-// negotiates audio+video. Do NOT add a video-only `codecs=` string here.
+// MediaRecorder is used ONLY for WebM here. MP4 via MediaRecorder is removed on
+// purpose: Chrome reports `isTypeSupported("video/mp4;codecs=avc1…,mp4a…")` as
+// true, then its experimental MP4 muxer throws `EncodingError: "Internal Error."`
+// mid-record — the production export failure. MP4 is produced instead by the
+// WebCodecs `Mp4WebCodecsSink` (see sinks/mp4-sink.ts). VP9 first (best quality),
+// then VP8, then a bare container — every entry carries Opus/UA-negotiated audio
+// (never add a video-only `codecs=` string: it silently drops the audio track).
 const PREFERRED_MIMES = [
-  "video/mp4;codecs=avc1.42E01E,mp4a.40.2", // H.264 + AAC
-  "video/mp4", // UA negotiates codecs — keeps audio
   "video/webm;codecs=vp9,opus", // VP9 + Opus
   "video/webm;codecs=vp8,opus", // VP8 + Opus
   "video/webm", // UA negotiates codecs — keeps audio
 ];
-
-/** True when `mime` can carry an audio track (named audio codec or bare container). */
-function mimeCarriesAudio(mime: string): boolean {
-  if (!/codecs=/i.test(mime)) return true; // bare container — UA adds audio
-  return /\b(mp4a|aac|opus|vorbis)\b/i.test(mime);
-}
 
 function pickMime(): { mime: string; ext: string } | null {
   if (typeof MediaRecorder === "undefined") return null;
@@ -447,6 +448,13 @@ interface RenderInput {
    * file. Absent / disabled → full frame (no crop).
    */
   sourceCrop?: SourceCrop;
+  /**
+   * Desired output container. "webm" (default) renders via MediaRecorder;
+   * "mp4" renders via the WebCodecs sink when the browser supports it, else
+   * falls back to "webm" with a non-fatal warning. The ACTUAL container used is
+   * reported back on the returned `ExportResult`.
+   */
+  container?: ExportContainer;
   onProgress: (p: ExportProgress) => void;
   signal?: AbortSignal;
   /**
@@ -459,22 +467,31 @@ interface RenderInput {
   applyWatermark?: boolean;
 }
 
+/** The rendered blob plus the container that was ACTUALLY produced (MP4 may
+ *  have fallen back to WebM), so the caller names/uploads the file correctly. */
+export interface ExportResult {
+  blob: Blob;
+  container: ExportContainer;
+}
+
 /**
  * Render the source video to a canvas, applying preview transforms per moment,
- * and capture via MediaRecorder. Returns a Blob that the caller can download
- * and/or upload.
+ * and capture via an `ExportSink` (WebM = MediaRecorder, MP4 = WebCodecs).
+ * Returns the encoded blob + the container actually produced.
  *
  * Honest limits:
  * - Audio: the canvas stream is video-only, so the source's audio is mixed in
  *   explicitly (`acquireExportAudio`) — preferring the element's own
  *   captureStream(), falling back to a Web Audio graph. A visible warning is
  *   surfaced via `onProgress` if neither yields a track.
- * - 4K is capped to 1920x1080 on the canvas to keep the browser stable.
- * - Some browsers don't support MediaRecorder of MP4 — we fall back to WebM.
+ * - Output long edge is bounded by the resolution (1920 / 3840) via
+ *   resolveOutputDims / resolveCanvasDims to stay within the encode budget.
+ * - MP4 requires WebCodecs + MediaStreamTrackProcessor (Chrome/Edge); elsewhere
+ *   it falls back to WebM with a non-fatal warning.
  */
 export async function renderProjectClientSide(
   input: RenderInput
-): Promise<Blob> {
+): Promise<ExportResult> {
   const {
     video,
     moments,
@@ -525,27 +542,16 @@ export async function renderProjectClientSide(
     );
   }
 
-  // ── Stage: recorder (MIME validation + fallback) ─────────────────────────
-  // `pickMime` walks PREFERRED_MIMES in order and returns the FIRST the UA
-  // actually supports (the requested fallback). Null = none supported.
-  const mime = pickMime();
+  // ── Stage: recorder (MIME probe) ─────────────────────────────────────────
+  // `pickMime` walks the WebM PREFERRED_MIMES and returns the first the UA
+  // supports (null = no WebM MediaRecorder). The actual encoder is chosen later
+  // by container (WebM = MediaRecorder, MP4 = WebCodecs) — so we DON'T throw
+  // here; the sink-selection block decides + fails with a clear reason.
+  const webmMime = pickMime();
   console.info("[export-recorder] mime probe", {
-    picked: mime?.mime ?? null,
+    picked: webmMime?.mime ?? null,
     supported: supportedMimes(),
   });
-  if (!mime) {
-    onProgress({
-      stage: "unsupported",
-      pct: 0,
-      message:
-        "Your browser does not support MediaRecorder for video. Try Chrome or Edge.",
-    });
-    throw new ExportError(
-      "recorder",
-      "This browser can't record video (no supported MediaRecorder format). Try Chrome or Edge.",
-      { detail: { supported: supportedMimes() } }
-    );
-  }
 
   onProgress({ stage: "preparing", pct: 0 });
 
@@ -898,7 +904,6 @@ export async function renderProjectClientSide(
   );
   const exportAudioTracksCount = outputStream.getAudioTracks().length;
   const finalStreamHasAudio = exportAudioTracksCount > 0;
-  const mimeSupportsAudio = mimeCarriesAudio(mime.mime);
   console.info("[export-audio]", {
     sourceHasAudio,
     audioTrackCount: exportAudioTracksCount,
@@ -907,8 +912,6 @@ export async function renderProjectClientSide(
     mutedSectionsCount,
     finalStreamHasAudio,
     audioPath: audio.path,
-    mime: mime.mime,
-    mimeSupportsAudio,
   });
 
   // Visible warning when the export will be silent (surfaced via onProgress;
@@ -921,37 +924,43 @@ export async function renderProjectClientSide(
       sourceHasAudio === true
         ? "Your recording has audio, but this browser couldn't capture it for export. Try Chrome or Edge."
         : "This export has no audio track. If your recording has narration and this looks wrong, try Chrome or Edge.";
-  } else if (!mimeSupportsAudio) {
-    audioWarning =
-      "This browser's recording format can't store audio, so the export will be silent. Try Chrome or Edge.";
   }
 
-  const audioBitsPerSecond = 128_000;
-  const videoBitsPerSecond = resolution === "4K" ? 12_000_000 : 6_000_000;
-  let recorder: MediaRecorder;
-  try {
-    recorder = new MediaRecorder(outputStream, {
-      mimeType: mime.mime,
-      videoBitsPerSecond,
-      audioBitsPerSecond,
+  // ── Stage: recorder (sink selection by container) ────────────────────────
+  // The render loop + `outputStream` are container-agnostic. WebM is recorded by
+  // MediaRecorder (reliable); MP4 is encoded by the WebCodecs sink (avoids
+  // Chrome's unstable MediaRecorder MP4 muxer). MP4 falls back to WebM when the
+  // browser lacks WebCodecs / MediaStreamTrackProcessor, with a non-fatal notice.
+  const requestedContainer: ExportContainer = input.container ?? "webm";
+  const videoBitsPerSecond = videoBitrateFor(resolution, fps);
+  const mp4Capable =
+    requestedContainer === "mp4"
+      ? await canEncodeMp4({ width: canvasW, height: canvasH, fps })
+      : false;
+
+  let sink: ExportSink;
+  if (requestedContainer === "mp4" && mp4Capable) {
+    sink = createMp4Sink({
+      outputStream,
+      width: canvasW,
+      height: canvasH,
+      fps,
+      videoBitrate: videoBitsPerSecond,
+      audioBitrate: AUDIO_BITRATE_AAC,
+      currentTime: () => video.currentTime,
     });
-  } catch (err) {
-    // Constructing with audio was rejected — degrade to a video-only file so the
-    // user still gets an export, and warn that it will be silent.
-    console.error(
-      "[export-recorder] rejected the audio+video stream; retrying video only",
-      describeError(err)
-    );
-    for (const t of outputStream.getAudioTracks()) outputStream.removeTrack(t);
-    audio.cleanup?.();
-    audioWarning =
-      audioWarning ??
-      "Audio couldn't be added to this export in this browser, so it's video-only. Try Chrome or Edge.";
-    try {
-      recorder = new MediaRecorder(outputStream, { mimeType: mime.mime, videoBitsPerSecond });
-    } catch (err2) {
-      // Even video-only construction failed — there's no recorder to fall back
-      // to. Stop the capture tracks and fail with a clear recorder-stage error.
+  } else {
+    if (requestedContainer === "mp4") {
+      audioWarning =
+        audioWarning ??
+        "MP4 isn't supported in this browser, so the export was rendered as WebM.";
+    }
+    if (!webmMime) {
+      onProgress({
+        stage: "unsupported",
+        pct: 0,
+        message: "Your browser does not support video export. Try Chrome or Edge.",
+      });
       for (const t of outputStream.getTracks()) {
         try {
           t.stop();
@@ -961,70 +970,37 @@ export async function renderProjectClientSide(
       }
       throw new ExportError(
         "recorder",
-        "This browser couldn't start a video recorder for the export. Try Chrome or Edge.",
-        { cause: err2, detail: { mime: mime.mime } }
+        "This browser can't export video (no supported recorder). Try Chrome or Edge.",
+        { detail: { supported: supportedMimes() } }
       );
     }
+    sink = createWebmSink({
+      outputStream,
+      mimeType: webmMime.mime,
+      videoBitsPerSecond,
+      audioBitsPerSecond: AUDIO_BITRATE_OPUS,
+      onAudioDropped: () => {
+        audio.cleanup?.();
+        audioWarning =
+          audioWarning ??
+          "Audio couldn't be added to this export in this browser, so it's video-only. Try Chrome or Edge.";
+      },
+      currentTime: () => video.currentTime,
+      audioPath: audio.path,
+    });
   }
+  const actualContainer = sink.container;
+  // The sink resolves this with the encoded blob (or rejects with an ExportError).
+  const recordedPromise = sink.done;
   console.info("[export-recorder]", {
-    mimeType: mime.mime,
-    isTypeSupported:
-      typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(mime.mime),
-    recorderState: recorder.state,
+    requestedContainer,
+    container: actualContainer,
+    videoCodec: sink.videoCodec,
+    mimeType: sink.mimeType,
     videoBitsPerSecond,
-    audioBitsPerSecond: outputStream.getAudioTracks().length ? audioBitsPerSecond : 0,
-  });
-
-  const chunks: Blob[] = [];
-  recorder.ondataavailable = (e) => {
-    if (e.data && e.data.size > 0) chunks.push(e.data);
-  };
-
-  const recordedPromise = new Promise<Blob>((resolve, reject) => {
-    recorder.onstop = () => resolve(new Blob(chunks, { type: mime.mime }));
-    recorder.onerror = (e) => {
-      // Surface the REAL DOMException (+ both track readyStates) instead of a
-      // generic string, so a recurrence is diagnosable from the console.
-      const domErr = (e as unknown as { error?: DOMException }).error;
-      const detail = {
-        name: domErr?.name,
-        message: domErr?.message,
-        audioPath: audio.path,
-        recorderState: recorder.state,
-        videoTrackState: outputStream.getVideoTracks()[0]?.readyState,
-        audioTrackState: outputStream.getAudioTracks()[0]?.readyState,
-        at: +video.currentTime.toFixed(2),
-        playbackRate: video.playbackRate,
-      };
-      console.error("[export-render-loop] MediaRecorder error", detail);
-      reject(
-        new ExportError(
-          "render",
-          "The video recorder failed mid-export. This often means the source track stopped or the format isn't fully supported — try Chrome or Edge.",
-          { cause: domErr, detail }
-        )
-      );
-    };
-  });
-
-  // Mid-record track-death probe. A recorded track going `ended` WHILE recording
-  // is the failure mode behind the historical "MediaRecorder error" — log when /
-  // which so any recurrence is diagnosable. Guarded on recorder.state so the
-  // intentional track teardown during cleanup doesn't raise a false alarm.
-  audio.track?.addEventListener("ended", () => {
-    if (recorder.state === "recording") {
-      console.warn("[export] export audio track ENDED mid-record", {
-        at: +video.currentTime.toFixed(2),
-        path: audio.path,
-      });
-    }
-  });
-  outputStream.getVideoTracks()[0]?.addEventListener("ended", () => {
-    if (recorder.state === "recording") {
-      console.warn("[export] export VIDEO track ENDED mid-record", {
-        at: +video.currentTime.toFixed(2),
-      });
-    }
+    audioBitsPerSecond:
+      actualContainer === "mp4" ? AUDIO_BITRATE_AAC : AUDIO_BITRATE_OPUS,
+    hasAudio: finalStreamHasAudio,
   });
 
   // `base` (the source placement: drawW/drawH + offsetX/offsetY) and `cover`
@@ -1073,7 +1049,7 @@ export async function renderProjectClientSide(
   let rafId = 0;
   let cleanedUp = false;
   const trackCounts = () => ({
-    recorderState: recorder.state,
+    container: actualContainer,
     tracks: outputStream.getTracks().length,
     videoTracks: outputStream.getVideoTracks().length,
     audioTracks: outputStream.getAudioTracks().length,
@@ -1082,11 +1058,8 @@ export async function renderProjectClientSide(
     if (cleanedUp) return;
     cleanedUp = true;
     if (rafId) cancelAnimationFrame(rafId);
-    try {
-      if (recorder.state !== "inactive") recorder.stop();
-    } catch {
-      /* already stopped */
-    }
+    // Hard-teardown the sink (recorder / WebCodecs encoders + readers).
+    sink.dispose();
     // Stop EVERY capture track so the canvas + audio pipelines stop the CPU.
     for (const t of outputStream.getTracks()) {
       try {
@@ -1120,19 +1093,19 @@ export async function renderProjectClientSide(
   };
 
   try {
-    recorder.start(500);
+    sink.start();
   } catch (err) {
-    // start() can still throw a DOMException even though isTypeSupported passed
-    // (start-time codec/track negotiation, a track already ended). The recorder
-    // is past the cleanup definition but cleanup is otherwise only reached via
-    // the recordedPromise finally — which we never get to — so tear the pipeline
-    // down HERE (idempotent cleanup stops both track sets, closes the per-export
-    // AudioContext, and restores the preview) before surfacing a tagged error.
+    // start() can still throw even though the capability probe passed (start-time
+    // codec/track negotiation, a track already ended). Cleanup is otherwise only
+    // reached via the recordedPromise finally — which we never get to — so tear
+    // the pipeline down HERE (idempotent cleanup stops both track sets, closes
+    // the per-export AudioContext, restores the preview) before a tagged error.
     cleanup();
+    if (err instanceof ExportError) throw err;
     throw new ExportError(
       "recorder",
-      "This browser couldn't start the video recorder for the export. Try Chrome or Edge.",
-      { cause: err, detail: { mime: mime.mime } }
+      "This browser couldn't start the video encoder for the export. Try Chrome or Edge.",
+      { cause: err, detail: { container: actualContainer } }
     );
   }
   console.info("[export] started", trackCounts());
@@ -1151,13 +1124,10 @@ export async function renderProjectClientSide(
       at: +video.currentTime.toFixed(2),
     });
     if (rafId) cancelAnimationFrame(rafId);
-    // Stop the recorder so `onstop` fires and `recordedPromise` resolves —
-    // otherwise the await below hangs forever and cleanup never runs.
-    try {
-      if (recorder.state !== "inactive") recorder.stop();
-    } catch {
-      /* ignore */
-    }
+    // Stop the sink so it finalizes and `recordedPromise` (sink.done) resolves —
+    // otherwise the await below hangs forever and cleanup never runs. The partial
+    // blob is discarded below (`if (aborted) throw`).
+    sink.stop();
   };
   signal?.addEventListener("abort", abortHandler);
 
@@ -1235,7 +1205,7 @@ export async function renderProjectClientSide(
 
   const draw = () => {
     if (stopped) return;
-    // Idle while a cut-seek is in flight — recorder is paused, capture nothing.
+    // Idle while a cut-seek is in flight — sink is paused, capture nothing.
     if (seekingPastCut) {
       rafId = requestAnimationFrame(draw);
       return;
@@ -1244,11 +1214,9 @@ export async function renderProjectClientSide(
     const cut = activeCutAt(moments, video.currentTime);
     if (cut) {
       seekingPastCut = true;
-      try {
-        if (recorder.state === "recording") recorder.pause();
-      } catch {
-        /* ignore */
-      }
+      // Pause the sink so the skipped span is never captured (WebM: recorder
+      // pause; MP4: drop frames + accumulate the gap so output is shorter).
+      sink.pause();
       const from = video.currentTime;
       const to = Math.min(input.duration, cut.endTime + 1e-3);
       console.info("[export-cut]", {
@@ -1259,11 +1227,7 @@ export async function renderProjectClientSide(
       const onSeeked = () => {
         video.removeEventListener("seeked", onSeeked);
         seekingPastCut = false;
-        try {
-          if (recorder.state === "paused") recorder.resume();
-        } catch {
-          /* ignore */
-        }
+        sink.resume();
       };
       video.addEventListener("seeked", onSeeked);
       try {
@@ -1332,7 +1296,7 @@ export async function renderProjectClientSide(
 
     if (video.ended || video.currentTime >= input.duration - 0.05) {
       stopped = true;
-      recorder.stop();
+      sink.stop();
       return;
     }
 
@@ -1345,11 +1309,7 @@ export async function renderProjectClientSide(
   const safety = setTimeout(() => {
     if (!stopped) {
       stopped = true;
-      try {
-        recorder.stop();
-      } catch {
-        /* ignore */
-      }
+      sink.stop();
     }
   }, maxDurationMs);
 
@@ -1366,10 +1326,10 @@ export async function renderProjectClientSide(
     console.info("[export] canceled");
     throw new Error("Export cancelled");
   }
-  console.info("[export] completed", { size: blob.size });
+  console.info("[export] completed", { size: blob.size, container: actualContainer });
   onProgress({ stage: "rendering", pct: 1 });
 
-  return blob;
+  return { blob, container: actualContainer };
 }
 
 /**

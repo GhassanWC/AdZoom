@@ -208,6 +208,7 @@ export default function ExportsPage() {
               </Link>
               <div className="text-fog">
                 {row.format} · {row.resolution} · {row.fps}fps
+                {row.container ? ` · ${row.container.toUpperCase()}` : ""}
               </div>
               <div className="font-mono text-xs tabular-nums text-fog">
                 {fmtBytes(row.fileSize)}

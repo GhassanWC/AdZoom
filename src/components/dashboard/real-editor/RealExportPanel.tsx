@@ -32,6 +32,12 @@ import {
 } from "@/components/export/ExportProvider";
 import { resolveOutputCanvas } from "@/lib/timeline/canvas-layout";
 import { buildTimelineMap } from "@/lib/timeline/crop-speed";
+import {
+  type ExportContainer,
+  CONTAINERS,
+  DEFAULT_CONTAINER,
+  canEncodeMp4,
+} from "./export-format";
 import type { ExportFormat, FitMode } from "@/lib/firebase/schema";
 import { useStoragePlan } from "@/lib/usage/useStoragePlan";
 import { planMeetsMinimum } from "@/lib/usage/plan";
@@ -81,7 +87,33 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
 
   const [resolution, setResolution] = React.useState<"1080p" | "4K">("1080p");
   const [fps, setFps] = React.useState<30 | 60>(30);
+  const [container, setContainer] = React.useState<ExportContainer>(DEFAULT_CONTAINER);
+  // null = probing; true/false = can this browser produce a real MP4 (WebCodecs)?
+  const [mp4Supported, setMp4Supported] = React.useState<boolean | null>(null);
   const [blockedWarning, setBlockedWarning] = React.useState<string | null>(null);
+
+  // Probe MP4 capability for the SELECTED resolution/fps (4K needs a higher
+  // H.264 level than 1080p). The renderer re-checks the real canvas dims and
+  // falls back to WebM if needed, so this is just for an accurate UI affordance.
+  React.useEffect(() => {
+    let alive = true;
+    setMp4Supported(null);
+    const dims =
+      resolution === "4K"
+        ? { width: 3840, height: 2160 }
+        : { width: 1920, height: 1080 };
+    void canEncodeMp4({ ...dims, fps }).then((ok) => {
+      if (alive) setMp4Supported(ok);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [resolution, fps]);
+
+  // If MP4 turns out unsupported, snap a stale MP4 selection back to WebM.
+  React.useEffect(() => {
+    if (mp4Supported === false && container === "mp4") setContainer("webm");
+  }, [mp4Supported, container]);
 
   // The export job is shown here ONLY when it belongs to this project — a
   // background export for another project surfaces in the global pill instead.
@@ -143,7 +175,8 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
       resolution,
       fps,
       format,
-      outputFormat: `${canvasSummary} · ${resolution} · ${fps}fps`,
+      container,
+      outputFormat: `${canvasSummary} · ${resolution} · ${fps}fps · ${CONTAINERS[container].label}`,
     };
     if (!startExport(params)) {
       setBlockedWarning(
@@ -186,6 +219,53 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
           onChange={setFps}
           renderLabel={(n) => `${n}fps`}
         />
+
+        {/* Format (container) — WebM is the reliable default; MP4 is produced by
+            a WebCodecs pipeline and only offered where the browser supports it. */}
+        <div>
+          <div className="mb-2 text-[10px] font-semibold uppercase tracking-[0.18em] text-fog">
+            Format
+          </div>
+          <div className="grid grid-cols-2 gap-1 rounded-lg border border-white/10 bg-white/[0.02] p-1">
+            {(["webm", "mp4"] as const).map((c) => {
+              const mp4Disabled = c === "mp4" && mp4Supported === false;
+              const selected = container === c;
+              return (
+                <button
+                  key={c}
+                  type="button"
+                  disabled={mp4Disabled}
+                  onClick={() => !mp4Disabled && setContainer(c)}
+                  title={
+                    mp4Disabled
+                      ? "MP4 export needs Chrome or Edge (WebCodecs)."
+                      : CONTAINERS[c].description
+                  }
+                  className={cn(
+                    "rounded-md px-3 py-2 text-xs font-medium transition-colors duration-150",
+                    selected
+                      ? "bg-violet-500/20 text-violet-200 ring-1 ring-violet-400/30"
+                      : mp4Disabled
+                        ? "cursor-not-allowed text-fog/40"
+                        : "text-fog hover:bg-white/[0.04] hover:text-white"
+                  )}
+                >
+                  {CONTAINERS[c].label}
+                  {c === "mp4" && mp4Supported === false && (
+                    <span className="ml-1 text-[10px] text-fog/50">· n/a</span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+          <p className="mt-1.5 text-[10.5px] leading-relaxed text-fog/80">
+            {container === "mp4"
+              ? CONTAINERS.mp4.description
+              : mp4Supported === false
+                ? "WebM — reliable, high quality. MP4 needs Chrome or Edge."
+                : CONTAINERS.webm.description}
+          </p>
+        </div>
 
         {/* Output canvas — aspect ratio + fit + background now live in the
             global Canvas panel (one source of truth for preview AND export).

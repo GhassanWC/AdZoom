@@ -1301,6 +1301,8 @@ export interface ExportDoc {
   format: ExportFormat;
   resolution: "1080p" | "4K";
   fps: 30 | 60;
+  /** Output container — "webm" (default) or "mp4". Absent on pre-MP4 docs. */
+  container?: "webm" | "mp4";
   exportUrl?: string;
   storagePath?: string;
   fileSize?: number;

@@ -15,6 +15,10 @@ import {
   isAbortError,
   type ExportStage,
 } from "@/components/dashboard/real-editor/export-error";
+import {
+  type ExportContainer,
+  containerExt,
+} from "@/components/dashboard/real-editor/export-format";
 import type {
   DetectedMoment,
   EffectsSettings,
@@ -84,6 +88,8 @@ export interface ExportJob {
   /** In-memory blob URL for an instant download this session. */
   localBlobUrl?: string;
   error?: string;
+  /** Container actually produced (MP4 may fall back to WebM) — drives download naming. */
+  container?: ExportContainer;
   /** Which stage failed — drives the UI hint + Details panel. */
   errorStage?: ExportStage;
   /** Non-secret diagnostics for the Details panel + bug reports. */
@@ -106,6 +112,9 @@ export interface ExportRenderParams {
   resolution: "1080p" | "4K";
   fps: 30 | 60;
   format: ExportFormat;
+  /** Desired output container ("webm" | "mp4"). MP4 needs WebCodecs; if absent
+   *  in this browser it falls back to WebM. */
+  container: ExportContainer;
   /** Human label for the job/pill. */
   outputFormat: string;
 }
@@ -123,6 +132,14 @@ interface ExportContextValue {
 const Ctx = React.createContext<ExportContextValue | null>(null);
 
 const ACTIVE: ExportStatusUI[] = ["preparing", "rendering", "uploading"];
+
+/** Swap (or append) a path's extension to match the produced container. */
+function withContainerExt(path: string, container: ExportContainer): string {
+  const ext = containerExt(container);
+  return /\.(webm|mp4)$/i.test(path)
+    ? path.replace(/\.(webm|mp4)$/i, `.${ext}`)
+    : `${path}.${ext}`;
+}
 
 /** Origin + path of a URL with the query string (and any token) stripped. */
 function safeUrlInfo(url: string | undefined): {
@@ -252,6 +269,7 @@ export function ExportProvider({ children }: { children: React.ReactNode }) {
         cutsCount,
         speedCount,
         cameraEditCount,
+        container: params.container,
         mimeType: pickedMimeType(),
       });
       void trackEvent(
@@ -302,6 +320,7 @@ export function ExportProvider({ children }: { children: React.ReactNode }) {
                 resolution: params.resolution,
                 format: params.format,
                 fps: params.fps,
+                container: params.container,
               }),
             });
           } catch (netErr) {
@@ -388,7 +407,7 @@ export function ExportProvider({ children }: { children: React.ReactNode }) {
         }
 
         setJob((j) => (j ? { ...j, status: "rendering", progress: 0 } : j));
-        const blob = await renderProjectClientSide({
+        const { blob, container: actualContainer } = await renderProjectClientSide({
           uid,
           projectId: params.projectId,
           projectTitle: params.projectTitle,
@@ -399,6 +418,7 @@ export function ExportProvider({ children }: { children: React.ReactNode }) {
           resolution: params.resolution,
           fps: params.fps,
           format: params.format,
+          container: params.container,
           visualAnalysis: params.visualAnalysis,
           sourceCrop: params.sourceCrop,
           applyWatermark: !!applyWatermark,
@@ -429,8 +449,9 @@ export function ExportProvider({ children }: { children: React.ReactNode }) {
           );
         }
         blobUrlRef.current = blobUrl;
-        // Record the rendered byte size so an upload-stage failure's Details
-        // panel can show "the render succeeded, the save failed".
+        // Record the rendered byte size + the container ACTUALLY produced (MP4
+        // may have fallen back to WebM) so downloads are named correctly and an
+        // upload-stage failure's Details panel can show "render OK, save failed".
         setJob((j) =>
           j
             ? {
@@ -438,17 +459,23 @@ export function ExportProvider({ children }: { children: React.ReactNode }) {
                 status: "uploading",
                 progress: 0,
                 localBlobUrl: blobUrl,
+                container: actualContainer,
                 debug: { ...j.debug, outputSize: blob.size },
               }
             : j
         );
 
-        // ── 3. Upload to the path the permit blessed (persistent download) ──
+        // ── 3. Upload to the permit's path, but with the extension of the
+        // container actually produced (the permit assumed the REQUESTED one; a
+        // rare MP4→WebM fallback would otherwise upload webm bytes to a .mp4
+        // path). Firestore rules don't pin storagePath to the permit's expected
+        // path, so this is allowed. ──
+        const finalUploadPath = withContainerExt(uploadPath, actualContainer);
         const { downloadURL } = await uploadExport({
           uid,
           projectId: params.projectId,
           exportId,
-          uploadPath,
+          uploadPath: finalUploadPath,
           blob,
           signal: controller.signal,
           onProgress: (pct) =>
@@ -585,7 +612,8 @@ export function ExportProvider({ children }: { children: React.ReactNode }) {
     if (!url) return;
     const a = document.createElement("a");
     a.href = url;
-    a.download = `${job?.projectTitle || "framevo-export"}.${pickedMimeExt()}`;
+    const ext = job?.container ? containerExt(job.container) : pickedMimeExt();
+    a.download = `${job?.projectTitle || "framevo-export"}.${ext}`;
     if (!localUrl) {
       // Remote Storage URL — open in a new tab so the browser handles it.
       a.target = "_blank";
@@ -597,7 +625,13 @@ export function ExportProvider({ children }: { children: React.ReactNode }) {
       { format: job?.outputFormat, source: localUrl ? "local" : "storage" },
       { projectId: job?.projectId }
     );
-  }, [job?.downloadUrl, job?.projectTitle, job?.outputFormat, job?.projectId]);
+  }, [
+    job?.downloadUrl,
+    job?.projectTitle,
+    job?.outputFormat,
+    job?.projectId,
+    job?.container,
+  ]);
 
   // Warn before leaving while a render/upload is in flight (mirrors recording).
   React.useEffect(() => {
