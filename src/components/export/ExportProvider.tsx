@@ -418,7 +418,16 @@ export function ExportProvider({ children }: { children: React.ReactNode }) {
 
         // Keep the rendered blob for an instant, in-session download.
         outputSizeForLog = blob.size;
-        const blobUrl = URL.createObjectURL(blob);
+        let blobUrl: string;
+        try {
+          blobUrl = URL.createObjectURL(blob);
+        } catch (err) {
+          throw new ExportError(
+            "upload",
+            "The export rendered, but the browser couldn't prepare the file (low memory?). Try a lower resolution.",
+            { cause: err, detail: { bytes: blob.size } }
+          );
+        }
         blobUrlRef.current = blobUrl;
         // Record the rendered byte size so an upload-stage failure's Details
         // panel can show "the render succeeded, the save failed".

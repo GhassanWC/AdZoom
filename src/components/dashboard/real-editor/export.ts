@@ -768,7 +768,16 @@ export async function renderProjectClientSide(
   ctx.fillRect(0, 0, canvasW, canvasH);
 
   // canvas.captureStream() is VIDEO ONLY — the source audio is mixed in below.
-  const canvasStream = canvas.captureStream(fps);
+  let canvasStream: MediaStream;
+  try {
+    canvasStream = canvas.captureStream(fps);
+  } catch (err) {
+    throw new ExportError(
+      "canvas",
+      "Couldn't capture the export canvas in this browser. Try Chrome or Edge.",
+      { cause: err }
+    );
+  }
 
   // Rewind to the start and UNMUTE the element BEFORE we tap its audio, so the
   // captured track isn't a leftover muted / mid-seek state. We remember the
@@ -779,12 +788,61 @@ export async function renderProjectClientSide(
   video.pause();
   video.currentTime = 0;
   video.muted = false;
-  await new Promise<void>((resolve) => {
-    const onSeek = () => {
+  // The pre-roll seek runs BEFORE the draw loop's abort handler is registered,
+  // so it must honour cancellation + a stall timeout itself — otherwise a cancel
+  // during pre-roll (or a decode stall on a flaky source) hangs the export in
+  // "rendering" forever instead of resolving to "canceled"/a tagged error.
+  await new Promise<void>((resolve, reject) => {
+    let done = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    function teardown() {
       video.removeEventListener("seeked", onSeek);
+      signal?.removeEventListener("abort", onAbort);
+      if (timer) clearTimeout(timer);
+    }
+    function onSeek() {
+      if (done) return;
+      done = true;
+      teardown();
       resolve();
-    };
+    }
+    function onAbort() {
+      if (done) return;
+      done = true;
+      teardown();
+      for (const t of canvasStream.getTracks()) {
+        try {
+          t.stop();
+        } catch {
+          /* ignore */
+        }
+      }
+      reject(new DOMException("Aborted", "AbortError"));
+    }
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
+    timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      teardown();
+      for (const t of canvasStream.getTracks()) {
+        try {
+          t.stop();
+        } catch {
+          /* ignore */
+        }
+      }
+      reject(
+        new ExportError(
+          "load-video",
+          "The source video stalled while preparing to export. It may be unavailable — reopen the project and try again."
+        )
+      );
+    }, 15000);
     video.addEventListener("seeked", onSeek);
+    signal?.addEventListener("abort", onAbort);
   });
 
   // ── Stage: canvas (one-time taint probe) ─────────────────────────────────
@@ -1061,7 +1119,22 @@ export async function renderProjectClientSide(
     console.info("[export] cleanup-complete", trackCounts());
   };
 
-  recorder.start(500);
+  try {
+    recorder.start(500);
+  } catch (err) {
+    // start() can still throw a DOMException even though isTypeSupported passed
+    // (start-time codec/track negotiation, a track already ended). The recorder
+    // is past the cleanup definition but cleanup is otherwise only reached via
+    // the recordedPromise finally — which we never get to — so tear the pipeline
+    // down HERE (idempotent cleanup stops both track sets, closes the per-export
+    // AudioContext, and restores the preview) before surfacing a tagged error.
+    cleanup();
+    throw new ExportError(
+      "recorder",
+      "This browser couldn't start the video recorder for the export. Try Chrome or Edge.",
+      { cause: err, detail: { mime: mime.mime } }
+    );
+  }
   console.info("[export] started", trackCounts());
 
   onProgress({ stage: "rendering", pct: 0, warning: audioWarning });
@@ -1851,7 +1924,16 @@ export async function uploadExport({
     if (signal?.aborted) throw err;
     const d = describeError(err);
     console.error("[export-upload] failed", { storagePath: uploadPath, ...d });
-    throw new ExportError("upload", friendlyStorageMessage(d.code, d.message), {
+    // The bytes upload + getDownloadURL throw storage/* codes; the completion
+    // setDoc/updateDoc throw Firestore codes (permission-denied / unavailable /
+    // failed-precondition). Map each to an accurate reason — a Firestore failure
+    // means the render + upload SUCCEEDED and only the record write failed, so
+    // don't dress it up in storage-flavoured text.
+    const isStorage = (d.code ?? "").startsWith("storage/");
+    const friendly = isStorage
+      ? friendlyStorageMessage(d.code, d.message)
+      : "Your export uploaded, but saving its record failed (permission or network). Please retry.";
+    throw new ExportError("upload", friendly, {
       cause: err,
       detail: { code: d.code, storagePath: uploadPath, bytes: blob.size },
     });
