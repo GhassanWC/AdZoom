@@ -16,6 +16,8 @@ import {
   Frame,
   Pencil,
   Scissors,
+  Copy,
+  Check,
 } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { cn } from "@/lib/cn";
@@ -24,6 +26,7 @@ import { BUILTIN_PRESETS_BY_ID } from "@/lib/presets";
 import { pickedMimeAvailable } from "./export";
 import {
   useExport,
+  type ExportJob,
   type ExportRenderParams,
   type ExportStatusUI,
 } from "@/components/export/ExportProvider";
@@ -390,9 +393,14 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
         )}
 
         {(blockedWarning || myJob?.status === "failed") && (
-          <div className="flex items-start gap-2 rounded-xl border border-rose-400/30 bg-rose-500/[0.06] px-4 py-3 text-xs text-rose-200">
-            <AlertCircle size={12} className="mt-0.5 shrink-0" />
-            <span>{blockedWarning || myJob?.error || "Export failed."}</span>
+          <div className="space-y-2 rounded-xl border border-rose-400/30 bg-rose-500/[0.06] px-4 py-3 text-xs text-rose-200">
+            <div className="flex items-start gap-2">
+              <AlertCircle size={12} className="mt-0.5 shrink-0" />
+              <span>{blockedWarning || myJob?.error || "Export failed."}</span>
+            </div>
+            {myJob?.status === "failed" && (
+              <ExportFailureDetails job={myJob} projectId={project.id} />
+            )}
           </div>
         )}
 
@@ -461,6 +469,81 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
         </p>
       </div>
     </>
+  );
+}
+
+/**
+ * Collapsible diagnostics for a failed export. Surfaces the stage + non-secret
+ * detail (the same fields in the `[export-failed]` console log) so a user can
+ * copy a useful bug report. Deliberately shows NO tokens / signed URLs. The
+ * failed state is never auto-hidden — it stays until the user dismisses or
+ * retries.
+ */
+function ExportFailureDetails({
+  job,
+  projectId,
+}: {
+  job: ExportJob;
+  projectId: string;
+}) {
+  const [copied, setCopied] = React.useState(false);
+  const d = job.debug;
+  const rows: Array<[string, string | undefined]> = [
+    ["Stage", job.errorStage ?? d?.stage],
+    ["Reason", job.error],
+    ["Error", [d?.name, d?.code].filter(Boolean).join(" · ") || undefined],
+    ["Project", projectId],
+    ["Export ID", job.id && job.id !== "pending" ? job.id : undefined],
+    ["Format", job.outputFormat],
+    ["Recorder MIME", d?.mimeType ?? undefined],
+    [
+      "Output size",
+      typeof d?.outputSize === "number"
+        ? `${(d.outputSize / (1024 * 1024)).toFixed(1)} MB`
+        : undefined,
+    ],
+    ["Browser", d?.browser],
+  ];
+  const visible = rows.filter(([, v]) => v);
+
+  const copy = () => {
+    const text = visible.map(([k, v]) => `${k}: ${v}`).join("\n");
+    void navigator.clipboard?.writeText(text).then(
+      () => {
+        setCopied(true);
+        window.setTimeout(() => setCopied(false), 1500);
+      },
+      () => {
+        /* clipboard blocked — ignore */
+      }
+    );
+  };
+
+  return (
+    <details className="rounded-lg border border-rose-400/20 bg-rose-500/[0.04] px-3 py-2 text-[11px] text-rose-100/90">
+      <summary className="flex cursor-pointer select-none items-center justify-between gap-2 text-rose-200/90">
+        <span className="font-medium">Details</span>
+        <button
+          type="button"
+          onClick={(e) => {
+            e.preventDefault();
+            copy();
+          }}
+          className="inline-flex items-center gap-1 rounded-md border border-rose-300/30 px-2 py-0.5 text-[10px] font-medium text-rose-100 transition-colors hover:bg-rose-400/10"
+        >
+          {copied ? <Check size={10} /> : <Copy size={10} />}
+          {copied ? "Copied" : "Copy"}
+        </button>
+      </summary>
+      <dl className="mt-2 space-y-1">
+        {visible.map(([k, v]) => (
+          <div key={k} className="flex gap-2">
+            <dt className="w-24 shrink-0 text-rose-200/60">{k}</dt>
+            <dd className="min-w-0 break-words font-mono text-rose-100/90">{v}</dd>
+          </div>
+        ))}
+      </dl>
+    </details>
   );
 }
 

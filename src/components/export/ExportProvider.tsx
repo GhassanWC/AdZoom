@@ -7,7 +7,14 @@ import {
   renderProjectClientSide,
   uploadExport,
   pickedMimeExt,
+  pickedMimeType,
 } from "@/components/dashboard/real-editor/export";
+import {
+  ExportError,
+  describeError,
+  isAbortError,
+  type ExportStage,
+} from "@/components/dashboard/real-editor/export-error";
 import type {
   DetectedMoment,
   EffectsSettings,
@@ -38,6 +45,29 @@ export type ExportStatusUI =
   | "failed"
   | "canceled";
 
+/**
+ * NON-SECRET diagnostic snapshot attached to a failed (or completed) job,
+ * surfaced in the export panel's collapsible "Details" section and the
+ * `[export-failed]` console log. Deliberately excludes anything sensitive —
+ * no tokens, no signed URLs, no auth headers.
+ */
+export interface ExportDebug {
+  /** Which pipeline stage threw. */
+  stage?: ExportStage;
+  /** Underlying error name (e.g. "SecurityError", "FirebaseError"). */
+  name?: string;
+  /** SDK error code (e.g. "storage/unauthorized"). */
+  code?: string;
+  /** Recorder MIME the browser would use. */
+  mimeType?: string | null;
+  /** Rendered byte size when known (e.g. an upload-stage failure). */
+  outputSize?: number;
+  /** Short UA string for the bug report. */
+  browser?: string;
+  /** Full stack — shown collapsed, copy-able. */
+  stack?: string;
+}
+
 export interface ExportJob {
   id: string;
   projectId: string;
@@ -54,6 +84,10 @@ export interface ExportJob {
   /** In-memory blob URL for an instant download this session. */
   localBlobUrl?: string;
   error?: string;
+  /** Which stage failed — drives the UI hint + Details panel. */
+  errorStage?: ExportStage;
+  /** Non-secret diagnostics for the Details panel + bug reports. */
+  debug?: ExportDebug;
   /** Non-fatal renderer notice (e.g. "this export will be silent"). */
   warning?: string;
 }
@@ -89,6 +123,22 @@ interface ExportContextValue {
 const Ctx = React.createContext<ExportContextValue | null>(null);
 
 const ACTIVE: ExportStatusUI[] = ["preparing", "rendering", "uploading"];
+
+/** Origin + path of a URL with the query string (and any token) stripped. */
+function safeUrlInfo(url: string | undefined): {
+  exists: boolean;
+  origin?: string;
+  ext?: string;
+} {
+  if (!url) return { exists: false };
+  try {
+    const u = new URL(url);
+    const ext = u.pathname.split(".").pop()?.toLowerCase();
+    return { exists: true, origin: u.origin, ext };
+  } catch {
+    return { exists: true };
+  }
+}
 
 /** Load the offscreen video for export; resolves once a frame is decodable. */
 function loadExportVideo(
@@ -168,9 +218,41 @@ export function ExportProvider({ children }: { children: React.ReactNode }) {
         outputFormat: params.outputFormat,
         startedAt: Date.now(),
       });
-      console.info("[export] started", {
+      const moms = params.moments ?? [];
+      const cutsCount = moms.filter(
+        (m) => m.effectType === "cut" && m.cut?.active !== false
+      ).length;
+      const speedCount = moms.filter((m) => m.effectType === "speed-up").length;
+      const cameraEditCount = moms.filter(
+        (m) =>
+          m.effectType === "zoom" ||
+          m.effectType === "cursor-focus" ||
+          m.effectType === "crop" ||
+          m.effectType === "click-highlight"
+      ).length;
+      const src = safeUrlInfo(params.originalVideoUrl);
+      console.info("[export-start]", {
         projectId: params.projectId,
+        userId: uid ?? null,
+        duration: params.duration,
+        sourceUrlExists: src.exists,
+        sourceOrigin: src.origin, // origin only — never the token-bearing URL
+        sourceType: src.ext,
+        resolution: params.resolution,
+        fps: params.fps,
+        format: params.format,
         outputFormat: params.outputFormat,
+        canvasFit: params.effects.outputCanvas
+          ? `${params.effects.outputCanvas.aspectRatio}/${params.effects.outputCanvas.fitMode}`
+          : "source",
+        sourceCrop: params.sourceCrop?.enabled
+          ? { reason: params.sourceCrop.reason ?? "manual" }
+          : "none",
+        momentsCount: moms.length,
+        cutsCount,
+        speedCount,
+        cameraEditCount,
+        mimeType: pickedMimeType(),
       });
       void trackEvent(
         EVENTS.EXPORT_STARTED,
@@ -178,58 +260,132 @@ export function ExportProvider({ children }: { children: React.ReactNode }) {
         { projectId: params.projectId }
       );
 
+      // Captured for the [export-failed] log even when the throw happens deep in
+      // a stage (block-scoped consts aren't reachable from the catch).
+      let exportIdForLog: string | undefined;
+      let outputSizeForLog: number | undefined;
+
       try {
-        if (!uid) throw new Error("Sign in to export.");
+        if (!uid) throw new ExportError("permit", "Sign in to export.");
         if (!params.originalVideoUrl) {
-          throw new Error("Project has no source video.");
+          throw new ExportError("load-video", "This project has no source video to export.");
         }
 
         // ── 1. Server permit (plan + monthly cap; locks resolution/watermark) ──
-        const token = await getIdToken();
-        if (!token) throw new Error("Sign in to export.");
-        const permitRes = await fetch("/api/billing/export-permit", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${token}`,
-          },
-          body: JSON.stringify({
-            projectId: params.projectId,
-            projectTitle: params.projectTitle,
-            resolution: params.resolution,
-            format: params.format,
-            fps: params.fps,
-          }),
-        });
-        const permitJson = (await permitRes.json()) as {
-          ok?: boolean;
-          exportId?: string;
-          uploadPath?: string;
-          applyWatermark?: boolean;
-          error?: string;
-          kind?: "plan_required" | "limit_reached";
-          used?: number;
-          limit?: number;
-        };
-        if (!permitRes.ok || !permitJson.ok) {
-          const friendly =
-            permitJson.kind === "plan_required"
-              ? "Pro plan required for 4K export. Upgrade in /pricing."
-              : permitJson.kind === "limit_reached"
-                ? `Export limit reached (${permitJson.used}/${permitJson.limit}). Upgrade to keep exporting.`
-                : permitJson.error || `Export blocked (${permitRes.status})`;
-          throw new Error(friendly);
-        }
-        const { exportId, uploadPath, applyWatermark } = permitJson;
-        if (!exportId || !uploadPath) {
-          throw new Error("Permit was missing exportId or uploadPath.");
-        }
+        const { exportId, uploadPath, applyWatermark } = await (async () => {
+          // `getIdToken()` hits Firebase Auth and can throw a raw, opaque error
+          // ("auth/internal-error", network) — a prime source of the bare
+          // "Internal Error" report. Tag it to the permit stage so the user gets
+          // an actionable message, not the SDK string.
+          let token: string | null;
+          try {
+            token = await getIdToken();
+          } catch (tokErr) {
+            throw new ExportError(
+              "permit",
+              "Couldn't verify your session for export. Sign out and back in, then retry.",
+              { cause: tokErr }
+            );
+          }
+          if (!token) throw new ExportError("permit", "Sign in to export.");
+          let permitRes: Response;
+          try {
+            permitRes = await fetch("/api/billing/export-permit", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${token}`,
+              },
+              body: JSON.stringify({
+                projectId: params.projectId,
+                projectTitle: params.projectTitle,
+                resolution: params.resolution,
+                format: params.format,
+                fps: params.fps,
+              }),
+            });
+          } catch (netErr) {
+            throw new ExportError(
+              "permit",
+              "Couldn't reach the export service. Check your connection and retry.",
+              { cause: netErr }
+            );
+          }
+          // The server returns JSON on success AND on its handled errors; a raw
+          // 500 (function crash) can return HTML, so guard the parse.
+          let permitJson: {
+            ok?: boolean;
+            exportId?: string;
+            uploadPath?: string;
+            applyWatermark?: boolean;
+            error?: string;
+            kind?: "plan_required" | "limit_reached";
+            used?: number;
+            limit?: number;
+          };
+          try {
+            permitJson = await permitRes.json();
+          } catch (parseErr) {
+            throw new ExportError(
+              "permit",
+              `The export service returned an unexpected response (${permitRes.status}). Please retry.`,
+              { cause: parseErr, detail: { status: permitRes.status } }
+            );
+          }
+          console.info("[export-permit]", {
+            started: true,
+            status: permitRes.status,
+            success: permitRes.ok && !!permitJson.ok,
+            kind: permitJson.kind,
+            message: permitJson.error,
+          });
+          if (!permitRes.ok || !permitJson.ok) {
+            const friendly =
+              permitJson.kind === "plan_required"
+                ? "Pro plan required for 4K export. Upgrade in /pricing."
+                : permitJson.kind === "limit_reached"
+                  ? `Export limit reached (${permitJson.used}/${permitJson.limit}). Upgrade to keep exporting.`
+                  : permitJson.error || `Export blocked (${permitRes.status})`;
+            throw new ExportError("permit", friendly, {
+              detail: { status: permitRes.status, kind: permitJson.kind },
+            });
+          }
+          if (!permitJson.exportId || !permitJson.uploadPath) {
+            throw new ExportError(
+              "permit",
+              "The export permit was incomplete (missing id or upload path). Please retry."
+            );
+          }
+          return {
+            exportId: permitJson.exportId,
+            uploadPath: permitJson.uploadPath,
+            applyWatermark: permitJson.applyWatermark,
+          };
+        })();
+        exportIdForLog = exportId;
         setJob((j) => (j ? { ...j, id: exportId } : j));
 
         // ── 2. Render on the provider's OWN offscreen video (decoupled) ──
         const video = offscreenVideoRef.current;
-        if (!video) throw new Error("Export video element not ready.");
-        await loadExportVideo(video, params.originalVideoUrl, controller.signal);
+        if (!video) {
+          throw new ExportError("load-video", "The export video element isn't ready. Reload and retry.");
+        }
+        console.info("[export-load-video]", {
+          started: true,
+          sourceOrigin: src.origin,
+          sourceType: src.ext,
+        });
+        try {
+          await loadExportVideo(video, params.originalVideoUrl, controller.signal);
+        } catch (loadErr) {
+          if (controller.signal.aborted) throw loadErr; // cancel — handled below
+          const d = describeError(loadErr);
+          throw new ExportError(
+            "load-video",
+            "The source video couldn't be loaded for export. It may have expired or be unavailable — reopen the project and try again.",
+            { cause: loadErr, detail: { name: d.name, mediaErrorCode: video.error?.code } }
+          );
+        }
 
         setJob((j) => (j ? { ...j, status: "rendering", progress: 0 } : j));
         const blob = await renderProjectClientSide({
@@ -261,10 +417,21 @@ export function ExportProvider({ children }: { children: React.ReactNode }) {
         });
 
         // Keep the rendered blob for an instant, in-session download.
+        outputSizeForLog = blob.size;
         const blobUrl = URL.createObjectURL(blob);
         blobUrlRef.current = blobUrl;
+        // Record the rendered byte size so an upload-stage failure's Details
+        // panel can show "the render succeeded, the save failed".
         setJob((j) =>
-          j ? { ...j, status: "uploading", progress: 0, localBlobUrl: blobUrl } : j
+          j
+            ? {
+                ...j,
+                status: "uploading",
+                progress: 0,
+                localBlobUrl: blobUrl,
+                debug: { ...j.debug, outputSize: blob.size },
+              }
+            : j
         );
 
         // ── 3. Upload to the path the permit blessed (persistent download) ──
@@ -304,7 +471,7 @@ export function ExportProvider({ children }: { children: React.ReactNode }) {
           href: "/dashboard/exports",
         });
       } catch (err) {
-        if (controller.signal.aborted) {
+        if (controller.signal.aborted || isAbortError(err)) {
           console.info("[export] canceled", { projectId: params.projectId });
           setJob((j) => (j ? { ...j, status: "canceled" } : j));
           void trackEvent(
@@ -313,19 +480,64 @@ export function ExportProvider({ children }: { children: React.ReactNode }) {
             { projectId: params.projectId }
           );
         } else {
-          const msg = err instanceof Error ? err.message : "Export failed.";
-          console.info("[export] failed", { projectId: params.projectId, msg });
-          setJob((j) => (j ? { ...j, status: "failed", error: msg } : j));
+          // Stage-tagged, human reason for the UI; full detail for the console.
+          const stage: ExportStage =
+            err instanceof ExportError ? err.stage : "unknown";
+          const d = describeError(err);
+          const reason = d.message || "Export failed.";
+          const debug: ExportDebug = {
+            stage,
+            name: d.name,
+            code: d.code,
+            mimeType: pickedMimeType(),
+            outputSize: outputSizeForLog,
+            browser:
+              typeof navigator !== "undefined"
+                ? navigator.userAgent.slice(0, 180)
+                : undefined,
+            stack: d.stack,
+          };
+          // Full failure object to the console — stage, name, code, message,
+          // stack, cause — so production failures are diagnosable end to end.
+          console.error("[export-failed]", {
+            projectId: params.projectId,
+            exportId: exportIdForLog,
+            stage,
+            name: d.name,
+            code: d.code,
+            message: reason,
+            outputSize: outputSizeForLog,
+            mimeType: debug.mimeType,
+            browser: debug.browser,
+            stack: d.stack,
+            cause: err instanceof ExportError ? err.cause : err,
+          });
+          setJob((j) =>
+            j
+              ? {
+                  ...j,
+                  status: "failed",
+                  error: reason,
+                  errorStage: stage,
+                  debug: { ...j.debug, ...debug },
+                }
+              : j
+          );
           void trackEvent(
             EVENTS.EXPORT_FAILED,
-            { format: params.outputFormat, message: msg.slice(0, 200) },
+            {
+              format: params.outputFormat,
+              stage,
+              code: d.code,
+              message: reason.slice(0, 200),
+            },
             { projectId: params.projectId }
           );
           notifications.push({
             id: `export-failed:${params.projectId}:${Date.now()}`,
             kind: "export-failed",
             title: "Export failed",
-            body: `${params.projectTitle || "Untitled"} — ${msg}`,
+            body: `${params.projectTitle || "Untitled"} — ${reason}`,
             href: `/dashboard/projects/${params.projectId}`,
           });
         }

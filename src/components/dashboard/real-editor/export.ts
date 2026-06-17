@@ -31,8 +31,13 @@ import {
   DEFAULT_SPEED,
 } from "@/lib/timeline/crop-speed";
 import { probeVideoBottomBand } from "@/lib/recording/health-check";
-import { resolveSourceRect } from "@/lib/timeline/source-crop";
+import { resolveSourceRect, type SourceRect } from "@/lib/timeline/source-crop";
 import { drawClickHighlight } from "@/lib/timeline/click-highlight";
+import {
+  ExportError,
+  describeError,
+  friendlyStorageMessage,
+} from "./export-error";
 import type {
   BackgroundMode,
   DetectedMoment,
@@ -82,6 +87,64 @@ function pickMime(): { mime: string; ext: string } | null {
     }
   }
   return null;
+}
+
+/** Diagnostics: which of the preferred MIMEs this browser actually supports. */
+function supportedMimes(): Record<string, boolean> {
+  const out: Record<string, boolean> = {};
+  if (typeof MediaRecorder === "undefined") return out;
+  for (const m of PREFERRED_MIMES) out[m] = MediaRecorder.isTypeSupported(m);
+  return out;
+}
+
+/**
+ * Resolve the effective source rectangle AND guarantee it's a valid 9-arg
+ * `drawImage` source before any frame is drawn. `resolveSourceRect` already
+ * clamps a configured crop inside the frame, but a zero-dimension / non-finite
+ * video (a source that never decoded — expired URL, decode error) would yield a
+ * degenerate rect that silently produces a black or broken export. This is the
+ * single guard the prompt asks for: every `sx/sy/sw/sh` is finite, `sw > 0`,
+ * `sh > 0`, and the rect stays inside `videoWidth × videoHeight` — otherwise we
+ * fail with a clear, stage-tagged error instead of encoding garbage.
+ *
+ * Note: the legacy `recordingCleanup` arg the original spec referenced no longer
+ * exists — green-bar cleanup is now just a `SourceCrop` with
+ * `reason:"browser-bar-cleanup"`, so this takes the unified `sourceCrop` only.
+ */
+function getSafeSourceRect(
+  video: HTMLVideoElement,
+  sourceCrop: SourceCrop | undefined | null
+): SourceRect {
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  if (!Number.isFinite(vw) || !Number.isFinite(vh) || vw <= 0 || vh <= 0) {
+    throw new ExportError(
+      "canvas",
+      "The source video has no usable dimensions, so it can't be drawn for export. The video may have failed to load or expired.",
+      { detail: { videoWidth: vw, videoHeight: vh, readyState: video.readyState } }
+    );
+  }
+
+  const rect = resolveSourceRect(vw, vh, sourceCrop);
+  const { sx, sy, sWidth, sHeight } = rect;
+  const finite =
+    Number.isFinite(sx) &&
+    Number.isFinite(sy) &&
+    Number.isFinite(sWidth) &&
+    Number.isFinite(sHeight);
+
+  if (!finite || sWidth <= 0 || sHeight <= 0 || sx + sWidth > vw || sy + sHeight > vh) {
+    // resolveSourceRect should never produce this, but if a future change or a
+    // hand-edited crop does, clamp to the full frame rather than fail the whole
+    // export — full-frame is always a valid, lossless fallback.
+    console.warn("[export-canvas] invalid source rect — clamping to full frame", {
+      rect,
+      videoWidth: vw,
+      videoHeight: vh,
+    });
+    return { sx: 0, sy: 0, sWidth: vw, sHeight: vh, cropActive: false };
+  }
+  return rect;
 }
 
 // ── Export audio mixing ─────────────────────────────────────────────────────
@@ -423,7 +486,53 @@ export async function renderProjectClientSide(
     signal,
   } = input;
 
+  // ── Stage: load-video (defensive re-check) ───────────────────────────────
+  // The provider already awaited `loadeddata`, but a source that decoded a
+  // header yet has no real frame (expired signed URL, decode error, codec the
+  // UA can't play) lands here with zero dims. Catch it BEFORE we build a canvas
+  // around bogus numbers so the failure is "video couldn't be loaded", not a
+  // downstream black-frame mystery.
+  const vw0 = video.videoWidth;
+  const vh0 = video.videoHeight;
+  console.info("[export-load-video]", {
+    videoWidth: vw0,
+    videoHeight: vh0,
+    duration: video.duration,
+    readyState: video.readyState,
+    networkState: video.networkState,
+    declaredDuration: input.duration,
+    error: video.error
+      ? { code: video.error.code, message: video.error.message }
+      : null,
+  });
+  if (
+    !(vw0 > 0) ||
+    !(vh0 > 0) ||
+    video.readyState < 2 /* HAVE_CURRENT_DATA */
+  ) {
+    throw new ExportError(
+      "load-video",
+      "The source video could not be loaded for export. It may have expired or be unavailable — reopen the project and try again.",
+      {
+        detail: {
+          videoWidth: vw0,
+          videoHeight: vh0,
+          readyState: video.readyState,
+          networkState: video.networkState,
+          mediaErrorCode: video.error?.code,
+        },
+      }
+    );
+  }
+
+  // ── Stage: recorder (MIME validation + fallback) ─────────────────────────
+  // `pickMime` walks PREFERRED_MIMES in order and returns the FIRST the UA
+  // actually supports (the requested fallback). Null = none supported.
   const mime = pickMime();
+  console.info("[export-recorder] mime probe", {
+    picked: mime?.mime ?? null,
+    supported: supportedMimes(),
+  });
   if (!mime) {
     onProgress({
       stage: "unsupported",
@@ -431,18 +540,25 @@ export async function renderProjectClientSide(
       message:
         "Your browser does not support MediaRecorder for video. Try Chrome or Edge.",
     });
-    throw new Error("MediaRecorder not supported");
+    throw new ExportError(
+      "recorder",
+      "This browser can't record video (no supported MediaRecorder format). Try Chrome or Edge.",
+      { detail: { supported: supportedMimes() } }
+    );
   }
 
   onProgress({ stage: "preparing", pct: 0 });
 
-  // Source video dims — used by drawCover. Default to 16:9 if not yet known.
-  // `resolveSourceRect` skips any cropped-out areas (Frame Crop / sharing bar)
-  // so the EFFECTIVE crop rect feeds every layout helper below; cropped-out
-  // pixels never reach the canvas. No crop → full frame (zero regression).
-  const fullSourceW = video.videoWidth || 1920;
-  const fullSourceH = video.videoHeight || 1080;
-  const srcRect = resolveSourceRect(fullSourceW, fullSourceH, input.sourceCrop);
+  // Effective source rect — feeds drawCover + every layout helper below.
+  // `resolveSourceRect` (wrapped by getSafeSourceRect) skips any cropped-out
+  // areas (Frame Crop / sharing bar) so cropped-out pixels never reach the
+  // canvas. No crop → full frame (zero regression). The video is guaranteed to
+  // have real dims by the load-video guard above, so there's no dimension guess.
+  // `getSafeSourceRect` guarantees a valid 9-arg drawImage source (finite,
+  // positive, inside the frame) — it also re-validates the video has real dims
+  // (the load-video guard above already did, but a crop math regression would
+  // be caught here too, clamping to full-frame rather than encoding garbage).
+  const srcRect = getSafeSourceRect(video, input.sourceCrop);
   const sourceX = srcRect.sx;
   const sourceY = srcRect.sy;
   const sourceW = srcRect.sWidth;
@@ -508,6 +624,19 @@ export async function renderProjectClientSide(
     outCropped = out.cropped;
   }
   const debugBorders = debugBordersEnabled();
+
+  // ── Stage: canvas (prod-safe summary) ────────────────────────────────────
+  // One line, ALWAYS logged (not dev-gated like the dimension audit below), so
+  // a production "Internal Error" report carries the resolved output geometry +
+  // the exact source rect that will feed every drawImage.
+  console.info("[export-canvas]", {
+    outputWidth: canvasW,
+    outputHeight: canvasH,
+    sourceRect: { sx: sourceX, sy: sourceY, sw: sourceW, sh: sourceH },
+    canvasFit: outMode,
+    cropActive: srcRect.cropActive,
+    willCrop: outCropped,
+  });
 
   // Effective fit + background after the Smart-Fit fallback decision. The
   // background layer fills the whole canvas behind the (crisp) video whenever
@@ -624,7 +753,13 @@ export async function renderProjectClientSide(
   canvas.width = canvasW;
   canvas.height = canvasH;
   const ctx = canvas.getContext("2d", { alpha: false });
-  if (!ctx) throw new Error("Could not get 2D context");
+  if (!ctx) {
+    throw new ExportError(
+      "canvas",
+      "Couldn't create the export canvas (no 2D context available in this browser).",
+      { detail: { canvasW, canvasH } }
+    );
+  }
 
   // Pre-fill black BEFORE the canvas is captured so MediaRecorder never
   // sees uninitialised GPU pixels (which often encode as green/magenta on
@@ -652,6 +787,38 @@ export async function renderProjectClientSide(
     video.addEventListener("seeked", onSeek);
   });
 
+  // ── Stage: canvas (one-time taint probe) ─────────────────────────────────
+  // Drawing a cross-origin video that ISN'T CORS-readable taints the canvas.
+  // A tainted canvas doesn't throw on drawImage — it fails LATER and opaquely
+  // (captureStream produces black / MediaRecorder errors mid-record), which is
+  // a prime "Internal Error" candidate in production. Detect it NOW with a
+  // single 1px readback so we can fail with an actionable message. We restore
+  // the black priming fill right after so the probe pixel never reaches a frame.
+  try {
+    ctx.drawImage(video, 0, 0, 1, 1);
+    ctx.getImageData(0, 0, 1, 1);
+  } catch (err) {
+    const d = describeError(err);
+    if (d.name === "SecurityError") {
+      for (const t of canvasStream.getTracks()) {
+        try {
+          t.stop();
+        } catch {
+          /* ignore */
+        }
+      }
+      throw new ExportError(
+        "canvas",
+        "The source video isn't CORS-accessible, so the export canvas is tainted and can't be encoded. Configure Storage CORS to allow this domain, then retry.",
+        { cause: err, detail: { videoWidth: video.videoWidth, videoHeight: video.videoHeight } }
+      );
+    }
+    // Any other readback failure is non-fatal for the probe — log and continue.
+    console.warn("[export-canvas] taint probe inconclusive", d);
+  }
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, canvasW, canvasH);
+
   // Mix the source audio into the recorded stream explicitly: one MediaStream
   // built from the canvas VIDEO track + the source AUDIO track. This combine is
   // what carries narration into the file — without it the canvas stream is mute.
@@ -674,9 +841,10 @@ export async function renderProjectClientSide(
   const exportAudioTracksCount = outputStream.getAudioTracks().length;
   const finalStreamHasAudio = exportAudioTracksCount > 0;
   const mimeSupportsAudio = mimeCarriesAudio(mime.mime);
-  console.info("[export] audio diagnostics", {
+  console.info("[export-audio]", {
     sourceHasAudio,
-    exportAudioTracksCount,
+    audioTrackCount: exportAudioTracksCount,
+    audioTrackState: audio.track?.readyState ?? "none",
     audioMode: speedAudioModes.length ? speedAudioModes.join(",") : "source (unmodified)",
     mutedSectionsCount,
     finalStreamHasAudio,
@@ -700,28 +868,54 @@ export async function renderProjectClientSide(
       "This browser's recording format can't store audio, so the export will be silent. Try Chrome or Edge.";
   }
 
+  const audioBitsPerSecond = 128_000;
   const videoBitsPerSecond = resolution === "4K" ? 12_000_000 : 6_000_000;
   let recorder: MediaRecorder;
   try {
     recorder = new MediaRecorder(outputStream, {
       mimeType: mime.mime,
       videoBitsPerSecond,
-      audioBitsPerSecond: 128_000,
+      audioBitsPerSecond,
     });
   } catch (err) {
     // Constructing with audio was rejected — degrade to a video-only file so the
     // user still gets an export, and warn that it will be silent.
     console.error(
-      "[export] MediaRecorder rejected the audio+video stream; recording video only",
-      err
+      "[export-recorder] rejected the audio+video stream; retrying video only",
+      describeError(err)
     );
     for (const t of outputStream.getAudioTracks()) outputStream.removeTrack(t);
     audio.cleanup?.();
     audioWarning =
       audioWarning ??
       "Audio couldn't be added to this export in this browser, so it's video-only. Try Chrome or Edge.";
-    recorder = new MediaRecorder(outputStream, { mimeType: mime.mime, videoBitsPerSecond });
+    try {
+      recorder = new MediaRecorder(outputStream, { mimeType: mime.mime, videoBitsPerSecond });
+    } catch (err2) {
+      // Even video-only construction failed — there's no recorder to fall back
+      // to. Stop the capture tracks and fail with a clear recorder-stage error.
+      for (const t of outputStream.getTracks()) {
+        try {
+          t.stop();
+        } catch {
+          /* ignore */
+        }
+      }
+      throw new ExportError(
+        "recorder",
+        "This browser couldn't start a video recorder for the export. Try Chrome or Edge.",
+        { cause: err2, detail: { mime: mime.mime } }
+      );
+    }
   }
+  console.info("[export-recorder]", {
+    mimeType: mime.mime,
+    isTypeSupported:
+      typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(mime.mime),
+    recorderState: recorder.state,
+    videoBitsPerSecond,
+    audioBitsPerSecond: outputStream.getAudioTracks().length ? audioBitsPerSecond : 0,
+  });
 
   const chunks: Blob[] = [];
   recorder.ondataavailable = (e) => {
@@ -734,7 +928,7 @@ export async function renderProjectClientSide(
       // Surface the REAL DOMException (+ both track readyStates) instead of a
       // generic string, so a recurrence is diagnosable from the console.
       const domErr = (e as unknown as { error?: DOMException }).error;
-      console.error("[export] MediaRecorder error", {
+      const detail = {
         name: domErr?.name,
         message: domErr?.message,
         audioPath: audio.path,
@@ -743,8 +937,15 @@ export async function renderProjectClientSide(
         audioTrackState: outputStream.getAudioTracks()[0]?.readyState,
         at: +video.currentTime.toFixed(2),
         playbackRate: video.playbackRate,
-      });
-      reject(domErr ?? new Error("MediaRecorder error"));
+      };
+      console.error("[export-render-loop] MediaRecorder error", detail);
+      reject(
+        new ExportError(
+          "render",
+          "The video recorder failed mid-export. This often means the source track stopped or the format isn't fully supported — try Chrome or Edge.",
+          { cause: domErr, detail }
+        )
+      );
     };
   });
 
@@ -869,6 +1070,7 @@ export async function renderProjectClientSide(
   let stopped = false;
   let aborted = false;
   let loggedDecile = -1;
+  let frame = 0;
   const abortHandler = () => {
     aborted = true;
     stopped = true;
@@ -888,11 +1090,25 @@ export async function renderProjectClientSide(
 
   // Swallow the AbortError that fires when the user cancels mid-export and we
   // pause the element before the play promise settles. The pause itself does
-  // the right thing — the only thing rejecting is the play() promise.
+  // the right thing — the only thing rejecting is the play() promise. Anything
+  // else (most likely an autoplay-policy NotAllowedError) is fatal: the recorder
+  // has already started, so tear it down BEFORE surfacing a clear render-stage
+  // error, otherwise the recorder + capture tracks would leak.
   try {
     await video.play();
   } catch (err) {
-    if (!(err instanceof DOMException) || err.name !== "AbortError") throw err;
+    if (err instanceof DOMException && err.name === "AbortError") {
+      // benign — cancellation; the abort handler tears the pipeline down.
+    } else {
+      signal?.removeEventListener("abort", abortHandler);
+      cleanup();
+      const d = describeError(err);
+      const msg =
+        d.name === "NotAllowedError"
+          ? "The browser blocked the playback needed to render this export. Click anywhere on the page, then run the export again."
+          : "Couldn't start playing the source video to render the export.";
+      throw new ExportError("render", msg, { cause: err, detail: { name: d.name } });
+    }
   }
 
   // Dev-mode: log the per-export render manifest + a few camera
@@ -1025,13 +1241,19 @@ export async function renderProjectClientSide(
     if (input.applyWatermark) drawWatermark(ctx, canvasW, canvasH);
 
     // progress
+    frame++;
     if (input.duration > 0) {
       const pct = Math.min(0.99, video.currentTime / input.duration);
       onProgress({ stage: "rendering", pct });
       const decile = Math.floor(pct * 10);
       if (decile !== loggedDecile) {
         loggedDecile = decile;
-        console.info("[export] progress", { pct: +pct.toFixed(2) });
+        console.info("[export-render-loop]", {
+          frame,
+          currentTime: +video.currentTime.toFixed(2),
+          progress: +pct.toFixed(2),
+          playbackRate: video.playbackRate,
+        });
       }
     }
 
@@ -1564,52 +1786,76 @@ export async function uploadExport({
   const { db, storage } = getFirebase();
 
   const sRef = storageRef(storage, uploadPath);
+  console.info("[export-upload] started", {
+    // Path only — NEVER the download URL (it carries an access token).
+    storagePath: uploadPath,
+    bytes: blob.size,
+    contentType: blob.type || "video/webm",
+  });
+
   // Resumable upload so we can report real progress (uploadBytes is one-shot
   // and exposes none). Cancelling the export aborts the in-flight upload too.
-  await new Promise<void>((resolve, reject) => {
-    const task = uploadBytesResumable(sRef, blob, {
-      contentType: blob.type || "video/webm",
-    });
-    const onAbort = () => task.cancel();
-    signal?.addEventListener("abort", onAbort);
-    task.on(
-      "state_changed",
-      (snap) => {
-        if (snap.totalBytes > 0) {
-          onProgress?.(snap.bytesTransferred / snap.totalBytes);
+  // Firebase Storage failures (CORS not configured for this domain, rules
+  // denial, expired auth, retry-limit) are mapped to a clear, actionable
+  // reason so the user never sees a raw "Internal Error".
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const task = uploadBytesResumable(sRef, blob, {
+        contentType: blob.type || "video/webm",
+      });
+      const onAbort = () => task.cancel();
+      signal?.addEventListener("abort", onAbort);
+      task.on(
+        "state_changed",
+        (snap) => {
+          if (snap.totalBytes > 0) {
+            onProgress?.(snap.bytesTransferred / snap.totalBytes);
+          }
+        },
+        (err) => {
+          signal?.removeEventListener("abort", onAbort);
+          reject(err);
+        },
+        () => {
+          signal?.removeEventListener("abort", onAbort);
+          resolve();
         }
+      );
+    });
+
+    const downloadURL = await getDownloadURL(sRef);
+
+    await setDoc(
+      doc(db, "users", uid, "exports", exportId),
+      {
+        storagePath: uploadPath,
+        exportUrl: downloadURL,
+        fileSize: blob.size,
+        status: "ready",
+        completedAt: serverTimestamp(),
       },
-      (err) => {
-        signal?.removeEventListener("abort", onAbort);
-        reject(err);
-      },
-      () => {
-        signal?.removeEventListener("abort", onAbort);
-        resolve();
-      }
+      { merge: true }
     );
-  });
-  const downloadURL = await getDownloadURL(sRef);
 
-  await setDoc(
-    doc(db, "users", uid, "exports", exportId),
-    {
-      storagePath: uploadPath,
+    await updateDoc(doc(db, "users", uid, "projects", projectId), {
       exportUrl: downloadURL,
-      fileSize: blob.size,
-      status: "ready",
-      completedAt: serverTimestamp(),
-    },
-    { merge: true }
-  );
+      status: "exported",
+      updatedAt: serverTimestamp(),
+    });
 
-  await updateDoc(doc(db, "users", uid, "projects", projectId), {
-    exportUrl: downloadURL,
-    status: "exported",
-    updatedAt: serverTimestamp(),
-  });
-
-  return { exportId, downloadURL };
+    console.info("[export-upload] success", { storagePath: uploadPath, downloadUrlExists: !!downloadURL });
+    return { exportId, downloadURL };
+  } catch (err) {
+    // Cancellation surfaces here as storage/canceled — let the provider's
+    // abort handling treat it as a cancel, not a failure.
+    if (signal?.aborted) throw err;
+    const d = describeError(err);
+    console.error("[export-upload] failed", { storagePath: uploadPath, ...d });
+    throw new ExportError("upload", friendlyStorageMessage(d.code, d.message), {
+      cause: err,
+      detail: { code: d.code, storagePath: uploadPath, bytes: blob.size },
+    });
+  }
 }
 
 export function pickedMimeAvailable(): boolean {
@@ -1619,3 +1865,11 @@ export function pickedMimeAvailable(): boolean {
 export function pickedMimeExt(): string {
   return pickMime()?.ext ?? "webm";
 }
+
+/** The MIME the recorder will use, or null if none is supported (debug panel). */
+export function pickedMimeType(): string | null {
+  return pickMime()?.mime ?? null;
+}
+
+export { ExportError } from "./export-error";
+export type { ExportStage } from "./export-error";

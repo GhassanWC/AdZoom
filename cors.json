@@ -1,13 +1,30 @@
 [
   {
     "origin": [
-       "https://framevo.app",
+      "https://framevo.app",
       "https://www.framevo.app",
       "https://adzoom-prod--adzoom-prod.us-east4.hosted.app",
       "http://localhost:3000"
     ],
-    "method": ["GET", "HEAD", "OPTIONS"],
-    "responseHeader": ["Content-Type", "Range", "Accept-Ranges", "Content-Range"],
+    "method": ["GET", "HEAD", "PUT", "POST", "DELETE", "OPTIONS"],
+    "responseHeader": [
+      "Content-Type",
+      "Content-Length",
+      "Content-Range",
+      "Content-Disposition",
+      "Range",
+      "Accept-Ranges",
+      "Authorization",
+      "X-Goog-Upload-Status",
+      "X-Goog-Upload-URL",
+      "X-Goog-Upload-Command",
+      "X-Goog-Upload-Protocol",
+      "X-Goog-Upload-Size-Received",
+      "X-Goog-Upload-Chunk-Granularity",
+      "X-Goog-Upload-Control-URL",
+      "X-Goog-Upload-Header-Content-Length",
+      "X-Goog-Upload-Header-Content-Type"
+    ],
     "maxAgeSeconds": 3600
   }
 ]
