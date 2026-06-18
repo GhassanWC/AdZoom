@@ -14,6 +14,7 @@
     "worker:dev": "npm --prefix services/export-worker run dev",
     "worker:build": "npm --prefix services/export-worker run build",
     "worker:typecheck": "npm --prefix services/export-worker run typecheck",
+    "worker:deploy": "node scripts/deploy-worker.mjs",
     "fb:whoami": "node scripts/firebase-active.mjs",
     "fb:use:dev": "firebase use dev",
     "fb:use:prod": "firebase use prod",
