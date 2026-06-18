@@ -2,6 +2,10 @@ import type { NextConfig } from "next";
 import path from "node:path";
 
 const nextConfig: NextConfig = {
+  // Firebase App Hosting serves the standalone output (.next/standalone). Set it
+  // explicitly so a local `next build` produces the SAME layout — lets us verify
+  // the proto assets land in .next/standalone/node_modules (see tracing below).
+  output: "standalone",
   turbopack: {
     root: path.resolve(__dirname),
   },
@@ -19,6 +23,22 @@ const nextConfig: NextConfig = {
     "@grpc/grpc-js",
     "@grpc/proto-loader",
   ],
+  // This repo has a second lockfile (services/export-worker), which can make
+  // Next infer the wrong workspace root for output-file tracing. Pin it to THIS
+  // app's root so the standalone node_modules layout + the include globs below
+  // resolve from the repo root (matches prod: /workspace/.next/standalone/...).
+  outputFileTracingRoot: path.resolve(__dirname),
+  // The externalized gRPC/google-gax packages load their protobuf descriptors
+  // (.json/.proto) via dynamic paths that @vercel/nft can't follow, so Next's
+  // standalone output drops them — at runtime the Cloud Tasks client throws:
+  //   Cannot find module '.../@google-cloud/tasks/build/protos/protos.json'
+  // Force the proto assets into the trace for the route that enqueues tasks.
+  outputFileTracingIncludes: {
+    "/api/export/cloud": [
+      "./node_modules/@google-cloud/tasks/build/protos/**",
+      "./node_modules/google-gax/build/protos/**",
+    ],
+  },
 };
 
 export default nextConfig;
