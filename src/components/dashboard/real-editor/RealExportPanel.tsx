@@ -18,9 +18,13 @@ import {
   Scissors,
   Copy,
   Check,
+  Cloud,
+  Zap,
+  X,
 } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { cn } from "@/lib/cn";
+import { downloadFile } from "@/lib/download";
 import { useEditorReal } from "./context";
 import { BUILTIN_PRESETS_BY_ID } from "@/lib/presets";
 import { pickedMimeAvailable } from "./export";
@@ -42,6 +46,16 @@ import type { ExportFormat, FitMode } from "@/lib/firebase/schema";
 import { useStoragePlan } from "@/lib/usage/useStoragePlan";
 import { planMeetsMinimum } from "@/lib/usage/plan";
 import { useMonthlyUsage } from "@/lib/usage/useMonthlyUsage";
+import { useCloudMinutes, type CloudMinutesState } from "@/lib/usage/useCloudMinutes";
+import {
+  CLOUD_EXPORT_MINUTES,
+  estimateExportMinutes,
+} from "@/lib/usage/cloud-minutes";
+import {
+  useCloudExport,
+  type StartCloudExportInput,
+} from "@/components/export/useCloudExport";
+import type { ExportJobView } from "@/lib/firebase/export-jobs";
 
 const resolutions = ["1080p", "4K"] as const;
 const fpsOptions = [30, 60] as const;
@@ -78,6 +92,17 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
   const usage = useMonthlyUsage();
   const { job, isExporting, startExport, cancelExport, downloadCurrent } =
     useExport();
+
+  // Paid plans (Pro/Creator) get server-side cloud MP4 export as the primary
+  // path; Free stays browser-only. The browser flow below remains available to
+  // paid users as an explicit fallback ("Render in browser instead").
+  // Gated by the kill switch: when NEXT_PUBLIC_CLOUD_EXPORT_ENABLED !== "true"
+  // the cloud UI is hidden entirely and everyone uses browser export.
+  const cloudExportEnabled = process.env.NEXT_PUBLIC_CLOUD_EXPORT_ENABLED === "true";
+  const isPaid = planMeetsMinimum(plan.tier, "pro");
+  const cloudPrimary = isPaid && cloudExportEnabled;
+  const cloudMinutes = useCloudMinutes();
+  const cloud = useCloudExport(project.id);
 
   // 4K requires a paid plan (Pro $19 and up). Free is capped at 1080p.
   const canExport4k = planMeetsMinimum(plan.tier, "pro");
@@ -486,8 +511,40 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
           </div>
         )}
 
+        {/* Cloud MP4 export (paid) — the primary path. Free sees an upgrade
+            nudge here and uses the browser export below. Hidden entirely while
+            the cloud-export kill switch is off. */}
+        {cloudExportEnabled && (
+        <CloudExportSection
+          isPaid={isPaid}
+          minutes={cloudMinutes}
+          cloud={cloud}
+          estimateMinutes={estimateExportMinutes(exportDuration)}
+          hasSource={!!project.originalVideoUrl}
+          input={{
+            projectId: project.id,
+            projectTitle: project.title,
+            resolution,
+            fps,
+            format,
+            sourceWidth: project.width ?? 0,
+            sourceHeight: project.height ?? 0,
+            sourceDuration: duration || project.duration || 0,
+            moments: project.analysis?.detectedMoments ?? [],
+            effects: project.effectsSettings,
+            sourceCrop: project.sourceCrop,
+            visualAnalysis: project.visualAnalysis,
+          }}
+        />
+        )}
+
         {/* Primary action — pinned to the bottom of the sheet body. */}
         <div className="space-y-2 pt-1">
+          {cloudPrimary && (
+            <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-fog/70">
+              Or render in browser
+            </div>
+          )}
           {exporting ? (
             <>
               <Button
@@ -529,13 +586,13 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
           ) : (
             <Button
               onClick={start}
-              variant="primary"
+              variant={cloudPrimary ? "ghost" : "primary"}
               size="lg"
               className="w-full"
               leftIcon={<Download size={15} />}
               disabled={!supported || otherExporting}
             >
-              Export {resolution}
+              {cloudPrimary ? "Render in browser instead" : `Export ${resolution}`}
             </Button>
           )}
           {otherExporting && (
@@ -546,8 +603,9 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
         </div>
 
         <p className="text-[10.5px] leading-relaxed text-fog/80">
-          Export runs entirely in your browser using canvas + MediaRecorder.
-          Files render at real-time speed (a 60s video takes ~60s).
+          {cloudPrimary
+            ? "Cloud export renders MP4 on our servers — you can close this and the export keeps going. Browser export stays available as a fallback."
+            : "Export runs entirely in your browser using canvas + MediaRecorder. Files render at real-time speed (a 60s video takes ~60s)."}
         </p>
       </div>
     </>
@@ -627,6 +685,203 @@ function ExportFailureDetails({
       </dl>
     </details>
   );
+}
+
+/**
+ * Cloud MP4 export block. For paid plans it's the primary export path —
+ * minutes meter, a one-click start, and live job status (queued → rendering →
+ * uploading → ready) driven by the Firestore `exportJobs` subscription, with
+ * cancel + download. For Free it's an upgrade nudge (browser export below is
+ * their path). Creator shows a priority badge.
+ */
+function CloudExportSection({
+  isPaid,
+  minutes,
+  cloud,
+  estimateMinutes,
+  hasSource,
+  input,
+}: {
+  isPaid: boolean;
+  minutes: CloudMinutesState;
+  cloud: ReturnType<typeof useCloudExport>;
+  estimateMinutes: number;
+  hasSource: boolean;
+  input: StartCloudExportInput;
+}) {
+  if (!isPaid) {
+    return (
+      <div className="rounded-xl border border-violet-400/25 bg-violet-500/[0.07] px-4 py-3">
+        <div className="flex items-center gap-2 text-[12.5px] font-medium text-violet-100">
+          <Cloud size={14} className="text-violet-300" />
+          Cloud MP4 export
+        </div>
+        <p className="mt-1 text-[11px] leading-relaxed text-fog">
+          Render high-quality MP4 on our servers — no browser tab needed, and the
+          export keeps going after you leave. Included with Pro (
+          {CLOUD_EXPORT_MINUTES.pro} min/mo) and Creator (
+          {CLOUD_EXPORT_MINUTES.creator} min/mo).
+        </p>
+        <Link
+          href="/pricing"
+          className="mt-2 inline-flex items-center gap-1 rounded-full border border-violet-400/30 bg-violet-500/10 px-2.5 py-1 text-[11px] font-semibold text-violet-200 hover:bg-violet-500/20"
+        >
+          Upgrade to Pro
+        </Link>
+      </div>
+    );
+  }
+
+  const { job, isActive, starting, error, startCloudExport, cancelCloudExport } =
+    cloud;
+  const isCreator = minutes.plan === "creator";
+  const enoughMinutes = minutes.remaining >= estimateMinutes;
+  const usedPct =
+    minutes.limit > 0 ? Math.min(100, (minutes.used / minutes.limit) * 100) : 0;
+  const blocked = !hasSource || !enoughMinutes || starting || isActive;
+
+  return (
+    <div className="space-y-3 rounded-xl border border-violet-400/30 bg-violet-500/[0.06] px-4 py-3.5">
+      <div className="flex items-center justify-between">
+        <span className="inline-flex items-center gap-2 text-[12.5px] font-semibold text-white">
+          <Cloud size={14} className="text-violet-300" />
+          Cloud MP4 export
+        </span>
+        {isCreator && (
+          <span className="inline-flex items-center gap-1 rounded-full border border-amber-300/30 bg-amber-400/10 px-2 py-0.5 text-[10px] font-semibold text-amber-200">
+            <Zap size={9} /> Priority
+          </span>
+        )}
+      </div>
+
+      {/* Minutes meter */}
+      <div className="flex flex-wrap items-center justify-between gap-2 text-[11.5px]">
+        <span className="inline-flex items-center gap-2 text-fog">
+          <span className="font-mono tabular-nums text-white/85">
+            {minutes.remaining}
+          </span>
+          <span className="text-fog/70">/ {minutes.limit} min left this month</span>
+        </span>
+        <span className="text-fog/70">~{estimateMinutes} min this export</span>
+      </div>
+      <div className="h-1 overflow-hidden rounded-full bg-white/[0.06]">
+        <div
+          className="h-full rounded-full bg-gradient-to-r from-violet-500 to-cyan-400"
+          style={{ width: `${usedPct}%` }}
+        />
+      </div>
+
+      {/* Live job status */}
+      {job &&
+        (job.status === "queued" ||
+          job.status === "rendering" ||
+          job.status === "uploading") && (
+          <div className="space-y-1.5">
+            <div className="flex items-center justify-between text-[11.5px]">
+              <span className="inline-flex items-center gap-1.5 text-white/85">
+                <Loader2 size={12} className="animate-spin text-violet-300" />
+                {cloudJobStageLabel(job)}
+              </span>
+              <span className="font-mono text-fog">
+                {Math.round((job.progress ?? 0) * 100)}%
+              </span>
+            </div>
+            <div className="h-1 overflow-hidden rounded-full bg-white/[0.06]">
+              <div
+                className="h-full rounded-full bg-gradient-to-r from-violet-500 to-cyan-400 transition-[width] duration-200"
+                style={{ width: `${(job.progress ?? 0) * 100}%` }}
+              />
+            </div>
+          </div>
+        )}
+
+      {job?.status === "ready" && job.downloadUrl && (
+        <button
+          type="button"
+          onClick={() =>
+            void downloadFile(
+              job.downloadUrl!,
+              `${(input.projectTitle || "framevo-export").replace(/[^\w.-]+/g, "_")}.mp4`
+            )
+          }
+          className="flex w-full items-center justify-center gap-2 rounded-lg border border-emerald-400/30 bg-emerald-500/[0.07] px-3 py-2 text-[11.5px] font-medium text-emerald-200 hover:bg-emerald-500/[0.12]"
+        >
+          <Download size={13} /> Download MP4
+        </button>
+      )}
+
+      {job?.status === "ready" && (job.warnings?.length ?? 0) > 0 && (
+        <div className="flex items-start gap-2 rounded-lg border border-amber-400/30 bg-amber-500/[0.06] px-3 py-2 text-[11px] text-amber-200">
+          <AlertCircle size={12} className="mt-0.5 shrink-0" />
+          <span>{job.warnings!.join(" ")}</span>
+        </div>
+      )}
+
+      {job?.status === "failed" && (
+        <div className="flex items-start gap-2 rounded-lg border border-rose-400/30 bg-rose-500/[0.06] px-3 py-2 text-[11px] text-rose-200">
+          <AlertCircle size={12} className="mt-0.5 shrink-0" />
+          <span>{job.errorMessage || "Cloud export failed."}</span>
+        </div>
+      )}
+
+      {error && (
+        <div className="flex items-start gap-2 rounded-lg border border-rose-400/30 bg-rose-500/[0.06] px-3 py-2 text-[11px] text-rose-200">
+          <AlertCircle size={12} className="mt-0.5 shrink-0" />
+          <span>{error}</span>
+        </div>
+      )}
+
+      {!enoughMinutes && !isActive && (
+        <Link
+          href="/pricing"
+          className="inline-flex items-center gap-1 rounded-full border border-rose-400/40 bg-rose-500/10 px-2 py-0.5 text-[10.5px] font-semibold text-rose-200 hover:bg-rose-500/20"
+        >
+          Out of minutes — upgrade
+        </Link>
+      )}
+
+      {/* Action */}
+      {isActive ? (
+        <Button
+          onClick={() => void cancelCloudExport()}
+          variant="ghost"
+          size="lg"
+          className="w-full"
+          leftIcon={<X size={15} />}
+        >
+          Cancel cloud export
+        </Button>
+      ) : (
+        <Button
+          onClick={() => void startCloudExport(input)}
+          variant="primary"
+          size="lg"
+          className="w-full"
+          leftIcon={<Cloud size={15} />}
+          disabled={blocked}
+        >
+          {starting ? "Starting…" : "Export to cloud (MP4)"}
+        </Button>
+      )}
+    </div>
+  );
+}
+
+function cloudJobStageLabel(job: ExportJobView): string {
+  switch (job.status) {
+    case "queued":
+      return "Queued…";
+    case "rendering":
+      return job.stage === "encoding" ? "Encoding…" : "Rendering…";
+    case "uploading":
+      return "Saving…";
+    case "ready":
+      return "Ready";
+    case "failed":
+      return "Failed";
+    case "canceled":
+      return "Canceled";
+  }
 }
 
 function PreFlightRow({

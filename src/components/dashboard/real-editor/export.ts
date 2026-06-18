@@ -8,31 +8,18 @@ import {
 } from "firebase/firestore";
 import { getDownloadURL, ref as storageRef, uploadBytesResumable } from "firebase/storage";
 import { getFirebase } from "@/lib/firebase/client";
-import {
-  resolveCameraFrame,
-  canvasTranslateFor,
-  cameraDiagnostic,
-} from "@/lib/timeline/camera";
-import { coverFitDims } from "@/lib/timeline/cover";
-import { resolveOutputDims } from "@/lib/timeline/output-dims";
-import {
-  resolveOutputCanvas,
-  resolveCanvasDims,
-  resolveCanvasPlacement,
-  computeSmartFitOffset,
-  buildSmartSignals,
-  type CanvasPlacement,
-  type SmartFitResult,
-} from "@/lib/timeline/canvas-layout";
+import { cameraDiagnostic } from "@/lib/timeline/camera";
 import {
   activeSpeedAt,
   activeCutAt,
-  buildTimelineMap,
   DEFAULT_SPEED,
 } from "@/lib/timeline/crop-speed";
 import { probeVideoBottomBand } from "@/lib/recording/health-check";
-import { resolveSourceRect, type SourceRect } from "@/lib/timeline/source-crop";
-import { drawClickHighlight } from "@/lib/timeline/click-highlight";
+import {
+  buildRenderRecipe,
+  type BasePlacement,
+} from "@/lib/render/recipe";
+import { composeFrame } from "@/lib/render/compose-frame";
 import {
   ExportError,
   describeError,
@@ -53,19 +40,14 @@ import type {
   DetectedMoment,
   EffectsSettings,
   ExportFormat,
-  FitMode,
   SourceCrop,
   SpeedSettings,
   VisualAnalysis,
 } from "@/lib/firebase/schema";
 
-/** The source's base placement in the output canvas, before the per-moment camera. */
-interface BasePlacement {
-  drawW: number;
-  drawH: number;
-  offsetX: number;
-  offsetY: number;
-}
+// `BasePlacement` + the per-export geometry now live in `@/lib/render/recipe`,
+// shared with the cloud worker. `BasePlacement` is imported above for the
+// dev-only manifest/camera-snapshot log helpers.
 
 // MediaRecorder is used ONLY for WebM here. MP4 via MediaRecorder is removed on
 // purpose: Chrome reports `isTypeSupported("video/mp4;codecs=avc1…,mp4a…")` as
@@ -96,56 +78,6 @@ function supportedMimes(): Record<string, boolean> {
   if (typeof MediaRecorder === "undefined") return out;
   for (const m of PREFERRED_MIMES) out[m] = MediaRecorder.isTypeSupported(m);
   return out;
-}
-
-/**
- * Resolve the effective source rectangle AND guarantee it's a valid 9-arg
- * `drawImage` source before any frame is drawn. `resolveSourceRect` already
- * clamps a configured crop inside the frame, but a zero-dimension / non-finite
- * video (a source that never decoded — expired URL, decode error) would yield a
- * degenerate rect that silently produces a black or broken export. This is the
- * single guard the prompt asks for: every `sx/sy/sw/sh` is finite, `sw > 0`,
- * `sh > 0`, and the rect stays inside `videoWidth × videoHeight` — otherwise we
- * fail with a clear, stage-tagged error instead of encoding garbage.
- *
- * Note: the legacy `recordingCleanup` arg the original spec referenced no longer
- * exists — green-bar cleanup is now just a `SourceCrop` with
- * `reason:"browser-bar-cleanup"`, so this takes the unified `sourceCrop` only.
- */
-function getSafeSourceRect(
-  video: HTMLVideoElement,
-  sourceCrop: SourceCrop | undefined | null
-): SourceRect {
-  const vw = video.videoWidth;
-  const vh = video.videoHeight;
-  if (!Number.isFinite(vw) || !Number.isFinite(vh) || vw <= 0 || vh <= 0) {
-    throw new ExportError(
-      "canvas",
-      "The source video has no usable dimensions, so it can't be drawn for export. The video may have failed to load or expired.",
-      { detail: { videoWidth: vw, videoHeight: vh, readyState: video.readyState } }
-    );
-  }
-
-  const rect = resolveSourceRect(vw, vh, sourceCrop);
-  const { sx, sy, sWidth, sHeight } = rect;
-  const finite =
-    Number.isFinite(sx) &&
-    Number.isFinite(sy) &&
-    Number.isFinite(sWidth) &&
-    Number.isFinite(sHeight);
-
-  if (!finite || sWidth <= 0 || sHeight <= 0 || sx + sWidth > vw || sy + sHeight > vh) {
-    // resolveSourceRect should never produce this, but if a future change or a
-    // hand-edited crop does, clamp to the full frame rather than fail the whole
-    // export — full-frame is always a valid, lossless fallback.
-    console.warn("[export-canvas] invalid source rect — clamping to full frame", {
-      rect,
-      videoWidth: vw,
-      videoHeight: vh,
-    });
-    return { sx: 0, sy: 0, sWidth: vw, sHeight: vh, cropActive: false };
-  }
-  return rect;
 }
 
 // ── Export audio mixing ─────────────────────────────────────────────────────
@@ -555,81 +487,37 @@ export async function renderProjectClientSide(
 
   onProgress({ stage: "preparing", pct: 0 });
 
-  // Effective source rect — feeds drawCover + every layout helper below.
-  // `resolveSourceRect` (wrapped by getSafeSourceRect) skips any cropped-out
-  // areas (Frame Crop / sharing bar) so cropped-out pixels never reach the
-  // canvas. No crop → full frame (zero regression). The video is guaranteed to
-  // have real dims by the load-video guard above, so there's no dimension guess.
-  // `getSafeSourceRect` guarantees a valid 9-arg drawImage source (finite,
-  // positive, inside the frame) — it also re-validates the video has real dims
-  // (the load-video guard above already did, but a crop math regression would
-  // be caught here too, clamping to full-frame rather than encoding garbage).
-  const srcRect = getSafeSourceRect(video, input.sourceCrop);
-  const sourceX = srcRect.sx;
-  const sourceY = srcRect.sy;
-  const sourceW = srcRect.sWidth;
-  const sourceH = srcRect.sHeight;
-
-  // Output size — resolved by the SHARED `resolveOutputDims` helper so the
-  // editor preview and this renderer always agree on framing. The default
-  // "Source" mode sets the canvas aspect EQUAL to the source aspect, so the
-  // full captured viewport is preserved with zero crop. The fixed-aspect
-  // presets ("YouTube 16:9", "TikTok 9:16", legacy verticalExport) are the
-  // only paths that crop, via `coverFitDims` (object-fit: cover semantics).
-  //
-  // Note on `"Custom"`: the literal is still in `ExportFormat` for type
-  // compatibility with persisted defaults, but the UI no longer exposes
-  // it (no width/height/bitrate panel exists yet). It maps to the safe
-  // 16:9 crop fallback inside `resolveOutputDims` until the Custom
-  // configuration panel ships. Don't add a `"Custom"` branch without also
-  // adding the UI for entering the dimensions; otherwise the renderer
-  // can't know what to produce.
-  // ── Global output canvas (Canvas Fit / Resize) ─────────────────────────
-  // `resolveOutputCanvas` is the single back-compat source of truth: it
-  // returns a concrete OutputCanvas for an explicit aspect/fit choice, or
-  // `null` for the full-frame "Source" path — in which case we keep the
-  // existing `resolveOutputDims` + centred-cover behaviour byte-for-byte.
-  const oc = resolveOutputCanvas(effects, format);
-
-  let canvasW: number;
-  let canvasH: number;
-  let outMode: string;
-  let outCropped: boolean;
-  let placement: CanvasPlacement | null = null;
-  let smart: SmartFitResult | undefined;
-
-  if (oc) {
-    const dims = resolveCanvasDims(
-      sourceW,
-      sourceH,
-      oc.aspectRatio,
-      resolution,
-      oc.aspectRatio === "custom"
-        ? { width: oc.width, height: oc.height }
-        : undefined
-    );
-    canvasW = dims.canvasW;
-    canvasH = dims.canvasH;
-    if (oc.fitMode === "smart-fit") {
-      smart = computeSmartFitOffset(
-        sourceW,
-        sourceH,
-        canvasW,
-        canvasH,
-        buildSmartSignals(input.visualAnalysis, moments)
-      );
-    }
-    placement = resolveCanvasPlacement(sourceW, sourceH, canvasW, canvasH, oc, smart);
-    outMode = `canvas-${oc.aspectRatio}/${oc.fitMode}${smart?.fallbackToBlur ? "→fit" : ""}`;
-    outCropped = !placement.hasLetterbox;
-  } else {
-    const out = resolveOutputDims(sourceW, sourceH, resolution, format, effects);
-    canvasW = out.canvasW;
-    canvasH = out.canvasH;
-    outMode = out.mode;
-    outCropped = out.cropped;
-  }
+  // ── Per-export render recipe (SHARED with the cloud worker) ──────────────
+  // `buildRenderRecipe` resolves the source rect (Frame Crop), the output canvas
+  // (Canvas Fit / Resize), the source's base placement, the background layer,
+  // and the cut/speed timeline map using the SAME pure helpers as the preview —
+  // the single source of truth for geometry. The browser exporter and the server
+  // worker both call `buildRenderRecipe` + `composeFrame`, so the two render
+  // paths agree by construction. The load-video guard above already verified the
+  // video has real dimensions; the recipe clamps any degenerate crop to the full
+  // frame internally rather than encoding garbage.
   const debugBorders = debugBordersEnabled();
+  const recipe = buildRenderRecipe({
+    sourceWidth: video.videoWidth,
+    sourceHeight: video.videoHeight,
+    fps,
+    resolution,
+    format,
+    sourceDuration: input.duration,
+    moments,
+    effects,
+    visualAnalysis: input.visualAnalysis,
+    sourceCrop: input.sourceCrop,
+    applyWatermark: input.applyWatermark === true,
+    debugBorders,
+  });
+  const { canvasW, canvasH, base, bgActive, bgMode, outMode, outCropped, effectiveFit } = recipe;
+  const sourceX = recipe.sourceRect.sx;
+  const sourceY = recipe.sourceRect.sy;
+  const sourceW = recipe.sourceRect.sWidth;
+  const sourceH = recipe.sourceRect.sHeight;
+  // Drives the audit log + bottom-band probe below — the rect actually drawn.
+  const auditCover = { drawW: base.drawW, drawH: base.drawH };
 
   // ── Stage: canvas (prod-safe summary) ────────────────────────────────────
   // One line, ALWAYS logged (not dev-gated like the dimension audit below), so
@@ -640,37 +528,9 @@ export async function renderProjectClientSide(
     outputHeight: canvasH,
     sourceRect: { sx: sourceX, sy: sourceY, sw: sourceW, sh: sourceH },
     canvasFit: outMode,
-    cropActive: srcRect.cropActive,
+    cropActive: recipe.sourceRect.cropActive,
     willCrop: outCropped,
   });
-
-  // Effective fit + background after the Smart-Fit fallback decision. The
-  // background layer fills the whole canvas behind the (crisp) video whenever
-  // the placement leaves empty space — Fit always, Manual when scaled < cover.
-  const effectiveFit: FitMode =
-    oc && oc.fitMode === "smart-fit" && smart?.fallbackToBlur ? "fit" : oc?.fitMode ?? "fill";
-  const bgMode: BackgroundMode = smart?.fallbackToBlur
-    ? "blur"
-    : oc?.backgroundMode ?? "blur";
-  const bgActive =
-    !!placement &&
-    placement.hasLetterbox &&
-    (effectiveFit === "fit" || effectiveFit === "manual");
-
-  // The source's base placement inside the canvas. Legacy/null path keeps the
-  // historical centred cover; the canvas path uses the resolved placement.
-  const cover = coverFitDims(sourceW, sourceH, canvasW, canvasH);
-  const base: BasePlacement = placement
-    ? {
-        drawW: placement.drawW,
-        drawH: placement.drawH,
-        offsetX: placement.baseOffsetX,
-        offsetY: placement.baseOffsetY,
-      }
-    : { drawW: cover.drawW, drawH: cover.drawH, offsetX: 0, offsetY: 0 };
-
-  // Drives the audit log + bottom-band probe below — the rect actually drawn.
-  const auditCover = { drawW: base.drawW, drawH: base.drawH };
 
   // ── Pipeline dimension audit ────────────────────────────────────────
   // The full capture → render → export chain in one log, so a "there's a
@@ -697,8 +557,8 @@ export async function renderProjectClientSide(
       format,
       verticalExport: effects.verticalExport === true,
       mode: outMode,
-      fitMode: oc?.fitMode ?? "source",
-      effectiveFit: oc ? effectiveFit : "source",
+      fitMode: recipe.fitMode,
+      effectiveFit,
       background: bgActive ? bgMode : "none",
       baseOffset: { x: +base.offsetX.toFixed(1), y: +base.offsetY.toFixed(1) },
       resolution,
@@ -1031,36 +891,12 @@ export async function renderProjectClientSide(
   // placement (Smart-Fit pan / Manual drag).
 
   // Paint the t=0 frame BEFORE the recorder picks up its first chunk so the
-  // start of the export isn't a green/black flash. Also re-fills black under
-  // the video in case the canvas got reset by the captureStream pipeline.
-  ctx.fillStyle = "#000";
-  ctx.fillRect(0, 0, canvasW, canvasH);
-  if (bgActive) {
-    drawCanvasBackground(ctx, video, bgMode, oc?.backgroundColor, canvasW, canvasH, sourceX, sourceY, sourceW, sourceH);
-  }
-  applyCameraFrame(
-    ctx,
-    video,
-    moments,
-    video.currentTime,
-    effects,
-    canvasW,
-    canvasH,
-    base,
-    sourceX,
-    sourceY,
-    sourceW,
-    sourceH,
-    debugBorders
-  );
-  if (debugBorders) drawDebugCanvasBorder(ctx, canvasW, canvasH);
-  // Defensive boolean coercion so a stray truthy value (e.g. an old
-  // string "true" left in Firestore by a hand-edit) can't flip the
-  // vignette on. The schema field is `vignette?: boolean` — only a
-  // literal `true` should opt in to the radial darkening.
-  const vignetteOn = effects.vignette === true;
-  if (vignetteOn) drawVignette(ctx, canvasW, canvasH);
-  if (input.applyWatermark) drawWatermark(ctx, canvasW, canvasH);
+  // start of the export isn't a green/black flash. `composeFrame` re-fills black
+  // under the video in case the canvas got reset by the captureStream pipeline.
+  composeFrame(ctx, video, recipe, video.currentTime);
+  // The recipe already resolved the vignette flag (strict `=== true` so a stray
+  // truthy Firestore value can't flip it on); reuse it for the manifest log.
+  const vignetteOn = recipe.effects.vignette;
 
   // ── Lifecycle teardown: cancel / natural-end / error all funnel through one
   // idempotent cleanup so the recorder, capture tracks, rAF and audio graph are
@@ -1200,7 +1036,7 @@ export async function renderProjectClientSide(
   // so the paused span is genuinely absent from the file); speed uses
   // playbackRate. Reported honestly so "did cuts/speed apply?" is answerable.
   {
-    const map = buildTimelineMap(moments, input.duration);
+    const map = recipe.timelineMap;
     const speedSections = moments.filter((m) => m.effectType === "speed-up").length;
     console.info("[cut-map]", {
       sourceDuration: +map.sourceDuration.toFixed(2),
@@ -1264,38 +1100,10 @@ export async function renderProjectClientSide(
     // mixer (never the whole export), kept/pitch-shifted otherwise.
     const activeSpeed = applySpeedForFrame(video, moments);
     audio.setSectionMuted(activeSpeed?.audioMode === "mute");
-    ctx.fillStyle = "#000";
-    ctx.fillRect(0, 0, canvasW, canvasH);
-    // Canvas Fit background — fills the whole frame behind the (crisp) video
-    // when the placement leaves empty space. Drawn OUTSIDE the camera, before
-    // the source, so the foreground paints over it.
-    if (bgActive) {
-      drawCanvasBackground(ctx, video, bgMode, oc?.backgroundColor, canvasW, canvasH, sourceX, sourceY, sourceW, sourceH);
-    }
-    applyCameraFrame(
-      ctx,
-      video,
-      moments,
-      video.currentTime,
-      effects,
-      canvasW,
-      canvasH,
-      base,
-      sourceX,
-      sourceY,
-      sourceW,
-      sourceH,
-      debugBorders
-    );
-    if (debugBorders) drawDebugCanvasBorder(ctx, canvasW, canvasH);
-
-    // Vignette + watermark sit OUTSIDE the camera transform so they
-    // stay anchored to the output frame (not zooming with the video).
-    // The vignette gate uses `vignetteOn` (the same `=== true` strict
-    // check the priming paint above used) so the draw loop can't drift
-    // out of sync with the export-start state.
-    if (vignetteOn) drawVignette(ctx, canvasW, canvasH);
-    if (input.applyWatermark) drawWatermark(ctx, canvasW, canvasH);
+    // Composite this frame through the SHARED render core — black backdrop,
+    // Canvas-Fit background, source + per-moment camera, click-highlight,
+    // vignette, watermark — exactly the layers the cloud worker bakes too.
+    composeFrame(ctx, video, recipe, video.currentTime);
 
     // progress
     frame++;
@@ -1358,58 +1166,15 @@ export async function renderProjectClientSide(
   return { blob, container: actualContainer };
 }
 
-/**
- * Apply the moment-aware camera transform for the given playhead time,
- * draw the video frame, and draw any in-camera overlays. The canvas
- * transform chain (translate→scale→translate→drawImage→overlays) is
- * defined here in ONE place — both the t=0 priming paint and the main
- * draw loop delegate to this function. Identity outside moments — the
- * same transform chain runs so the source video is always centred.
- *
- * ─────────────────────────────────────────────────────────────────────
- * EXPORT RENDER MANIFEST — the only contract for what gets baked in
- * ─────────────────────────────────────────────────────────────────────
- *
- * The exporter draws into a HIDDEN OffscreenCanvas-style 2D context. It
- * does NOT capture from the preview DOM. Preview-only CSS (control bar
- * gradients, the focus-box drag overlay, the camera-path SVG, debug
- * overlays, etc.) is structurally incapable of leaking into the file.
- * Whatever the file contains MUST come from one of the four ordered
- * layers below.
- *
- *   1. BLACK BACKDROP — `ctx.fillStyle = "#000"; ctx.fillRect(...)`,
- *      drawn EVERY frame before the video. Visible only when the video
- *      doesn't fully cover the canvas — `coverFitDims` is designed to
- *      always cover, so in practice this is dead pixels.
- *
- *   2. SOURCE VIDEO — `ctx.drawImage(video, ...)` inside the camera
- *      transform. The user's recording, framed by the resolver's
- *      `{scale, cx, cy}`.
- *
- *   3. CLICK HIGHLIGHT (conditional) — gated on
- *      `effects.clickHighlights === true` AND the active moment is a
- *      `click-highlight`. Drawn INSIDE the camera transform so it
- *      scales with zoom.
- *
- *   4. VIGNETTE (conditional) — gated on `effects.vignette === true`.
- *      Drawn OUTSIDE the camera transform by the caller, anchored to
- *      the output frame. Strictly opt-in — the schema field is
- *      `vignette?: boolean` and the default is undefined → falsy →
- *      not drawn.
- *
- *   5. WATERMARK (conditional) — gated on `input.applyWatermark`,
- *      which is set by the server's export-permit endpoint based on
- *      the user's plan (free tier gets watermarked, paid tiers don't).
- *      Drawn OUTSIDE the camera transform by the caller. A small pill
- *      in the bottom-right corner — not a full-frame gradient.
- *
- * Adding a 6th draw layer (any new gradient, mask, badge, watermark
- * variant, debug overlay …) means updating this manifest AND the
- * dev-mode `[export] render manifest` log emitted at render start.
- *
- * Note `effects` is the FULL `EffectsSettings` (not just `autoZoom`)
- * because layers 3 and 4 need fields from the same record.
- */
+// ─────────────────────────────────────────────────────────────────────────
+// EXPORT RENDER MANIFEST — the contract for what gets baked into the file —
+// now lives in `@/lib/render/compose-frame` (`composeFrame`), the single
+// per-frame compositor shared by this browser exporter and the cloud worker.
+// The ordered layers (black backdrop → Canvas-Fit background → source+camera →
+// click-highlight → vignette → watermark) are documented there. The dev-mode
+// `[export] render manifest` log below mirrors that contract for the console.
+// ─────────────────────────────────────────────────────────────────────────
+
 /**
  * Set the source element's playbackRate + pitch handling for the speed section
  * under the current playhead, and RETURN that section (or null). Real-time
@@ -1437,195 +1202,6 @@ function applySpeedForFrame(
     /* not supported — ignore */
   }
   return sp;
-}
-
-function applyCameraFrame(
-  ctx: CanvasRenderingContext2D,
-  video: HTMLVideoElement,
-  moments: DetectedMoment[],
-  t: number,
-  effects: EffectsSettings,
-  canvasW: number,
-  canvasH: number,
-  base: BasePlacement,
-  /** Effective source rect (Frame Crop sub-rectangle of the full frame). */
-  sourceX: number,
-  sourceY: number,
-  sourceW: number,
-  sourceH: number,
-  debugBorders = false
-): void {
-  // Single source of truth — same call the preview makes. Returns the
-  // moment's camera state OR identity when no moment overlaps.
-  const { camera, moment } = resolveCameraFrame(moments, t, {
-    autoZoom: effects.autoZoom,
-  });
-  const { tx, ty } = canvasTranslateFor(camera, base.drawW, base.drawH);
-
-  // The Canvas Fit base placement (`base.offsetX/Y`) shifts the placement
-  // centre — Smart-Fit pan / Manual drag / Fit letterbox. The per-moment
-  // camera (scale + tx/ty) then composes relative to the placed source.
-  ctx.save();
-  ctx.translate(canvasW / 2 + base.offsetX, canvasH / 2 + base.offsetY);
-  ctx.scale(camera.scale, camera.scale);
-  ctx.translate(tx, ty);
-  // 9-arg source rect: only the Frame Crop sub-rectangle is sampled, so
-  // cropped-out areas never reach the canvas.
-  ctx.drawImage(
-    video,
-    sourceX,
-    sourceY,
-    sourceW,
-    sourceH,
-    -base.drawW / 2,
-    -base.drawH / 2,
-    base.drawW,
-    base.drawH
-  );
-
-  // DEBUG: RED border = the video's drawImage destination bounds. Line
-  // width is divided by scale so it renders ~4px regardless of zoom.
-  if (debugBorders) {
-    ctx.lineWidth = 4 / camera.scale;
-    ctx.strokeStyle = "rgba(255,0,0,0.95)";
-    ctx.strokeRect(-base.drawW / 2, -base.drawH / 2, base.drawW, base.drawH);
-  }
-
-  // Click-highlight overlay — drawn INSIDE the camera transform so the
-  // ring/pulse/burst scales with the zoom, matching the preview where
-  // the CSS scale on the wrapper magnifies the highlight's child span.
-  // Skipped when the user has clickHighlights off OR the active moment
-  // isn't a click-highlight type.
-  if (
-    effects.clickHighlights &&
-    moment &&
-    moment.effectType === "click-highlight"
-  ) {
-    const dur = Math.max(0.1, moment.endTime - moment.startTime);
-    drawClickHighlight(
-      ctx,
-      {
-        cx: moment.focusRegion.x + moment.focusRegion.width / 2,
-        cy: moment.focusRegion.y + moment.focusRegion.height / 2,
-        progress: Math.max(0, Math.min(1, (t - moment.startTime) / dur)),
-        style: effects.clickHighlightStyle,
-        sizePct: effects.clickHighlightSize,
-      },
-      base.drawW,
-      base.drawH,
-      canvasW
-    );
-  }
-
-  ctx.restore();
-}
-
-/**
- * Canvas Fit background — fills the WHOLE output frame behind the (crisp)
- * source video whenever the placement leaves empty space (Fit always; Manual
- * when scaled below cover; Smart-Fit's blur fallback). Drawn OUTSIDE the
- * camera transform, before the video, so the foreground paints over it and we
- * never need to compute the exact gap rectangle.
- *
- *  - "blur"  → the same frame, cover-placed + Gaussian-blurred + dimmed
- *              (the classic vertical-video backdrop), overscaled to hide bleed.
- *  - "solid" → `backgroundColor` (defaults to black).
- *  - "dark"  → near-black; "light" → near-white.
- */
-function drawCanvasBackground(
-  ctx: CanvasRenderingContext2D,
-  video: HTMLVideoElement,
-  bgMode: BackgroundMode,
-  backgroundColor: string | undefined,
-  canvasW: number,
-  canvasH: number,
-  sourceX: number,
-  sourceY: number,
-  sourceW: number,
-  sourceH: number
-): void {
-  if (bgMode === "blur") {
-    const bg = coverFitDims(sourceW, sourceH, canvasW, canvasH);
-    const k = 1.08; // overscale to hide the blur kernel's transparent edge
-    ctx.save();
-    ctx.filter = "blur(40px) brightness(0.7)";
-    // 9-arg source rect — crop the blurred backdrop to the same sub-rectangle so
-    // cropped-out areas can't smear into the letterbox area.
-    ctx.drawImage(
-      video,
-      sourceX,
-      sourceY,
-      sourceW,
-      sourceH,
-      canvasW / 2 - (bg.drawW * k) / 2,
-      canvasH / 2 - (bg.drawH * k) / 2,
-      bg.drawW * k,
-      bg.drawH * k
-    );
-    ctx.filter = "none";
-    ctx.restore();
-    return;
-  }
-  ctx.save();
-  ctx.fillStyle =
-    bgMode === "solid"
-      ? backgroundColor || "#000000"
-      : bgMode === "light"
-        ? "#f5f5f5"
-        : "#0a0a0a"; // "dark"
-  ctx.fillRect(0, 0, canvasW, canvasH);
-  ctx.restore();
-}
-
-/**
- * Soft radial dark fade at the frame edges — the canvas equivalent of
- * the preview's CSS
- * `bg-[radial-gradient(ellipse at center, transparent 60%, rgba(0,0,0,0.25) 100%)]`.
- * Drawn AFTER the camera transform completes (outside `ctx.save()` /
- * `ctx.restore()`) so it anchors to the output frame and doesn't zoom
- * with the video. Opt-in via `effects.vignette` so the user controls
- * whether the gradient gets baked in.
- */
-/**
- * DEBUG: BLUE border = the canvas (export frame) bounds. Drawn OUTSIDE the
- * camera transform so it's always flush to the encoded frame edges. Pair
- * with the RED video-bounds border in `applyCameraFrame`: at rest (no
- * zoom) RED should sit exactly under BLUE. Any visible BLUE-only strip is
- * a region the video doesn't cover — i.e. a renderer-introduced band.
- * Inset by half the line width so the stroke isn't clipped at the edge.
- */
-function drawDebugCanvasBorder(
-  ctx: CanvasRenderingContext2D,
-  canvasW: number,
-  canvasH: number
-): void {
-  const lw = 4;
-  ctx.save();
-  ctx.lineWidth = lw;
-  ctx.strokeStyle = "rgba(0,120,255,0.95)";
-  ctx.strokeRect(lw / 2, lw / 2, canvasW - lw, canvasH - lw);
-  ctx.restore();
-}
-
-function drawVignette(
-  ctx: CanvasRenderingContext2D,
-  canvasW: number,
-  canvasH: number
-): void {
-  const gradient = ctx.createRadialGradient(
-    canvasW / 2,
-    canvasH / 2,
-    Math.min(canvasW, canvasH) * 0.6,
-    canvasW / 2,
-    canvasH / 2,
-    Math.max(canvasW, canvasH) / 2
-  );
-  gradient.addColorStop(0, "rgba(0,0,0,0)");
-  gradient.addColorStop(1, "rgba(0,0,0,0.25)");
-  ctx.save();
-  ctx.fillStyle = gradient;
-  ctx.fillRect(0, 0, canvasW, canvasH);
-  ctx.restore();
 }
 
 /**
@@ -1742,65 +1318,6 @@ function logExportCameraSnapshots(
     }))
   );
   console.groupEnd();
-}
-
-/**
- * Draw the free-tier watermark in the bottom-right corner. Sized relative
- * to the canvas height so it reads at any resolution. Uses a pill shape
- * with a subtle backdrop tint to stay legible on both light and dark video
- * content.
- *
- * NOTE: this is rendered by the client. A tampered client could omit it.
- * Tamper-proof watermarking requires server-side rendering — documented as
- * a follow-up in the plan.
- */
-function drawWatermark(
-  ctx: CanvasRenderingContext2D,
-  canvasW: number,
-  canvasH: number
-) {
-  const fontSize = Math.max(18, Math.round(canvasH * 0.024));
-  const padX = Math.round(fontSize * 0.9);
-  const padY = Math.round(fontSize * 0.45);
-  const text = "Made with Framevo";
-
-  ctx.save();
-  ctx.font = `600 ${fontSize}px -apple-system, "Segoe UI", system-ui, sans-serif`;
-  const textW = ctx.measureText(text).width;
-  const boxW = textW + padX * 2;
-  const boxH = fontSize + padY * 2;
-  const x = canvasW - boxW - Math.round(canvasH * 0.035);
-  const y = canvasH - boxH - Math.round(canvasH * 0.035);
-  const r = boxH / 2;
-
-  // Backdrop pill — translucent black for contrast.
-  ctx.fillStyle = "rgba(0,0,0,0.55)";
-  ctx.beginPath();
-  ctx.moveTo(x + r, y);
-  ctx.lineTo(x + boxW - r, y);
-  ctx.arcTo(x + boxW, y, x + boxW, y + r, r);
-  ctx.lineTo(x + boxW, y + boxH - r);
-  ctx.arcTo(x + boxW, y + boxH, x + boxW - r, y + boxH, r);
-  ctx.lineTo(x + r, y + boxH);
-  ctx.arcTo(x, y + boxH, x, y + boxH - r, r);
-  ctx.lineTo(x, y + r);
-  ctx.arcTo(x, y, x + r, y, r);
-  ctx.closePath();
-  ctx.fill();
-
-  // Subtle violet dot to match brand.
-  ctx.fillStyle = "rgba(196,181,253,1)";
-  const dotR = Math.round(fontSize * 0.32);
-  ctx.beginPath();
-  ctx.arc(x + padX + dotR / 2, y + boxH / 2, dotR / 2, 0, Math.PI * 2);
-  ctx.fill();
-
-  // Text.
-  ctx.fillStyle = "rgba(255,255,255,0.95)";
-  ctx.textBaseline = "middle";
-  ctx.fillText(text, x + padX + dotR + Math.round(fontSize * 0.45), y + boxH / 2);
-
-  ctx.restore();
 }
 
 /**

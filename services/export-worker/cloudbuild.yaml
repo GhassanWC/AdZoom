@@ -1,0 +1,19 @@
+# Cloud Build config for the Framevo export worker.
+#
+# The build context MUST be the REPO ROOT — the Dockerfile bundles shared code
+# from src/ via the "@" alias. Submit from the repo root:
+#
+#   gcloud builds submit \
+#     --config services/export-worker/cloudbuild.yaml \
+#     --substitutions=_IMAGE=REGION-docker.pkg.dev/PROJECT/REPO/export-worker:TAG \
+#     .
+#
+# (`.gcloudignore` at the repo root keeps node_modules + secrets out of the
+# uploaded context.)
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ["build", "-f", "services/export-worker/Dockerfile", "-t", "${_IMAGE}", "."]
+images: ["${_IMAGE}"]
+options:
+  machineType: E2_HIGHCPU_8
+timeout: 1800s

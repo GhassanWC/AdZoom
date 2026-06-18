@@ -102,9 +102,25 @@ service cloud.firestore {
         allow delete: if false;
       }
 
+      // ── Cloud export jobs (server-side render) ────────────────────────
+      // The PAID cloud MP4 path. `POST /api/export/cloud` creates the job
+      // (status "queued") after plan + minutes gating; the Cloud Run worker
+      // writes every subsequent status/progress transition via the Admin SDK
+      // (which bypasses these rules). The client only ever READS its jobs to
+      // drive the live UI — cancellation goes through `POST /api/export/cancel`
+      // (which sets `cancelRequested` server-side), NOT a direct write. So the
+      // client can forge nothing about a render: status, progress,
+      // downloadUrl, consumedExportMinutes, and renderRecipe are all
+      // server-owned.
+      match /exportJobs/{jobId} {
+        allow read: if isOwner(uid);
+        allow create, update, delete: if false;
+      }
+
       // ── Monthly usage counters ────────────────────────────────────────
       // Read-only to the owner so the billing page can show "X / Y exports
-      // this month". All mutations go through the export-permit endpoint.
+      // this month" + cloud minutes remaining. All mutations go through the
+      // export-permit / export-cloud endpoints.
       match /usage/{periodId} {
         allow read: if isOwner(uid);
         allow write: if false;

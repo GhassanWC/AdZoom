@@ -1,0 +1,17 @@
+# Controls what `gcloud builds submit` uploads as the build context. When this
+# file exists gcloud uses it INSTEAD of .gitignore, so it must list everything
+# to exclude. Critically: keep ALL node_modules out (the worker's are Windows
+# binaries that would break the Linux image) and never upload secrets.
+.git/
+.gitignore
+node_modules/
+**/node_modules/
+.next/
+**/.next/
+services/export-worker/dist/
+**/*.log
+.env
+.env.*
+!.env*.example
+.claude/
+.vscode/

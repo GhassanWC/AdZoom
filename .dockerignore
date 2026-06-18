@@ -1,0 +1,13 @@
+# Build context for services/export-worker/Dockerfile is the REPO ROOT. Keep
+# host node_modules (wrong-platform binaries that would clobber the Linux
+# install) and any secrets out of the image.
+**/node_modules
+**/.next
+.git
+**/*.log
+**/.env
+**/.env.*
+!**/.env*.example
+services/export-worker/dist
+.claude
+.vscode

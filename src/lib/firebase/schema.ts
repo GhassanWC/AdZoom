@@ -1042,6 +1042,19 @@ export interface MonthlyUsage {
   /** Epoch ms of the most recent export permit. */
   lastExportAt?: number;
   updatedAt: number;
+  /**
+   * Cloud-export minutes RESERVED by in-flight jobs this month (paid plans
+   * only). Double-entry with `cloudMinutesConsumed`: a job reserves its
+   * estimate at enqueue, then on a terminal state either settles the reservation
+   * into `cloudMinutesConsumed` (success) or releases it (failure/cancel).
+   * `remaining = limit − reserved − consumed`. Server-written; read-only to the
+   * client. Absent ⇒ 0. See src/lib/usage/cloud-minutes.ts.
+   */
+  cloudMinutesReserved?: number;
+  /** Cloud-export minutes CONSUMED by successful jobs this month. */
+  cloudMinutesConsumed?: number;
+  /** Epoch ms of the most recent cloud-export settlement. */
+  lastCloudExportAt?: number;
 }
 
 export interface ProjectDoc {
@@ -1324,4 +1337,108 @@ export interface ExportDoc {
   expectedStoragePath?: string;
   /** Month bucket ("YYYY-MM") this export counted against. */
   monthlyBucket?: string;
+}
+
+// ── Cloud export jobs (server-side render) ──────────────────────────────────
+// The browser `ExportDoc` above is the Free / fallback path (client renders +
+// uploads). PAID cloud MP4 export instead creates an `ExportJobDoc` that a
+// Cloud Run worker picks up, renders with FFmpeg + the shared render core, and
+// uploads. Kept in a SEPARATE collection (`users/{uid}/exportJobs/{jobId}`) so
+// the audited `exports` rule stays untouched and the writer model can invert
+// (worker writes status; client only requests cancel via the API).
+
+/**
+ * The DOM-free, serializable render inputs persisted on an export job. The
+ * worker feeds these straight into `buildRenderRecipe` (src/lib/render/recipe),
+ * the SAME function the browser exporter calls — storing RAW inputs (full
+ * `moments` + `effects` + `sourceCrop`) rather than pre-bucketed cut/speed/
+ * camera lists is what guarantees preview/export parity.
+ */
+export interface SerializedRenderRecipe {
+  sourceWidth: number;
+  sourceHeight: number;
+  fps: 30 | 60;
+  resolution: "1080p" | "4K";
+  format: ExportFormat;
+  /** Full SOURCE duration in seconds (pre cuts/speed). */
+  sourceDuration: number;
+  moments: DetectedMoment[];
+  effects: EffectsSettings;
+  visualAnalysis?: VisualAnalysis;
+  sourceCrop?: SourceCrop | null;
+  /** Always false for paid cloud exports (Free has no cloud export). */
+  applyWatermark: boolean;
+}
+
+/**
+ * Cloud-export job lifecycle:
+ *   queued → rendering → uploading → ready   (happy path)
+ *   queued|rendering → failed                (worker error; minutes refunded)
+ *   queued|rendering → canceled              (cancelRequested honored; refunded)
+ *
+ * Created by `POST /api/export/cloud` with `status:"queued"` AFTER plan +
+ * minutes gating. Every status/progress transition after that is written by the
+ * worker (Admin SDK). The client only ever sets `cancelRequested` via
+ * `POST /api/export/cancel`.
+ */
+export type ExportJobStatus =
+  | "queued"
+  | "rendering"
+  | "uploading"
+  | "ready"
+  | "failed"
+  | "canceled";
+
+/** Fine-grained worker stage, surfaced in the UI alongside `progress`. */
+export type ExportJobStage =
+  | "queued"
+  | "downloading"
+  | "decoding"
+  | "rendering"
+  | "encoding"
+  | "uploading";
+
+export interface ExportJobDoc {
+  id: string;
+  userId: string;
+  projectId: string;
+  projectTitle: string;
+  status: ExportJobStatus;
+  /** Plan at job-creation time (Free can't reach this path). */
+  plan: "pro" | "creator";
+  /** Queue tier — creator → "priority", pro → "normal". */
+  priority: "normal" | "priority";
+  /** Source video Storage path (users/{uid}/projects/{pid}/original/<file>). */
+  sourceStoragePath: string;
+  /** Storage path the worker writes the MP4 to. */
+  outputPath: string;
+  /** Public download URL — set once the upload finishes. */
+  downloadUrl?: string;
+  format: "mp4";
+  outputWidth: number;
+  outputHeight: number;
+  fps: 30 | 60;
+  /** OUTPUT duration in seconds (post cuts/speed) — what minutes bill on. */
+  durationSeconds: number;
+  estimatedExportMinutes: number;
+  /** Settled only on success; mirrors `cloudMinutesConsumed` for this job. */
+  consumedExportMinutes?: number;
+  /** 0..1 for the active stage. */
+  progress: number;
+  stage?: ExportJobStage;
+  errorMessage?: string;
+  errorCode?: string;
+  /** Set by /api/export/cancel; the worker polls it between frames. */
+  cancelRequested?: boolean;
+  /** Non-fatal worker notices (e.g. "source has no audio — exported silent"). */
+  warnings?: string[];
+  /** Month bucket ("YYYY-MM") this job reserved/consumed minutes against. */
+  monthlyBucket: string;
+  /** Raw render inputs the worker feeds to `buildRenderRecipe`. */
+  renderRecipe: SerializedRenderRecipe;
+  createdAt: number;
+  updatedAt: number;
+  startedAt?: number;
+  completedAt?: number;
+  canceledAt?: number;
 }
