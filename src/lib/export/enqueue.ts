@@ -1,4 +1,9 @@
 import "server-only";
+// Static, server-only import. Must NOT be a dynamic `import()`/`require()` —
+// and the package is externalized in next.config.ts (serverExternalPackages) so
+// its google-gax/gRPC dynamic proto requires are resolved from node_modules at
+// runtime rather than bundled by webpack.
+import { CloudTasksClient } from "@google-cloud/tasks";
 
 /**
  * Export-job dispatch — hands a created `exportJobs/{jobId}` doc to the Cloud
@@ -60,8 +65,6 @@ async function enqueueLocal({ uid, jobId }: EnqueueParams): Promise<void> {
 
 /** Production: enqueue a Cloud Tasks task targeting the private Cloud Run worker. */
 async function enqueueCloudTask({ uid, jobId, priority }: EnqueueParams): Promise<void> {
-  const { CloudTasksClient } = await import("@google-cloud/tasks");
-
   const project =
     process.env.GCLOUD_PROJECT ??
     process.env.GOOGLE_CLOUD_PROJECT ??
@@ -69,33 +72,66 @@ async function enqueueCloudTask({ uid, jobId, priority }: EnqueueParams): Promis
   const location = process.env.EXPORT_QUEUE_LOCATION;
   const workerUrl = process.env.EXPORT_WORKER_URL;
   const invokerSa = process.env.EXPORT_INVOKER_SA;
+  const queueEnv =
+    priority === "priority" ? "EXPORT_QUEUE_PRIORITY" : "EXPORT_QUEUE_NORMAL";
   const queue =
     priority === "priority"
       ? process.env.EXPORT_QUEUE_PRIORITY
       : process.env.EXPORT_QUEUE_NORMAL;
 
   if (!project || !location || !workerUrl || !invokerSa || !queue) {
-    throw new Error(
-      "Cloud Tasks dispatch is misconfigured. Required env: GCLOUD_PROJECT (or NEXT_PUBLIC_FIREBASE_PROJECT_ID), EXPORT_QUEUE_LOCATION, EXPORT_WORKER_URL, EXPORT_INVOKER_SA, EXPORT_QUEUE_NORMAL, EXPORT_QUEUE_PRIORITY."
-    );
+    const missing = [
+      !project && "GCLOUD_PROJECT (or NEXT_PUBLIC_FIREBASE_PROJECT_ID)",
+      !location && "EXPORT_QUEUE_LOCATION",
+      !workerUrl && "EXPORT_WORKER_URL",
+      !invokerSa && "EXPORT_INVOKER_SA",
+      !queue && queueEnv,
+    ].filter(Boolean);
+    const msg = `Cloud Tasks dispatch is misconfigured — missing env: ${missing.join(", ")}.`;
+    console.error(`[export-enqueue] ${msg}`, { jobId, priority });
+    throw new Error(msg);
   }
 
   const client = new CloudTasksClient();
   const parent = client.queuePath(project, location, queue);
-  await client.createTask({
-    parent,
-    task: {
-      httpRequest: {
-        httpMethod: "POST",
-        url: workerUrl,
-        headers: { "Content-Type": "application/json" },
-        body: Buffer.from(JSON.stringify({ uid, jobId })).toString("base64"),
-        oidcToken: {
-          serviceAccountEmail: invokerSa,
-          // Audience must equal the worker URL so the worker can verify `aud`.
-          audience: workerUrl,
+  try {
+    const [task] = await client.createTask({
+      parent,
+      task: {
+        httpRequest: {
+          httpMethod: "POST",
+          url: workerUrl,
+          headers: { "Content-Type": "application/json" },
+          body: Buffer.from(JSON.stringify({ uid, jobId })).toString("base64"),
+          oidcToken: {
+            serviceAccountEmail: invokerSa,
+            // Audience must equal the worker URL so the worker can verify `aud`.
+            audience: workerUrl,
+          },
         },
       },
-    },
-  });
+    });
+    console.log(
+      `[export-enqueue] queued Cloud Task for job ${jobId} (${priority}) on ${queue} → ${task.name ?? "(unnamed)"}`
+    );
+  } catch (err) {
+    // Surface the REAL reason (gRPC status code + message + non-secret target
+    // config) so production logs explain why dispatch failed, instead of only
+    // the generic 502 the client sees.
+    const code = (err as { code?: unknown })?.code;
+    console.error(`[export-enqueue] createTask failed for job ${jobId}`, {
+      jobId,
+      priority,
+      project,
+      location,
+      queue,
+      workerUrl,
+      invokerSa,
+      grpcCode: code,
+      message: err instanceof Error ? err.message : String(err),
+    });
+    throw err instanceof Error
+      ? err
+      : new Error(`Cloud Tasks createTask failed: ${String(err)}`);
+  }
 }
