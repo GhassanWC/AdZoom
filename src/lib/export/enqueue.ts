@@ -66,6 +66,7 @@ async function enqueueLocal({ uid, jobId }: EnqueueParams): Promise<void> {
 /** Production: enqueue a Cloud Tasks task targeting the private Cloud Run worker. */
 async function enqueueCloudTask({ uid, jobId, priority }: EnqueueParams): Promise<void> {
   const project =
+    process.env.CLOUD_TASKS_PROJECT_ID ??
     process.env.GCLOUD_PROJECT ??
     process.env.GOOGLE_CLOUD_PROJECT ??
     process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID;
@@ -81,7 +82,8 @@ async function enqueueCloudTask({ uid, jobId, priority }: EnqueueParams): Promis
 
   if (!project || !location || !workerUrl || !invokerSa || !queue) {
     const missing = [
-      !project && "GCLOUD_PROJECT (or NEXT_PUBLIC_FIREBASE_PROJECT_ID)",
+      !project &&
+        "CLOUD_TASKS_PROJECT_ID (or GCLOUD_PROJECT / GOOGLE_CLOUD_PROJECT / NEXT_PUBLIC_FIREBASE_PROJECT_ID)",
       !location && "EXPORT_QUEUE_LOCATION",
       !workerUrl && "EXPORT_WORKER_URL",
       !invokerSa && "EXPORT_INVOKER_SA",
