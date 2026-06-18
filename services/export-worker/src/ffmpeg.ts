@@ -50,6 +50,11 @@ export interface SourceInfo {
   durationSec: number;
   hasAudio: boolean;
   audioSampleRate: number;
+  /** Audio codec name per ffprobe (e.g. "aac", "opus"); "" if no audio. May be
+   *  "none"/"unknown" for codecs the build can't identify (e.g. Apple `apac`). */
+  audioCodec: string;
+  /** Four-char codec tag (e.g. "apac") — useful when codec_name is "none". */
+  audioCodecTag: string;
 }
 
 export async function probeSource(path: string): Promise<SourceInfo> {
@@ -65,6 +70,8 @@ export async function probeSource(path: string): Promise<SourceInfo> {
   const json = JSON.parse(stdout) as {
     streams?: Array<{
       codec_type?: string;
+      codec_name?: string;
+      codec_tag_string?: string;
       width?: number;
       height?: number;
       sample_rate?: string;
@@ -80,7 +87,45 @@ export async function probeSource(path: string): Promise<SourceInfo> {
     durationSec: Number(json.format?.duration ?? 0),
     hasAudio: !!a,
     audioSampleRate: a?.sample_rate ? Number(a.sample_rate) : 48000,
+    audioCodec: a?.codec_name ?? "",
+    audioCodecTag: a?.codec_tag_string ?? "",
   };
+}
+
+/**
+ * Can the bundled ffmpeg actually DECODE this file's first audio stream? Some
+ * containers carry codecs the static build has no decoder for — notably Apple's
+ * `apac` spatial-audio codec, which makes the encoder abort at startup
+ * ("no decoder found for: none") and leaves the frame writer with a bare EPIPE.
+ * We decode a short slice to the null muxer up front, so the render can fall
+ * back to a silent export (with a clear warning) instead of crashing.
+ *
+ * Returns false on ANY decode failure (unknown codec, corrupt stream, or a
+ * missing binary) — the caller treats that as "drop audio", which is always the
+ * safe degradation. Only call when `probeSource` reported `hasAudio`.
+ */
+export async function canDecodeAudio(path: string): Promise<boolean> {
+  try {
+    await execFileP(ffmpegBin(), [
+      "-hide_banner",
+      "-v",
+      "error",
+      "-i",
+      path,
+      "-map",
+      "0:a:0",
+      // Decode a brief slice only — enough to prove the decoder works without
+      // processing the whole track.
+      "-t",
+      "0.5",
+      "-f",
+      "null",
+      "-",
+    ]);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -396,8 +441,23 @@ export async function spawnEncoder(opts: EncoderOptions): Promise<Encoder> {
           return;
         }
         const ok = stdin.write(frame, (err) => {
-          if (err) reject(exitError ?? err);
-          else if (ok) resolve();
+          if (!err) {
+            if (ok) resolve();
+            return;
+          }
+          // A write error is almost always a broken pipe because ffmpeg just
+          // died (e.g. it can't decode the source audio). The bare EPIPE is
+          // useless on its own — prefer the REAL ffmpeg error, which carries the
+          // stderr tail. It's set by the 'close' handler, which fires right
+          // after the pipe breaks; wait briefly (bounded) for it.
+          if (exitError) {
+            reject(exitError);
+            return;
+          }
+          Promise.race([
+            exitPromise,
+            new Promise<void>((r) => setTimeout(r, 2000)),
+          ]).then(() => reject(exitError ?? err));
         });
         if (!ok) stdin.once("drain", () => resolve());
       });

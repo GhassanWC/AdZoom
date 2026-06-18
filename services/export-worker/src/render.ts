@@ -13,6 +13,7 @@ import type { SerializedRenderRecipe } from "@/lib/firebase/schema";
 import type { TimelineMap } from "@/lib/timeline/crop-speed";
 import {
   probeSource,
+  canDecodeAudio,
   spawnDecoder,
   spawnEncoder,
   type EncoderAudio,
@@ -72,11 +73,27 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
     recipe;
 
   const info = await probeSource(opts.sourcePath);
-  const hasAudio = info.hasAudio;
+  // `hasAudio` may be demoted to false below if the source has an audio stream
+  // the bundled ffmpeg can't decode — we then export silently rather than let
+  // the encoder abort (and the frame writer EPIPE) trying to transcode it.
+  let hasAudio = info.hasAudio;
   if (!hasAudio) {
     warnings.push(
       "Source has no audio track — the export will be silent. This matches the source."
     );
+  } else if (!(await canDecodeAudio(opts.sourcePath))) {
+    // Unsupported codec (e.g. Apple `apac`). No decoder ⇒ no transcode possible,
+    // so drop audio and tell the user. Keep working for AAC/Opus/etc., which
+    // pass the decode test above.
+    hasAudio = false;
+    const codec = info.audioCodec || info.audioCodecTag || "unknown";
+    warnings.push(
+      `Source audio codec "${codec}" is unsupported, exported without audio.`
+    );
+    console.warn("[worker:audio] unsupported codec — exporting silent", {
+      codec: info.audioCodec,
+      tag: info.audioCodecTag,
+    });
   }
 
   // One scratch canvas for the decoded source frame, one for the output. Reused
