@@ -297,7 +297,7 @@ export async function POST(req: NextRequest) {
       });
     } catch (err) {
       console.error("[export-cloud] enqueue failed — rolling back", err);
-      await releaseAndFail(db, uid, jobId, monthKey, estimate, err).catch((e) =>
+      await releaseAndFail(db, uid, jobId, monthKey, estimate).catch((e) =>
         console.error("[export-cloud] rollback failed", e)
       );
       return NextResponse.json(
@@ -332,14 +332,18 @@ function numOr(primary: number | undefined, fallback: number | undefined): numbe
   return 0;
 }
 
-/** Mark a queued job failed and release its minute reservation atomically. */
+/**
+ * Mark a queued job failed and release its minute reservation atomically.
+ * The persisted `errorMessage` is a CLEAN, fixed line (shown verbatim in the
+ * export panel) — the raw dispatch error (Cloud Tasks/gRPC text) is logged by
+ * the caller, never written to Firestore/the UI.
+ */
 async function releaseAndFail(
   db: FirebaseFirestore.Firestore,
   uid: string,
   jobId: string,
   monthKey: string,
-  estimate: number,
-  cause: unknown
+  estimate: number
 ): Promise<void> {
   const usageRef = db.doc(`users/${uid}/usage/${monthKey}`);
   const jobRef = db.doc(`users/${uid}/exportJobs/${jobId}`);
@@ -356,7 +360,7 @@ async function releaseAndFail(
       {
         status: "failed",
         errorCode: "dispatch_failed",
-        errorMessage: cause instanceof Error ? cause.message : "Failed to queue render.",
+        errorMessage: "Couldn't queue the export for rendering. Please try again.",
         updatedAt: FieldValue.serverTimestamp(),
         completedAt: FieldValue.serverTimestamp(),
       },

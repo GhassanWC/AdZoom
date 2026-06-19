@@ -24,6 +24,12 @@ import ffprobeStatic from "ffprobe-static";
 
 const execFileP = promisify(execFile);
 
+// Bound the short-lived ffprobe/ffmpeg helpers so a malformed source can't hang
+// the worker or overrun the default stdout buffer. A timeout KILLS the child and
+// rejects the promise — which `canDecodeAudio` treats as "drop audio", the safe
+// degradation, rather than letting a stuck probe wedge the whole job.
+const EXEC_OPTS = { timeout: 60_000, maxBuffer: 32 * 1024 * 1024 } as const;
+
 /**
  * Prefer the bundled static binary, but fall back to a system binary on PATH if
  * the static download is missing (e.g. a flaky postinstall left ffmpeg-static
@@ -58,15 +64,19 @@ export interface SourceInfo {
 }
 
 export async function probeSource(path: string): Promise<SourceInfo> {
-  const { stdout } = await execFileP(ffprobeBin(), [
-    "-v",
-    "quiet",
-    "-print_format",
-    "json",
-    "-show_format",
-    "-show_streams",
-    path,
-  ]);
+  const { stdout } = await execFileP(
+    ffprobeBin(),
+    [
+      "-v",
+      "quiet",
+      "-print_format",
+      "json",
+      "-show_format",
+      "-show_streams",
+      path,
+    ],
+    EXEC_OPTS
+  );
   const json = JSON.parse(stdout) as {
     streams?: Array<{
       codec_type?: string;
@@ -106,22 +116,26 @@ export async function probeSource(path: string): Promise<SourceInfo> {
  */
 export async function canDecodeAudio(path: string): Promise<boolean> {
   try {
-    await execFileP(ffmpegBin(), [
-      "-hide_banner",
-      "-v",
-      "error",
-      "-i",
-      path,
-      "-map",
-      "0:a:0",
-      // Decode a brief slice only — enough to prove the decoder works without
-      // processing the whole track.
-      "-t",
-      "0.5",
-      "-f",
-      "null",
-      "-",
-    ]);
+    await execFileP(
+      ffmpegBin(),
+      [
+        "-hide_banner",
+        "-v",
+        "error",
+        "-i",
+        path,
+        "-map",
+        "0:a:0",
+        // Decode a brief slice only — enough to prove the decoder works without
+        // processing the whole track.
+        "-t",
+        "0.5",
+        "-f",
+        "null",
+        "-",
+      ],
+      EXEC_OPTS
+    );
     return true;
   } catch {
     return false;

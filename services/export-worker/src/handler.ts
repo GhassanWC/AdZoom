@@ -18,6 +18,7 @@ import { getAdmin, bucket } from "./firebase.js";
 import { loadConfig } from "./config.js";
 import { releaseMinutes } from "./minutes.js";
 import { renderToMp4, CanceledError } from "./render.js";
+import { toUserFacingError } from "./errors.js";
 import type { ExportJobDoc } from "@/lib/firebase/schema";
 
 /** How long a claimed-but-unfinished job is considered owned by an instance. */
@@ -220,14 +221,17 @@ export async function processJob(uid: string, jobId: string): Promise<string> {
     }
     // Genuine failure (render/stall/upload) — the worker owns release + status.
     await releaseMinutes(db, uid, monthKey, estimate).catch(() => {});
-    const message = err instanceof Error ? err.message : "Render failed.";
+    // The user sees a CLEAN one-liner; the raw ffmpeg/stack detail stays in the
+    // worker logs only (never persisted to Firestore / shown in the UI).
+    const raw = err instanceof Error ? err.message : "Render failed.";
+    const friendly = toUserFacingError(err);
     await patch({
       status: "failed",
-      errorCode: "render_failed",
-      errorMessage: message.slice(0, 500),
+      errorCode: friendly.code,
+      errorMessage: friendly.message,
       completedAt: FieldValue.serverTimestamp(),
     }).catch(() => {});
-    console.error("[worker] failed", { uid, jobId, error: message });
+    console.error("[worker] failed", { uid, jobId, errorCode: friendly.code, error: raw });
     return "failed";
   } finally {
     clearInterval(cancelPoll);

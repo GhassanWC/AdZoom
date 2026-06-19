@@ -1052,6 +1052,7 @@ import { join } from "node:path";
 import ffmpegStatic from "ffmpeg-static";
 import ffprobeStatic from "ffprobe-static";
 var execFileP = promisify(execFile);
+var EXEC_OPTS = { timeout: 6e4, maxBuffer: 32 * 1024 * 1024 };
 function resolveBinary(p, fallback) {
   return p && existsSync(p) ? p : fallback;
 }
@@ -1062,15 +1063,19 @@ function ffprobeBin() {
   return resolveBinary(ffprobeStatic?.path, "ffprobe");
 }
 async function probeSource(path) {
-  const { stdout } = await execFileP(ffprobeBin(), [
-    "-v",
-    "quiet",
-    "-print_format",
-    "json",
-    "-show_format",
-    "-show_streams",
-    path
-  ]);
+  const { stdout } = await execFileP(
+    ffprobeBin(),
+    [
+      "-v",
+      "quiet",
+      "-print_format",
+      "json",
+      "-show_format",
+      "-show_streams",
+      path
+    ],
+    EXEC_OPTS
+  );
   const json = JSON.parse(stdout);
   const streams = json.streams ?? [];
   const v = streams.find((s) => s.codec_type === "video");
@@ -1087,22 +1092,26 @@ async function probeSource(path) {
 }
 async function canDecodeAudio(path) {
   try {
-    await execFileP(ffmpegBin(), [
-      "-hide_banner",
-      "-v",
-      "error",
-      "-i",
-      path,
-      "-map",
-      "0:a:0",
-      // Decode a brief slice only — enough to prove the decoder works without
-      // processing the whole track.
-      "-t",
-      "0.5",
-      "-f",
-      "null",
-      "-"
-    ]);
+    await execFileP(
+      ffmpegBin(),
+      [
+        "-hide_banner",
+        "-v",
+        "error",
+        "-i",
+        path,
+        "-map",
+        "0:a:0",
+        // Decode a brief slice only — enough to prove the decoder works without
+        // processing the whole track.
+        "-t",
+        "0.5",
+        "-f",
+        "null",
+        "-"
+      ],
+      EXEC_OPTS
+    );
     return true;
   } catch {
     return false;
@@ -1570,6 +1579,33 @@ async function renderToMp4(opts) {
   }
 }
 
+// src/errors.ts
+function toUserFacingError(err) {
+  const raw = (err instanceof Error ? err.message : String(err ?? "")).toLowerCase();
+  if (raw.includes("no decoder found") || raw.includes("could not find codec parameters") || raw.includes("initializing a simple filtergraph") || raw.includes("error initializing")) {
+    return {
+      code: "audio_unsupported",
+      message: "This video's audio is in a format we can't process. Please try exporting again \u2014 if it keeps failing, the audio track may be unsupported."
+    };
+  }
+  if (raw.includes("stalled")) {
+    return {
+      code: "render_stalled",
+      message: "The export stalled while rendering. The source video may be unreadable or in an unsupported format. Please try again."
+    };
+  }
+  if (raw.includes("enoent") || raw.includes("spawn")) {
+    return {
+      code: "worker_error",
+      message: "The export service hit a temporary problem. Please try again in a moment."
+    };
+  }
+  return {
+    code: "render_failed",
+    message: "Something went wrong while exporting your video. Please try again."
+  };
+}
+
 // src/handler.ts
 var LEASE_MS = 30 * 60 * 1e3;
 function toMs(v) {
@@ -1709,15 +1745,16 @@ async function processJob(uid, jobId) {
     }
     await releaseMinutes(db, uid, monthKey, estimate).catch(() => {
     });
-    const message = err instanceof Error ? err.message : "Render failed.";
+    const raw = err instanceof Error ? err.message : "Render failed.";
+    const friendly = toUserFacingError(err);
     await patch({
       status: "failed",
-      errorCode: "render_failed",
-      errorMessage: message.slice(0, 500),
+      errorCode: friendly.code,
+      errorMessage: friendly.message,
       completedAt: FieldValue2.serverTimestamp()
     }).catch(() => {
     });
-    console.error("[worker] failed", { uid, jobId, error: message });
+    console.error("[worker] failed", { uid, jobId, errorCode: friendly.code, error: raw });
     return "failed";
   } finally {
     clearInterval(cancelPoll);
