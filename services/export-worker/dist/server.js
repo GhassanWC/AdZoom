@@ -15,7 +15,10 @@ function loadConfig() {
     devSecret: process.env.EXPORT_WORKER_DEV_SECRET,
     pollEveryFrames: Number(process.env.WORKER_POLL_EVERY_FRAMES ?? 30),
     crf: Number(process.env.WORKER_X264_CRF ?? 19),
-    preset: process.env.WORKER_X264_PRESET ?? "veryfast"
+    preset: process.env.WORKER_X264_PRESET ?? "veryfast",
+    normalizeEnabled: process.env.WORKER_NORMALIZE_ENABLED === "1",
+    normalizeCrf: Number(process.env.WORKER_NORMALIZE_CRF ?? 18),
+    normalizePreset: process.env.WORKER_NORMALIZE_PRESET ?? "veryfast"
   };
 }
 
@@ -1062,6 +1065,14 @@ function ffmpegBin() {
 function ffprobeBin() {
   return resolveBinary(ffprobeStatic?.path, "ffprobe");
 }
+function parseRate(raw) {
+  if (!raw) return 0;
+  const [n, d] = raw.split("/");
+  const num = Number(n);
+  const den = d === void 0 ? 1 : Number(d);
+  if (!Number.isFinite(num) || !Number.isFinite(den) || den === 0) return 0;
+  return num / den;
+}
 async function probeSource(path) {
   const { stdout } = await execFileP(
     ffprobeBin(),
@@ -1078,16 +1089,25 @@ async function probeSource(path) {
   );
   const json = JSON.parse(stdout);
   const streams = json.streams ?? [];
-  const v = streams.find((s) => s.codec_type === "video");
+  const videoStreams = streams.filter(
+    (s) => s.codec_type === "video" && s.disposition?.attached_pic !== 1
+  );
+  const v = videoStreams[0];
   const a = streams.find((s) => s.codec_type === "audio");
   return {
     width: v?.width ?? 0,
     height: v?.height ?? 0,
     durationSec: Number(json.format?.duration ?? 0),
+    videoCodec: v?.codec_name ?? "",
+    fps: parseRate(v?.r_frame_rate) || parseRate(v?.avg_frame_rate),
+    nbVideoStreams: videoStreams.length,
+    nbAudioStreams: streams.filter((s) => s.codec_type === "audio").length,
     hasAudio: !!a,
     audioSampleRate: a?.sample_rate ? Number(a.sample_rate) : 48e3,
+    audioChannels: a?.channels ?? 0,
     audioCodec: a?.codec_name ?? "",
-    audioCodecTag: a?.codec_tag_string ?? ""
+    audioCodecTag: a?.codec_tag_string ?? "",
+    bitrate: Number(json.format?.bit_rate ?? 0)
   };
 }
 async function canDecodeAudio(path) {
@@ -1115,6 +1135,41 @@ async function canDecodeAudio(path) {
     return true;
   } catch {
     return false;
+  }
+}
+var NORMALIZE_EXEC_OPTS = {
+  timeout: 20 * 6e4,
+  maxBuffer: 16 * 1024 * 1024
+};
+async function normalizeSource(opts) {
+  const { sourcePath, outputPath, dropAudio, crf, preset } = opts;
+  const args = [
+    "-hide_banner",
+    "-loglevel",
+    "warning",
+    "-i",
+    sourcePath,
+    "-c:v",
+    "libx264",
+    "-preset",
+    preset,
+    "-crf",
+    String(crf),
+    "-pix_fmt",
+    "yuv420p",
+    ...dropAudio ? ["-an"] : ["-c:a", "aac", "-b:a", "192k"],
+    "-movflags",
+    "+faststart",
+    "-y",
+    outputPath
+  ];
+  try {
+    await execFileP(ffmpegBin(), args, { ...NORMALIZE_EXEC_OPTS, signal: opts.signal });
+  } catch (err) {
+    const e = err;
+    const detail = (e.stderr || e.message || "").toString().trim();
+    console.error("[worker:normalize] failed", detail.slice(-4e3));
+    throw new Error(`normalize failed: ${detail.slice(-500)}`);
   }
 }
 function makeFrameReader(stream, frameBytes) {
@@ -1411,6 +1466,27 @@ function buildAudioFilterComplex(segments, moments, sampleRate) {
   return [...chains, concat].join(";");
 }
 
+// src/preflight.ts
+var AUDIO_UNSUPPORTED_WARNING = "This source audio format is not supported. The video was exported without audio.";
+async function computePreflight(path) {
+  const info = await probeSource(path);
+  const audioDecodable = info.hasAudio ? await canDecodeAudio(path) : false;
+  const needsAudioDrop = info.hasAudio && !audioDecodable;
+  const reasons = [];
+  if (info.videoCodec && info.videoCodec !== "h264") {
+    reasons.push(`video codec "${info.videoCodec}" is not h264`);
+  }
+  if (info.nbVideoStreams !== 1) {
+    reasons.push(`unexpected video stream count: ${info.nbVideoStreams}`);
+  }
+  if (info.hasAudio && info.audioCodec !== "aac") {
+    reasons.push(
+      needsAudioDrop ? `audio codec "${info.audioCodec || info.audioCodecTag || "unknown"}" is undecodable` : `audio codec "${info.audioCodec}" is not aac`
+    );
+  }
+  return { info, risky: reasons.length > 0, reasons, audioDecodable, needsAudioDrop };
+}
+
 // src/render.ts
 var CanceledError = class extends Error {
   constructor() {
@@ -1436,16 +1512,15 @@ async function renderToMp4(opts) {
   const { canvasW, canvasH, sourceWidth, sourceHeight, fps, outputDuration, timelineMap } = recipe;
   const info = await probeSource(opts.sourcePath);
   let hasAudio = info.hasAudio;
-  if (!hasAudio) {
+  if (opts.audioAlreadyDropped) {
+    hasAudio = false;
+  } else if (!hasAudio) {
     warnings.push(
       "Source has no audio track \u2014 the export will be silent. This matches the source."
     );
   } else if (!await canDecodeAudio(opts.sourcePath)) {
     hasAudio = false;
-    const codec = info.audioCodec || info.audioCodecTag || "unknown";
-    warnings.push(
-      `Source audio codec "${codec}" is unsupported, exported without audio.`
-    );
+    warnings.push(AUDIO_UNSUPPORTED_WARNING);
     console.warn("[worker:audio] unsupported codec \u2014 exporting silent", {
       codec: info.audioCodec,
       tag: info.audioCodecTag
@@ -1600,6 +1675,12 @@ function toUserFacingError(err) {
       message: "The export service hit a temporary problem. Please try again in a moment."
     };
   }
+  if (raw.includes("epipe") || raw.includes("broken pipe") || raw.includes("write after end")) {
+    return {
+      code: "encoder_pipe_broken",
+      message: "The export ended unexpectedly while encoding. Please try again."
+    };
+  }
   return {
     code: "render_failed",
     message: "Something went wrong while exporting your video. Please try again."
@@ -1634,6 +1715,87 @@ async function claimJob(db, uid, jobId) {
     return { action: "claimed", job };
   });
 }
+async function prepareSource(args) {
+  const { db, uid, jobId, job, cfg, srcPath, workDir, signal, patch } = args;
+  const pf = await computePreflight(srcPath);
+  const summary = {
+    videoCodec: pf.info.videoCodec,
+    audioCodec: pf.info.audioCodec,
+    risky: pf.risky,
+    normalized: false
+  };
+  if (!pf.risky || !cfg.normalizeEnabled) {
+    if (pf.risky) {
+      console.warn("[worker:preflight] risky source, normalization disabled", {
+        jobId,
+        reasons: pf.reasons
+      });
+    }
+    return { renderSourcePath: srcPath, audioDropped: false, warnings: [], preflight: summary };
+  }
+  console.info("[worker:preflight] risky source \u2014 normalizing", { jobId, reasons: pf.reasons });
+  const projRef = db.doc(`users/${uid}/projects/${job.projectId}`);
+  const proj = (await projRef.get()).data();
+  const normStoragePath = `users/${uid}/projects/${job.projectId}/normalized/source.mp4`;
+  const normPath = join2(workDir, "normalized.mp4");
+  let key = "";
+  try {
+    const [meta] = await bucket().file(job.sourceStoragePath).getMetadata();
+    key = `${meta.generation ?? ""}:${meta.md5Hash ?? ""}`;
+  } catch {
+    key = "";
+  }
+  if (key && proj?.normalizedSourcePath && proj.normalizedSourceKey === key) {
+    const [exists] = await bucket().file(proj.normalizedSourcePath).exists();
+    if (exists) {
+      await bucket().file(proj.normalizedSourcePath).download({ destination: normPath });
+      const audioDropped = !!proj.normalizedAudioDropped;
+      console.info("[worker:normalize] cache hit", { jobId, path: proj.normalizedSourcePath });
+      return {
+        renderSourcePath: normPath,
+        audioDropped,
+        warnings: audioDropped ? [AUDIO_UNSUPPORTED_WARNING] : [],
+        preflight: { ...summary, normalized: true }
+      };
+    }
+  }
+  await patch({ stage: "normalizing", progress: 0 });
+  try {
+    await normalizeSource({
+      sourcePath: srcPath,
+      outputPath: normPath,
+      dropAudio: pf.needsAudioDrop,
+      crf: cfg.normalizeCrf,
+      preset: cfg.normalizePreset,
+      signal
+    });
+  } catch (err) {
+    if (signal.aborted) throw new CanceledError();
+    throw err;
+  }
+  if (signal.aborted) throw new CanceledError();
+  await bucket().upload(normPath, {
+    destination: normStoragePath,
+    metadata: { contentType: "video/mp4" }
+  });
+  await projRef.set(
+    {
+      normalizedSourcePath: normStoragePath,
+      normalizedSourceKey: key,
+      normalizedAudioDropped: pf.needsAudioDrop,
+      updatedAt: Date.now()
+    },
+    { merge: true }
+  ).catch(() => {
+  });
+  console.info("[worker:normalize] done", { jobId, audioDropped: pf.needsAudioDrop });
+  return {
+    renderSourcePath: normPath,
+    audioDropped: pf.needsAudioDrop,
+    warnings: pf.needsAudioDrop ? [AUDIO_UNSUPPORTED_WARNING] : [],
+    preflight: { ...summary, normalized: true }
+  };
+}
 async function processJob(uid, jobId) {
   const cfg = loadConfig();
   const { db, bucketName } = getAdmin();
@@ -1663,20 +1825,38 @@ async function processJob(uid, jobId) {
     });
   }, 1e3);
   const patch = (data) => jobRef.set({ ...data, updatedAt: FieldValue2.serverTimestamp() }, { merge: true });
+  const heartbeat = setInterval(() => {
+    void patch({}).catch(() => {
+    });
+  }, 6e4);
   let workDir = null;
   try {
     workDir = await mkdtemp(join2(tmpdir2(), `framevo-job-${jobId}-`));
     const srcPath = join2(workDir, `source${extname(job.sourceStoragePath) || ".mp4"}`);
     const outPath = join2(workDir, `${jobId}.mp4`);
     await bucket().file(job.sourceStoragePath).download({ destination: srcPath });
+    const prepared = await prepareSource({
+      db,
+      uid,
+      jobId,
+      job,
+      cfg,
+      srcPath,
+      workDir,
+      signal: controller.signal,
+      patch
+    });
     let lastPct = -1;
     const result = await renderToMp4({
       serialized: job.renderRecipe,
-      sourcePath: srcPath,
+      sourcePath: prepared.renderSourcePath,
       outputPath: outPath,
       crf: cfg.crf,
       preset: cfg.preset,
       signal: controller.signal,
+      // Normalization already stripped unsupported audio — tell the render so it
+      // emits the right warning (not "source has no audio").
+      audioAlreadyDropped: prepared.audioDropped,
       onProgress: ({ stage, progress }) => {
         const pct = Math.round(progress * 100);
         if (pct === lastPct) return;
@@ -1684,6 +1864,7 @@ async function processJob(uid, jobId) {
         void patch({ stage, progress });
       }
     });
+    const warnings = Array.from(/* @__PURE__ */ new Set([...prepared.warnings, ...result.warnings]));
     await patch({ stage: "uploading", progress: 0.98 });
     const token = randomUUID();
     await bucket().upload(outPath, {
@@ -1722,7 +1903,8 @@ async function processJob(uid, jobId) {
           progress: 1,
           downloadUrl,
           consumedExportMinutes: estimate,
-          warnings: result.warnings,
+          warnings,
+          preflight: prepared.preflight,
           completedAt: FieldValue2.serverTimestamp(),
           updatedAt: FieldValue2.serverTimestamp()
         },
@@ -1758,6 +1940,7 @@ async function processJob(uid, jobId) {
     return "failed";
   } finally {
     clearInterval(cancelPoll);
+    clearInterval(heartbeat);
     if (workDir) await rm(workDir, { recursive: true, force: true }).catch(() => {
     });
   }

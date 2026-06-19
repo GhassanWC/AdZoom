@@ -29,6 +29,18 @@ export interface WorkerConfig {
   crf: number;
   /** x264 preset. */
   preset: string;
+  /**
+   * When true, the worker PREFLIGHTS the source and, for "risky" inputs (non-
+   * H.264 video or non-AAC/undecodable audio), transcodes it to a worker-safe
+   * H.264+AAC MP4 BEFORE rendering — caching the result per project. Default
+   * off so the feature ships dark (flip via `WORKER_NORMALIZE_ENABLED=1`).
+   */
+  normalizeEnabled: boolean;
+  /** x264 CRF used for the normalization pass (slightly higher quality than the
+   *  render CRF to limit double-compression loss). */
+  normalizeCrf: number;
+  /** x264 preset for the normalization pass. */
+  normalizePreset: string;
 }
 
 export function loadConfig(): WorkerConfig {
@@ -46,5 +58,8 @@ export function loadConfig(): WorkerConfig {
     pollEveryFrames: Number(process.env.WORKER_POLL_EVERY_FRAMES ?? 30),
     crf: Number(process.env.WORKER_X264_CRF ?? 19),
     preset: process.env.WORKER_X264_PRESET ?? "veryfast",
+    normalizeEnabled: process.env.WORKER_NORMALIZE_ENABLED === "1",
+    normalizeCrf: Number(process.env.WORKER_NORMALIZE_CRF ?? 18),
+    normalizePreset: process.env.WORKER_NORMALIZE_PRESET ?? "veryfast",
   };
 }

@@ -4,6 +4,7 @@ import * as React from "react";
 import { useAuth } from "@/lib/firebase/AuthProvider";
 import {
   subscribeExportJobs,
+  isJobStale,
   type ExportJobView,
 } from "@/lib/firebase/export-jobs";
 import type {
@@ -72,7 +73,22 @@ export function useCloudExport(projectId: string) {
     () => jobs.find((j) => j.projectId === projectId) ?? null,
     [jobs, projectId]
   );
+
+  // Tick a clock while a job is active so `isStale` flips even when Firestore
+  // stops updating (a dead worker never writes `updatedAt` again).
+  const [now, setNow] = React.useState(() => Date.now());
+  React.useEffect(() => {
+    if (!job || !ACTIVE_STATUSES.includes(job.status)) return;
+    const id = setInterval(() => setNow(Date.now()), 30_000);
+    return () => clearInterval(id);
+  }, [job]);
+
   const isActive = !!job && ACTIVE_STATUSES.includes(job.status);
+  // A job stuck active with no recent update — the worker likely died. The UI
+  // swaps the eternal "Rendering 0%" for a clean "stuck — cancel & retry" state
+  // (cancelling releases the reserved minutes immediately); the server
+  // reconciler is the backstop for users who never reopen the panel.
+  const isStale = !!job && isJobStale(job, now);
 
   const startCloudExport = React.useCallback(
     async (input: StartCloudExportInput): Promise<StartCloudExportResult> => {
@@ -151,6 +167,7 @@ export function useCloudExport(projectId: string) {
   return {
     job,
     isActive,
+    isStale,
     starting,
     error,
     startCloudExport,

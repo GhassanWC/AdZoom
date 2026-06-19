@@ -24,6 +24,29 @@ import type { ExportJobDoc } from "./schema";
 /** The UI-facing view of an export job — everything except `renderRecipe`. */
 export type ExportJobView = Omit<ExportJobDoc, "renderRecipe">;
 
+/**
+ * UI staleness window — slightly larger than the server reconciler's 10-min
+ * threshold so the client only flags a job "stuck" after the server has had a
+ * chance to fail it cleanly.
+ */
+export const STALE_UI_MS = 12 * 60_000;
+
+const ACTIVE_FOR_STALE: ExportJobView["status"][] = [
+  "queued",
+  "rendering",
+  "uploading",
+];
+
+/**
+ * Derived (never stored): an active job whose last update is older than the
+ * staleness window — the worker most likely died, so the UI should stop showing
+ * a frozen "Rendering 0%" and offer a retry. Re-evaluate on a timer, since
+ * `updatedAt` stops changing once the worker is gone.
+ */
+export function isJobStale(job: ExportJobView, now: number = Date.now()): boolean {
+  return ACTIVE_FOR_STALE.includes(job.status) && now - job.updatedAt > STALE_UI_MS;
+}
+
 function millis(v: unknown): number | undefined {
   const t = v as { toMillis?: () => number } | undefined;
   return t?.toMillis?.();

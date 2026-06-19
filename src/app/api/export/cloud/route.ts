@@ -3,7 +3,7 @@ import { FieldValue } from "firebase-admin/firestore";
 import { getAdmin } from "@/lib/firebase/admin";
 import { getUserPlan } from "@/lib/usage/gating";
 import { currentMonthKey } from "@/lib/usage/usage";
-import { normalizePlan } from "@/lib/usage/plan";
+import { normalizePlan, planMeetsMinimum } from "@/lib/usage/plan";
 import {
   CLOUD_EXPORT_MINUTES,
   CloudExportNotAllowedError,
@@ -163,6 +163,21 @@ export async function POST(req: NextRequest) {
       );
     }
     const paidPlan = plan === "creator" ? "creator" : "pro";
+
+    // ── Output-tier gate: 4K and 60fps are Pro+ only ───────────────────────
+    // Cloud export already requires Pro+, so this is defense in depth (and the
+    // explicit home for the rule if cloud export ever opens to lower tiers). The
+    // browser path enforces the same caps in /api/billing/export-permit.
+    if ((resolution === "4K" || fps === 60) && !planMeetsMinimum(plan, "pro")) {
+      return NextResponse.json(
+        {
+          error: "4K and 60fps exports require a Pro or Creator plan.",
+          kind: "tier_requires_pro",
+          actual: plan,
+        },
+        { status: 402 }
+      );
+    }
 
     // ── Recipe (shared with the worker) → output dims + billed duration ─────
     const recipe = buildRenderRecipe({

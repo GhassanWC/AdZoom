@@ -118,14 +118,40 @@ The invoker SA needs `roles/run.invoker` on the worker service and
 | `EXPORT_WORKER_DEV_SECRET` | optional dev shared-secret header | unset |
 | `WORKER_X264_CRF` / `WORKER_X264_PRESET` | encode quality/speed | `19` / `veryfast` |
 | `WORKER_POLL_EVERY_FRAMES` | cancel-flag + progress cadence | `30` |
+| `WORKER_NORMALIZE_ENABLED` | `1` → preflight + transcode "risky" sources to H.264+AAC before render (see below) | unset (off) |
+| `WORKER_NORMALIZE_CRF` / `WORKER_NORMALIZE_PRESET` | normalization pass quality/speed | `18` / `veryfast` |
 
-## Reservation sweeper (recommended)
+## Source preflight + normalization
+
+Before the (expensive) render commits to a source, the worker ffprobes it
+(`computePreflight` in `src/preflight.ts`) and classifies it as worker-safe or
+**risky** — a non-H.264 video codec, or audio that isn't AAC (transcode) or
+can't be decoded at all (e.g. Apple `apac` → drop audio). When
+`WORKER_NORMALIZE_ENABLED=1` and the source is risky, the worker transcodes it
+to a worker-safe H.264 + AAC MP4 (`normalizeSource`), stores it at
+`users/{uid}/projects/{pid}/normalized/source.mp4`, and **reuses it for future
+exports** of that project (cache keyed on the original object's
+`generation:md5Hash`, recorded on the `ProjectDoc`). Already-safe sources skip
+normalization. Regardless of the flag, the render's `canDecodeAudio` guard still
+drops undecodable audio and exports silently with a clear warning — the export
+never fails because of an unsupported audio codec.
+
+## Stale-job reconciler
 
 Minutes are reserved at enqueue and settled/released at a terminal state. A
-crashed worker could leak a reservation. Run a scheduled reconciler (Cloud
-Scheduler → a small admin job) that, per active month, recomputes
-`cloudMinutesReserved` as the sum of `estimatedExportMinutes` over non-terminal
-jobs and corrects drift. (Not included here — a follow-up.)
+crashed worker would otherwise leave its job stuck non-terminal ("Rendering 0%")
+forever AND leak the reservation. The worker heartbeats `updatedAt` every 60s
+while alive, and **`POST /api/cron/reconcile-exports`** (in the main app) fails
+any non-terminal job whose `updatedAt` is older than 10 min and releases its
+reserved minutes (idempotent). Wire it on a Cloud Scheduler cron (~every 5 min)
+with header `x-cron-secret: <EXPORT_RECONCILE_SECRET>`. The export panel also
+shows a "stuck — cancel & retry" state client-side so the UI never sits at 0%.
+
+## Output tiers
+
+Default export is **1080p / 30fps**. 4K and 60fps require a paid plan (Pro+),
+enforced server-side in `/api/export/cloud` (and `/api/billing/export-permit`
+for the browser path) and reflected in the export panel.
 
 ## Parity test
 

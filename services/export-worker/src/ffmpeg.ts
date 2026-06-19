@@ -54,13 +54,36 @@ export interface SourceInfo {
   width: number;
   height: number;
   durationSec: number;
+  /** Video codec name per ffprobe (e.g. "h264", "hevc", "vp9"); "" if no video. */
+  videoCodec: string;
+  /** Frames per second of the source's first video stream (best-effort, parsed
+   *  from r_frame_rate / avg_frame_rate). 0 when unknown. Informational only —
+   *  the render fps comes from the recipe, not the source. */
+  fps: number;
+  /** Stream counts — a "normal" editable clip has exactly 1 video stream. */
+  nbVideoStreams: number;
+  nbAudioStreams: number;
   hasAudio: boolean;
   audioSampleRate: number;
+  /** Audio channel count (0 when no audio). */
+  audioChannels: number;
   /** Audio codec name per ffprobe (e.g. "aac", "opus"); "" if no audio. May be
    *  "none"/"unknown" for codecs the build can't identify (e.g. Apple `apac`). */
   audioCodec: string;
   /** Four-char codec tag (e.g. "apac") — useful when codec_name is "none". */
   audioCodecTag: string;
+  /** Container bitrate in bits/sec (0 when unknown). */
+  bitrate: number;
+}
+
+/** Parse an ffprobe rate like "30000/1001" or "30/1" into a number; 0 on junk. */
+function parseRate(raw: string | undefined): number {
+  if (!raw) return 0;
+  const [n, d] = raw.split("/");
+  const num = Number(n);
+  const den = d === undefined ? 1 : Number(d);
+  if (!Number.isFinite(num) || !Number.isFinite(den) || den === 0) return 0;
+  return num / den;
 }
 
 export async function probeSource(path: string): Promise<SourceInfo> {
@@ -85,20 +108,36 @@ export async function probeSource(path: string): Promise<SourceInfo> {
       width?: number;
       height?: number;
       sample_rate?: string;
+      channels?: number;
+      r_frame_rate?: string;
+      avg_frame_rate?: string;
+      disposition?: { attached_pic?: number };
     }>;
-    format?: { duration?: string };
+    format?: { duration?: string; bit_rate?: string };
   };
   const streams = json.streams ?? [];
-  const v = streams.find((s) => s.codec_type === "video");
+  // Exclude cover-art / thumbnail streams (attached_pic) — they're tagged as
+  // video by ffprobe but aren't a real video track, so they'd otherwise inflate
+  // the stream count and falsely flag a normal clip as "risky".
+  const videoStreams = streams.filter(
+    (s) => s.codec_type === "video" && s.disposition?.attached_pic !== 1
+  );
+  const v = videoStreams[0];
   const a = streams.find((s) => s.codec_type === "audio");
   return {
     width: v?.width ?? 0,
     height: v?.height ?? 0,
     durationSec: Number(json.format?.duration ?? 0),
+    videoCodec: v?.codec_name ?? "",
+    fps: parseRate(v?.r_frame_rate) || parseRate(v?.avg_frame_rate),
+    nbVideoStreams: videoStreams.length,
+    nbAudioStreams: streams.filter((s) => s.codec_type === "audio").length,
     hasAudio: !!a,
     audioSampleRate: a?.sample_rate ? Number(a.sample_rate) : 48000,
+    audioChannels: a?.channels ?? 0,
     audioCodec: a?.codec_name ?? "",
     audioCodecTag: a?.codec_tag_string ?? "",
+    bitrate: Number(json.format?.bit_rate ?? 0),
   };
 }
 
@@ -139,6 +178,65 @@ export async function canDecodeAudio(path: string): Promise<boolean> {
     return true;
   } catch {
     return false;
+  }
+}
+
+// A full transcode can take minutes — far longer than EXEC_OPTS' 60s probe
+// budget. Bound it well under the 30-min job lease + 3600s Cloud Run timeout.
+const NORMALIZE_EXEC_OPTS = {
+  timeout: 20 * 60_000,
+  maxBuffer: 16 * 1024 * 1024,
+} as const;
+
+export interface NormalizeOptions {
+  sourcePath: string;
+  outputPath: string;
+  /** true → `-an` (source audio is undecodable, e.g. apac); false → transcode to AAC. */
+  dropAudio: boolean;
+  crf: number;
+  preset: string;
+  /** Aborting (job cancel) kills the ffmpeg child and rejects the promise. */
+  signal?: AbortSignal;
+}
+
+/**
+ * Transcode a "risky" source into a worker-safe H.264 + AAC MP4 — a single
+ * ffmpeg pass that PRESERVES resolution / fps / duration (no scaling, no `-r`).
+ * The render then decodes a predictable input instead of an exotic codec the
+ * encoder might choke on mid-stream. On failure the raw ffmpeg tail is logged
+ * (worker logs only) and a tagged error is thrown for `toUserFacingError`.
+ */
+export async function normalizeSource(opts: NormalizeOptions): Promise<void> {
+  const { sourcePath, outputPath, dropAudio, crf, preset } = opts;
+  const args = [
+    "-hide_banner",
+    "-loglevel",
+    "warning",
+    "-i",
+    sourcePath,
+    "-c:v",
+    "libx264",
+    "-preset",
+    preset,
+    "-crf",
+    String(crf),
+    "-pix_fmt",
+    "yuv420p",
+    ...(dropAudio ? ["-an"] : ["-c:a", "aac", "-b:a", "192k"]),
+    "-movflags",
+    "+faststart",
+    "-y",
+    outputPath,
+  ];
+  try {
+    await execFileP(ffmpegBin(), args, { ...NORMALIZE_EXEC_OPTS, signal: opts.signal });
+  } catch (err) {
+    const e = err as { stderr?: string; message?: string };
+    const detail = (e.stderr || e.message || "").toString().trim();
+    console.error("[worker:normalize] failed", detail.slice(-4000));
+    // Keep the tail on the thrown message so toUserFacingError can classify it;
+    // it never reaches Firestore (the handler logs raw, persists the clean line).
+    throw new Error(`normalize failed: ${detail.slice(-500)}`);
   }
 }
 

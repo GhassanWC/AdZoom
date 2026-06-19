@@ -15,11 +15,13 @@ import { tmpdir } from "node:os";
 import { join, extname } from "node:path";
 import { FieldValue, type Firestore } from "firebase-admin/firestore";
 import { getAdmin, bucket } from "./firebase.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, type WorkerConfig } from "./config.js";
 import { releaseMinutes } from "./minutes.js";
 import { renderToMp4, CanceledError } from "./render.js";
+import { normalizeSource } from "./ffmpeg.js";
+import { computePreflight, AUDIO_UNSUPPORTED_WARNING } from "./preflight.js";
 import { toUserFacingError } from "./errors.js";
-import type { ExportJobDoc } from "@/lib/firebase/schema";
+import type { ExportJobDoc, ProjectDoc } from "@/lib/firebase/schema";
 
 /** How long a claimed-but-unfinished job is considered owned by an instance. */
 const LEASE_MS = 30 * 60 * 1000;
@@ -67,6 +69,134 @@ async function claimJob(
     });
     return { action: "claimed", job };
   });
+}
+
+interface PreparedSource {
+  /** Local path the render should read (the original, or a normalized copy). */
+  renderSourcePath: string;
+  /** True when unsupported audio was stripped (apac etc.) — drives the warning. */
+  audioDropped: boolean;
+  /** Warnings the preparation step itself produced (audio-dropped notice). */
+  warnings: string[];
+  /** Summary recorded on the job for observability. */
+  preflight: { videoCodec: string; audioCodec: string; risky: boolean; normalized: boolean };
+}
+
+/**
+ * Preflight the downloaded source and, when normalization is enabled AND the
+ * source is "risky" (non-H.264 video / non-AAC / undecodable audio), transcode
+ * it to a worker-safe H.264+AAC MP4 — cached per project and reused across
+ * exports. A non-risky source (or a disabled flag) renders the original
+ * untouched; the render's own `canDecodeAudio` guard remains the fallback.
+ */
+async function prepareSource(args: {
+  db: Firestore;
+  uid: string;
+  jobId: string;
+  job: ExportJobDoc;
+  cfg: WorkerConfig;
+  srcPath: string;
+  workDir: string;
+  signal: AbortSignal;
+  patch: (data: Record<string, unknown>) => Promise<unknown>;
+}): Promise<PreparedSource> {
+  const { db, uid, jobId, job, cfg, srcPath, workDir, signal, patch } = args;
+
+  const pf = await computePreflight(srcPath);
+  const summary = {
+    videoCodec: pf.info.videoCodec,
+    audioCodec: pf.info.audioCodec,
+    risky: pf.risky,
+    normalized: false,
+  };
+
+  // Not risky, or the feature is off → render the original. The render's
+  // canDecodeAudio guard still drops undecodable audio (defense in depth).
+  if (!pf.risky || !cfg.normalizeEnabled) {
+    if (pf.risky) {
+      console.warn("[worker:preflight] risky source, normalization disabled", {
+        jobId,
+        reasons: pf.reasons,
+      });
+    }
+    return { renderSourcePath: srcPath, audioDropped: false, warnings: [], preflight: summary };
+  }
+
+  console.info("[worker:preflight] risky source — normalizing", { jobId, reasons: pf.reasons });
+
+  const projRef = db.doc(`users/${uid}/projects/${job.projectId}`);
+  const proj = (await projRef.get()).data() as ProjectDoc | undefined;
+  const normStoragePath = `users/${uid}/projects/${job.projectId}/normalized/source.mp4`;
+  const normPath = join(workDir, "normalized.mp4");
+
+  // Identity of the ORIGINAL object: re-uploading the source changes its
+  // generation (and md5Hash), which invalidates this cache key automatically.
+  let key = "";
+  try {
+    const [meta] = await bucket().file(job.sourceStoragePath).getMetadata();
+    key = `${meta.generation ?? ""}:${meta.md5Hash ?? ""}`;
+  } catch {
+    key = ""; // metadata unreadable → treat as a miss (re-normalize)
+  }
+
+  // Cache hit: reuse the project's normalized copy when it matches the current
+  // source AND still exists in Storage.
+  if (key && proj?.normalizedSourcePath && proj.normalizedSourceKey === key) {
+    const [exists] = await bucket().file(proj.normalizedSourcePath).exists();
+    if (exists) {
+      await bucket().file(proj.normalizedSourcePath).download({ destination: normPath });
+      const audioDropped = !!proj.normalizedAudioDropped;
+      console.info("[worker:normalize] cache hit", { jobId, path: proj.normalizedSourcePath });
+      return {
+        renderSourcePath: normPath,
+        audioDropped,
+        warnings: audioDropped ? [AUDIO_UNSUPPORTED_WARNING] : [],
+        preflight: { ...summary, normalized: true },
+      };
+    }
+  }
+
+  // Cache miss: transcode now (honoring cancel), upload, record the cache.
+  await patch({ stage: "normalizing", progress: 0 });
+  try {
+    await normalizeSource({
+      sourcePath: srcPath,
+      outputPath: normPath,
+      dropAudio: pf.needsAudioDrop,
+      crf: cfg.normalizeCrf,
+      preset: cfg.normalizePreset,
+      signal,
+    });
+  } catch (err) {
+    if (signal.aborted) throw new CanceledError();
+    throw err;
+  }
+  if (signal.aborted) throw new CanceledError();
+
+  await bucket().upload(normPath, {
+    destination: normStoragePath,
+    metadata: { contentType: "video/mp4" },
+  });
+  // Best-effort cache write — a failure just means the next export re-normalizes.
+  await projRef
+    .set(
+      {
+        normalizedSourcePath: normStoragePath,
+        normalizedSourceKey: key,
+        normalizedAudioDropped: pf.needsAudioDrop,
+        updatedAt: Date.now(),
+      },
+      { merge: true }
+    )
+    .catch(() => {});
+
+  console.info("[worker:normalize] done", { jobId, audioDropped: pf.needsAudioDrop });
+  return {
+    renderSourcePath: normPath,
+    audioDropped: pf.needsAudioDrop,
+    warnings: pf.needsAudioDrop ? [AUDIO_UNSUPPORTED_WARNING] : [],
+    preflight: { ...summary, normalized: true },
+  };
 }
 
 export async function processJob(uid: string, jobId: string): Promise<string> {
@@ -117,6 +247,15 @@ export async function processJob(uid: string, jobId: string): Promise<string> {
   const patch = (data: Record<string, unknown>) =>
     jobRef.set({ ...data, updatedAt: FieldValue.serverTimestamp() }, { merge: true });
 
+  // Heartbeat: bump `updatedAt` every 60s while THIS instance is alive, so the
+  // stale-job reconciler (which fails jobs whose updatedAt is too old) only ever
+  // fires for a genuinely dead/crashed worker — not for a long-but-healthy
+  // download or normalization pass that writes no progress of its own. (A wedged
+  // render is handled separately by renderToMp4's 90s stall watchdog.)
+  const heartbeat = setInterval(() => {
+    void patch({}).catch(() => {});
+  }, 60_000);
+
   let workDir: string | null = null;
   try {
     workDir = await mkdtemp(join(tmpdir(), `framevo-job-${jobId}-`));
@@ -126,15 +265,33 @@ export async function processJob(uid: string, jobId: string): Promise<string> {
     // ── Download source ──────────────────────────────────────────────────
     await bucket().file(job.sourceStoragePath).download({ destination: srcPath });
 
+    // ── Preflight + (conditional) normalization ─────────────────────────
+    // Risky sources (exotic video codec / non-AAC / undecodable audio) are
+    // transcoded to a worker-safe H.264+AAC MP4 first, cached per project.
+    const prepared = await prepareSource({
+      db,
+      uid,
+      jobId,
+      job,
+      cfg,
+      srcPath,
+      workDir,
+      signal: controller.signal,
+      patch,
+    });
+
     // ── Render (canvas parity + ffmpeg) ─────────────────────────────────
     let lastPct = -1;
     const result = await renderToMp4({
       serialized: job.renderRecipe,
-      sourcePath: srcPath,
+      sourcePath: prepared.renderSourcePath,
       outputPath: outPath,
       crf: cfg.crf,
       preset: cfg.preset,
       signal: controller.signal,
+      // Normalization already stripped unsupported audio — tell the render so it
+      // emits the right warning (not "source has no audio").
+      audioAlreadyDropped: prepared.audioDropped,
       onProgress: ({ stage, progress }) => {
         const pct = Math.round(progress * 100);
         if (pct === lastPct) return;
@@ -142,6 +299,9 @@ export async function processJob(uid: string, jobId: string): Promise<string> {
         void patch({ stage, progress });
       },
     });
+
+    // Preparation warnings (audio-dropped) + render warnings, de-duplicated.
+    const warnings = Array.from(new Set([...prepared.warnings, ...result.warnings]));
 
     // ── Upload + Firebase download URL ──────────────────────────────────
     await patch({ stage: "uploading", progress: 0.98 });
@@ -190,7 +350,8 @@ export async function processJob(uid: string, jobId: string): Promise<string> {
           progress: 1,
           downloadUrl,
           consumedExportMinutes: estimate,
-          warnings: result.warnings,
+          warnings,
+          preflight: prepared.preflight,
           completedAt: FieldValue.serverTimestamp(),
           updatedAt: FieldValue.serverTimestamp(),
         },
@@ -235,6 +396,7 @@ export async function processJob(uid: string, jobId: string): Promise<string> {
     return "failed";
   } finally {
     clearInterval(cancelPoll);
+    clearInterval(heartbeat);
     if (workDir) await rm(workDir, { recursive: true, force: true }).catch(() => {});
   }
 }

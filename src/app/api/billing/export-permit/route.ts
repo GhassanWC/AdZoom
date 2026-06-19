@@ -5,6 +5,7 @@ import {
   EXPORT_LIMITS,
   ExportLimitError,
   PlanRequiredError,
+  canExportFps,
   canExportResolution,
   getUserPlan,
 } from "@/lib/usage/gating";
@@ -96,12 +97,13 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // 1. Plan vs resolution. 4K requires a paid plan (Pro $19 and up).
-    if (!(await canExportResolution(uid, resolution))) {
+    // 1. Plan vs output tier. 4K and 60fps require a paid plan (Pro $19 and up);
+    //    1080p/30 is universal.
+    if (!(await canExportResolution(uid, resolution)) || !(await canExportFps(uid, fps))) {
       const plan = await getUserPlan(uid);
       return NextResponse.json(
         {
-          error: "A paid plan is required for 4K export",
+          error: "A paid plan is required for 4K and 60fps export",
           kind: "plan_required",
           required: "pro",
           actual: plan,

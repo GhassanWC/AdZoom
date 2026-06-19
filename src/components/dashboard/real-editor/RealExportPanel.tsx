@@ -104,11 +104,13 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
   const cloudMinutes = useCloudMinutes();
   const cloud = useCloudExport(project.id);
 
-  // 4K requires a paid plan (Pro $19 and up). Free is capped at 1080p.
+  // 4K and 60fps require a paid plan (Pro $19 and up). Free is capped at 1080p/30.
   const canExport4k = planMeetsMinimum(plan.tier, "pro");
+  const canExport60 = planMeetsMinimum(plan.tier, "pro");
   const availableResolutions = (
     canExport4k ? resolutions : (["1080p"] as const)
   ) as readonly ("1080p" | "4K")[];
+  const availableFps = (canExport60 ? fpsOptions : ([30] as const)) as readonly (30 | 60)[];
 
   const [resolution, setResolution] = React.useState<"1080p" | "4K">("1080p");
   const [fps, setFps] = React.useState<30 | 60>(30);
@@ -151,11 +153,14 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
   // Another project's export is mid-flight — block starting a duplicate.
   const otherExporting = isExporting && job?.projectId !== project.id;
 
-  // Defensive: if the user was on a paid plan at 4K and downgraded to free
-  // mid-session, snap them back to 1080p before they hit Export.
+  // Defensive: if the user was on a paid plan at 4K/60 and downgraded to free
+  // mid-session, snap them back to 1080p/30 before they hit Export.
   React.useEffect(() => {
     if (!canExport4k && resolution === "4K") setResolution("1080p");
   }, [canExport4k, resolution]);
+  React.useEffect(() => {
+    if (!canExport60 && fps === 60) setFps(30);
+  }, [canExport60, fps]);
 
   const supported = pickedMimeAvailable();
 
@@ -237,13 +242,30 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
           />
         </div>
 
-        <Segmented
-          label="Frame rate"
-          options={fpsOptions}
-          value={fps}
-          onChange={setFps}
-          renderLabel={(n) => `${n}fps`}
-        />
+        <div>
+          <div className="mb-2 flex items-center justify-between">
+            <span className="text-[10px] font-semibold uppercase tracking-[0.18em] text-fog">
+              Frame rate
+            </span>
+            {!canExport60 && (
+              <Link
+                href="/pricing"
+                className="inline-flex items-center gap-1 rounded-full border border-violet-400/30 bg-violet-500/10 px-2 py-0.5 text-[10px] font-semibold text-violet-200 hover:bg-violet-500/20"
+                title="60fps exports require a Pro plan"
+              >
+                <Lock size={9} />
+                60fps — Pro
+              </Link>
+            )}
+          </div>
+          <Segmented
+            label=""
+            options={availableFps}
+            value={fps}
+            onChange={setFps}
+            renderLabel={(n) => `${n}fps`}
+          />
+        </div>
 
         {/* Format (container) — WebM is the reliable default; MP4 is produced by
             a WebCodecs pipeline and only offered where the browser supports it. */}
@@ -732,13 +754,17 @@ function CloudExportSection({
     );
   }
 
-  const { job, isActive, starting, error, startCloudExport, cancelCloudExport } =
+  const { job, isActive, isStale, starting, error, startCloudExport, cancelCloudExport } =
     cloud;
   const isCreator = minutes.plan === "creator";
   const enoughMinutes = minutes.remaining >= estimateMinutes;
   const usedPct =
     minutes.limit > 0 ? Math.min(100, (minutes.used / minutes.limit) * 100) : 0;
   const blocked = !hasSource || !enoughMinutes || starting || isActive;
+  // Set expectations before a long render: 4K/60fps and longer clips take
+  // noticeably more wall-clock time on the worker.
+  const slowExport =
+    estimateMinutes >= 8 || input.resolution === "4K" || input.fps === 60;
 
   return (
     <div className="space-y-3 rounded-xl border border-violet-400/30 bg-violet-500/[0.06] px-4 py-3.5">
@@ -771,29 +797,48 @@ function CloudExportSection({
         />
       </div>
 
-      {/* Live job status */}
-      {job &&
-        (job.status === "queued" ||
-          job.status === "rendering" ||
-          job.status === "uploading") && (
-          <div className="space-y-1.5">
-            <div className="flex items-center justify-between text-[11.5px]">
-              <span className="inline-flex items-center gap-1.5 text-white/85">
-                <Loader2 size={12} className="animate-spin text-violet-300" />
-                {cloudJobStageLabel(job)}
-              </span>
-              <span className="font-mono text-fog">
-                {Math.round((job.progress ?? 0) * 100)}%
-              </span>
-            </div>
-            <div className="h-1 overflow-hidden rounded-full bg-white/[0.06]">
-              <div
-                className="h-full rounded-full bg-gradient-to-r from-violet-500 to-cyan-400 transition-[width] duration-200"
-                style={{ width: `${(job.progress ?? 0) * 100}%` }}
-              />
-            </div>
+      {/* Slow-export heads-up (only when nothing is in flight) */}
+      {slowExport && !isActive && (
+        <div className="flex items-start gap-2 rounded-lg border border-amber-400/25 bg-amber-500/[0.05] px-3 py-2 text-[11px] text-amber-200/90">
+          <Clock size={12} className="mt-0.5 shrink-0" />
+          <span>
+            Large export — 4K, 60fps, and longer clips take noticeably longer to
+            render. You can close this tab; the export keeps running.
+          </span>
+        </div>
+      )}
+
+      {/* Live job status — hidden once the job goes stale (worker likely died) */}
+      {isActive && !isStale && job && (
+        <div className="space-y-1.5">
+          <div className="flex items-center justify-between text-[11.5px]">
+            <span className="inline-flex items-center gap-1.5 text-white/85">
+              <Loader2 size={12} className="animate-spin text-violet-300" />
+              {cloudJobStageLabel(job)}
+            </span>
+            <span className="font-mono text-fog">
+              {Math.round((job.progress ?? 0) * 100)}%
+            </span>
           </div>
-        )}
+          <div className="h-1 overflow-hidden rounded-full bg-white/[0.06]">
+            <div
+              className="h-full rounded-full bg-gradient-to-r from-violet-500 to-cyan-400 transition-[width] duration-200"
+              style={{ width: `${(job.progress ?? 0) * 100}%` }}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* Stale job — stuck with no progress. Offer cancel (releases minutes) + retry. */}
+      {isActive && isStale && (
+        <div className="flex items-start gap-2 rounded-lg border border-rose-400/30 bg-rose-500/[0.06] px-3 py-2 text-[11px] text-rose-200">
+          <AlertCircle size={12} className="mt-0.5 shrink-0" />
+          <span>
+            This export seems stuck and may have failed. Cancel it to free up your
+            minutes, then try again.
+          </span>
+        </div>
+      )}
 
       {job?.status === "ready" && job.downloadUrl && (
         <button
@@ -872,7 +917,11 @@ function cloudJobStageLabel(job: ExportJobView): string {
     case "queued":
       return "Queued…";
     case "rendering":
-      return job.stage === "encoding" ? "Encoding…" : "Rendering…";
+      return job.stage === "normalizing"
+        ? "Preparing source…"
+        : job.stage === "encoding"
+          ? "Encoding…"
+          : "Rendering…";
     case "uploading":
       return "Saving…";
     case "ready":

@@ -1107,6 +1107,20 @@ export interface ProjectDoc {
    * `resolveSourceRect`. Absent / disabled ⇒ full frame (no crop).
    */
   sourceCrop?: SourceCrop;
+  /**
+   * Cloud-export NORMALIZED-source cache. The worker transcodes a "risky"
+   * source (non-H.264 video or non-AAC/undecodable audio) to a worker-safe
+   * H.264+AAC MP4 once, stores it at `users/{uid}/projects/{pid}/normalized/
+   * source.mp4`, and reuses it for future exports of this project.
+   * `normalizedSourceKey` is the original object's identity (`generation:md5Hash`)
+   * — when the source is re-uploaded the key changes and the cache is rebuilt.
+   * `normalizedAudioDropped` records whether the normalized file was built with
+   * `-an` (unsupported audio) so the silent-export warning stays consistent on
+   * reuse. All absent until the first risky export with normalization enabled.
+   */
+  normalizedSourcePath?: string;
+  normalizedSourceKey?: string;
+  normalizedAudioDropped?: boolean;
   createdAt: number;
   updatedAt: number;
 }
@@ -1393,6 +1407,7 @@ export type ExportJobStatus =
 export type ExportJobStage =
   | "queued"
   | "downloading"
+  | "normalizing"
   | "decoding"
   | "rendering"
   | "encoding"
@@ -1432,6 +1447,17 @@ export interface ExportJobDoc {
   cancelRequested?: boolean;
   /** Non-fatal worker notices (e.g. "source has no audio — exported silent"). */
   warnings?: string[];
+  /**
+   * Preflight summary the worker recorded for this job (observability — shown in
+   * the admin exports view). `normalized` ⇒ the worker rendered from the
+   * transcoded H.264+AAC copy rather than the raw source.
+   */
+  preflight?: {
+    videoCodec: string;
+    audioCodec: string;
+    risky: boolean;
+    normalized: boolean;
+  };
   /** Month bucket ("YYYY-MM") this job reserved/consumed minutes against. */
   monthlyBucket: string;
   /** Raw render inputs the worker feeds to `buildRenderRecipe`. */

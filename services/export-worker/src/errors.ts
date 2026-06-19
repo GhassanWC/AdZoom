@@ -55,6 +55,19 @@ export function toUserFacingError(err: unknown): UserFacingError {
     };
   }
 
+  // A broken encoder pipe that slipped past spawnEncoder's error-race (rare) —
+  // map it cleanly rather than leaking a bare "write EPIPE" to the user.
+  if (
+    raw.includes("epipe") ||
+    raw.includes("broken pipe") ||
+    raw.includes("write after end")
+  ) {
+    return {
+      code: "encoder_pipe_broken",
+      message: "The export ended unexpectedly while encoding. Please try again.",
+    };
+  }
+
   // Anything else: a generic, non-leaky fallback.
   return {
     code: "render_failed",

@@ -117,6 +117,19 @@ export async function canExportResolution(
 }
 
 /**
+ * Whether the user can export at the requested frame rate. 30fps is available
+ * on any plan; 60fps requires a paid plan (Pro $19 and above) — matching the
+ * 4K gate above.
+ */
+export async function canExportFps(
+  uid: string,
+  fps: 30 | 60
+): Promise<boolean> {
+  if (fps === 30) return true;
+  return planMeetsMinimum(await getUserPlan(uid), "pro");
+}
+
+/**
  * Whether the user can apply the named preset.
  *
  * Looks up the preset in `BUILTIN_PRESETS_BY_ID`; if found and it carries

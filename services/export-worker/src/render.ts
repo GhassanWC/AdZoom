@@ -19,6 +19,7 @@ import {
   type EncoderAudio,
 } from "./ffmpeg.js";
 import { buildAudioFilterComplex } from "./audio.js";
+import { AUDIO_UNSUPPORTED_WARNING } from "./preflight.js";
 
 export type RenderStage = "decoding" | "rendering" | "encoding";
 
@@ -39,6 +40,13 @@ export interface RenderOptions {
   preset: string;
   /** Aborting kills both ffmpeg processes (breaks a hung await) → CanceledError. */
   signal: AbortSignal;
+  /**
+   * The normalization step already stripped unsupported audio from the source
+   * (so the file has no audio). The render then treats it as silent WITHOUT
+   * emitting its own "source has no audio" notice — the handler owns the
+   * AUDIO_UNSUPPORTED_WARNING in that case (avoids a wrong/duplicate warning).
+   */
+  audioAlreadyDropped?: boolean;
   onProgress: (p: { stage: RenderStage; progress: number }) => void;
 }
 
@@ -77,7 +85,11 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
   // the bundled ffmpeg can't decode — we then export silently rather than let
   // the encoder abort (and the frame writer EPIPE) trying to transcode it.
   let hasAudio = info.hasAudio;
-  if (!hasAudio) {
+  if (opts.audioAlreadyDropped) {
+    // Normalization stripped unsupported audio; the handler already queued the
+    // AUDIO_UNSUPPORTED_WARNING. Render silently without a second notice.
+    hasAudio = false;
+  } else if (!hasAudio) {
     warnings.push(
       "Source has no audio track — the export will be silent. This matches the source."
     );
@@ -86,10 +98,7 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
     // so drop audio and tell the user. Keep working for AAC/Opus/etc., which
     // pass the decode test above.
     hasAudio = false;
-    const codec = info.audioCodec || info.audioCodecTag || "unknown";
-    warnings.push(
-      `Source audio codec "${codec}" is unsupported, exported without audio.`
-    );
+    warnings.push(AUDIO_UNSUPPORTED_WARNING);
     console.warn("[worker:audio] unsupported codec — exporting silent", {
       codec: info.audioCodec,
       tag: info.audioCodecTag,
