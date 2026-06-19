@@ -1,98 +1,9 @@
 import { createRequire as _cr } from 'module'; const require = _cr(import.meta.url);
 
-// src/server.ts
-import os from "node:os";
+// src/cli.ts
 import { readFileSync } from "node:fs";
-import express from "express";
-
-// src/config.ts
-function loadConfig() {
-  return {
-    projectId: process.env.GCLOUD_PROJECT ?? process.env.GOOGLE_CLOUD_PROJECT ?? process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID,
-    storageBucket: process.env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET,
-    port: Number(process.env.PORT ?? 8787),
-    oidcAudience: process.env.WORKER_OIDC_AUDIENCE,
-    invokerServiceAccount: process.env.EXPORT_INVOKER_SA,
-    devDisableOidc: process.env.DEV_DISABLE_OIDC === "1",
-    devSecret: process.env.EXPORT_WORKER_DEV_SECRET,
-    pollEveryFrames: Number(process.env.WORKER_POLL_EVERY_FRAMES ?? 30),
-    crf: Number(process.env.WORKER_X264_CRF ?? 19),
-    preset: process.env.WORKER_X264_PRESET ?? "veryfast",
-    normalizeEnabled: process.env.WORKER_NORMALIZE_ENABLED === "1",
-    normalizeCrf: Number(process.env.WORKER_NORMALIZE_CRF ?? 18),
-    normalizePreset: process.env.WORKER_NORMALIZE_PRESET ?? "veryfast"
-  };
-}
-
-// src/oidc.ts
-import { OAuth2Client } from "google-auth-library";
-var oauth = new OAuth2Client();
-async function verifyRequestAuth(req, cfg) {
-  if (cfg.devDisableOidc) {
-    if (cfg.devSecret) {
-      const got = req.header("x-export-dev-secret");
-      if (got !== cfg.devSecret) return { ok: false, reason: "bad dev secret" };
-    }
-    return { ok: true };
-  }
-  const header = req.header("authorization") ?? "";
-  const token = header.startsWith("Bearer ") ? header.slice(7) : null;
-  if (!token) return { ok: false, reason: "missing bearer token" };
-  if (!cfg.oidcAudience) return { ok: false, reason: "WORKER_OIDC_AUDIENCE not set" };
-  try {
-    const ticket = await oauth.verifyIdToken({
-      idToken: token,
-      audience: cfg.oidcAudience
-    });
-    const payload = ticket.getPayload();
-    if (!payload) return { ok: false, reason: "empty token payload" };
-    if (cfg.invokerServiceAccount && payload.email !== cfg.invokerServiceAccount) {
-      return { ok: false, reason: "unexpected token email" };
-    }
-    return { ok: true };
-  } catch (err) {
-    return { ok: false, reason: `token verify failed: ${err.message}` };
-  }
-}
-
-// src/handler.ts
-import { randomUUID } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir as tmpdir2 } from "node:os";
-import { join as join2, extname } from "node:path";
-import { FieldValue } from "firebase-admin/firestore";
-
-// src/firebase.ts
-import {
-  applicationDefault,
-  cert,
-  getApps,
-  initializeApp
-} from "firebase-admin/app";
-import { getFirestore } from "firebase-admin/firestore";
-import { getStorage } from "firebase-admin/storage";
-var app;
-function getAdmin() {
-  const cfg = loadConfig();
-  if (!app) {
-    if (getApps().length) {
-      app = getApps()[0];
-    } else {
-      const b64 = process.env.FIREBASE_SERVICE_ACCOUNT_B64;
-      const credential = b64 ? cert(JSON.parse(Buffer.from(b64, "base64").toString("utf8"))) : applicationDefault();
-      app = initializeApp({
-        credential,
-        projectId: cfg.projectId,
-        storageBucket: cfg.storageBucket
-      });
-    }
-  }
-  return { app, db: getFirestore(app), bucketName: cfg.storageBucket };
-}
-function bucket() {
-  const { app: app2, bucketName } = getAdmin();
-  return getStorage(app2).bucket(bucketName);
-}
+import { dirname, join as join2 } from "node:path";
+import { createInterface } from "node:readline";
 
 // src/render.ts
 import { createCanvas, ImageData } from "@napi-rs/canvas";
@@ -1804,458 +1715,133 @@ function toUserFacingError(err) {
   };
 }
 
-// src/handler.ts
-var HEARTBEAT_STALE_MS = 3 * 60 * 1e3;
-function toMs(v) {
-  const t = v;
-  return t?.toMillis?.() ?? 0;
+// src/cli.ts
+function emit(event) {
+  process.stdout.write(JSON.stringify(event) + "\n");
 }
-async function claimJob(db, uid, jobId) {
-  const jobRef = db.doc(`users/${uid}/exportJobs/${jobId}`);
-  return db.runTransaction(async (tx) => {
-    const snap = await tx.get(jobRef);
-    if (!snap.exists) return { action: "missing" };
-    const job = snap.data();
-    if (job.status === "ready" || job.status === "failed" || job.status === "canceled") {
-      return { action: "terminal" };
-    }
-    const inFlight = job.status === "rendering" || job.status === "uploading";
-    if (inFlight && Date.now() - toMs(job.updatedAt) < HEARTBEAT_STALE_MS) {
-      return { action: "leased" };
-    }
-    if (inFlight) {
-      console.warn("[worker] re-claiming abandoned job (stale heartbeat)", {
-        uid,
-        jobId,
-        status: job.status,
-        updatedAtAgeMs: Date.now() - toMs(job.updatedAt)
-      });
-    }
-    tx.update(jobRef, {
-      status: "rendering",
-      stage: "downloading",
-      progress: 0,
-      startedAt: FieldValue.serverTimestamp(),
-      updatedAt: FieldValue.serverTimestamp()
-    });
-    return { action: "claimed", job };
-  });
+function toStderr(...args) {
+  process.stderr.write(
+    args.map((a) => typeof a === "string" ? a : JSON.stringify(a)).join(" ") + "\n"
+  );
 }
-async function prepareSource(args) {
-  const { db, uid, jobId, job, cfg, srcPath, workDir, signal, patch } = args;
-  const pf = await computePreflight(srcPath);
-  if (!pf.videoDecodable) {
-    throw new Error("preflight: source video could not be decoded");
-  }
-  const summary = {
-    videoCodec: pf.info.videoCodec,
-    audioCodec: pf.info.audioCodec,
-    risky: pf.risky,
-    normalized: false
-  };
-  if (!pf.risky || !cfg.normalizeEnabled) {
-    if (pf.risky) {
-      console.warn("[worker:preflight] risky source, normalization disabled", {
-        jobId,
-        reasons: pf.reasons
-      });
-    }
-    return { renderSourcePath: srcPath, audioDropped: false, warnings: [], preflight: summary };
-  }
-  console.info("[worker:preflight] risky source \u2014 normalizing", { jobId, reasons: pf.reasons });
-  const projRef = db.doc(`users/${uid}/projects/${job.projectId}`);
-  const proj = (await projRef.get()).data();
-  const normStoragePath = `users/${uid}/projects/${job.projectId}/normalized/source.mp4`;
-  const normPath = join2(workDir, "normalized.mp4");
-  let key = "";
-  try {
-    const [meta] = await bucket().file(job.sourceStoragePath).getMetadata();
-    key = `${meta.generation ?? ""}:${meta.md5Hash ?? ""}`;
-  } catch {
-    key = "";
-  }
-  if (key && proj?.normalizedSourcePath && proj.normalizedSourceKey === key) {
-    const [exists] = await bucket().file(proj.normalizedSourcePath).exists();
-    if (exists) {
-      await bucket().file(proj.normalizedSourcePath).download({ destination: normPath });
-      const audioDropped = !!proj.normalizedAudioDropped;
-      console.info("[worker:normalize] cache hit", { jobId, path: proj.normalizedSourcePath });
-      return {
-        renderSourcePath: normPath,
-        audioDropped,
-        warnings: audioDropped ? [AUDIO_UNSUPPORTED_WARNING] : [],
-        preflight: { ...summary, normalized: true }
-      };
-    }
-  }
-  await patch({ stage: "normalizing", progress: 0 });
-  try {
-    await normalizeSource({
-      sourcePath: srcPath,
-      outputPath: normPath,
-      dropAudio: pf.needsAudioDrop,
-      crf: cfg.normalizeCrf,
-      preset: cfg.normalizePreset,
-      signal
-    });
-  } catch (err) {
-    if (signal.aborted) throw new CanceledError();
-    throw err;
-  }
-  if (signal.aborted) throw new CanceledError();
-  await bucket().upload(normPath, {
-    destination: normStoragePath,
-    metadata: { contentType: "video/mp4" }
-  });
-  await projRef.set(
-    {
-      normalizedSourcePath: normStoragePath,
-      normalizedSourceKey: key,
-      normalizedAudioDropped: pf.needsAudioDrop,
-      updatedAt: Date.now()
-    },
-    { merge: true }
-  ).catch(() => {
-  });
-  console.info("[worker:normalize] done", { jobId, audioDropped: pf.needsAudioDrop });
-  return {
-    renderSourcePath: normPath,
-    audioDropped: pf.needsAudioDrop,
-    warnings: pf.needsAudioDrop ? [AUDIO_UNSUPPORTED_WARNING] : [],
-    preflight: { ...summary, normalized: true }
-  };
-}
-async function processJob(uid, jobId) {
-  const cfg = loadConfig();
-  const { db, bucketName } = getAdmin();
-  const jobRef = db.doc(`users/${uid}/exportJobs/${jobId}`);
-  const claim = await claimJob(db, uid, jobId);
-  if (claim.action !== "claimed") {
-    console.info("[worker] skip", { uid, jobId, reason: claim.action });
-    return claim.action;
-  }
-  const job = claim.job;
-  const estimate = job.estimatedExportMinutes ?? 0;
-  const monthKey = job.monthlyBucket;
-  const controller = new AbortController();
-  let polling = false;
-  const cancelPoll = setInterval(() => {
-    if (polling) return;
-    polling = true;
-    void jobRef.get().then((snap) => {
-      const st = snap.exists ? snap.get("status") : void 0;
-      if (!snap.exists || snap.get("cancelRequested") === true || st === "canceled" || st === "failed") {
-        controller.abort();
-        clearInterval(cancelPoll);
-      }
-    }).catch(() => {
-    }).finally(() => {
-      polling = false;
-    });
-  }, 1e3);
-  const patch = (data) => jobRef.set({ ...data, updatedAt: FieldValue.serverTimestamp() }, { merge: true });
-  const heartbeat = setInterval(() => {
-    void patch({}).catch(() => {
-    });
-  }, 6e4);
-  let workDir = null;
-  try {
-    workDir = await mkdtemp(join2(tmpdir2(), `framevo-job-${jobId}-`));
-    const srcPath = join2(workDir, `source${extname(job.sourceStoragePath) || ".mp4"}`);
-    const outPath = join2(workDir, `${jobId}.mp4`);
-    await patch({ stage: "downloading", progress: 0.02 });
-    const dlStart = Date.now();
-    await bucket().file(job.sourceStoragePath).download({ destination: srcPath });
-    console.info("[worker:timing] download", { jobId, ms: Date.now() - dlStart });
-    const prepStart = Date.now();
-    const prepared = await prepareSource({
-      db,
-      uid,
-      jobId,
-      job,
-      cfg,
-      srcPath,
-      workDir,
-      signal: controller.signal,
-      patch
-    });
-    console.info("[worker:timing] prepare", {
-      jobId,
-      ms: Date.now() - prepStart,
-      normalized: prepared.preflight.normalized
-    });
-    let lastPct = -1;
-    const result = await renderToMp4({
-      serialized: job.renderRecipe,
-      sourcePath: prepared.renderSourcePath,
-      outputPath: outPath,
-      crf: cfg.crf,
-      preset: cfg.preset,
-      signal: controller.signal,
-      // Normalization already stripped unsupported audio — tell the render so it
-      // emits the right warning (not "source has no audio").
-      audioAlreadyDropped: prepared.audioDropped,
-      onProgress: ({ stage, progress }) => {
-        const pct = Math.round(progress * 100);
-        if (pct === lastPct) return;
-        lastPct = pct;
-        void patch({ stage, progress });
-      }
-    });
-    const warnings = Array.from(/* @__PURE__ */ new Set([...prepared.warnings, ...result.warnings]));
-    await patch({ stage: "uploading", progress: 0.98 });
-    const token = randomUUID();
-    await bucket().upload(outPath, {
-      destination: job.outputPath,
-      metadata: {
-        contentType: "video/mp4",
-        metadata: { firebaseStorageDownloadTokens: token }
-      }
-    });
-    const downloadUrl = `https://firebasestorage.googleapis.com/v0/b/${bucketName}/o/${encodeURIComponent(
-      job.outputPath
-    )}?alt=media&token=${token}`;
-    const finalized = await db.runTransaction(async (tx) => {
-      const snap = await tx.get(jobRef);
-      if (!snap.exists) return false;
-      const st = snap.get("status");
-      if (st === "canceled" || st === "failed" || st === "ready") return false;
-      const usageRef = db.doc(`users/${uid}/usage/${monthKey}`);
-      const usageSnap = await tx.get(usageRef);
-      const u = usageSnap.data() ?? {};
-      tx.set(
-        usageRef,
-        {
-          cloudMinutesReserved: Math.max(0, (u.cloudMinutesReserved ?? 0) - estimate),
-          cloudMinutesConsumed: Math.max(0, u.cloudMinutesConsumed ?? 0) + estimate,
-          lastCloudExportAt: Date.now(),
-          updatedAt: Date.now()
-        },
-        { merge: true }
-      );
-      tx.set(
-        jobRef,
-        {
-          status: "ready",
-          stage: "uploading",
-          progress: 1,
-          downloadUrl,
-          consumedExportMinutes: estimate,
-          warnings,
-          preflight: prepared.preflight,
-          completedAt: FieldValue.serverTimestamp(),
-          updatedAt: FieldValue.serverTimestamp()
-        },
-        { merge: true }
-      );
-      return true;
-    });
-    if (!finalized) {
-      console.info("[worker] canceled during upload \u2014 skipping ready", { uid, jobId });
-      return "canceled";
-    }
-    await db.doc(`users/${uid}/projects/${job.projectId}`).set({ exportUrl: downloadUrl, updatedAt: Date.now() }, { merge: true }).catch(() => {
-    });
-    console.info("[worker] done", { uid, jobId, minutes: estimate });
-    return "ready";
-  } catch (err) {
-    if (err instanceof CanceledError) {
-      console.info("[worker] canceled", { uid, jobId });
-      return "canceled";
-    }
-    const raw = err instanceof Error ? err.message : "Render failed.";
-    const friendly = toUserFacingError(err);
-    await db.runTransaction(async (tx) => {
-      const snap = await tx.get(jobRef);
-      if (!snap.exists) return;
-      const st = snap.get("status");
-      if (st === "ready" || st === "failed" || st === "canceled") return;
-      if (estimate > 0 && monthKey) {
-        const usageRef = db.doc(`users/${uid}/usage/${monthKey}`);
-        const uSnap = await tx.get(usageRef);
-        const reserved = uSnap.data()?.cloudMinutesReserved ?? 0;
-        tx.set(
-          usageRef,
-          { cloudMinutesReserved: Math.max(0, reserved - estimate), updatedAt: Date.now() },
-          { merge: true }
-        );
-      }
-      tx.set(
-        jobRef,
-        {
-          status: "failed",
-          errorCode: friendly.code,
-          errorMessage: friendly.message,
-          completedAt: FieldValue.serverTimestamp(),
-          updatedAt: FieldValue.serverTimestamp()
-        },
-        { merge: true }
-      );
-    }).catch((e) => console.error("[worker] failed-finalize txn error", { uid, jobId, e }));
-    console.error("[worker] failed", { uid, jobId, errorCode: friendly.code, error: raw });
-    return "failed";
-  } finally {
-    clearInterval(cancelPoll);
-    clearInterval(heartbeat);
-    if (workDir) await rm(workDir, { recursive: true, force: true }).catch(() => {
-    });
-  }
-}
-
-// src/server.ts
-function detectMemoryLimitMB() {
-  for (const p of ["/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"]) {
-    try {
-      const raw = readFileSync(p, "utf8").trim();
-      if (raw === "max") continue;
-      const n = Number(raw);
-      if (Number.isFinite(n) && n > 0 && n < 1024 ** 4) return Math.round(n / 1048576);
-    } catch {
-    }
-  }
-  return "unknown";
-}
-function logStartup(cfg) {
-  const availableCpus = typeof os.availableParallelism === "function" ? os.availableParallelism() : os.cpus().length;
-  console.info("[worker:startup]", {
-    // "version/commit": Cloud Run sets K_SERVICE/K_REVISION; WORKER_COMMIT is
-    // an optional git SHA the deploy can inject.
-    service: process.env.K_SERVICE ?? "(local)",
-    revision: process.env.K_REVISION ?? "(local)",
-    commit: process.env.WORKER_COMMIT ?? "(unset)",
-    node: process.version,
-    oidc: cfg.devDisableOidc ? "disabled(dev)" : "enabled",
-    normalizeEnabled: cfg.normalizeEnabled,
-    storageBucket: cfg.storageBucket ?? "(MISSING)",
-    oidcAudience: cfg.oidcAudience ? "present" : "MISSING",
-    invokerSA: cfg.invokerServiceAccount ? "present" : "MISSING",
-    cpus: availableCpus,
-    memoryLimitMB: detectMemoryLimitMB(),
-    totalMemMB: Math.round(os.totalmem() / 1048576),
-    port: cfg.port,
-    x264: `${cfg.preset}/crf${cfg.crf}`,
-    normalize: `${cfg.normalizePreset}/crf${cfg.normalizeCrf}`
-  });
-  const warnings = [];
-  if (cfg.devDisableOidc && process.env.K_SERVICE) {
-    warnings.push(
-      "DEV_DISABLE_OIDC is set on Cloud Run (K_SERVICE present) \u2014 this disables auth; unset it in production. (The worker now still renders synchronously here, but this combo is unsafe.)"
-    );
-  }
-  if (!cfg.normalizeEnabled) {
-    warnings.push(
-      "WORKER_NORMALIZE_ENABLED is not 1 \u2014 risky sources (HEVC / unsupported audio like apac) will NOT be pre-normalized; they fall back to the render-time guard only."
-    );
-  }
-  if (!cfg.storageBucket) {
-    warnings.push(
-      "NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET is missing \u2014 the worker cannot download sources or upload exports; every job will fail."
-    );
-  }
-  if (!cfg.devDisableOidc) {
-    if (!cfg.oidcAudience) {
-      warnings.push(
-        "WORKER_OIDC_AUDIENCE is missing \u2014 production OIDC verification can't validate the token audience; authenticated requests will be rejected."
-      );
-    }
-    if (!cfg.invokerServiceAccount) {
-      warnings.push(
-        "EXPORT_INVOKER_SA is missing \u2014 the OIDC token's email claim won't be checked (weaker auth)."
-      );
-    }
-  }
-  if (warnings.length) {
-    console.warn(`[worker:startup] \u26A0 ${warnings.length} CONFIG WARNING(S) \u2014 this revision may be misconfigured:`);
-    for (const w of warnings) console.warn(`  \u26A0 ${w}`);
-  } else {
-    console.info("[worker:startup] config looks OK");
-  }
-}
-function installProcessGuards() {
-  process.on("uncaughtException", (err) => {
-    console.error("[worker:fatal] uncaughtException", err);
+console.log = toStderr;
+console.info = toStderr;
+console.debug = toStderr;
+console.warn = toStderr;
+console.error = toStderr;
+async function main() {
+  const specPath = process.argv[2];
+  if (!specPath) {
+    emit({ type: "error", code: "bad_invocation", message: "Missing job-spec path argument." });
     process.exit(1);
-  });
-  process.on("unhandledRejection", (reason) => {
-    console.error("[worker:fatal] unhandledRejection", reason);
-  });
-  process.on("SIGTERM", () => {
-    console.warn(
-      "[worker:signal] SIGTERM \u2014 instance shutting down; any in-flight job will be re-claimed after its heartbeat goes stale"
-    );
-  });
-  process.on("exit", (code) => {
-    console.warn("[worker:exit] process exiting", { code });
-  });
-}
-function start() {
-  installProcessGuards();
-  const cfg = loadConfig();
-  logStartup(cfg);
-  const app2 = express();
-  app2.use(express.json({ limit: "16mb" }));
-  app2.get("/healthz", (_req, res) => {
-    res.status(200).send("ok");
-  });
-  app2.post("/", async (req, res) => {
-    const authed = await verifyRequestAuth(req, cfg);
-    if (!authed.ok) {
-      console.warn("[worker] auth rejected:", authed.reason);
-      res.status(401).json({ error: "unauthorized" });
-      return;
+  }
+  let spec;
+  try {
+    spec = JSON.parse(readFileSync(specPath, "utf8"));
+  } catch (err) {
+    emit({
+      type: "error",
+      code: "bad_invocation",
+      message: "Unreadable job spec: " + err.message
+    });
+    process.exit(1);
+  }
+  const controller = new AbortController();
+  const rl = createInterface({ input: process.stdin });
+  rl.on("line", (line) => {
+    if (line.trim() === "cancel") {
+      toStderr("[worker:cli] cancel requested");
+      controller.abort();
     }
-    const { uid, jobId } = req.body ?? {};
-    if (!uid || !jobId) {
-      res.status(400).json({ error: "body must include { uid, jobId }" });
-      return;
+  });
+  rl.on("error", () => {
+  });
+  const crf = spec.crf ?? 19;
+  const preset = spec.preset ?? "veryfast";
+  const warnings = [];
+  const pushWarning = (w) => {
+    if (!warnings.includes(w)) {
+      warnings.push(w);
+      emit({ type: "warning", message: w });
     }
-    console.info("[worker:request-start]", { uid, jobId });
+  };
+  try {
+    const pf = await computePreflight(spec.sourcePath);
+    const audioCodec = pf.info.audioCodec || pf.info.audioCodecTag || "";
+    emit({
+      type: "preflight",
+      videoCodec: pf.info.videoCodec,
+      audioCodec,
+      risky: pf.risky,
+      videoDecodable: pf.videoDecodable,
+      audioDecodable: pf.audioDecodable,
+      needsAudioDrop: pf.needsAudioDrop,
+      normalized: false
+    });
+    if (!pf.videoDecodable) {
+      throw new Error("preflight: source video could not be decoded");
+    }
+    let renderSource = spec.sourcePath;
+    let audioDropped = !!spec.audioAlreadyDropped;
+    let normalized = false;
+    if (spec.normalizeEnabled && pf.risky) {
+      emit({ type: "stage", name: "normalizing" });
+      const normPath = join2(dirname(spec.outputPath), "normalized.mp4");
+      await normalizeSource({
+        sourcePath: spec.sourcePath,
+        outputPath: normPath,
+        dropAudio: pf.needsAudioDrop,
+        crf: spec.normalizeCrf ?? 18,
+        preset: spec.normalizePreset ?? "veryfast",
+        signal: controller.signal
+      });
+      renderSource = normPath;
+      normalized = true;
+      if (pf.needsAudioDrop) audioDropped = true;
+    }
+    if (audioDropped) pushWarning(AUDIO_UNSUPPORTED_WARNING);
     const startedMs = Date.now();
-    const respondAsync = cfg.devDisableOidc && !process.env.K_SERVICE;
-    if (respondAsync) {
-      res.status(202).json({ accepted: true, jobId });
-      console.info("[worker:request-end]", {
-        uid,
-        jobId,
-        outcome: "accepted(async-dev)",
-        status: 202,
-        durationMs: Date.now() - startedMs
-      });
-      processJob(uid, jobId).catch(
-        (err) => console.error("[worker] background processJob threw", err)
-      );
-      return;
+    let lastStage = "";
+    let firstFrameEmitted = false;
+    const result = await renderToMp4({
+      serialized: spec.serializedRecipe,
+      sourcePath: renderSource,
+      outputPath: spec.outputPath,
+      crf,
+      preset,
+      signal: controller.signal,
+      audioAlreadyDropped: audioDropped,
+      onProgress: ({ stage, progress }) => {
+        if (stage !== lastStage) {
+          lastStage = stage;
+          emit({ type: "stage", name: stage });
+          if (stage === "rendering" && !firstFrameEmitted) {
+            firstFrameEmitted = true;
+            emit({ type: "first-frame", ms: Date.now() - startedMs });
+          }
+        }
+        emit({ type: "progress", value: progress });
+      }
+    });
+    for (const w of result.warnings) pushWarning(w);
+    emit({
+      type: "done",
+      warnings,
+      preflight: { videoCodec: pf.info.videoCodec, audioCodec, risky: pf.risky, normalized }
+    });
+    rl.close();
+    process.exit(0);
+  } catch (err) {
+    if (controller.signal.aborted) {
+      emit({ type: "canceled" });
+      rl.close();
+      process.exit(2);
     }
-    try {
-      const outcome = await processJob(uid, jobId);
-      const status = outcome === "leased" ? 409 : 200;
-      console.info("[worker:request-end]", {
-        uid,
-        jobId,
-        outcome,
-        status,
-        durationMs: Date.now() - startedMs
-      });
-      res.status(status).json({ outcome });
-    } catch (err) {
-      console.error("[worker] processJob threw", err);
-      console.info("[worker:request-end]", {
-        uid,
-        jobId,
-        outcome: "error",
-        status: 500,
-        durationMs: Date.now() - startedMs
-      });
-      res.status(500).json({ error: err.message });
-    }
-  });
-  app2.listen(cfg.port, () => {
-    console.info(
-      `[worker] listening on :${cfg.port} (oidc=${cfg.devDisableOidc ? "disabled(dev)" : "enabled"})`
-    );
-  });
+    const friendly = toUserFacingError(err);
+    toStderr("[worker:cli] render failed:", err?.message ?? String(err));
+    emit({ type: "error", code: friendly.code, message: friendly.message });
+    rl.close();
+    process.exit(1);
+  }
 }
-start();
-export {
-  start
-};
+void main();

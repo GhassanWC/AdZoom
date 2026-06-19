@@ -31,7 +31,11 @@ import {
   normalizeSource,
 } from "../src/ffmpeg.js";
 import { renderToMp4 } from "../src/render.js";
-import { computePreflight, AUDIO_UNSUPPORTED_WARNING } from "../src/preflight.js";
+import {
+  computePreflight,
+  isUnsupportedAudioCodec,
+  AUDIO_UNSUPPORTED_WARNING,
+} from "../src/preflight.js";
 import { DEFAULT_EFFECTS_SETTINGS } from "@/lib/firebase/schema";
 import type { DetectedMoment, SerializedRenderRecipe } from "@/lib/firebase/schema";
 
@@ -106,6 +110,24 @@ async function assertValidMp4(path: string, label: string) {
 async function main(): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), "framevo-e2e-"));
   console.log(`\nCloud-export readiness gate — workdir ${dir}\n`);
+
+  // ── Case 0: unsupported-audio codec DECISION (unit, no ffmpeg) ───────────
+  // The authoritative guard that keeps apac/none/unknown audio out of the
+  // encoder. (A real apac file can't be synthesized — ffmpeg has no apac encoder
+  // and rejects the remux tag — so the decision is unit-tested here and the
+  // silent-export integration is covered by case 3.)
+  await runCase("0. unsupported-audio codec decision (unit)", async () => {
+    for (const c of ["apac", "none", "unknown", "", "APAC", "None"]) {
+      assert(isUnsupportedAudioCodec(c), `expected codec "${c}" to be unsupported`);
+    }
+    for (const c of ["aac", "opus", "mp3", "vorbis", "flac"]) {
+      assert(!isUnsupportedAudioCodec(c), `expected codec "${c}" to be supported`);
+    }
+    // codec_tag_string "apac" must drop even if codec_name looks benign:
+    assert(isUnsupportedAudioCodec("aac", "apac"), "tag apac should be unsupported");
+    assert(!isUnsupportedAudioCodec("aac", "mp4a"), "aac/mp4a should be supported");
+    return "apac/none/unknown/\"\"/tag:apac → drop; aac/opus/mp3/vorbis/flac → keep";
+  });
 
   const h264 = join(dir, "h264_aac.mp4");
   await genH264Aac(h264);

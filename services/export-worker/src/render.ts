@@ -20,7 +20,7 @@ import {
   type EncoderAudio,
 } from "./ffmpeg.js";
 import { buildAudioFilterComplex } from "./audio.js";
-import { AUDIO_UNSUPPORTED_WARNING } from "./preflight.js";
+import { AUDIO_UNSUPPORTED_WARNING, isUnsupportedAudioCodec } from "./preflight.js";
 
 export type RenderStage = "decoding" | "rendering" | "encoding";
 
@@ -53,6 +53,9 @@ export interface RenderOptions {
 
 /** No frames for this long ⇒ the render is wedged; kill it and fail the job. */
 const STALL_MS = 90_000;
+
+/** Cadence (in output frames) for the heartbeat progress + memory log. */
+const PROGRESS_LOG_EVERY = 500;
 
 export interface RenderResult {
   warnings: string[];
@@ -107,15 +110,20 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
     warnings.push(
       "Source has no audio track — the export will be silent. This matches the source."
     );
-  } else if (!(await canDecodeAudio(opts.sourcePath))) {
-    // Unsupported codec (e.g. Apple `apac`). No decoder ⇒ no transcode possible,
-    // so drop audio and tell the user. Keep working for AAC/Opus/etc., which
-    // pass the decode test above.
+  } else if (
+    isUnsupportedAudioCodec(info.audioCodec, info.audioCodecTag) ||
+    !(await canDecodeAudio(opts.sourcePath))
+  ) {
+    // Unsupported codec (e.g. Apple `apac`, codec_name "none"). The codec-name
+    // check is AUTHORITATIVE and short-circuits the decode probe — so apac/none/
+    // unknown audio can NEVER reach `direct`/`filter` (which would abort the
+    // encoder with "no decoder found"), even if `canDecodeAudio` flakily passes.
+    // Drop audio and export silently. AAC/Opus/etc. that genuinely decode are kept.
     hasAudio = false;
     warnings.push(AUDIO_UNSUPPORTED_WARNING);
-    console.warn("[worker:audio] unsupported codec — exporting silent", {
-      codec: info.audioCodec,
-      tag: info.audioCodecTag,
+    console.warn("[worker:audio] audio_dropped_unsupported", {
+      codec: info.audioCodec || "(none)",
+      tag: info.audioCodecTag || "(none)",
     });
   }
 
@@ -234,6 +242,21 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
       if (pct !== lastPct) {
         lastPct = pct;
         opts.onProgress({ stage: "rendering", progress: pct / 100 });
+      }
+
+      // Heartbeat progress + memory every N frames — proves the render is
+      // advancing and surfaces a climb toward the Cloud Run memory cap (the
+      // likely cause of a mid-render 503/SIGKILL).
+      if (i > 0 && i % PROGRESS_LOG_EVERY === 0) {
+        const mem = process.memoryUsage();
+        console.info("[worker:progress]", {
+          frame: i,
+          totalFrames,
+          pct,
+          rssMB: Math.round(mem.rss / 1048576),
+          heapUsedMB: Math.round(mem.heapUsed / 1048576),
+          externalMB: Math.round(mem.external / 1048576),
+        });
       }
 
       const outputTime = i / fps;

@@ -4,6 +4,7 @@ import "server-only";
 // its google-gax/gRPC dynamic proto requires are resolved from node_modules at
 // runtime rather than bundled by webpack.
 import { CloudTasksClient } from "@google-cloud/tasks";
+import { exportBackend, dotnetEnqueueSignal } from "./dotnet-backend";
 
 /**
  * Export-job dispatch — hands a created `exportJobs/{jobId}` doc to the Cloud
@@ -32,7 +33,17 @@ export interface EnqueueParams {
 /** Dispatch a created export job to the worker. Throws on failure so the caller
  *  can fail the job + release its minute reservation. */
 export async function enqueueExportJob(params: EnqueueParams): Promise<void> {
+  // EXPORT_BACKEND selects the render backend. "dotnet" → the C# export API runs
+  // the job (Next.js already created + reserved it; this only signals the runner,
+  // which also polls). Anything else keeps the old Node worker path below.
+  if (exportBackend() === "dotnet") {
+    console.log(`[export-enqueue] backend=dotnet job=${params.jobId} (${params.priority})`);
+    await dotnetEnqueueSignal(params.uid, params.jobId);
+    return;
+  }
+
   const mode = (process.env.EXPORT_DISPATCH ?? "local").toLowerCase();
+  console.log(`[export-enqueue] backend=cloudtasks dispatch=${mode} job=${params.jobId} (${params.priority})`);
   if (mode === "cloudtasks") {
     await enqueueCloudTask(params);
   } else {

@@ -120,6 +120,14 @@ The invoker SA needs `roles/run.invoker` on the worker service and
 | `WORKER_POLL_EVERY_FRAMES` | cancel-flag + progress cadence | `30` |
 | `WORKER_NORMALIZE_ENABLED` | `1` → preflight + transcode "risky" sources to H.264+AAC before render (see below) | unset (off) |
 | `WORKER_NORMALIZE_CRF` / `WORKER_NORMALIZE_PRESET` | normalization pass quality/speed | `18` / `veryfast` |
+| `WORKER_COMMIT` | optional git SHA, surfaced in the `[worker:startup]` log | unset |
+
+On boot the worker logs a single **`[worker:startup]`** block (revision via Cloud
+Run's `K_SERVICE`/`K_REVISION`, `WORKER_COMMIT`, `normalizeEnabled`, bucket,
+OIDC audience/invoker presence, detected cpu/memory-limit, encode settings) and
+then **warns loudly** about production misconfig (normalization off, missing
+bucket / OIDC audience / invoker SA). It never blocks startup — a misconfigured
+revision is obvious in the logs without crash-looping the service.
 
 ## Source preflight + normalization
 
@@ -136,16 +144,40 @@ normalization. Regardless of the flag, the render's `canDecodeAudio` guard still
 drops undecodable audio and exports silently with a clear warning — the export
 never fails because of an unsupported audio codec.
 
-## Stale-job reconciler
+## Crash recovery: heartbeat lease + reconciler
 
-Minutes are reserved at enqueue and settled/released at a terminal state. A
-crashed worker would otherwise leave its job stuck non-terminal ("Rendering 0%")
-forever AND leak the reservation. The worker heartbeats `updatedAt` every 60s
-while alive, and **`POST /api/cron/reconcile-exports`** (in the main app) fails
-any non-terminal job whose `updatedAt` is older than 10 min and releases its
-reserved minutes (idempotent). Wire it on a Cloud Scheduler cron (~every 5 min)
-with header `x-cron-secret: <EXPORT_RECONCILE_SECRET>`. The export panel also
-shows a "stuck — cancel & retry" state client-side so the UI never sits at 0%.
+A render can die mid-flight (OOM SIGKILL, a Cloud Run instance recycle, an
+unhandled error) — Cloud Run returns 503 and Cloud Tasks retries. Recovery has
+three cooperating layers, all keyed on the worker's 60s `updatedAt` **heartbeat**
+(it also bumps `updatedAt` on every progress write):
+
+1. **Heartbeat lease (`claimJob`)** — a non-terminal job is "owned" only while its
+   `updatedAt` is fresh (< 3 min). A retry that arrives while the owner is alive
+   gets `action:"leased"` → the server returns **HTTP 409** (retryable) so Cloud
+   Tasks keeps the task and tries later. Once the owner's heartbeat goes stale
+   (it crashed), the next retry **re-claims and re-renders** the job — the minute
+   reservation persists across the crash, so it's reused (no double-reserve), and
+   the success settle is idempotent (skips if already `ready`). This is what stops
+   a crashed job from being stuck on "leased" for the old fixed 30-min window.
+   (Previously `action:"leased"` returned 200, so Cloud Tasks acked + stopped
+   retrying entirely — a crashed job was never resumed.)
+
+2. **Reconciler (`POST /api/cron/reconcile-exports`)** — backstop for when Cloud
+   Tasks gives up before a retry re-claims: fails any non-terminal job whose
+   `updatedAt` is older than 10 min and releases its reserved minutes
+   (idempotent). Wire it on a Cloud Scheduler cron (~every 5 min) with header
+   `x-cron-secret: <EXPORT_RECONCILE_SECRET>`. (3-min re-claim < 10-min reconcile,
+   so a retry gets first chance to resume before the job is failed.)
+
+3. **UI** — the export panel shows a "stuck — cancel & retry" state client-side so
+   it never sits at "Rendering 0%".
+
+Process-level deaths are logged via `[worker:fatal]` (uncaughtException /
+unhandledRejection), `[worker:signal]` (SIGTERM — instance recycle), and
+`[worker:exit]`. An OOM kill is SIGKILL (uncatchable) — watch the
+`[worker:progress] rssMB` heartbeat (every 500 frames) for a climb toward the
+Cloud Run memory cap, and `[worker:decode]/[worker:encode] ffmpeg … exited` for a
+mid-render ffmpeg death.
 
 ## Output tiers
 

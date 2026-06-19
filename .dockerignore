@@ -9,5 +9,8 @@
 **/.env.*
 !**/.env*.example
 services/export-worker/dist
+# .NET build artifacts (services/export-api-dotnet) — rebuilt inside the image.
+**/bin
+**/obj
 .claude
 .vscode

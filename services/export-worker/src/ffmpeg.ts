@@ -430,6 +430,15 @@ export function spawnDecoder(
     }
   });
 
+  // A non-zero exit (code !== 0/null) means the DECODER died on its own mid-run
+  // — surface it. A signal kill (code === null) is our own kill() on
+  // completion/cancel, not an error.
+  child.on("close", (code, signal) => {
+    if (code !== null && code !== 0) {
+      console.error("[worker:decode] ffmpeg decoder exited", { code, signal });
+    }
+  });
+
   return {
     reader: makeFrameReader(child.stdout, width * height * 4),
     child,
@@ -593,6 +602,15 @@ export async function spawnEncoder(opts: EncoderOptions): Promise<Encoder> {
     child.on("close", (code) => {
       if (code !== 0 && !exitError) {
         exitError = new Error(`ffmpeg encoder exited ${code}: ${stderrTail.trim()}`);
+      }
+      // A non-zero exit means the ENCODER died mid-render (e.g. libx264 error) —
+      // log the code + stderr tail (worker logs only). code === null is our own
+      // kill() on cancel/stall, not a failure.
+      if (code !== null && code !== 0) {
+        console.error("[worker:encode] ffmpeg encoder exited", {
+          code,
+          tail: stderrTail.trim().slice(-1000),
+        });
       }
       done();
     });

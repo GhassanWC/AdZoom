@@ -1,6 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { FieldValue } from "firebase-admin/firestore";
 import { getAdmin } from "@/lib/firebase/admin";
+import { exportBackend, dotnetCancel } from "@/lib/export/dotnet-backend";
 import type { ExportJobDoc } from "@/lib/firebase/schema";
 
 export const runtime = "nodejs";
@@ -40,6 +41,40 @@ export async function POST(req: NextRequest) {
     const jobId = body.jobId;
     if (typeof jobId !== "string" || !jobId) {
       return NextResponse.json({ error: "Body must include { jobId }" }, { status: 400 });
+    }
+
+    // dotnet backend: cancellation is authoritative in the C# API (it releases
+    // minutes + sets canceled; its runner kills the in-flight render). On 404 or
+    // success we're done; on any other failure (or missing config) we fall through
+    // to the local transaction.
+    //
+    // The fallback is double-release SAFE: C#'s cancel does the minute release AND
+    // status=canceled in ONE atomic Firestore transaction, and the local txn below
+    // reads+writes the SAME job + usage docs — so Firestore serializes them. If C#
+    // already canceled, the local txn reads the terminal status and returns BEFORE
+    // touching the usage doc (the guard at the top of the txn), releasing exactly
+    // once. (Invariant: C#'s release+status flip MUST stay in one transaction.)
+    if (exportBackend() === "dotnet") {
+      try {
+        const r = await dotnetCancel(uid, jobId);
+        if (r) {
+          console.log(`[export-cancel] backend=dotnet proxied job=${jobId} status=${r.status} state=${r.state ?? ""}`);
+          if (r.status === 404) {
+            return NextResponse.json({ error: "Export job not found." }, { status: 404 });
+          }
+          if (r.ok) {
+            return NextResponse.json({ ok: true, state: r.state ?? "canceled" });
+          }
+          console.warn(`[export-cancel] backend=dotnet proxy non-2xx (${r.status}) — local fallback`, { jobId });
+        } else {
+          console.warn("[export-cancel] backend=dotnet but EXPORT_API_URL/secret missing — local fallback", { jobId });
+        }
+      } catch (err) {
+        console.warn("[export-cancel] backend=dotnet proxy failed — local fallback", {
+          jobId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
 
     const jobRef = db.doc(`users/${uid}/exportJobs/${jobId}`);
@@ -87,6 +122,9 @@ export async function POST(req: NextRequest) {
       return { status: 200 as const, state: "canceled" as const };
     });
 
+    console.log(
+      `[export-cancel] local txn job=${jobId} result=${result.status === 404 ? "404" : result.state}`
+    );
     if (result.status === 404) {
       return NextResponse.json({ error: "Export job not found." }, { status: 404 });
     }

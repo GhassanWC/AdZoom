@@ -8,7 +8,8 @@
   "scripts": {
     "dev": "tsx watch --tsconfig tsconfig.json src/dev-server.ts",
     "start": "node dist/server.js",
-    "build": "node esbuild.mjs",
+    "build": "node esbuild.mjs && node esbuild.cli.mjs",
+    "build:cli": "node esbuild.cli.mjs",
     "typecheck": "tsc --noEmit",
     "test:e2e": "tsx --tsconfig tsconfig.json test/e2e.ts"
   },

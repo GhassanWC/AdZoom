@@ -19,6 +19,27 @@ import { canDecodeAudio, canDecodeVideo, probeSource, type SourceInfo } from "./
 export const AUDIO_UNSUPPORTED_WARNING =
   "This source audio format is not supported. The video was exported without audio.";
 
+/**
+ * Audio codecs the bundled ffmpeg cannot decode — keyed on the ffprobe
+ * `codec_name` (or the 4-char `codec_tag_string`). This is the AUTHORITATIVE,
+ * fast guard: a source whose audio is `none`/`apac`/`unknown`/empty must NEVER
+ * be sent to the encoder as `direct`/`filter` audio (it aborts with
+ * "no decoder found for: none"). It does NOT rely on the `canDecodeAudio` probe
+ * — that probe was observed letting `apac` through in production, leaving
+ * `mode:direct`. Decodable codecs (aac/opus/mp3/…) return false here and are
+ * still gated by `canDecodeAudio` as a secondary check.
+ */
+const UNDECODABLE_AUDIO = new Set(["", "none", "unknown", "apac"]);
+export function isUnsupportedAudioCodec(
+  codec: string | undefined,
+  tag?: string | undefined
+): boolean {
+  return (
+    UNDECODABLE_AUDIO.has((codec ?? "").toLowerCase()) ||
+    (tag ?? "").toLowerCase() === "apac"
+  );
+}
+
 export interface Preflight {
   info: SourceInfo;
   /** Source should be transcoded to a worker-safe H.264+AAC MP4 before render. */
@@ -41,7 +62,12 @@ export async function computePreflight(path: string): Promise<Preflight> {
     canDecodeVideo(path),
     info.hasAudio ? canDecodeAudio(path) : Promise.resolve(false),
   ]);
-  const needsAudioDrop = info.hasAudio && !audioDecodable;
+  // Drop audio when the codec is one ffmpeg can't decode (authoritative,
+  // codec-name based) OR the decode probe failed. The codec check guards against
+  // the probe flakily passing `apac`/`none`.
+  const needsAudioDrop =
+    info.hasAudio &&
+    (isUnsupportedAudioCodec(info.audioCodec, info.audioCodecTag) || !audioDecodable);
 
   const reasons: string[] = [];
   // Video — anything other than H.264 (hevc/vp9/av1/prores/…) is risky.

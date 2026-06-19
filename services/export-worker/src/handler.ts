@@ -16,15 +16,23 @@ import { join, extname } from "node:path";
 import { FieldValue, type Firestore } from "firebase-admin/firestore";
 import { getAdmin, bucket } from "./firebase.js";
 import { loadConfig, type WorkerConfig } from "./config.js";
-import { releaseMinutes } from "./minutes.js";
 import { renderToMp4, CanceledError } from "./render.js";
 import { normalizeSource } from "./ffmpeg.js";
 import { computePreflight, AUDIO_UNSUPPORTED_WARNING } from "./preflight.js";
 import { toUserFacingError } from "./errors.js";
 import type { ExportJobDoc, ProjectDoc } from "@/lib/firebase/schema";
 
-/** How long a claimed-but-unfinished job is considered owned by an instance. */
-const LEASE_MS = 30 * 60 * 1000;
+/**
+ * A claimed job is "owned" only while its owner is HEARTBEATING. The worker bumps
+ * `updatedAt` every 60s (plus on every progress write), so a non-terminal job
+ * whose `updatedAt` is older than this is an ABANDONED job (the instance crashed
+ * / was OOM-killed / recycled) and may be re-claimed by a Cloud Tasks retry.
+ * 3 missed heartbeats ⇒ dead. Keeping this short (vs. a fixed 30-min lease from
+ * `startedAt`) is what lets a retry RESUME a crashed render in minutes instead of
+ * being told "leased" for half an hour. It must stay below the reconciler's
+ * stale window (10 min) so a retry gets a chance to resume before the job is failed.
+ */
+const HEARTBEAT_STALE_MS = 3 * 60 * 1000;
 
 type ClaimResult =
   | { action: "missing" }
@@ -56,8 +64,25 @@ async function claimJob(
       return { action: "terminal" };
     }
 
-    if (job.status === "rendering" && Date.now() - toMs(job.startedAt) < LEASE_MS) {
+    // In-flight AND recently heartbeated ⇒ a live worker owns it; skip (the
+    // server returns a RETRYABLE status so Cloud Tasks tries again later — by
+    // which point the owner has either finished (→ terminal) or gone stale
+    // (→ re-claimable here)).
+    const inFlight = job.status === "rendering" || job.status === "uploading";
+    if (inFlight && Date.now() - toMs(job.updatedAt) < HEARTBEAT_STALE_MS) {
       return { action: "leased" };
+    }
+    // Otherwise: queued, or an abandoned in-flight job (stale heartbeat) — claim
+    // it and (re-)render from scratch. The minute reservation persists across the
+    // crash, so re-rendering reuses it (no double reserve); the success txn is
+    // idempotent against a resurrected original owner.
+    if (inFlight) {
+      console.warn("[worker] re-claiming abandoned job (stale heartbeat)", {
+        uid,
+        jobId,
+        status: job.status,
+        updatedAtAgeMs: Date.now() - toMs(job.updatedAt),
+      });
     }
 
     tx.update(jobRef, {
@@ -339,9 +364,11 @@ export async function processJob(uid: string, jobId: string): Promise<string> {
       const snap = await tx.get(jobRef);
       if (!snap.exists) return false;
       const st = snap.get("status") as string | undefined;
-      // The cancel route may have finalized this job during upload — don't
-      // resurrect it or double-spend the reservation it already released.
-      if (st === "canceled" || st === "failed") return false;
+      // Don't double-settle. The cancel route may have finalized this during
+      // upload (canceled/failed → it released the reservation), OR another worker
+      // that re-claimed this job after a stale heartbeat already settled it
+      // (ready) — settling again would double-spend `cloudMinutesConsumed`.
+      if (st === "canceled" || st === "failed" || st === "ready") return false;
 
       const usageRef = db.doc(`users/${uid}/usage/${monthKey}`);
       const usageSnap = await tx.get(usageRef);
@@ -397,18 +424,47 @@ export async function processJob(uid: string, jobId: string): Promise<string> {
       console.info("[worker] canceled", { uid, jobId });
       return "canceled";
     }
-    // Genuine failure (render/stall/upload) — the worker owns release + status.
-    await releaseMinutes(db, uid, monthKey, estimate).catch(() => {});
-    // The user sees a CLEAN one-liner; the raw ffmpeg/stack detail stays in the
-    // worker logs only (never persisted to Firestore / shown in the UI).
+    // Genuine failure (render/stall/upload). Finalize in ONE transaction that
+    // re-checks status first — exactly like the success settle — so it can't:
+    //   • clobber a `ready` status (a retry that re-claimed this job after a
+    //     stale heartbeat may have already settled it), nor
+    //   • double-release the reservation (cancel route / reconciler may have
+    //     released it), which on the shared usage doc could wipe a SIBLING job's
+    //     reservation.
+    // The user sees a CLEAN one-liner; raw ffmpeg/stack detail stays in the logs.
     const raw = err instanceof Error ? err.message : "Render failed.";
     const friendly = toUserFacingError(err);
-    await patch({
-      status: "failed",
-      errorCode: friendly.code,
-      errorMessage: friendly.message,
-      completedAt: FieldValue.serverTimestamp(),
-    }).catch(() => {});
+    await db
+      .runTransaction(async (tx) => {
+        const snap = await tx.get(jobRef);
+        if (!snap.exists) return;
+        const st = snap.get("status") as string | undefined;
+        if (st === "ready" || st === "failed" || st === "canceled") return; // already terminal
+        if (estimate > 0 && monthKey) {
+          const usageRef = db.doc(`users/${uid}/usage/${monthKey}`);
+          const uSnap = await tx.get(usageRef);
+          const reserved =
+            (uSnap.data() as { cloudMinutesReserved?: number } | undefined)
+              ?.cloudMinutesReserved ?? 0;
+          tx.set(
+            usageRef,
+            { cloudMinutesReserved: Math.max(0, reserved - estimate), updatedAt: Date.now() },
+            { merge: true }
+          );
+        }
+        tx.set(
+          jobRef,
+          {
+            status: "failed",
+            errorCode: friendly.code,
+            errorMessage: friendly.message,
+            completedAt: FieldValue.serverTimestamp(),
+            updatedAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+      })
+      .catch((e) => console.error("[worker] failed-finalize txn error", { uid, jobId, e }));
     console.error("[worker] failed", { uid, jobId, errorCode: friendly.code, error: raw });
     return "failed";
   } finally {
