@@ -153,9 +153,66 @@ Default export is **1080p / 30fps**. 4K and 60fps require a paid plan (Pro+),
 enforced server-side in `/api/export/cloud` (and `/api/billing/export-permit`
 for the browser path) and reflected in the export panel.
 
-## Parity test
+## Production-readiness gate
 
-`tests/render-parity.test.ts` (repo root) diffs worker frames against stored
-browser goldens within tolerance. **Keep cloud export behind
-`CLOUD_EXPORT_ENABLED` until that test is green** — blur, BT.709 color, and font
-metrics are the known parity risks.
+**Cloud export MUST stay disabled (`CLOUD_EXPORT_ENABLED` unset/false) until ALL
+of the following pass.** Do not expose it to users while `render_stalled` /
+`apac` failures can still happen.
+
+1. **End-to-end render gate** — from `services/export-worker`:
+   ```bash
+   npm run test:e2e
+   ```
+   Runs the REAL render core (`renderToMp4` / `normalizeSource` / preflight) on
+   generated samples and requires a valid MP4 for each:
+   - normal H.264/AAC → MP4 **with** audio
+   - cuts + speed → shorter MP4 **with** audio (filtergraph path)
+   - unsupported audio → MP4 **without** audio (never fails)
+   - non-H.264 (HEVC) → normalized to H.264 → MP4
+   - undecodable source → **fast** decode failure (seconds, not the 90s stall)
+
+   Exits non-zero if any case fails. ffmpeg/ffprobe are the bundled static
+   binaries — no external setup.
+
+2. **Render-parity** — `tests/render-parity.test.ts` (repo root) diffs worker
+   frames against stored browser goldens within tolerance (blur, BT.709 color,
+   and font metrics are the known risks).
+
+3. **Deployed revision check** — confirm the live Cloud Run revision actually
+   has normalization on and is the new image:
+   ```bash
+   gcloud run services describe "$WORKER_SERVICE_NAME" \
+     --project="$PROJECT_ID" --region="$REGION" \
+     --format="value(spec.template.spec.containers[0].env)"      # must list WORKER_NORMALIZE_ENABLED=1
+   gcloud run services describe "$WORKER_SERVICE_NAME" \
+     --project="$PROJECT_ID" --region="$REGION" \
+     --format="value(status.latestReadyRevisionName, status.url)"
+   ```
+   `npm run worker:deploy` sets the rest of the env but NOT
+   `WORKER_NORMALIZE_ENABLED` — add it explicitly:
+   ```bash
+   gcloud run services update "$WORKER_SERVICE_NAME" \
+     --project="$PROJECT_ID" --region="$REGION" \
+     --update-env-vars WORKER_NORMALIZE_ENABLED=1
+   ```
+
+### Fast-fail + observability
+
+A source whose video can't be decoded now fails in **seconds** via a preflight
+decode probe (`canDecodeVideo` / `probeSource`) with a clean `decode_failed`
+message — it never reaches the 90s stall watchdog, and minutes are released (not
+consumed). Each job emits, in order:
+`[worker:timing] download` → `[worker:preflight]` → `[worker:normalize]` (risky
+only) + `[worker:timing] prepare` → `[worker:decode]` → `[worker:render-start]`
+→ `[worker:first-decoded-frame]` → `[worker:first-composed-frame]` →
+`[worker:first-frame]` → `[worker:complete]`. The `afterMs` on the first-frame
+logs pinpoints where any latency lives (decode vs compose vs encode), and
+`[worker:first-decoded-frame].decodedToIndex` shows how many source frames had
+to be decoded+discarded before the first OUTPUT frame (a large value means a
+long leading cut / speed-up, not a stall).
+
+**Frame pipeline:** the decoder is a single continuous ffmpeg rawvideo pipe (no
+per-frame seeking); the `FrameReader` assembles each frame from a chunk queue in
+O(frameBytes) (the previous per-chunk `Buffer.concat` was O(frameBytes²) — ~1 GB
+of copying per 1080p frame, the cause of slow first frames). The decoder runs
+`-an` (video only).

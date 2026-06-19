@@ -1074,20 +1074,24 @@ function parseRate(raw) {
   return num / den;
 }
 async function probeSource(path) {
-  const { stdout } = await execFileP(
-    ffprobeBin(),
-    [
-      "-v",
-      "quiet",
-      "-print_format",
-      "json",
-      "-show_format",
-      "-show_streams",
-      path
-    ],
-    EXEC_OPTS
-  );
-  const json = JSON.parse(stdout);
+  let stdout;
+  try {
+    ({ stdout } = await execFileP(
+      ffprobeBin(),
+      ["-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", path],
+      EXEC_OPTS
+    ));
+  } catch (err) {
+    const detail = err.stderr ?? err.message ?? "";
+    console.error("[worker:preflight] ffprobe failed", String(detail).slice(-2e3));
+    throw new Error("preflight: could not read source video (ffprobe failed)");
+  }
+  let json;
+  try {
+    json = JSON.parse(stdout);
+  } catch {
+    throw new Error("preflight: could not read source video (unparseable ffprobe output)");
+  }
   const streams = json.streams ?? [];
   const videoStreams = streams.filter(
     (s) => s.codec_type === "video" && s.disposition?.attached_pic !== 1
@@ -1137,6 +1141,18 @@ async function canDecodeAudio(path) {
     return false;
   }
 }
+async function canDecodeVideo(path) {
+  try {
+    await execFileP(
+      ffmpegBin(),
+      ["-hide_banner", "-v", "error", "-i", path, "-map", "0:v:0", "-frames:v", "1", "-f", "null", "-"],
+      EXEC_OPTS
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
 var NORMALIZE_EXEC_OPTS = {
   timeout: 20 * 6e4,
   maxBuffer: 16 * 1024 * 1024
@@ -1174,7 +1190,8 @@ async function normalizeSource(opts) {
 }
 function makeFrameReader(stream, frameBytes) {
   const MAX_BACKLOG = frameBytes * 4;
-  let buffered = Buffer.alloc(0);
+  const chunks = [];
+  let bufferedLen = 0;
   let ended = false;
   let errored = null;
   let paused = false;
@@ -1185,8 +1202,9 @@ function makeFrameReader(stream, frameBytes) {
     if (w) w();
   };
   stream.on("data", (chunk) => {
-    buffered = buffered.length ? Buffer.concat([buffered, chunk]) : chunk;
-    if (buffered.length >= MAX_BACKLOG && !paused) {
+    chunks.push(chunk);
+    bufferedLen += chunk.length;
+    if (bufferedLen >= MAX_BACKLOG && !paused) {
       paused = true;
       stream.pause();
     }
@@ -1205,18 +1223,36 @@ function makeFrameReader(stream, frameBytes) {
     ended = true;
     wake();
   });
+  const takeFrame = () => {
+    const frame = Buffer.allocUnsafe(frameBytes);
+    let off = 0;
+    while (off < frameBytes) {
+      const c = chunks[0];
+      const need = frameBytes - off;
+      if (c.length <= need) {
+        c.copy(frame, off);
+        off += c.length;
+        chunks.shift();
+      } else {
+        c.copy(frame, off, 0, need);
+        chunks[0] = c.subarray(need);
+        off += need;
+      }
+    }
+    bufferedLen -= frameBytes;
+    return frame;
+  };
   return {
     async next() {
       for (; ; ) {
         if (errored) throw errored;
-        if (buffered.length >= frameBytes) {
-          const frame = buffered.subarray(0, frameBytes);
-          buffered = buffered.subarray(frameBytes);
-          if (paused && buffered.length < MAX_BACKLOG) {
+        if (bufferedLen >= frameBytes) {
+          const frame = takeFrame();
+          if (paused && bufferedLen < MAX_BACKLOG) {
             paused = false;
             stream.resume();
           }
-          return Buffer.from(frame);
+          return frame;
         }
         if (ended) return null;
         await new Promise((resolve) => {
@@ -1236,6 +1272,9 @@ function spawnDecoder(path, fps, width, height) {
       "-hide_banner",
       "-loglevel",
       "error",
+      // The decoder emits ONLY video — skip opening/analyzing the audio stream
+      // so input setup (and the first frame) isn't delayed by it.
+      "-an",
       "-i",
       path,
       // Force exact dims so each frame is exactly `width*height*4` bytes (the
@@ -1470,7 +1509,10 @@ function buildAudioFilterComplex(segments, moments, sampleRate) {
 var AUDIO_UNSUPPORTED_WARNING = "This source audio format is not supported. The video was exported without audio.";
 async function computePreflight(path) {
   const info = await probeSource(path);
-  const audioDecodable = info.hasAudio ? await canDecodeAudio(path) : false;
+  const [videoDecodable, audioDecodable] = await Promise.all([
+    canDecodeVideo(path),
+    info.hasAudio ? canDecodeAudio(path) : Promise.resolve(false)
+  ]);
   const needsAudioDrop = info.hasAudio && !audioDecodable;
   const reasons = [];
   if (info.videoCodec && info.videoCodec !== "h264") {
@@ -1484,7 +1526,29 @@ async function computePreflight(path) {
       needsAudioDrop ? `audio codec "${info.audioCodec || info.audioCodecTag || "unknown"}" is undecodable` : `audio codec "${info.audioCodec}" is not aac`
     );
   }
-  return { info, risky: reasons.length > 0, reasons, audioDecodable, needsAudioDrop };
+  const pf = {
+    info,
+    risky: reasons.length > 0,
+    reasons,
+    videoDecodable,
+    audioDecodable,
+    needsAudioDrop
+  };
+  console.info("[worker:preflight]", {
+    videoCodec: info.videoCodec,
+    audioCodec: info.audioCodec || info.audioCodecTag || "(none)",
+    width: info.width,
+    height: info.height,
+    fps: info.fps,
+    durationSec: info.durationSec,
+    videoStreams: info.nbVideoStreams,
+    audioStreams: info.nbAudioStreams,
+    videoDecodable,
+    audioDecodable,
+    risky: pf.risky,
+    reasons
+  });
+  return pf;
 }
 
 // src/render.ts
@@ -1511,6 +1575,14 @@ async function renderToMp4(opts) {
   const recipe = buildRenderRecipe({ ...opts.serialized, debugBorders: false });
   const { canvasW, canvasH, sourceWidth, sourceHeight, fps, outputDuration, timelineMap } = recipe;
   const info = await probeSource(opts.sourcePath);
+  if (!await canDecodeVideo(opts.sourcePath)) {
+    console.error("[worker:decode] source video is undecodable \u2014 failing fast", {
+      videoCodec: info.videoCodec,
+      width: info.width,
+      height: info.height
+    });
+    throw new Error("preflight: source video could not be decoded \u2014 no frames were produced");
+  }
   let hasAudio = info.hasAudio;
   if (opts.audioAlreadyDropped) {
     hasAudio = false;
@@ -1599,8 +1671,17 @@ async function renderToMp4(opts) {
   const onAbort = () => killBoth();
   opts.signal.addEventListener("abort", onAbort);
   let lastPct = -1;
+  const renderStartMs = Date.now();
   try {
     if (opts.signal.aborted) throw new CanceledError();
+    console.info("[worker:render-start]", {
+      canvasW,
+      canvasH,
+      fps,
+      totalFrames,
+      audio: audio.kind
+    });
+    opts.onProgress({ stage: "decoding", progress: 0.01 });
     armWatchdog();
     for (let i = 0; i < totalFrames; i++) {
       if (opts.signal.aborted) throw new CanceledError();
@@ -1612,6 +1693,12 @@ async function renderToMp4(opts) {
       const outputTime = i / fps;
       const sourceTime = sourceTimeForOutput(timelineMap, outputTime);
       const frame = await frameForSourceTime(sourceTime);
+      if (i === 0) {
+        console.info("[worker:first-decoded-frame]", {
+          afterMs: Date.now() - renderStartMs,
+          decodedToIndex: decodedIndex
+        });
+      }
       if (frame && frame.length === frameBytes) {
         srcCtx.putImageData(
           new ImageData(
@@ -1629,15 +1716,29 @@ async function renderToMp4(opts) {
         recipe,
         sourceTime
       );
+      if (i === 0) {
+        console.info("[worker:first-composed-frame]", { afterMs: Date.now() - renderStartMs });
+      }
       const img = outCtx.getImageData(0, 0, canvasW, canvasH);
       await encoder.writeFrame(
         Buffer.from(img.data.buffer, img.data.byteOffset, img.data.byteLength)
       );
+      if (i === 0) {
+        console.info("[worker:first-frame]", { afterMs: Date.now() - renderStartMs });
+      }
       armWatchdog();
     }
     opts.onProgress({ stage: "encoding", progress: 0.97 });
     await encoder.finish();
     decoder.kill();
+    console.info("[worker:complete]", {
+      outputWidth: canvasW,
+      outputHeight: canvasH,
+      fps,
+      frames: totalFrames,
+      elapsedMs: Date.now() - renderStartMs,
+      warnings: warnings.length
+    });
     return { warnings, outputWidth: canvasW, outputHeight: canvasH, fps };
   } catch (err) {
     killBoth();
@@ -1661,6 +1762,12 @@ function toUserFacingError(err) {
     return {
       code: "audio_unsupported",
       message: "This video's audio is in a format we can't process. Please try exporting again \u2014 if it keeps failing, the audio track may be unsupported."
+    };
+  }
+  if (raw.includes("could not be decoded") || raw.includes("preflight")) {
+    return {
+      code: "decode_failed",
+      message: "We couldn't read this video \u2014 it may be corrupt or in a format we can't process. Please re-upload it or try a different file."
     };
   }
   if (raw.includes("stalled")) {
@@ -1718,6 +1825,9 @@ async function claimJob(db, uid, jobId) {
 async function prepareSource(args) {
   const { db, uid, jobId, job, cfg, srcPath, workDir, signal, patch } = args;
   const pf = await computePreflight(srcPath);
+  if (!pf.videoDecodable) {
+    throw new Error("preflight: source video could not be decoded");
+  }
   const summary = {
     videoCodec: pf.info.videoCodec,
     audioCodec: pf.info.audioCodec,
@@ -1834,7 +1944,11 @@ async function processJob(uid, jobId) {
     workDir = await mkdtemp(join2(tmpdir2(), `framevo-job-${jobId}-`));
     const srcPath = join2(workDir, `source${extname(job.sourceStoragePath) || ".mp4"}`);
     const outPath = join2(workDir, `${jobId}.mp4`);
+    await patch({ stage: "downloading", progress: 0.02 });
+    const dlStart = Date.now();
     await bucket().file(job.sourceStoragePath).download({ destination: srcPath });
+    console.info("[worker:timing] download", { jobId, ms: Date.now() - dlStart });
+    const prepStart = Date.now();
     const prepared = await prepareSource({
       db,
       uid,
@@ -1845,6 +1959,11 @@ async function processJob(uid, jobId) {
       workDir,
       signal: controller.signal,
       patch
+    });
+    console.info("[worker:timing] prepare", {
+      jobId,
+      ms: Date.now() - prepStart,
+      normalized: prepared.preflight.normalized
     });
     let lastPct = -1;
     const result = await renderToMp4({

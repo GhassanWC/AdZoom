@@ -9,7 +9,8 @@
     "dev": "tsx watch --tsconfig tsconfig.json src/dev-server.ts",
     "start": "node dist/server.js",
     "build": "node esbuild.mjs",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:e2e": "tsx --tsconfig tsconfig.json test/e2e.ts"
   },
   "dependencies": {
     "@napi-rs/canvas": "^0.1.65",

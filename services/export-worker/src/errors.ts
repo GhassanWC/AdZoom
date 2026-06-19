@@ -38,6 +38,16 @@ export function toUserFacingError(err: unknown): UserFacingError {
     };
   }
 
+  // Preflight fast-fail: the bundled ffmpeg can't decode the source video at all
+  // (corrupt / truly unsupported). Distinct from a stall — we caught it up front.
+  if (raw.includes("could not be decoded") || raw.includes("preflight")) {
+    return {
+      code: "decode_failed",
+      message:
+        "We couldn't read this video — it may be corrupt or in a format we can't process. Please re-upload it or try a different file.",
+    };
+  }
+
   // Watchdog tripped — no frames produced within the stall timeout.
   if (raw.includes("stalled")) {
     return {

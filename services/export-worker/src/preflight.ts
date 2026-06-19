@@ -11,7 +11,7 @@
  * One ffprobe + one short audio-decode test feed BOTH the normalization decision
  * and the render, so nothing is probed twice.
  */
-import { canDecodeAudio, probeSource, type SourceInfo } from "./ffmpeg.js";
+import { canDecodeAudio, canDecodeVideo, probeSource, type SourceInfo } from "./ffmpeg.js";
 
 /** The single source of truth for the audio-dropped warning copy. Pushed onto
  *  the job's `warnings[]` whether audio was dropped during normalization or by
@@ -25,6 +25,9 @@ export interface Preflight {
   risky: boolean;
   /** Human-readable risk reasons — LOGS ONLY, never persisted or shown to users. */
   reasons: string[];
+  /** Whether ffmpeg can decode the source's VIDEO. false ⇒ the export can't be
+   *  rendered at all (corrupt / unsupported) — fail fast, don't stall. */
+  videoDecodable: boolean;
   /** Whether ffmpeg can decode the source's audio (false when there's no audio). */
   audioDecodable: boolean;
   /** Audio present but undecodable (e.g. apac) ⇒ must export/normalize silent. */
@@ -33,7 +36,11 @@ export interface Preflight {
 
 export async function computePreflight(path: string): Promise<Preflight> {
   const info = await probeSource(path);
-  const audioDecodable = info.hasAudio ? await canDecodeAudio(path) : false;
+  // Run the two decode probes concurrently — both are short slices to null.
+  const [videoDecodable, audioDecodable] = await Promise.all([
+    canDecodeVideo(path),
+    info.hasAudio ? canDecodeAudio(path) : Promise.resolve(false),
+  ]);
   const needsAudioDrop = info.hasAudio && !audioDecodable;
 
   const reasons: string[] = [];
@@ -54,5 +61,27 @@ export async function computePreflight(path: string): Promise<Preflight> {
     );
   }
 
-  return { info, risky: reasons.length > 0, reasons, audioDecodable, needsAudioDrop };
+  const pf: Preflight = {
+    info,
+    risky: reasons.length > 0,
+    reasons,
+    videoDecodable,
+    audioDecodable,
+    needsAudioDrop,
+  };
+  console.info("[worker:preflight]", {
+    videoCodec: info.videoCodec,
+    audioCodec: info.audioCodec || info.audioCodecTag || "(none)",
+    width: info.width,
+    height: info.height,
+    fps: info.fps,
+    durationSec: info.durationSec,
+    videoStreams: info.nbVideoStreams,
+    audioStreams: info.nbAudioStreams,
+    videoDecodable,
+    audioDecodable,
+    risky: pf.risky,
+    reasons,
+  });
+  return pf;
 }

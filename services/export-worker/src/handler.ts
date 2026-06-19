@@ -103,6 +103,14 @@ async function prepareSource(args: {
   const { db, uid, jobId, job, cfg, srcPath, workDir, signal, patch } = args;
 
   const pf = await computePreflight(srcPath);
+
+  // Fast-fail: an undecodable source can't be normalized OR rendered — bail now
+  // with a clear decode error (the handler releases the reserved minutes)
+  // instead of attempting a doomed normalize/render that would only stall.
+  if (!pf.videoDecodable) {
+    throw new Error("preflight: source video could not be decoded");
+  }
+
   const summary = {
     videoCodec: pf.info.videoCodec,
     audioCodec: pf.info.audioCodec,
@@ -263,11 +271,15 @@ export async function processJob(uid: string, jobId: string): Promise<string> {
     const outPath = join(workDir, `${jobId}.mp4`);
 
     // ── Download source ──────────────────────────────────────────────────
+    await patch({ stage: "downloading", progress: 0.02 });
+    const dlStart = Date.now();
     await bucket().file(job.sourceStoragePath).download({ destination: srcPath });
+    console.info("[worker:timing] download", { jobId, ms: Date.now() - dlStart });
 
     // ── Preflight + (conditional) normalization ─────────────────────────
     // Risky sources (exotic video codec / non-AAC / undecodable audio) are
     // transcoded to a worker-safe H.264+AAC MP4 first, cached per project.
+    const prepStart = Date.now();
     const prepared = await prepareSource({
       db,
       uid,
@@ -278,6 +290,11 @@ export async function processJob(uid: string, jobId: string): Promise<string> {
       workDir,
       signal: controller.signal,
       patch,
+    });
+    console.info("[worker:timing] prepare", {
+      jobId,
+      ms: Date.now() - prepStart,
+      normalized: prepared.preflight.normalized,
     });
 
     // ── Render (canvas parity + ffmpeg) ─────────────────────────────────

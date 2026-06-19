@@ -87,20 +87,22 @@ function parseRate(raw: string | undefined): number {
 }
 
 export async function probeSource(path: string): Promise<SourceInfo> {
-  const { stdout } = await execFileP(
-    ffprobeBin(),
-    [
-      "-v",
-      "quiet",
-      "-print_format",
-      "json",
-      "-show_format",
-      "-show_streams",
-      path,
-    ],
-    EXEC_OPTS
-  );
-  const json = JSON.parse(stdout) as {
+  let stdout: string;
+  try {
+    ({ stdout } = await execFileP(
+      ffprobeBin(),
+      ["-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", path],
+      EXEC_OPTS
+    ));
+  } catch (err) {
+    // ffprobe couldn't read the file at all (corrupt / not a media file / wrong
+    // bytes). Throw a tagged PREFLIGHT error so it fails fast with a clean
+    // user message (decode_failed) instead of leaking raw ffprobe text.
+    const detail = (err as { stderr?: string; message?: string }).stderr ?? (err as Error).message ?? "";
+    console.error("[worker:preflight] ffprobe failed", String(detail).slice(-2000));
+    throw new Error("preflight: could not read source video (ffprobe failed)");
+  }
+  let json: {
     streams?: Array<{
       codec_type?: string;
       codec_name?: string;
@@ -115,6 +117,11 @@ export async function probeSource(path: string): Promise<SourceInfo> {
     }>;
     format?: { duration?: string; bit_rate?: string };
   };
+  try {
+    json = JSON.parse(stdout);
+  } catch {
+    throw new Error("preflight: could not read source video (unparseable ffprobe output)");
+  }
   const streams = json.streams ?? [];
   // Exclude cover-art / thumbnail streams (attached_pic) — they're tagged as
   // video by ffprobe but aren't a real video track, so they'd otherwise inflate
@@ -173,6 +180,28 @@ export async function canDecodeAudio(path: string): Promise<boolean> {
         "null",
         "-",
       ],
+      EXEC_OPTS
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Can the bundled ffmpeg DECODE this file's video at all? A source whose video
+ * can't be decoded (corrupt, truly unsupported, or zero usable video streams)
+ * would otherwise produce NO frames — and the render would hang until the 90s
+ * stall watchdog ("render_stalled"), a slow, opaque failure. We decode a single
+ * frame up front so such a source fails FAST with a clear preflight error,
+ * before the expensive render. Returns false on ANY decode failure (or a 60s
+ * timeout — a source that can't yield one frame in a minute is unusable).
+ */
+export async function canDecodeVideo(path: string): Promise<boolean> {
+  try {
+    await execFileP(
+      ffmpegBin(),
+      ["-hide_banner", "-v", "error", "-i", path, "-map", "0:v:0", "-frames:v", "1", "-f", "null", "-"],
       EXEC_OPTS
     );
     return true;
@@ -253,7 +282,14 @@ export interface FrameReader {
 
 function makeFrameReader(stream: Readable, frameBytes: number): FrameReader {
   const MAX_BACKLOG = frameBytes * 4; // ~4 frames in flight
-  let buffered: Buffer = Buffer.alloc(0);
+  // A QUEUE of raw pipe chunks (not a single growing Buffer). Assembling a frame
+  // copies exactly `frameBytes` once across the queued chunks — O(frameBytes) per
+  // frame. The old `Buffer.concat([buffered, chunk])` on every ~64 KB pipe chunk
+  // was O(frameBytes²/chunk): at 1080p (≈8 MB/frame) that's ~1 GB of copying PER
+  // frame, which dominated decode time (and exploded when many frames were
+  // decoded+discarded across a leading cut / speed section).
+  const chunks: Buffer[] = [];
+  let bufferedLen = 0;
   let ended = false;
   let errored: Error | null = null;
   let paused = false;
@@ -266,8 +302,9 @@ function makeFrameReader(stream: Readable, frameBytes: number): FrameReader {
   };
 
   stream.on("data", (chunk: Buffer) => {
-    buffered = buffered.length ? Buffer.concat([buffered, chunk]) : chunk;
-    if (buffered.length >= MAX_BACKLOG && !paused) {
+    chunks.push(chunk);
+    bufferedLen += chunk.length;
+    if (bufferedLen >= MAX_BACKLOG && !paused) {
       paused = true;
       stream.pause();
     }
@@ -289,19 +326,38 @@ function makeFrameReader(stream: Readable, frameBytes: number): FrameReader {
     wake();
   });
 
+  /** Copy exactly `frameBytes` out of the head of the chunk queue. */
+  const takeFrame = (): Buffer => {
+    const frame = Buffer.allocUnsafe(frameBytes);
+    let off = 0;
+    while (off < frameBytes) {
+      const c = chunks[0]!;
+      const need = frameBytes - off;
+      if (c.length <= need) {
+        c.copy(frame, off);
+        off += c.length;
+        chunks.shift();
+      } else {
+        c.copy(frame, off, 0, need);
+        chunks[0] = c.subarray(need);
+        off += need;
+      }
+    }
+    bufferedLen -= frameBytes;
+    return frame;
+  };
+
   return {
     async next(): Promise<Buffer | null> {
       for (;;) {
         if (errored) throw errored;
-        if (buffered.length >= frameBytes) {
-          const frame = buffered.subarray(0, frameBytes);
-          buffered = buffered.subarray(frameBytes);
-          if (paused && buffered.length < MAX_BACKLOG) {
+        if (bufferedLen >= frameBytes) {
+          const frame = takeFrame(); // freshly allocated + owned — safe to hand off
+          if (paused && bufferedLen < MAX_BACKLOG) {
             paused = false;
             stream.resume();
           }
-          // Copy out so a later concat can't alias this frame's memory.
-          return Buffer.from(frame);
+          return frame;
         }
         if (ended) return null;
         await new Promise<void>((resolve) => {
@@ -338,6 +394,9 @@ export function spawnDecoder(
       "-hide_banner",
       "-loglevel",
       "error",
+      // The decoder emits ONLY video — skip opening/analyzing the audio stream
+      // so input setup (and the first frame) isn't delayed by it.
+      "-an",
       "-i",
       path,
       // Force exact dims so each frame is exactly `width*height*4` bytes (the

@@ -14,6 +14,7 @@ import type { TimelineMap } from "@/lib/timeline/crop-speed";
 import {
   probeSource,
   canDecodeAudio,
+  canDecodeVideo,
   spawnDecoder,
   spawnEncoder,
   type EncoderAudio,
@@ -81,6 +82,19 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
     recipe;
 
   const info = await probeSource(opts.sourcePath);
+
+  // Fast-fail preflight: if the bundled ffmpeg can't decode even one video frame,
+  // the render would otherwise hang until the 90s stall watchdog. Fail NOW with a
+  // clear decode error (cheap — a single-frame decode) so the job never wedges.
+  if (!(await canDecodeVideo(opts.sourcePath))) {
+    console.error("[worker:decode] source video is undecodable — failing fast", {
+      videoCodec: info.videoCodec,
+      width: info.width,
+      height: info.height,
+    });
+    throw new Error("preflight: source video could not be decoded — no frames were produced");
+  }
+
   // `hasAudio` may be demoted to false below if the source has an audio stream
   // the bundled ffmpeg can't decode — we then export silently rather than let
   // the encoder abort (and the frame writer EPIPE) trying to transcode it.
@@ -198,8 +212,20 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
   opts.signal.addEventListener("abort", onAbort);
 
   let lastPct = -1;
+  const renderStartMs = Date.now();
   try {
     if (opts.signal.aborted) throw new CanceledError();
+    console.info("[worker:render-start]", {
+      canvasW,
+      canvasH,
+      fps,
+      totalFrames,
+      audio: audio.kind,
+    });
+    // Nudge the UI off 0% while the first frame decodes (it can take a moment on
+    // a big GOP) — without this the bar looks frozen between "downloading" and
+    // the first rendered frame.
+    opts.onProgress({ stage: "decoding", progress: 0.01 });
     armWatchdog();
     for (let i = 0; i < totalFrames; i++) {
       if (opts.signal.aborted) throw new CanceledError();
@@ -213,6 +239,12 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
       const outputTime = i / fps;
       const sourceTime = sourceTimeForOutput(timelineMap, outputTime);
       const frame = await frameForSourceTime(sourceTime);
+      if (i === 0) {
+        console.info("[worker:first-decoded-frame]", {
+          afterMs: Date.now() - renderStartMs,
+          decodedToIndex: decodedIndex,
+        });
+      }
 
       if (frame && frame.length === frameBytes) {
         srcCtx.putImageData(
@@ -234,17 +266,32 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
         recipe,
         sourceTime
       );
+      if (i === 0) {
+        console.info("[worker:first-composed-frame]", { afterMs: Date.now() - renderStartMs });
+      }
 
       const img = outCtx.getImageData(0, 0, canvasW, canvasH);
       await encoder.writeFrame(
         Buffer.from(img.data.buffer, img.data.byteOffset, img.data.byteLength)
       );
+      if (i === 0) {
+        // First frame accepted by the encoder — the pipeline is flowing.
+        console.info("[worker:first-frame]", { afterMs: Date.now() - renderStartMs });
+      }
       armWatchdog(); // progress was made — reset the stall timer
     }
 
     opts.onProgress({ stage: "encoding", progress: 0.97 });
     await encoder.finish();
     decoder.kill();
+    console.info("[worker:complete]", {
+      outputWidth: canvasW,
+      outputHeight: canvasH,
+      fps,
+      frames: totalFrames,
+      elapsedMs: Date.now() - renderStartMs,
+      warnings: warnings.length,
+    });
     return { warnings, outputWidth: canvasW, outputHeight: canvasH, fps };
   } catch (err) {
     killBoth();
