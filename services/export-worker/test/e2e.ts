@@ -27,7 +27,9 @@ import { join } from "node:path";
 import {
   ffmpegBin,
   probeSource,
+  probeAudioStreams,
   canDecodeVideo,
+  canDecodeAudioStream,
   normalizeSource,
 } from "../src/ffmpeg.js";
 import { renderToMp4 } from "../src/render.js";
@@ -76,6 +78,18 @@ async function genH264Aac(out: string): Promise<void> {
   await ff([
     "-f", "lavfi", "-i", `testsrc2=size=${SRC_W}x${SRC_H}:rate=30:duration=${SRC_DUR}`,
     "-f", "lavfi", "-i", `sine=frequency=440:duration=${SRC_DUR}`,
+    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", out,
+  ]);
+}
+
+/** testsrc2 video + TWO sine audio tracks → H.264/AAC MOV with 2 audio streams
+ *  (the multi-track shape that crashed `-map 1:a` before normalization). */
+async function genTwoAudioMov(out: string): Promise<void> {
+  await ff([
+    "-f", "lavfi", "-i", `testsrc2=size=${SRC_W}x${SRC_H}:rate=30:duration=${SRC_DUR}`,
+    "-f", "lavfi", "-i", `sine=frequency=440:duration=${SRC_DUR}`,
+    "-f", "lavfi", "-i", `sine=frequency=880:duration=${SRC_DUR}`,
+    "-map", "0:v", "-map", "1:a", "-map", "2:a",
     "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", out,
   ]);
 }
@@ -242,12 +256,12 @@ async function main(): Promise<void> {
     assert(pf.risky, `case4: HEVC source should be flagged risky (codec=${pf.info.videoCodec})`);
 
     const norm = join(dir, "hevc_norm.mp4");
-    await normalizeSource({
-      sourcePath: hevc, outputPath: norm,
-      dropAudio: pf.needsAudioDrop, crf: 23, preset: "ultrafast",
+    const nr = await normalizeSource({
+      sourcePath: hevc, outputPath: norm, crf: 23, preset: "ultrafast",
     });
     const normInfo = await probeSource(norm);
     assert(normInfo.videoCodec === "h264", `case4: normalized video is "${normInfo.videoCodec}", expected h264`);
+    assert(nr.audioStatus === "preserved", `case4: expected audio preserved, got ${nr.audioStatus}`);
 
     const out = join(dir, "out4.mp4");
     await renderToMp4({
@@ -327,6 +341,99 @@ async function main(): Promise<void> {
     // this is a few seconds; the old O(n²) concat would take far longer.
     assert(elapsed < 30_000, `case6: render took ${elapsed}ms — frame pipeline too slow`);
     return `discarded ~150 frames + rendered ${info.durationSec.toFixed(1)}s in ${elapsed}ms`;
+  });
+
+  // ── Case 7: MULTI-audio source → normalize keeps exactly ONE clean AAC ───
+  // The deterministic proof for the MOV multi-stream crash: a 2-audio-track
+  // source must normalize to a single-audio H.264 MP4 that renders with audio.
+  await runCase("7. multi-audio source → normalize keeps ONE clean AAC", async () => {
+    const multi = join(dir, "multi.mov");
+    await genTwoAudioMov(multi);
+    const probe = await probeSource(multi);
+    assert(probe.nbAudioStreams >= 2, `case7: fixture should have ≥2 audio streams (got ${probe.nbAudioStreams})`);
+
+    const norm = join(dir, "multi_norm.mp4");
+    const nr = await normalizeSource({ sourcePath: multi, outputPath: norm, crf: 23, preset: "ultrafast" });
+    assert(nr.audioStatus === "preserved", `case7: expected preserved, got ${nr.audioStatus}`);
+    const ni = await probeSource(norm);
+    assert(ni.videoCodec === "h264", `case7: normalized video "${ni.videoCodec}" != h264`);
+    assert(ni.nbAudioStreams === 1, `case7: normalized must have exactly 1 audio stream (got ${ni.nbAudioStreams})`);
+
+    const out = join(dir, "out7.mp4");
+    const res = await renderToMp4({
+      serialized: recipe(SRC_DUR), sourcePath: norm, outputPath: out,
+      crf: 23, preset: "ultrafast", signal: neverAbort, onProgress: () => {},
+    });
+    const oi = await assertValidMp4(out, "case7");
+    assert(oi.hasAudio, "case7: output missing audio");
+    return `2 audio streams → 1 clean AAC, rendered with audio (warnings=${res.warnings.length})`;
+  });
+
+  // ── Case 8: MOV [good AAC + bad apac] → normalize picks the AAC, no crash ──
+  // The EXACT production failure shape (a valid AAC track alongside an
+  // unsupported apac/none track). Normalize must select the decodable AAC.
+  await runCase("8. MOV [AAC + apac] → normalize picks the good AAC", async () => {
+    const multi = join(dir, "multi8.mov");
+    await genTwoAudioMov(multi);
+    const tagged = join(dir, "multi8_apac.mov");
+    try {
+      // Re-tag ONLY the 2nd audio stream as apac (best-effort; some builds reject).
+      await ff(["-i", multi, "-map", "0", "-c", "copy", "-tag:a:1", "apac", tagged]);
+    } catch {
+      return "SKIPPED — this ffmpeg build rejects the apac remux tag";
+    }
+    const normOut = join(dir, "out8_norm.mp4");
+    const nr = await normalizeSource({ sourcePath: tagged, outputPath: normOut, crf: 23, preset: "ultrafast" });
+    // Stream 0 is a decodable AAC → audio preserved regardless of the bad stream.
+    assert(nr.audioStatus === "preserved", `case8: expected preserved (good AAC stream 0), got ${nr.audioStatus}`);
+    const ni = await probeSource(normOut);
+    assert(ni.nbAudioStreams === 1 && ni.hasAudio, `case8: normalized must have exactly 1 audio stream`);
+
+    const out = join(dir, "out8.mp4");
+    await renderToMp4({
+      serialized: recipe(SRC_DUR), sourcePath: normOut, outputPath: out,
+      crf: 23, preset: "ultrafast", signal: neverAbort, onProgress: () => {},
+    });
+    await assertValidMp4(out, "case8");
+    return "AAC + apac MOV → AAC preserved, no audio-codec crash";
+  });
+
+  // ── Case 9: ALL audio undecodable → silent normalize + warning ───────────
+  await runCase("9. all-audio-undecodable → silent normalize + warning", async () => {
+    const apac = join(dir, "apac9.mov");
+    let undecodable = false;
+    try {
+      await ff(["-i", h264, "-c", "copy", "-tag:a", "apac", apac]);
+      const streams = await probeAudioStreams(apac);
+      undecodable = streams.length > 0 && !(await canDecodeAudioStream(apac, 0));
+    } catch {
+      undecodable = false;
+    }
+
+    if (undecodable) {
+      const norm = join(dir, "out9_norm.mp4");
+      const nr = await normalizeSource({ sourcePath: apac, outputPath: norm, crf: 23, preset: "ultrafast" });
+      assert(nr.audioStatus === "removed", `case9: expected removed, got ${nr.audioStatus}`);
+      assert(nr.warnings.includes(AUDIO_UNSUPPORTED_WARNING), "case9: missing audio-removed warning");
+      const ni = await probeSource(norm);
+      assert(!ni.hasAudio, "case9: normalized output should be silent");
+      return "undecodable audio → silent normalize + warning";
+    }
+
+    // Fallback (apac not reproducible on this build): verify the silent path for a
+    // genuinely-silent source → audioStatus "none", no warning.
+    const silent = join(dir, "silent9.mp4");
+    await ff([
+      "-f", "lavfi", "-i", `testsrc2=size=${SRC_W}x${SRC_H}:rate=30:duration=${SRC_DUR}`,
+      "-c:v", "libx264", "-pix_fmt", "yuv420p", silent,
+    ]);
+    const norm = join(dir, "out9_norm.mp4");
+    const nr = await normalizeSource({ sourcePath: silent, outputPath: norm, crf: 23, preset: "ultrafast" });
+    assert(nr.audioStatus === "none", `case9: expected none for silent source, got ${nr.audioStatus}`);
+    assert(nr.warnings.length === 0, "case9: silent source must not warn");
+    const ni = await probeSource(norm);
+    assert(!ni.hasAudio, "case9: silent source normalized silent");
+    return "apac not reproducible on this build → silent-source path verified (audioStatus=none)";
   });
 
   await rm(dir, { recursive: true, force: true }).catch(() => {});

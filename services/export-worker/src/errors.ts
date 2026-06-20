@@ -38,6 +38,17 @@ export function toUserFacingError(err: unknown): UserFacingError {
     };
   }
 
+  // Normalization couldn't transcode the source VIDEO even video-only (corrupt /
+  // truly unsupported codec). The normalizer drops bad AUDIO silently, so this is
+  // specifically an unusable video track — the one case that legitimately fails.
+  if (raw.includes("unsupported_video")) {
+    return {
+      code: "unsupported_video",
+      message:
+        "We couldn't process this video's format. Please re-upload it or try a different file.",
+    };
+  }
+
   // Preflight fast-fail: the bundled ffmpeg can't decode the source video at all
   // (corrupt / truly unsupported). Distinct from a stall — we caught it up front.
   if (raw.includes("could not be decoded") || raw.includes("preflight")) {

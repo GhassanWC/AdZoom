@@ -58,12 +58,16 @@ public sealed class JobPipeline(
         var lastPct = -1;
         var lastLoggedPct = -1;
         var renderStart = DateTime.UtcNow;
+        var normalizingStarted = false;
+        var normalizeReadyLogged = false;
+        string? audioStatus = null;
 
         void OnEvent(RenderEvent ev)
         {
             switch (ev.Type)
             {
                 case "preflight":
+                    audioStatus = ev.AudioStatus ?? audioStatus;
                     preflight = new Dictionary<string, object?>
                     {
                         ["videoCodec"] = ev.VideoCodec ?? "",
@@ -79,8 +83,20 @@ public sealed class JobPipeline(
                     {
                         lastStage = ev.Name!;
                         FireForget(fs.PatchAsync(uid, jobId, new() { [JobFields.Stage] = ev.Name }));
+                        if (ev.Name == "normalizing")
+                        {
+                            normalizingStarted = true;
+                            log.LogInformation("[{Tag}:normalize-start] job={JobId}", opts.WorkerTag, jobId);
+                        }
+                        else if (normalizingStarted && !normalizeReadyLogged)
+                        {
+                            // First stage AFTER normalizing (decoding/rendering) ⇒ the
+                            // normalized-source.mp4 is ready and the render is starting.
+                            normalizeReadyLogged = true;
+                            log.LogInformation("[{Tag}:normalize-ready] job={JobId}", opts.WorkerTag, jobId);
+                        }
                         if (ev.Name == "rendering")
-                            log.LogInformation("[export:render-start] job={JobId}", jobId);
+                            log.LogInformation("[{Tag}:render-start] job={JobId}", opts.WorkerTag, jobId);
                     }
                     break;
                 case "progress":
@@ -94,7 +110,7 @@ public sealed class JobPipeline(
                             if (pct - lastLoggedPct >= 25)
                             {
                                 lastLoggedPct = pct;
-                                log.LogInformation("[export:progress] job={JobId} pct={Pct}", jobId, pct);
+                                log.LogInformation("[{Tag}:progress] job={JobId} pct={Pct}", opts.WorkerTag, jobId, pct);
                             }
                         }
                     }
@@ -140,6 +156,7 @@ public sealed class JobPipeline(
                 // "rendering" → the heartbeat lease lets another instance
                 // re-claim. Either way the runner must NOT touch the ledger.
                 log.LogInformation("[export:canceled] job={JobId} (cancel or shutdown)", jobId);
+                log.LogInformation("[{Tag}:lease-released] job={JobId} (cancel or shutdown)", opts.WorkerTag, jobId);
                 return;
             }
 
@@ -149,13 +166,23 @@ public sealed class JobPipeline(
                 var code = outcome.Error?.Code ?? "render_failed";
                 var msg = outcome.Error?.Message ?? "Something went wrong while exporting your video. Please try again.";
                 await fs.FailAndReleaseAsync(uid, jobId, month, estimate, code, msg);
-                log.LogError("[export:failed] job={JobId} code={Code}", jobId, code);
+                log.LogError("[{Tag}:failed] job={JobId} code={Code}", opts.WorkerTag, jobId, code);
                 return;
             }
 
             // ── Upload + settle ──────────────────────────────────────────────
             await fs.PatchAsync(uid, jobId, new() { [JobFields.Stage] = "uploading", [JobFields.Progress] = 0.98 });
+            log.LogInformation("[{Tag}:upload-start] job={JobId}", opts.WorkerTag, jobId);
             var downloadUrl = await storage.UploadMp4Async(outFile, outputPath, cancelCts.Token);
+
+            // Reflect the post-normalization audio outcome on the stored preflight
+            // (observability — `audio_removed_unsupported` already rides warnings[]).
+            audioStatus = outcome.Done.AudioStatus ?? audioStatus;
+            if (preflight is not null)
+            {
+                if (outcome.Done.Normalized is { } didNorm) preflight["normalized"] = didNorm;
+                if (!string.IsNullOrEmpty(audioStatus)) preflight["audioStatus"] = audioStatus!;
+            }
 
             var doneWarnings = outcome.Done.Warnings is { Length: > 0 } w
                 ? w.Concat(warnings).Distinct().ToList()
@@ -166,7 +193,7 @@ public sealed class JobPipeline(
                 // Best-effort mirror onto the project (matches the Node worker).
                 try { await fs.MirrorProjectExportUrlAsync(uid, projectId, downloadUrl); }
                 catch (Exception ex) { log.LogWarning(ex, "[export] project exportUrl mirror failed job={JobId}", jobId); }
-                log.LogInformation("[export:complete] job={JobId} minutes={Min}", jobId, estimate);
+                log.LogInformation("[{Tag}:complete] job={JobId} minutes={Min} audio={Audio}", opts.WorkerTag, jobId, estimate, audioStatus ?? "(n/a)");
             }
             else
             {
@@ -177,10 +204,11 @@ public sealed class JobPipeline(
         {
             // Shutdown/cancel mid-download or mid-upload — leave for re-claim / cancel route.
             log.LogInformation("[export:canceled] job={JobId} (operation canceled)", jobId);
+            log.LogInformation("[{Tag}:lease-released] job={JobId} (operation canceled)", opts.WorkerTag, jobId);
         }
         catch (Exception ex)
         {
-            log.LogError(ex, "[export:failed] job={JobId} unexpected", jobId);
+            log.LogError(ex, "[{Tag}:failed] job={JobId} unexpected", opts.WorkerTag, jobId);
             try
             {
                 await fs.FailAndReleaseAsync(uid, jobId, month, estimate, "render_failed",

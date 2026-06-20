@@ -33,10 +33,21 @@ export interface EnqueueParams {
 /** Dispatch a created export job to the worker. Throws on failure so the caller
  *  can fail the job + release its minute reservation. */
 export async function enqueueExportJob(params: EnqueueParams): Promise<void> {
+  const backend = exportBackend();
+
+  // EXPORT_BACKEND=vm → rendering runs on the long-lived GCE VM worker, which
+  // POLLS Firestore for queued jobs. Next.js already CREATED + reserved the job
+  // (the /api/export/cloud transaction); there is NOTHING to dispatch — no Cloud
+  // Tasks, no HTTP call to Cloud Run. The poller picks it up within its interval.
+  if (backend === "vm") {
+    console.log(`[export-enqueue] backend=vm job=${params.jobId} (${params.priority}) — VM poller will deliver`);
+    return;
+  }
+
   // EXPORT_BACKEND selects the render backend. "dotnet" → the C# export API runs
   // the job (Next.js already created + reserved it; this only signals the runner,
   // which also polls). Anything else keeps the old Node worker path below.
-  if (exportBackend() === "dotnet") {
+  if (backend === "dotnet") {
     console.log(`[export-enqueue] backend=dotnet job=${params.jobId} (${params.priority})`);
     await dotnetEnqueueSignal(params.uid, params.jobId);
     return;

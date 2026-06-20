@@ -11,34 +11,19 @@
  * One ffprobe + one short audio-decode test feed BOTH the normalization decision
  * and the render, so nothing is probed twice.
  */
-import { canDecodeAudio, canDecodeVideo, probeSource, type SourceInfo } from "./ffmpeg.js";
+import {
+  AUDIO_UNSUPPORTED_WARNING,
+  canDecodeAudio,
+  canDecodeVideo,
+  isUnsupportedAudioCodec,
+  probeSource,
+  type SourceInfo,
+} from "./ffmpeg.js";
 
-/** The single source of truth for the audio-dropped warning copy. Pushed onto
- *  the job's `warnings[]` whether audio was dropped during normalization or by
- *  the render's `canDecodeAudio` guard, so the user sees identical wording. */
-export const AUDIO_UNSUPPORTED_WARNING =
-  "This source audio format is not supported. The video was exported without audio.";
-
-/**
- * Audio codecs the bundled ffmpeg cannot decode — keyed on the ffprobe
- * `codec_name` (or the 4-char `codec_tag_string`). This is the AUTHORITATIVE,
- * fast guard: a source whose audio is `none`/`apac`/`unknown`/empty must NEVER
- * be sent to the encoder as `direct`/`filter` audio (it aborts with
- * "no decoder found for: none"). It does NOT rely on the `canDecodeAudio` probe
- * — that probe was observed letting `apac` through in production, leaving
- * `mode:direct`. Decodable codecs (aac/opus/mp3/…) return false here and are
- * still gated by `canDecodeAudio` as a secondary check.
- */
-const UNDECODABLE_AUDIO = new Set(["", "none", "unknown", "apac"]);
-export function isUnsupportedAudioCodec(
-  codec: string | undefined,
-  tag?: string | undefined
-): boolean {
-  return (
-    UNDECODABLE_AUDIO.has((codec ?? "").toLowerCase()) ||
-    (tag ?? "").toLowerCase() === "apac"
-  );
-}
+// The audio-codec policy (warning copy + the `apac`/`none` guard) now lives in
+// ffmpeg.ts so the normalizer can share it without a circular import. Re-export
+// for preflight's existing callers (render.ts, cli.ts, test/e2e.ts).
+export { AUDIO_UNSUPPORTED_WARNING, isUnsupportedAudioCodec };
 
 export interface Preflight {
   info: SourceInfo;

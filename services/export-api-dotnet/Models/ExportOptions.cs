@@ -51,6 +51,24 @@ public sealed class ExportOptions
     public int NormalizeCrf { get; set; } = 18;
     public string NormalizePreset { get; set; } = "veryfast";
 
+    // ── Deployment role (GCE VM worker vs Cloud Run control plane) ───────────
+    /// <summary>"firestore-poll" → this instance runs the background poll/claim/
+    /// render loop (the GCE VM worker). "disabled" → HTTP control plane only,
+    /// never claims a job (set on Cloud Run so it can't grab a job and die
+    /// mid-render). From EXPORT_WORKER_MODE; default "firestore-poll" (back-compat
+    /// with the current Cloud Run deploy, which renders in-process today).</summary>
+    public string WorkerMode { get; set; } = "firestore-poll";
+
+    /// <summary>Whether to register the ExportRunner + Reconciler background
+    /// services. False when WorkerMode=="disabled" or EXPORT_RUN_WORKER=false.</summary>
+    public bool RunWorker { get; set; } = true;
+
+    /// <summary>Log-tag prefix for lifecycle milestones — "vm-worker" in VM poll
+    /// mode, else "export". Used as a structured {Tag} field in log templates so
+    /// the VM emits the [vm-worker:*] lines the runbook greps for.</summary>
+    public string WorkerTag =>
+        WorkerMode.Equals("firestore-poll", StringComparison.OrdinalIgnoreCase) ? "vm-worker" : "export";
+
     /// <summary>Local scratch dir for downloads + render output.</summary>
     public string WorkDir { get; set; } = Path.Combine(Path.GetTempPath(), "export-api");
 
@@ -83,6 +101,11 @@ public sealed class ExportOptions
         o.NormalizeEnabled = EnvBool("WORKER_NORMALIZE_ENABLED", o.NormalizeEnabled);
         o.NormalizeCrf = EnvInt("WORKER_NORMALIZE_CRF", o.NormalizeCrf);
         o.NormalizePreset = Env("WORKER_NORMALIZE_PRESET") ?? o.NormalizePreset;
+        o.WorkerMode = (Env("EXPORT_WORKER_MODE") ?? o.WorkerMode).Trim().ToLowerInvariant();
+        // Don't run the worker loop when explicitly disabled (Cloud Run control
+        // plane) or when EXPORT_RUN_WORKER=false.
+        o.RunWorker = !o.WorkerMode.Equals("disabled", StringComparison.OrdinalIgnoreCase)
+                      && EnvBool("EXPORT_RUN_WORKER", true);
         return o;
     }
 }

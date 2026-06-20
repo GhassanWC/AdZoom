@@ -31,6 +31,9 @@ public sealed class RenderEvent
     [JsonPropertyName("videoDecodable")] public bool? VideoDecodable { get; set; }
     [JsonPropertyName("audioDecodable")] public bool? AudioDecodable { get; set; }
     [JsonPropertyName("needsAudioDrop")] public bool? NeedsAudioDrop { get; set; }
+    /// <summary>preserved | removed | none — the audio outcome after normalization
+    /// (top-level on preflight + done events).</summary>
+    [JsonPropertyName("audioStatus")] public string? AudioStatus { get; set; }
     [JsonPropertyName("preflight")] public JsonElement? Preflight { get; set; }
 
     public static readonly JsonSerializerOptions JsonOpts = new()

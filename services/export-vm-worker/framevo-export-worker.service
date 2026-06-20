@@ -1,0 +1,27 @@
+# systemd unit for the Framevo export VM worker.
+# Install: sudo cp framevo-export-worker.service /etc/systemd/system/
+#          sudo systemctl daemon-reload && sudo systemctl enable --now framevo-export-worker
+#
+# Runs `docker compose up` in the foreground; systemd restarts it on crash and on
+# reboot. The worker is NEVER tied to a request lifecycle — it polls Firestore and
+# renders as long as the VM is up.
+
+[Unit]
+Description=Framevo export worker (Firestore-poll render worker)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/framevo/export-vm-worker
+ExecStartPre=-/usr/bin/docker compose -f /opt/framevo/export-vm-worker/docker-compose.yml --env-file /opt/framevo/export-vm-worker/.env pull
+ExecStart=/usr/bin/docker compose -f /opt/framevo/export-vm-worker/docker-compose.yml --env-file /opt/framevo/export-vm-worker/.env up
+ExecStop=/usr/bin/docker compose -f /opt/framevo/export-vm-worker/docker-compose.yml down
+Restart=always
+RestartSec=10
+# Match the app's 25s graceful shutdown (flush in-flight Firestore writes).
+TimeoutStopSec=40
+
+[Install]
+WantedBy=multi-user.target

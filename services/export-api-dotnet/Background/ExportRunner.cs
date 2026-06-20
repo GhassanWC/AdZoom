@@ -53,9 +53,13 @@ public sealed class ExportRunner(
             try
             {
                 var jobs = await fs.FindClaimableAsync(limit: 20);
+                if (jobs.Count > 0)
+                    log.LogInformation("[{Tag}:poll] claimable={N}", opts.WorkerTag, jobs.Count);
+                else
+                    log.LogDebug("[{Tag}:poll] idle", opts.WorkerTag);
                 foreach (var (uid, jobId) in jobs) signal.Notify(uid, jobId);
             }
-            catch (Exception ex) { log.LogWarning(ex, "[export:runner] poll failed"); }
+            catch (Exception ex) { log.LogWarning(ex, "[{Tag}:poll] failed", opts.WorkerTag); }
 
             try { await Task.Delay(TimeSpan.FromSeconds(Math.Max(1, opts.PollIntervalSeconds)), stopping); }
             catch (OperationCanceledException) { break; }
@@ -67,7 +71,7 @@ public sealed class ExportRunner(
         var (result, snap) = await fs.TryClaimAsync(uid, jobId);
         if (result == FirestoreService.ClaimResult.Claimed && snap is not null)
         {
-            log.LogInformation("[export:claim] uid={Uid} jobId={JobId}", uid, jobId);
+            log.LogInformation("[{Tag}:claim] uid={Uid} jobId={JobId}", opts.WorkerTag, uid, jobId);
             await pipeline.ProcessAsync(uid, jobId, snap, stopping);
         }
         else

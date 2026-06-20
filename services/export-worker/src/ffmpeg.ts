@@ -50,6 +50,37 @@ export function ffprobeBin(): string {
   return resolveBinary((ffprobeStatic as { path?: string } | undefined)?.path, "ffprobe");
 }
 
+// ── Audio-codec policy ──────────────────────────────────────────────────────
+// Lives HERE (the lowest-level ffmpeg module, no internal imports) so both the
+// normalizer below and preflight.ts can share it without a circular import.
+// preflight.ts re-exports these for its existing callers (render.ts, cli.ts).
+
+/** The single source of truth for the audio-removed warning copy. Pushed onto
+ *  the job's `warnings[]` whenever audio can't be safely processed, so the user
+ *  sees identical wording whether it was dropped at normalization or render. */
+export const AUDIO_UNSUPPORTED_WARNING =
+  "This video's audio could not be processed, so the exported video will be silent.";
+
+/**
+ * Audio codecs the bundled ffmpeg cannot decode — keyed on the ffprobe
+ * `codec_name` (or the 4-char `codec_tag_string`). AUTHORITATIVE, fast guard: a
+ * stream whose audio is `none`/`apac`/`unknown`/empty must NEVER be selected for
+ * the normalized output (it would abort ffmpeg with "no decoder found"). Does not
+ * rely on the decode probe — that probe was observed letting `apac` through in
+ * production. Decodable codecs (aac/opus/mp3/…) return false and are still gated
+ * by the decode probe as a secondary check.
+ */
+const UNDECODABLE_AUDIO = new Set(["", "none", "unknown", "apac"]);
+export function isUnsupportedAudioCodec(
+  codec: string | undefined,
+  tag?: string | undefined
+): boolean {
+  return (
+    UNDECODABLE_AUDIO.has((codec ?? "").toLowerCase()) ||
+    (tag ?? "").toLowerCase() === "apac"
+  );
+}
+
 export interface SourceInfo {
   width: number;
   height: number;
@@ -148,19 +179,68 @@ export async function probeSource(path: string): Promise<SourceInfo> {
   };
 }
 
+/** One audio stream as seen by ffprobe (`-select_streams a`, in container order). */
+export interface AudioStreamInfo {
+  /** 0-based index AMONG audio streams — use directly in `-map 0:a:<audioIndex>`. */
+  audioIndex: number;
+  /** ffprobe codec_name (e.g. "aac", "opus"); "" / "none" for codecs it can't id. */
+  codec: string;
+  /** Four-char codec tag (e.g. "apac") — useful when codec_name is "none". */
+  tag: string;
+  channels: number;
+  sampleRate: number;
+}
+
 /**
- * Can the bundled ffmpeg actually DECODE this file's first audio stream? Some
- * containers carry codecs the static build has no decoder for — notably Apple's
- * `apac` spatial-audio codec, which makes the encoder abort at startup
- * ("no decoder found for: none") and leaves the frame writer with a bare EPIPE.
- * We decode a short slice to the null muxer up front, so the render can fall
- * back to a silent export (with a clear warning) instead of crashing.
- *
- * Returns false on ANY decode failure (unknown codec, corrupt stream, or a
- * missing binary) — the caller treats that as "drop audio", which is always the
- * safe degradation. Only call when `probeSource` reported `hasAudio`.
+ * List EVERY audio stream (not just the first, as `probeSource` does) so the
+ * normalizer can pick ONE safe stream out of a multi-track source — e.g. a MOV
+ * that carries a valid AAC track PLUS an unsupported `apac`/`none` track. Returns
+ * [] when there's no audio or ffprobe can't read the file.
  */
-export async function canDecodeAudio(path: string): Promise<boolean> {
+export async function probeAudioStreams(path: string): Promise<AudioStreamInfo[]> {
+  let stdout: string;
+  try {
+    ({ stdout } = await execFileP(
+      ffprobeBin(),
+      ["-v", "quiet", "-print_format", "json", "-show_streams", "-select_streams", "a", path],
+      EXEC_OPTS
+    ));
+  } catch {
+    return [];
+  }
+  let json: {
+    streams?: Array<{
+      codec_name?: string;
+      codec_tag_string?: string;
+      channels?: number;
+      sample_rate?: string;
+    }>;
+  };
+  try {
+    json = JSON.parse(stdout);
+  } catch {
+    return [];
+  }
+  return (json.streams ?? []).map((s, i) => ({
+    audioIndex: i,
+    codec: s.codec_name ?? "",
+    tag: s.codec_tag_string ?? "",
+    channels: s.channels ?? 0,
+    sampleRate: s.sample_rate ? Number(s.sample_rate) : 0,
+  }));
+}
+
+/**
+ * Can the bundled ffmpeg actually DECODE the given audio stream? Some containers
+ * carry codecs the static build has no decoder for — notably Apple's `apac`
+ * spatial-audio codec, which makes ffmpeg abort at startup ("no decoder found
+ * for: none"). We decode a short slice to the null muxer up front so the
+ * normalizer can skip that stream (or drop audio entirely) instead of crashing.
+ *
+ * Returns false on ANY decode failure (unknown codec, corrupt stream, missing
+ * binary) — always the safe degradation.
+ */
+export async function canDecodeAudioStream(path: string, audioIndex: number): Promise<boolean> {
   try {
     await execFileP(
       ffmpegBin(),
@@ -171,9 +251,8 @@ export async function canDecodeAudio(path: string): Promise<boolean> {
         "-i",
         path,
         "-map",
-        "0:a:0",
-        // Decode a brief slice only — enough to prove the decoder works without
-        // processing the whole track.
+        `0:a:${audioIndex}`,
+        // Decode a brief slice only — enough to prove the decoder works.
         "-t",
         "0.5",
         "-f",
@@ -186,6 +265,11 @@ export async function canDecodeAudio(path: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/** Back-compat: can ffmpeg decode the FIRST audio stream? (render.ts guard.) */
+export async function canDecodeAudio(path: string): Promise<boolean> {
+  return canDecodeAudioStream(path, 0);
 }
 
 /**
@@ -220,29 +304,49 @@ const NORMALIZE_EXEC_OPTS = {
 export interface NormalizeOptions {
   sourcePath: string;
   outputPath: string;
-  /** true → `-an` (source audio is undecodable, e.g. apac); false → transcode to AAC. */
-  dropAudio: boolean;
   crf: number;
   preset: string;
   /** Aborting (job cancel) kills the ffmpeg child and rejects the promise. */
   signal?: AbortSignal;
 }
 
-/**
- * Transcode a "risky" source into a worker-safe H.264 + AAC MP4 — a single
- * ffmpeg pass that PRESERVES resolution / fps / duration (no scaling, no `-r`).
- * The render then decodes a predictable input instead of an exotic codec the
- * encoder might choke on mid-stream. On failure the raw ffmpeg tail is logged
- * (worker logs only) and a tagged error is thrown for `toUserFacingError`.
- */
-export async function normalizeSource(opts: NormalizeOptions): Promise<void> {
-  const { sourcePath, outputPath, dropAudio, crf, preset } = opts;
-  const args = [
+export interface NormalizeResult {
+  /**
+   *   "preserved" — exactly one clean AAC track was carried into the output.
+   *   "removed"   — the source HAD audio but none could be safely decoded, so the
+   *                 output is silent (a warning is queued). Bad audio NEVER fails.
+   *   "none"      — the source genuinely had no audio (silent, no warning).
+   */
+  audioStatus: "preserved" | "removed" | "none";
+  /** User-facing notices to push onto the job's `warnings[]` (audio-removed). */
+  warnings: string[];
+}
+
+/** Build the single-pass normalize args. `audioMap` = the audio-stream index to
+ *  keep, or null for a silent (`-an`) output. Always one video + ≤one audio
+ *  track; subtitles/data/extra streams + global metadata are stripped. */
+function normalizeArgs(
+  sourcePath: string,
+  outputPath: string,
+  audioMap: number | null,
+  crf: number,
+  preset: string
+): string[] {
+  return [
     "-hide_banner",
     "-loglevel",
     "warning",
     "-i",
     sourcePath,
+    // Exactly one real video stream + (optionally) one chosen audio stream.
+    "-map",
+    "0:v:0",
+    ...(audioMap !== null ? ["-map", `0:a:${audioMap}`] : []),
+    // Strip subtitles, data streams, and global/stream metadata.
+    "-sn",
+    "-dn",
+    "-map_metadata",
+    "-1",
     "-c:v",
     "libx264",
     "-preset",
@@ -251,22 +355,91 @@ export async function normalizeSource(opts: NormalizeOptions): Promise<void> {
     String(crf),
     "-pix_fmt",
     "yuv420p",
-    ...(dropAudio ? ["-an"] : ["-c:a", "aac", "-b:a", "192k"]),
+    ...(audioMap !== null
+      ? ["-c:a", "aac", "-ac", "2", "-ar", "48000", "-b:a", "192k"]
+      : ["-an"]),
     "-movflags",
     "+faststart",
     "-y",
     outputPath,
   ];
-  try {
-    await execFileP(ffmpegBin(), args, { ...NORMALIZE_EXEC_OPTS, signal: opts.signal });
-  } catch (err) {
-    const e = err as { stderr?: string; message?: string };
-    const detail = (e.stderr || e.message || "").toString().trim();
-    console.error("[worker:normalize] failed", detail.slice(-4000));
-    // Keep the tail on the thrown message so toUserFacingError can classify it;
-    // it never reaches Firestore (the handler logs raw, persists the clean line).
-    throw new Error(`normalize failed: ${detail.slice(-500)}`);
+}
+
+function normalizeTail(err: unknown): string {
+  const e = err as { stderr?: string; message?: string };
+  return (e.stderr || e.message || "").toString().trim();
+}
+
+/**
+ * Transcode ANY accepted source into a worker-safe `normalized-source.mp4`:
+ * H.264 + exactly ONE clean AAC track (or silent), resolution/fps/duration
+ * preserved (no scaling, no `-r`). This is the single choke point that makes
+ * "accepted upload ⇒ exportable" true — the renderer only ever sees this file.
+ *
+ *   1. Probe + choose ONE safe audio stream (prefer decodable AAC; else the
+ *      first stream that actually decodes; else none) out of a multi-track
+ *      source — so a MOV with a good AAC track + a bad `apac` track keeps the AAC.
+ *   2. Attempt encode WITH that audio. If it still fails, retry video-only (`-an`)
+ *      and mark audio removed. Bad audio must NEVER fail the export.
+ *   3. If even the video-only pass fails (corrupt / truly unsupported video),
+ *      throw `unsupported_video`.
+ *
+ * On any ffmpeg failure the raw stderr tail is logged (worker logs only); only a
+ * tagged, classifiable error is thrown (never reaches Firestore/the UI).
+ */
+export async function normalizeSource(opts: NormalizeOptions): Promise<NormalizeResult> {
+  const { sourcePath, outputPath, crf, preset } = opts;
+  const exec = { ...NORMALIZE_EXEC_OPTS, signal: opts.signal };
+
+  // ── 1. Pick one safe audio stream ────────────────────────────────────────
+  const streams = await probeAudioStreams(sourcePath);
+  const hadAudio = streams.length > 0;
+  // Prefer a decodable AAC stream, then any other decodable stream.
+  const ranked = [
+    ...streams.filter((s) => s.codec.toLowerCase() === "aac"),
+    ...streams.filter((s) => s.codec.toLowerCase() !== "aac"),
+  ];
+  let chosen: number | null = null;
+  for (const s of ranked) {
+    if (isUnsupportedAudioCodec(s.codec, s.tag)) continue;
+    if (await canDecodeAudioStream(sourcePath, s.audioIndex)) {
+      chosen = s.audioIndex;
+      break;
+    }
   }
+  console.info("[worker:normalize] audio-select", {
+    audioStreams: streams.map((s) => `${s.audioIndex}:${s.codec || s.tag || "?"}`),
+    chosen,
+  });
+
+  // ── 2. Attempt WITH the chosen audio stream ──────────────────────────────
+  if (chosen !== null) {
+    try {
+      await execFileP(ffmpegBin(), normalizeArgs(sourcePath, outputPath, chosen, crf, preset), exec);
+      return { audioStatus: "preserved", warnings: [] };
+    } catch (err) {
+      // The chosen stream decoded in the probe but the full transcode still
+      // tripped — fall through to a silent output rather than fail the export.
+      console.warn(
+        "[worker:normalize] audio transcode failed despite probe — retrying silent",
+        normalizeTail(err).slice(-1000)
+      );
+    }
+  }
+
+  // ── 3. Video-only (silent) — either no usable audio, or attempt 2 failed ──
+  try {
+    await execFileP(ffmpegBin(), normalizeArgs(sourcePath, outputPath, null, crf, preset), exec);
+  } catch (err) {
+    const detail = normalizeTail(err);
+    console.error("[worker:normalize] video-only pass failed", detail.slice(-4000));
+    // The video itself can't be transcoded → unsupported source video.
+    throw new Error(`unsupported_video: normalize failed: ${detail.slice(-500)}`);
+  }
+
+  return hadAudio
+    ? { audioStatus: "removed", warnings: [AUDIO_UNSUPPORTED_WARNING] }
+    : { audioStatus: "none", warnings: [] };
 }
 
 /**
@@ -535,15 +708,17 @@ export async function spawnEncoder(opts: EncoderOptions): Promise<Encoder> {
       "192k"
     );
   } else if (audio.kind === "direct") {
-    // Map the source's first audio stream straight through (`?` = tolerate if,
-    // despite the probe, it's somehow absent rather than failing the whole job).
+    // Map ONLY the source's FIRST audio stream (`1:a:0`, not `1:a` = all streams)
+    // — the normalized input has exactly one clean AAC track, and pinning the
+    // index means a stray extra stream can never reach the encoder. `?` tolerates
+    // a (shouldn't-happen) absence rather than failing the whole job.
     args.push(
       "-i",
       sourcePath,
       "-map",
       "0:v",
       "-map",
-      "1:a?",
+      "1:a:0?",
       "-c:a",
       "aac",
       "-b:a",

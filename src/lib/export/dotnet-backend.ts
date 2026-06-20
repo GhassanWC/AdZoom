@@ -17,10 +17,15 @@ import "server-only";
  * metadata server is unreachable → no bearer (a local C# instance isn't gated).
  */
 
-export function exportBackend(): "dotnet" | "cloudtasks" {
-  return (process.env.EXPORT_BACKEND ?? "cloudtasks").toLowerCase() === "dotnet"
-    ? "dotnet"
-    : "cloudtasks";
+export function exportBackend(): "vm" | "dotnet" | "cloudtasks" {
+  const b = (process.env.EXPORT_BACKEND ?? "cloudtasks").toLowerCase();
+  // "vm"      → rendering runs on the GCE VM worker, which POLLS Firestore. Next.js
+  //             only CREATES the job; there is no HTTP dispatch (the poller delivers).
+  // "dotnet"  → the C# export API (Cloud Run) renders; we send a best-effort signal.
+  // otherwise → the legacy Node Cloud-Run worker via Cloud Tasks.
+  if (b === "vm") return "vm";
+  if (b === "dotnet") return "dotnet";
+  return "cloudtasks";
 }
 
 function apiBase(): string | null {

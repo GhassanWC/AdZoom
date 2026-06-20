@@ -1048,6 +1048,11 @@ function ffmpegBin() {
 function ffprobeBin() {
   return resolveBinary(ffprobeStatic?.path, "ffprobe");
 }
+var AUDIO_UNSUPPORTED_WARNING = "This video's audio could not be processed, so the exported video will be silent.";
+var UNDECODABLE_AUDIO = /* @__PURE__ */ new Set(["", "none", "unknown", "apac"]);
+function isUnsupportedAudioCodec(codec, tag) {
+  return UNDECODABLE_AUDIO.has((codec ?? "").toLowerCase()) || (tag ?? "").toLowerCase() === "apac";
+}
 function parseRate(raw) {
   if (!raw) return 0;
   const [n, d] = raw.split("/");
@@ -1097,7 +1102,32 @@ async function probeSource(path) {
     bitrate: Number(json.format?.bit_rate ?? 0)
   };
 }
-async function canDecodeAudio(path) {
+async function probeAudioStreams(path) {
+  let stdout;
+  try {
+    ({ stdout } = await execFileP(
+      ffprobeBin(),
+      ["-v", "quiet", "-print_format", "json", "-show_streams", "-select_streams", "a", path],
+      EXEC_OPTS
+    ));
+  } catch {
+    return [];
+  }
+  let json;
+  try {
+    json = JSON.parse(stdout);
+  } catch {
+    return [];
+  }
+  return (json.streams ?? []).map((s, i) => ({
+    audioIndex: i,
+    codec: s.codec_name ?? "",
+    tag: s.codec_tag_string ?? "",
+    channels: s.channels ?? 0,
+    sampleRate: s.sample_rate ? Number(s.sample_rate) : 0
+  }));
+}
+async function canDecodeAudioStream(path, audioIndex) {
   try {
     await execFileP(
       ffmpegBin(),
@@ -1108,9 +1138,8 @@ async function canDecodeAudio(path) {
         "-i",
         path,
         "-map",
-        "0:a:0",
-        // Decode a brief slice only — enough to prove the decoder works without
-        // processing the whole track.
+        `0:a:${audioIndex}`,
+        // Decode a brief slice only — enough to prove the decoder works.
         "-t",
         "0.5",
         "-f",
@@ -1123,6 +1152,9 @@ async function canDecodeAudio(path) {
   } catch {
     return false;
   }
+}
+async function canDecodeAudio(path) {
+  return canDecodeAudioStream(path, 0);
 }
 async function canDecodeVideo(path) {
   try {
@@ -1140,14 +1172,22 @@ var NORMALIZE_EXEC_OPTS = {
   timeout: 20 * 6e4,
   maxBuffer: 16 * 1024 * 1024
 };
-async function normalizeSource(opts) {
-  const { sourcePath, outputPath, dropAudio, crf, preset } = opts;
-  const args = [
+function normalizeArgs(sourcePath, outputPath, audioMap, crf, preset) {
+  return [
     "-hide_banner",
     "-loglevel",
     "warning",
     "-i",
     sourcePath,
+    // Exactly one real video stream + (optionally) one chosen audio stream.
+    "-map",
+    "0:v:0",
+    ...audioMap !== null ? ["-map", `0:a:${audioMap}`] : [],
+    // Strip subtitles, data streams, and global/stream metadata.
+    "-sn",
+    "-dn",
+    "-map_metadata",
+    "-1",
     "-c:v",
     "libx264",
     "-preset",
@@ -1156,20 +1196,57 @@ async function normalizeSource(opts) {
     String(crf),
     "-pix_fmt",
     "yuv420p",
-    ...dropAudio ? ["-an"] : ["-c:a", "aac", "-b:a", "192k"],
+    ...audioMap !== null ? ["-c:a", "aac", "-ac", "2", "-ar", "48000", "-b:a", "192k"] : ["-an"],
     "-movflags",
     "+faststart",
     "-y",
     outputPath
   ];
-  try {
-    await execFileP(ffmpegBin(), args, { ...NORMALIZE_EXEC_OPTS, signal: opts.signal });
-  } catch (err) {
-    const e = err;
-    const detail = (e.stderr || e.message || "").toString().trim();
-    console.error("[worker:normalize] failed", detail.slice(-4e3));
-    throw new Error(`normalize failed: ${detail.slice(-500)}`);
+}
+function normalizeTail(err) {
+  const e = err;
+  return (e.stderr || e.message || "").toString().trim();
+}
+async function normalizeSource(opts) {
+  const { sourcePath, outputPath, crf, preset } = opts;
+  const exec = { ...NORMALIZE_EXEC_OPTS, signal: opts.signal };
+  const streams = await probeAudioStreams(sourcePath);
+  const hadAudio = streams.length > 0;
+  const ranked = [
+    ...streams.filter((s) => s.codec.toLowerCase() === "aac"),
+    ...streams.filter((s) => s.codec.toLowerCase() !== "aac")
+  ];
+  let chosen = null;
+  for (const s of ranked) {
+    if (isUnsupportedAudioCodec(s.codec, s.tag)) continue;
+    if (await canDecodeAudioStream(sourcePath, s.audioIndex)) {
+      chosen = s.audioIndex;
+      break;
+    }
   }
+  console.info("[worker:normalize] audio-select", {
+    audioStreams: streams.map((s) => `${s.audioIndex}:${s.codec || s.tag || "?"}`),
+    chosen
+  });
+  if (chosen !== null) {
+    try {
+      await execFileP(ffmpegBin(), normalizeArgs(sourcePath, outputPath, chosen, crf, preset), exec);
+      return { audioStatus: "preserved", warnings: [] };
+    } catch (err) {
+      console.warn(
+        "[worker:normalize] audio transcode failed despite probe \u2014 retrying silent",
+        normalizeTail(err).slice(-1e3)
+      );
+    }
+  }
+  try {
+    await execFileP(ffmpegBin(), normalizeArgs(sourcePath, outputPath, null, crf, preset), exec);
+  } catch (err) {
+    const detail = normalizeTail(err);
+    console.error("[worker:normalize] video-only pass failed", detail.slice(-4e3));
+    throw new Error(`unsupported_video: normalize failed: ${detail.slice(-500)}`);
+  }
+  return hadAudio ? { audioStatus: "removed", warnings: [AUDIO_UNSUPPORTED_WARNING] } : { audioStatus: "none", warnings: [] };
 }
 function makeFrameReader(stream, frameBytes) {
   const MAX_BACKLOG = frameBytes * 4;
@@ -1347,7 +1424,7 @@ async function spawnEncoder(opts) {
       "-map",
       "0:v",
       "-map",
-      "1:a?",
+      "1:a:0?",
       "-c:a",
       "aac",
       "-b:a",
@@ -1500,11 +1577,6 @@ function buildAudioFilterComplex(segments, moments, sampleRate) {
 }
 
 // src/preflight.ts
-var AUDIO_UNSUPPORTED_WARNING = "This source audio format is not supported. The video was exported without audio.";
-var UNDECODABLE_AUDIO = /* @__PURE__ */ new Set(["", "none", "unknown", "apac"]);
-function isUnsupportedAudioCodec(codec, tag) {
-  return UNDECODABLE_AUDIO.has((codec ?? "").toLowerCase()) || (tag ?? "").toLowerCase() === "apac";
-}
 async function computePreflight(path) {
   const info = await probeSource(path);
   const [videoDecodable, audioDecodable] = await Promise.all([
@@ -1774,6 +1846,12 @@ function toUserFacingError(err) {
       message: "This video's audio is in a format we can't process. Please try exporting again \u2014 if it keeps failing, the audio track may be unsupported."
     };
   }
+  if (raw.includes("unsupported_video")) {
+    return {
+      code: "unsupported_video",
+      message: "We couldn't process this video's format. Please re-upload it or try a different file."
+    };
+  }
   if (raw.includes("could not be decoded") || raw.includes("preflight")) {
     return {
       code: "decode_failed",
@@ -1878,26 +1956,27 @@ async function prepareSource(args) {
     const [exists] = await bucket().file(proj.normalizedSourcePath).exists();
     if (exists) {
       await bucket().file(proj.normalizedSourcePath).download({ destination: normPath });
-      const audioDropped = !!proj.normalizedAudioDropped;
+      const audioDropped2 = !!proj.normalizedAudioDropped;
       console.info("[worker:normalize] cache hit", { jobId, path: proj.normalizedSourcePath });
       return {
         renderSourcePath: normPath,
-        audioDropped,
-        warnings: audioDropped ? [AUDIO_UNSUPPORTED_WARNING] : [],
+        audioDropped: audioDropped2,
+        warnings: audioDropped2 ? [AUDIO_UNSUPPORTED_WARNING] : [],
         preflight: { ...summary, normalized: true }
       };
     }
   }
   await patch({ stage: "normalizing", progress: 0 });
+  let audioDropped = false;
   try {
-    await normalizeSource({
+    const norm = await normalizeSource({
       sourcePath: srcPath,
       outputPath: normPath,
-      dropAudio: pf.needsAudioDrop,
       crf: cfg.normalizeCrf,
       preset: cfg.normalizePreset,
       signal
     });
+    audioDropped = norm.audioStatus === "removed";
   } catch (err) {
     if (signal.aborted) throw new CanceledError();
     throw err;
@@ -1911,17 +1990,17 @@ async function prepareSource(args) {
     {
       normalizedSourcePath: normStoragePath,
       normalizedSourceKey: key,
-      normalizedAudioDropped: pf.needsAudioDrop,
+      normalizedAudioDropped: audioDropped,
       updatedAt: Date.now()
     },
     { merge: true }
   ).catch(() => {
   });
-  console.info("[worker:normalize] done", { jobId, audioDropped: pf.needsAudioDrop });
+  console.info("[worker:normalize] done", { jobId, audioDropped });
   return {
     renderSourcePath: normPath,
-    audioDropped: pf.needsAudioDrop,
-    warnings: pf.needsAudioDrop ? [AUDIO_UNSUPPORTED_WARNING] : [],
+    audioDropped,
+    warnings: audioDropped ? [AUDIO_UNSUPPORTED_WARNING] : [],
     preflight: { ...summary, normalized: true }
   };
 }

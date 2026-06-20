@@ -1,0 +1,36 @@
+# Framevo export worker (Google Compute Engine VM).
+#
+# Runs the SAME image as the Cloud Run export-api
+# (services/export-api-dotnet/Dockerfile: .NET API + Node render CLI + bundled
+# ffmpeg/ffprobe), but on a LONG-LIVED VM — so a 2-3 min render is never cut off
+# by the Cloud Run request/instance lifecycle. Rendering is driven entirely by
+# the Firestore poller (EXPORT_WORKER_MODE=firestore-poll); Next.js only creates
+# the job doc (EXPORT_BACKEND=vm), no HTTP dispatch.
+#
+# Credentials: Application Default Credentials resolve from the VM's ATTACHED
+# service account via the metadata server — there is NO key file to mount.
+
+services:
+  export-worker:
+    image: ${EXPORT_IMAGE:-us-central1-docker.pkg.dev/adzoom-prod/framevo/export-api:latest}
+    container_name: framevo-export-worker
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Hard-pin the VM worker role here so the critical bits never depend on a
+      # mis-edited .env: this instance RUNS the poll/claim/render loop.
+      EXPORT_WORKER_MODE: firestore-poll
+      WORKER_NORMALIZE_ENABLED: "1"
+    # The Google auth libraries probe `metadata.google.internal` first; map it to
+    # the metadata IP so ADC works from inside the container on a GCE VM.
+    extra_hosts:
+      - "metadata.google.internal:169.254.169.254"
+    # Local-only /health (the app serves it on 8080, exempt from the auth secret).
+    # Not published publicly — bound to loopback for `curl localhost:8080/health`.
+    ports:
+      - "127.0.0.1:8080:8080"
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"

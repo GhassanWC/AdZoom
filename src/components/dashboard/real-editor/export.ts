@@ -8,6 +8,7 @@ import {
 } from "firebase/firestore";
 import { getDownloadURL, ref as storageRef, uploadBytesResumable } from "firebase/storage";
 import { getFirebase } from "@/lib/firebase/client";
+import { safeVideoContentType } from "@/lib/firebase/projects";
 import { cameraDiagnostic } from "@/lib/timeline/camera";
 import {
   activeSpeedAt,
@@ -1366,7 +1367,7 @@ export async function uploadExport({
     // Path only — NEVER the download URL (it carries an access token).
     storagePath: uploadPath,
     bytes: blob.size,
-    contentType: blob.type || "video/webm",
+    contentType: safeVideoContentType(blob.type),
   });
 
   // Resumable upload so we can report real progress (uploadBytes is one-shot
@@ -1377,7 +1378,9 @@ export async function uploadExport({
   try {
     await new Promise<void>((resolve, reject) => {
       const task = uploadBytesResumable(sRef, blob, {
-        contentType: blob.type || "video/webm",
+        // Bare media type (no MediaRecorder codecs) so the stored Content-Type
+        // is a valid header for downstream typed clients.
+        contentType: safeVideoContentType(blob.type),
       });
       const onAbort = () => task.cancel();
       signal?.addEventListener("abort", onAbort);

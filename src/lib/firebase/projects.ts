@@ -43,6 +43,19 @@ export function isVideoAccepted(file: File): boolean {
   return /\.(mp4|mov|webm|mkv)$/i.test(file.name);
 }
 
+/**
+ * A bare video media type for the GCS object contentType. A recording's
+ * `file.type` is the MediaRecorder mimeType, which INCLUDES codecs (e.g.
+ * "video/mp4;codecs=avc1.42e01e,mp4a.40.2"); the comma makes it an unparseable
+ * Content-Type header for downstream clients (the C# export API's typed
+ * download throws FormatException on it). Strip the codecs but keep the real
+ * base type (mp4/webm/quicktime/…) so the source isn't mislabeled.
+ */
+export function safeVideoContentType(type: string | undefined | null): string {
+  const base = (type ?? "").split(";")[0].trim().toLowerCase();
+  return base.startsWith("video/") ? base : "video/mp4";
+}
+
 export function projectPath(uid: string, projectId: string) {
   return `users/${uid}/projects/${projectId}`;
 }
@@ -165,7 +178,9 @@ export async function createProjectFromFile({
   const sRef = storageRef(storage, path);
 
   const task = uploadBytesResumable(sRef, file, {
-    contentType: file.type || "video/mp4",
+    // Strip MediaRecorder codecs from the contentType — a codecs-bearing value
+    // breaks downstream typed downloads (see safeVideoContentType).
+    contentType: safeVideoContentType(file.type),
   });
 
   await new Promise<void>((resolve, reject) => {

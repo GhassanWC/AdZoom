@@ -31,8 +31,16 @@ builder.Services.AddSingleton<RenderSubprocess>();
 builder.Services.AddSingleton<JobPipeline>();
 builder.Services.AddSingleton<JobSignal>();
 builder.Services.AddSingleton<LogBuffer>();
-builder.Services.AddHostedService<ExportRunner>();
-builder.Services.AddHostedService<Reconciler>();
+// Background poll/claim/render loop — ONLY when this instance is a worker. On the
+// GCE VM, EXPORT_WORKER_MODE=firestore-poll runs it (long-lived, no request
+// lifecycle). On Cloud Run set EXPORT_WORKER_MODE=disabled so the control-plane
+// instance never claims a job (no double-claim, no mid-render shutdown). The HTTP
+// endpoints (health/enqueue-signal/cancel/status) stay available either way.
+if (opts.RunWorker)
+{
+    builder.Services.AddHostedService<ExportRunner>();
+    builder.Services.AddHostedService<Reconciler>();
+}
 
 // Give in-flight Firestore writes time to flush on SIGTERM — but NOT enough to
 // wait out a render (a killed render's job stays "rendering" and is re-claimed).
@@ -57,6 +65,14 @@ static void LogStartup(ILogger logger, ExportOptions o)
         o.ProjectId ?? "(ADC default)",
         o.NormalizeEnabled, o.WorkerConcurrency, o.HeartbeatSeconds, o.HeartbeatStaleSeconds, o.ReconcileStaleSeconds,
         o.RenderCliEntry);
+
+    // Deployment-role banner. On the GCE VM this is the [vm-worker:startup] line
+    // the runbook tails to confirm the worker came up with ADC from the attached
+    // service account (no key file).
+    logger.LogInformation(
+        "[{Tag}:startup] mode={Mode} runWorker={Run} concurrency={Conc} pollEvery={Poll}s normalize={Norm} bucket={Bucket} project={Project} creds=ADC(metadata SA)",
+        o.WorkerTag, o.WorkerMode, o.RunWorker, o.WorkerConcurrency, o.PollIntervalSeconds, o.NormalizeEnabled,
+        o.StorageBucket ?? "(MISSING)", o.ProjectId ?? "(ADC default)");
 
     if (string.IsNullOrWhiteSpace(o.InternalSecret))
         logger.LogWarning("[export:startup] ⚠ EXPORT_API_INTERNAL_SECRET is not set — ALL /exports/* requests will be rejected (401).");

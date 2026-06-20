@@ -189,17 +189,20 @@ async function prepareSource(args: {
     }
   }
 
-  // Cache miss: transcode now (honoring cancel), upload, record the cache.
+  // Cache miss: transcode now (honoring cancel), upload, record the cache. The
+  // normalizer selects ONE clean audio stream and falls back to silent on bad
+  // audio — it never fails the export for an audio problem.
   await patch({ stage: "normalizing", progress: 0 });
+  let audioDropped = false;
   try {
-    await normalizeSource({
+    const norm = await normalizeSource({
       sourcePath: srcPath,
       outputPath: normPath,
-      dropAudio: pf.needsAudioDrop,
       crf: cfg.normalizeCrf,
       preset: cfg.normalizePreset,
       signal,
     });
+    audioDropped = norm.audioStatus === "removed";
   } catch (err) {
     if (signal.aborted) throw new CanceledError();
     throw err;
@@ -216,18 +219,18 @@ async function prepareSource(args: {
       {
         normalizedSourcePath: normStoragePath,
         normalizedSourceKey: key,
-        normalizedAudioDropped: pf.needsAudioDrop,
+        normalizedAudioDropped: audioDropped,
         updatedAt: Date.now(),
       },
       { merge: true }
     )
     .catch(() => {});
 
-  console.info("[worker:normalize] done", { jobId, audioDropped: pf.needsAudioDrop });
+  console.info("[worker:normalize] done", { jobId, audioDropped });
   return {
     renderSourcePath: normPath,
-    audioDropped: pf.needsAudioDrop,
-    warnings: pf.needsAudioDrop ? [AUDIO_UNSUPPORTED_WARNING] : [],
+    audioDropped,
+    warnings: audioDropped ? [AUDIO_UNSUPPORTED_WARNING] : [],
     preflight: { ...summary, normalized: true },
   };
 }

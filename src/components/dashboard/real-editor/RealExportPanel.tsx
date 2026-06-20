@@ -865,7 +865,12 @@ function CloudExportSection({
       {job?.status === "failed" && (
         <div className="flex items-start gap-2 rounded-lg border border-rose-400/30 bg-rose-500/[0.06] px-3 py-2 text-[11px] text-rose-200">
           <AlertCircle size={12} className="mt-0.5 shrink-0" />
-          <span>{job.errorMessage || "Cloud export failed."}</span>
+          {/* Show the backend errorCode alongside the message so a generic
+              "Something went wrong" still carries the actionable reason. */}
+          <span>
+            {job.errorMessage || "Cloud export failed."}
+            {job.errorCode ? ` (${job.errorCode})` : ""}
+          </span>
         </div>
       )}
 

@@ -117,29 +117,39 @@ async function main(): Promise<void> {
       normalized: false,
     });
     if (!pf.videoDecodable) {
-      throw new Error("preflight: source video could not be decoded");
+      throw new Error("unsupported_video: source video could not be decoded");
     }
 
-    // 2. Conditional normalization — risky source → worker-safe H.264 + AAC.
+    // 2. Normalization — ALWAYS transcode to a worker-safe normalized-source.mp4
+    //    (H.264 + exactly one clean AAC track, or silent). The renderer ONLY ever
+    //    sees this file, so no exotic / extra / undecodable source stream — e.g. a
+    //    MOV's bad `apac` track alongside a good AAC one — can crash the export.
     let renderSource = spec.sourcePath;
-    let audioDropped = !!spec.audioAlreadyDropped;
+    let audioStatus: "preserved" | "removed" | "none" = pf.info.hasAudio
+      ? pf.needsAudioDrop
+        ? "removed"
+        : "preserved"
+      : "none";
     let normalized = false;
-    if (spec.normalizeEnabled && pf.risky) {
+    if (spec.normalizeEnabled !== false) {
       emit({ type: "stage", name: "normalizing" });
-      const normPath = join(dirname(spec.outputPath), "normalized.mp4");
-      await normalizeSource({
+      const normPath = join(dirname(spec.outputPath), "normalized-source.mp4");
+      const norm = await normalizeSource({
         sourcePath: spec.sourcePath,
         outputPath: normPath,
-        dropAudio: pf.needsAudioDrop,
         crf: spec.normalizeCrf ?? 18,
         preset: spec.normalizePreset ?? "veryfast",
         signal: controller.signal,
       });
       renderSource = normPath;
       normalized = true;
-      if (pf.needsAudioDrop) audioDropped = true;
+      audioStatus = norm.audioStatus;
     }
-    if (audioDropped) pushWarning(AUDIO_UNSUPPORTED_WARNING);
+    // A caller can still force-drop (legacy); the normalized file has no audio
+    // when removed/absent, so the render stays silent WITHOUT its own notice.
+    if (spec.audioAlreadyDropped && audioStatus === "preserved") audioStatus = "removed";
+    const audioDropped = audioStatus !== "preserved";
+    if (audioStatus === "removed") pushWarning(AUDIO_UNSUPPORTED_WARNING);
 
     // 3. Render — decode → composeFrame → encode (canvas parity with browser).
     const startedMs = Date.now();
@@ -170,7 +180,11 @@ async function main(): Promise<void> {
     emit({
       type: "done",
       warnings,
-      preflight: { videoCodec: pf.info.videoCodec, audioCodec, risky: pf.risky, normalized },
+      // Top-level normalized/audioStatus so the orchestrator reads them off the
+      // flat event (no nested-preflight parse). Mirrored inside `preflight` too.
+      normalized,
+      audioStatus,
+      preflight: { videoCodec: pf.info.videoCodec, audioCodec, risky: pf.risky, normalized, audioStatus },
     });
     rl.close();
     process.exit(0);
