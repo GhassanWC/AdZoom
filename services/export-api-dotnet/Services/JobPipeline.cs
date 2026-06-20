@@ -82,7 +82,11 @@ public sealed class JobPipeline(
                     if (!string.IsNullOrEmpty(ev.Name) && ev.Name != lastStage)
                     {
                         lastStage = ev.Name!;
-                        FireForget(fs.PatchAsync(uid, jobId, new() { [JobFields.Stage] = ev.Name }));
+                        FireForget(fs.PatchAsync(uid, jobId, new()
+                        {
+                            [JobFields.Stage] = ev.Name,
+                            ["progressStage"] = ToProgressStage(ev.Name!),
+                        }));
                         if (ev.Name == "normalizing")
                         {
                             normalizingStarted = true;
@@ -139,7 +143,7 @@ public sealed class JobPipeline(
         try
         {
             // ── Download ─────────────────────────────────────────────────────
-            await fs.PatchAsync(uid, jobId, new() { [JobFields.Stage] = "downloading", [JobFields.Progress] = 0.02 });
+            await fs.PatchAsync(uid, jobId, new() { [JobFields.Stage] = "downloading", ["progressStage"] = "preparing", [JobFields.Progress] = 0.02 });
             var dl = DateTime.UtcNow;
             log.LogInformation("[export:download] job={JobId} src={Src}", jobId, sourcePath);
             await storage.DownloadAsync(sourcePath, srcFile, cancelCts.Token);
@@ -194,7 +198,7 @@ public sealed class JobPipeline(
             }
 
             // ── Upload + settle ──────────────────────────────────────────────
-            await fs.PatchAsync(uid, jobId, new() { [JobFields.Stage] = "uploading", [JobFields.Progress] = 0.98 });
+            await fs.PatchAsync(uid, jobId, new() { [JobFields.Stage] = "uploading", ["progressStage"] = "uploading", [JobFields.Progress] = 0.98 });
             log.LogInformation("[{Tag}:upload-start] job={JobId}", opts.WorkerTag, jobId);
             var downloadUrl = await storage.UploadMp4Async(outFile, outputPath, cancelCts.Token);
 
@@ -294,6 +298,16 @@ public sealed class JobPipeline(
     private void FireForget(Task t) =>
         t.ContinueWith(x => log.LogWarning(x.Exception, "[export] patch failed"),
             TaskContinuationOptions.OnlyOnFaulted);
+
+    /// <summary>Map the raw worker stage to the friendly UI stage the dialog shows
+    /// (download + normalize read as "preparing" so the bar is never frozen).</summary>
+    private static string ToProgressStage(string stage) => stage switch
+    {
+        "queued" => "queued",
+        "downloading" or "normalizing" => "preparing",
+        "uploading" => "uploading",
+        _ => "rendering", // decoding / rendering / encoding
+    };
 
     private static string? Str(DocumentSnapshot s, string f) =>
         s.ContainsField(f) ? s.GetValue<object>(f)?.ToString() : null;

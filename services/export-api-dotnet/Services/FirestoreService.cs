@@ -120,6 +120,11 @@ public sealed class FirestoreService(FirestoreDb db, ExportOptions opts, ILogger
             {
                 [JobFields.Status] = JobFields.Rendering,
                 [JobFields.Stage] = "downloading",
+                ["progressStage"] = "preparing",
+                // Multi-VM attribution + liveness — which worker took the job, when.
+                ["workerId"] = opts.WorkerId,
+                ["claimedAt"] = FieldValue.ServerTimestamp,
+                ["lastHeartbeatAt"] = FieldValue.ServerTimestamp,
                 [JobFields.Progress] = 0,
                 [JobFields.StartedAt] = FieldValue.ServerTimestamp,
                 [JobFields.UpdatedAt] = FieldValue.ServerTimestamp,
@@ -139,7 +144,10 @@ public sealed class FirestoreService(FirestoreDb db, ExportOptions opts, ILogger
 
     public Task HeartbeatAsync(string uid, string jobId) =>
         JobRef(uid, jobId).SetAsync(new Dictionary<string, object>
-        { [JobFields.UpdatedAt] = FieldValue.ServerTimestamp }, SetOptions.MergeAll);
+        {
+            [JobFields.UpdatedAt] = FieldValue.ServerTimestamp,
+            ["lastHeartbeatAt"] = FieldValue.ServerTimestamp,
+        }, SetOptions.MergeAll);
 
     // ── Settle on success (ports handler.ts success txn) ─────────────────────
     public Task<bool> SettleSuccessAsync(string uid, string jobId, string month, int estimate,
@@ -169,6 +177,7 @@ public sealed class FirestoreService(FirestoreDb db, ExportOptions opts, ILogger
             {
                 [JobFields.Status] = JobFields.Ready,
                 [JobFields.Stage] = JobFields.Uploading,
+                ["progressStage"] = "ready",
                 [JobFields.Progress] = 1,
                 [JobFields.DownloadUrl] = downloadUrl,
                 [JobFields.ConsumedExportMinutes] = estimate,

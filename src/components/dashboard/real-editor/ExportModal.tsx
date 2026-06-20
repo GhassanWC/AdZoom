@@ -19,10 +19,10 @@ export function ExportModal({
     <EditorSheet
       open={open}
       onClose={onClose}
-      title="Export"
-      subtitle="Render in your browser. Audio is baked in."
+      title="Export video"
+      subtitle="Choose your export settings. Framevo will prepare your MP4 automatically."
       icon={<Download size={17} />}
-      maxWidth="max-w-2xl"
+      maxWidth="max-w-xl"
     >
       <RealExportPanel onClose={onClose} />
     </EditorSheet>

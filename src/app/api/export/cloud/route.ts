@@ -150,6 +150,35 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    // ── One active export per user ─────────────────────────────────────────
+    // Reject a SECOND concurrent export (the worker is single-flight per VM and
+    // the UI enforces this too). A STALE active job (dead worker) does NOT block —
+    // the reconciler / a fresh job supersedes it, so retry after a crash works.
+    try {
+      const activeSnap = await db
+        .collection(`users/${uid}/exportJobs`)
+        .where("status", "in", ["queued", "rendering", "uploading"])
+        .limit(5)
+        .get();
+      const STALE_MS = 12 * 60 * 1000;
+      const hasFresh = activeSnap.docs.some((d) => {
+        const data = d.data();
+        const beat = tsToMs(data.lastHeartbeatAt) ?? tsToMs(data.updatedAt) ?? 0;
+        return Date.now() - beat < STALE_MS;
+      });
+      if (hasFresh) {
+        return NextResponse.json(
+          {
+            error: "You already have an export running. Wait for it to finish or cancel it.",
+            kind: "export_already_running",
+          },
+          { status: 409 }
+        );
+      }
+    } catch (err) {
+      console.warn("[export-cloud] active-export check failed (continuing)", err);
+    }
+
     // ── Plan gate (Free has 0 cloud minutes) ───────────────────────────────
     const plan = await getUserPlan(uid);
     if (!planAllowsCloudExport(plan)) {
@@ -221,6 +250,22 @@ export async function POST(req: NextRequest) {
     const jobId = jobRef.id;
     const outputPath = `users/${uid}/projects/${projectId}/exports/${jobId}.mp4`;
 
+    // Best-effort queue position (active jobs across all users, ahead of this
+    // one). Snapshot at creation — not updated live. Wrapped so a missing
+    // collection-group index can never block export creation.
+    let queuePosition: number | undefined;
+    try {
+      const ahead = await db
+        .collectionGroup("exportJobs")
+        .where("status", "in", ["queued", "rendering", "uploading"])
+        .count()
+        .get();
+      const n = ahead.data().count ?? 0;
+      if (n > 0) queuePosition = n + 1;
+    } catch {
+      /* no index / unsupported → omit; the UI shows "Queued" without a number */
+    }
+
     // ── Transaction: re-check + reserve minutes + create the job ───────────
     try {
       await db.runTransaction(async (tx) => {
@@ -271,6 +316,8 @@ export async function POST(req: NextRequest) {
           estimatedExportMinutes: estimate,
           progress: 0,
           stage: "queued",
+          progressStage: "queued",
+          ...(queuePosition ? { queuePosition } : {}),
           monthlyBucket: monthKey,
           renderRecipe: serializedRecipe,
           createdAt: FieldValue.serverTimestamp(),
@@ -345,6 +392,14 @@ function numOr(primary: number | undefined, fallback: number | undefined): numbe
   if (typeof primary === "number" && Number.isFinite(primary) && primary > 0) return primary;
   if (typeof fallback === "number" && Number.isFinite(fallback) && fallback > 0) return fallback;
   return 0;
+}
+
+/** Firestore Timestamp | epoch-ms → epoch ms (undefined if unset). */
+function tsToMs(v: unknown): number | undefined {
+  const t = v as { toMillis?: () => number } | undefined;
+  if (t?.toMillis) return t.toMillis();
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  return undefined;
 }
 
 /**

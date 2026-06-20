@@ -1462,9 +1462,28 @@ export interface ExportJobDoc {
   monthlyBucket: string;
   /** Raw render inputs the worker feeds to `buildRenderRecipe`. */
   renderRecipe: SerializedRenderRecipe;
+  // ── Multi-VM claim + heartbeat (atomic claim lets many VM workers share the
+  //    queue safely; these record WHICH worker took the job + liveness). ──────
+  /** Id of the VM worker that claimed the job (EXPORT_WORKER_ID or hostname). */
+  workerId?: string;
+  /** Epoch ms when a worker claimed the job. */
+  claimedAt?: number;
+  /** Epoch ms of the worker's last heartbeat — drives the "taking longer than
+   *  expected" / stale detection in the UI (independent of `updatedAt`). */
+  lastHeartbeatAt?: number;
+  /** Best-effort queue position recorded at enqueue (active jobs created before
+   *  this one). Shown while `status === "queued"`; not updated live. */
+  queuePosition?: number;
+  /** Friendly, UI-facing stage label written by the worker alongside `stage`:
+   *  "queued" | "preparing" | "rendering" | "uploading" | "ready". The raw
+   *  `stage` stays for diagnostics; this is what the dialog renders. */
+  progressStage?: ExportUiStage;
   createdAt: number;
   updatedAt: number;
   startedAt?: number;
   completedAt?: number;
   canceledAt?: number;
 }
+
+/** Friendly progress stages the export dialog shows (maps from status + stage). */
+export type ExportUiStage = "queued" | "preparing" | "rendering" | "uploading" | "ready";

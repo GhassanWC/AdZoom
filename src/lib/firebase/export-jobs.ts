@@ -19,10 +19,57 @@ import {
   type Unsubscribe,
 } from "firebase/firestore";
 import { getFirebase } from "./client";
-import type { ExportJobDoc } from "./schema";
+import type { ExportJobDoc, ExportUiStage } from "./schema";
 
 /** The UI-facing view of an export job — everything except `renderRecipe`. */
 export type ExportJobView = Omit<ExportJobDoc, "renderRecipe">;
+
+/** Human labels for the friendly progress stages shown in the dialog. */
+export const EXPORT_STAGE_LABEL: Record<ExportUiStage, string> = {
+  queued: "Queued",
+  preparing: "Preparing your video…",
+  rendering: "Rendering",
+  uploading: "Uploading",
+  ready: "Ready",
+};
+
+/**
+ * Friendly stage for the UI. Prefers the worker-written `progressStage`; falls
+ * back to deriving it from `status` + the raw `stage` so older jobs still map
+ * cleanly (and a job that's claimed/normalizing reads as "Preparing…", never a
+ * frozen percentage).
+ */
+export function exportUiStage(
+  job: Pick<ExportJobView, "status" | "stage" | "progressStage">
+): ExportUiStage {
+  if (job.progressStage) return job.progressStage;
+  switch (job.status) {
+    case "queued":
+      return "queued";
+    case "uploading":
+      return "uploading";
+    case "ready":
+    case "failed":
+    case "canceled":
+      return "ready";
+    case "rendering":
+    default:
+      // download + normalize are the "preparing" phase (no real % yet) — show an
+      // animated "Preparing…" rather than a stuck bar.
+      return job.stage === "normalizing" ||
+        job.stage === "downloading" ||
+        job.stage === "queued" ||
+        !job.stage
+        ? "preparing"
+        : "rendering";
+  }
+}
+
+/** True while the UI should show an indeterminate (animated) bar — queued or the
+ *  preparing phase, where the worker emits no real percentage yet. */
+export function isIndeterminateStage(stage: ExportUiStage): boolean {
+  return stage === "queued" || stage === "preparing";
+}
 
 /**
  * UI staleness window — slightly larger than the server reconciler's 10-min
@@ -44,7 +91,10 @@ const ACTIVE_FOR_STALE: ExportJobView["status"][] = [
  * `updatedAt` stops changing once the worker is gone.
  */
 export function isJobStale(job: ExportJobView, now: number = Date.now()): boolean {
-  return ACTIVE_FOR_STALE.includes(job.status) && now - job.updatedAt > STALE_UI_MS;
+  // Prefer the worker heartbeat (lastHeartbeatAt) — it's the truest liveness
+  // signal; fall back to updatedAt for jobs/workers that don't write it yet.
+  const beat = job.lastHeartbeatAt ?? job.updatedAt;
+  return ACTIVE_FOR_STALE.includes(job.status) && now - beat > STALE_UI_MS;
 }
 
 function millis(v: unknown): number | undefined {
@@ -76,10 +126,15 @@ export function materializeExportJob(
     consumedExportMinutes: data.consumedExportMinutes as number | undefined,
     progress: (data.progress as number) ?? 0,
     stage: data.stage as ExportJobDoc["stage"],
+    progressStage: data.progressStage as ExportJobDoc["progressStage"],
     errorMessage: data.errorMessage as string | undefined,
     errorCode: data.errorCode as string | undefined,
     cancelRequested: data.cancelRequested as boolean | undefined,
     warnings: data.warnings as string[] | undefined,
+    workerId: data.workerId as string | undefined,
+    claimedAt: millis(data.claimedAt) ?? (data.claimedAt as number | undefined),
+    lastHeartbeatAt: millis(data.lastHeartbeatAt) ?? (data.lastHeartbeatAt as number | undefined),
+    queuePosition: data.queuePosition as number | undefined,
     monthlyBucket: (data.monthlyBucket as string) ?? "",
     createdAt: millis(data.createdAt) ?? Date.now(),
     updatedAt: millis(data.updatedAt) ?? Date.now(),

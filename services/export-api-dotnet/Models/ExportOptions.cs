@@ -76,6 +76,11 @@ public sealed class ExportOptions
     /// BUILD_VERSION. Logged at startup + per job so a STALE VM image is obvious.</summary>
     public string BuildVersion { get; set; } = "unknown";
 
+    /// <summary>Stable id of THIS worker, recorded on claimed jobs so the queue is
+    /// safe across MULTIPLE VM workers (which VM took which job). From
+    /// EXPORT_WORKER_ID; falls back to the machine name.</summary>
+    public string WorkerId { get; set; } = Environment.MachineName;
+
     /// <summary>Resolve from env with appsettings fallback; env wins (Cloud Run sets env).</summary>
     public static ExportOptions Load(IConfiguration config)
     {
@@ -106,6 +111,7 @@ public sealed class ExportOptions
         o.NormalizeCrf = EnvInt("WORKER_NORMALIZE_CRF", o.NormalizeCrf);
         o.NormalizePreset = Env("WORKER_NORMALIZE_PRESET") ?? o.NormalizePreset;
         o.BuildVersion = Env("BUILD_VERSION") ?? o.BuildVersion;
+        o.WorkerId = Env("EXPORT_WORKER_ID") ?? o.WorkerId;
         o.WorkerMode = (Env("EXPORT_WORKER_MODE") ?? o.WorkerMode).Trim().ToLowerInvariant();
         // Don't run the worker loop when explicitly disabled (Cloud Run control
         // plane) or when EXPORT_RUN_WORKER=false.
