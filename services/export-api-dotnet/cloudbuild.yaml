@@ -17,10 +17,15 @@ steps:
       - build
       - -f
       - services/export-api-dotnet/Dockerfile
+      - --build-arg
+      - BUILD_VERSION=${_BUILD_VERSION}
       - -t
       - ${_IMAGE}
       - .
 images: ["${_IMAGE}"]
+substitutions:
+  # Pass the git sha at submit time: --substitutions=_BUILD_VERSION=$(git rev-parse --short HEAD)
+  _BUILD_VERSION: dev
 options:
   # Multi-stage build (npm install + dotnet restore/publish) — give it headroom.
   machineType: E2_HIGHCPU_8

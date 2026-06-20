@@ -6,6 +6,8 @@
  * H.264/AAC. Cuts + speed are honored via the recipe's timeline map; audio is
  * rebuilt by `buildAudioFilterComplex` from the same segments.
  */
+import v8 from "node:v8";
+import vm from "node:vm";
 import { createCanvas, ImageData } from "@napi-rs/canvas";
 import { buildRenderRecipe } from "@/lib/render/recipe";
 import { composeFrame } from "@/lib/render/compose-frame";
@@ -54,8 +56,49 @@ export interface RenderOptions {
 /** No frames for this long ⇒ the render is wedged; kill it and fail the job. */
 const STALL_MS = 90_000;
 
-/** Cadence (in output frames) for the heartbeat progress + memory log. */
-const PROGRESS_LOG_EVERY = 500;
+/** Cadence (in output frames) for the heartbeat progress + memory log + leak guard. */
+const PROGRESS_LOG_EVERY = 250;
+
+/**
+ * Force a GC this often (output frames). The composited frame each `getImageData`
+ * hands us is @napi-rs/canvas EXTERNAL (skia) memory that V8's GC heuristics
+ * under-count — so without a nudge the garbage piles up ~one 8 MB frame per
+ * output frame (500 frames → ~4 GB RSS) until the container OOM-restarts. The
+ * buffers are unreferenced once ffmpeg accepts the frame; a periodic full GC
+ * reclaims them and keeps RSS flat. 50 frames ≈ a small sawtooth, ~sub-percent CPU.
+ */
+const GC_EVERY = 50;
+
+/**
+ * Hard RSS ceiling — a correctly-streaming 1080p / concurrency-1 render plateaus
+ * well under ~1.5 GB. Blow past this and we fail fast (`memory_leak_detected`)
+ * instead of letting the container OOM-restart in a loop. Override via env.
+ */
+const MAX_RSS_MB = Number(process.env.RENDER_MAX_RSS_MB) || 4096;
+
+/** Linear-growth tripwire: this much RSS gain on EACH of 3 consecutive
+ *  heartbeats (past warmup) means frames aren't being released — fail fast. */
+const LEAK_SLOPE_MB = 400;
+
+/**
+ * Force-GC handle. Prefer an already-exposed `global.gc` (node --expose-gc);
+ * otherwise enable it at runtime (no launch flag needed) via the v8 flag + a
+ * fresh VM context. Null only if both are somehow unavailable (then we still
+ * have the ceiling/slope guards + bounded buffering as the safety net).
+ */
+function resolveForceGc(): (() => void) | null {
+  try {
+    const existing = (globalThis as { gc?: () => void }).gc;
+    if (typeof existing === "function") return existing;
+    v8.setFlagsFromString("--expose-gc");
+    const gc = vm.runInNewContext("gc") as unknown;
+    v8.setFlagsFromString("--no-expose-gc");
+    return typeof gc === "function" ? (gc as () => void) : null;
+  } catch {
+    return null;
+  }
+}
+const forceGc = resolveForceGc();
 
 export interface RenderResult {
   warnings: string[];
@@ -221,6 +264,8 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
 
   let lastPct = -1;
   const renderStartMs = Date.now();
+  // Recent RSS samples (one per heartbeat) for the linear-growth tripwire.
+  const rssSamples: number[] = [];
   try {
     if (opts.signal.aborted) throw new CanceledError();
     console.info("[worker:render-start]", {
@@ -244,19 +289,46 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
         opts.onProgress({ stage: "rendering", progress: pct / 100 });
       }
 
+      // Reclaim the external composited-frame buffers before they pile up. They
+      // were handed to ffmpeg + dereferenced already; a periodic full GC keeps
+      // RSS flat instead of growing one ~8 MB frame per output frame.
+      if (forceGc && i > 0 && i % GC_EVERY === 0) forceGc();
+
       // Heartbeat progress + memory every N frames — proves the render is
-      // advancing and surfaces a climb toward the Cloud Run memory cap (the
-      // likely cause of a mid-render 503/SIGKILL).
+      // advancing AND that frames are being streamed (queue stays at 1–3, RSS
+      // plateaus). A runaway is failed fast as `memory_leak_detected` rather than
+      // left to OOM-restart the container mid-render.
       if (i > 0 && i % PROGRESS_LOG_EVERY === 0) {
         const mem = process.memoryUsage();
+        const rssMB = Math.round(mem.rss / 1048576);
+        const queueLen = decoder.reader.bufferedFrames();
         console.info("[worker:progress]", {
           frame: i,
           totalFrames,
           pct,
-          rssMB: Math.round(mem.rss / 1048576),
+          queueLen,
+          rssMB,
           heapUsedMB: Math.round(mem.heapUsed / 1048576),
           externalMB: Math.round(mem.external / 1048576),
         });
+
+        // (a) Hard ceiling.
+        if (rssMB > MAX_RSS_MB) {
+          throw new Error(
+            `memory_leak_detected: RSS ${rssMB}MB exceeded ${MAX_RSS_MB}MB at frame ${i}/${totalFrames} — frames are not being released to ffmpeg`
+          );
+        }
+        // (b) Linear-growth tripwire — RSS climbing by > LEAK_SLOPE_MB on each of
+        // the last 3 heartbeats (past warmup) means it isn't stabilizing.
+        rssSamples.push(rssMB);
+        if (rssSamples.length >= 4) {
+          const [a, b, c, d] = rssSamples.slice(-4);
+          if (b - a > LEAK_SLOPE_MB && c - b > LEAK_SLOPE_MB && d - c > LEAK_SLOPE_MB) {
+            throw new Error(
+              `memory_leak_detected: RSS rising ${a}→${b}→${c}→${d}MB across heartbeats — frames are not being released to ffmpeg`
+            );
+          }
+        }
       }
 
       const outputTime = i / fps;
@@ -293,10 +365,13 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
         console.info("[worker:first-composed-frame]", { afterMs: Date.now() - renderStartMs });
       }
 
-      const img = outCtx.getImageData(0, 0, canvasW, canvasH);
-      await encoder.writeFrame(
-        Buffer.from(img.data.buffer, img.data.byteOffset, img.data.byteLength)
-      );
+      // Read the composited frame via canvas.data() (a fresh, owned RGBA copy) —
+      // NOT getImageData. @napi-rs/canvas's getImageData leaks ~one frame of
+      // native (skia) memory PER CALL, invisible to V8/GC, which OOM-kills a long
+      // render (~8 MB/frame at 1080p). canvas.data() returns the SAME RGBA bytes
+      // with no such leak (verified) and is GC-tracked, so it streams cleanly.
+      const composited = outCanvas.data();
+      await encoder.writeFrame(composited);
       if (i === 0) {
         // First frame accepted by the encoder — the pipeline is flowing.
         console.info("[worker:first-frame]", { afterMs: Date.now() - renderStartMs });

@@ -70,8 +70,8 @@ static void LogStartup(ILogger logger, ExportOptions o)
     // the runbook tails to confirm the worker came up with ADC from the attached
     // service account (no key file).
     logger.LogInformation(
-        "[{Tag}:startup] mode={Mode} runWorker={Run} concurrency={Conc} pollEvery={Poll}s normalize={Norm} bucket={Bucket} project={Project} creds=ADC(metadata SA)",
-        o.WorkerTag, o.WorkerMode, o.RunWorker, o.WorkerConcurrency, o.PollIntervalSeconds, o.NormalizeEnabled,
+        "[{Tag}:startup] build={Build} mode={Mode} runWorker={Run} concurrency={Conc} pollEvery={Poll}s normalize={Norm} bucket={Bucket} project={Project} creds=ADC(metadata SA)",
+        o.WorkerTag, o.BuildVersion, o.WorkerMode, o.RunWorker, o.WorkerConcurrency, o.PollIntervalSeconds, o.NormalizeEnabled,
         o.StorageBucket ?? "(MISSING)", o.ProjectId ?? "(ADC default)");
 
     if (string.IsNullOrWhiteSpace(o.InternalSecret))

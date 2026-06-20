@@ -23,9 +23,17 @@
  *
  * Exit codes: 0 = done, 1 = error, 2 = canceled.
  */
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
+
+/**
+ * Bumped whenever the render/normalization contract changes. Logged at startup +
+ * emitted as a `version` event so a STALE worker image is OBVIOUS in the logs: a
+ * new image logs `2025.06-normalize+canvasdata`; an old one logs a different
+ * value (or none at all — pre-versioning images never emit a `version` event).
+ */
+const RENDER_CLI_VERSION = "2025.06-normalize+canvasdata";
 
 // ── stdout = NDJSON only; route every console.* to stderr ───────────────────
 function emit(event: Record<string, unknown>): void {
@@ -64,6 +72,12 @@ interface JobSpec {
 }
 
 async function main(): Promise<void> {
+  // Proof-of-build: always the FIRST line so a stale image is detectable even if
+  // the job later fails. The C# orchestrator logs this as [vm-worker:cli-version].
+  const build = process.env.BUILD_VERSION ?? "unknown";
+  emit({ type: "version", cliVersion: RENDER_CLI_VERSION, build, node: process.version });
+  toStderr(`[worker:cli] start version=${RENDER_CLI_VERSION} build=${build} node=${process.version}`);
+
   const specPath = process.argv[2];
   if (!specPath) {
     emit({ type: "error", code: "bad_invocation", message: "Missing job-spec path argument." });
@@ -124,6 +138,8 @@ async function main(): Promise<void> {
     //    (H.264 + exactly one clean AAC track, or silent). The renderer ONLY ever
     //    sees this file, so no exotic / extra / undecodable source stream — e.g. a
     //    MOV's bad `apac` track alongside a good AAC one — can crash the export.
+    const normPath = join(dirname(spec.outputPath), "normalized-source.mp4");
+    const expectNormalize = spec.normalizeEnabled !== false;
     let renderSource = spec.sourcePath;
     let audioStatus: "preserved" | "removed" | "none" = pf.info.hasAudio
       ? pf.needsAudioDrop
@@ -131,9 +147,8 @@ async function main(): Promise<void> {
         : "preserved"
       : "none";
     let normalized = false;
-    if (spec.normalizeEnabled !== false) {
+    if (expectNormalize) {
       emit({ type: "stage", name: "normalizing" });
-      const normPath = join(dirname(spec.outputPath), "normalized-source.mp4");
       const norm = await normalizeSource({
         sourcePath: spec.sourcePath,
         outputPath: normPath,
@@ -150,6 +165,28 @@ async function main(): Promise<void> {
     if (spec.audioAlreadyDropped && audioStatus === "preserved") audioStatus = "removed";
     const audioDropped = audioStatus !== "preserved";
     if (audioStatus === "removed") pushWarning(AUDIO_UNSUPPORTED_WARNING);
+
+    // 2b. REQUIRED pre-render contract — prove exactly what the renderer will read.
+    emit({
+      type: "render-input",
+      inputFile: spec.sourcePath,
+      normalizedFile: normPath,
+      renderSource,
+      wasNormalizationRun: normalized,
+    });
+    toStderr(
+      `[worker:cli] render-input input=${spec.sourcePath} normalizedFile=${normPath} renderSource=${renderSource} wasNormalizationRun=${normalized}`
+    );
+    // HARD GUARD — never silently render the ORIGINAL. If normalization was
+    // expected but didn't run (stale image / bug), fail the job loudly instead.
+    if (expectNormalize && (!normalized || renderSource !== normPath)) {
+      throw new Error(
+        `normalize_not_executed: normalizeEnabled but normalization did not run (renderSource=${renderSource})`
+      );
+    }
+    if (normalized && !existsSync(renderSource)) {
+      throw new Error(`normalize_not_executed: normalized-source.mp4 missing at ${renderSource}`);
+    }
 
     // 3. Render — decode → composeFrame → encode (canvas parity with browser).
     const startedMs = Date.now();

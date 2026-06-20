@@ -22,6 +22,26 @@ export interface UserFacingError {
 export function toUserFacingError(err: unknown): UserFacingError {
   const raw = (err instanceof Error ? err.message : String(err ?? "")).toLowerCase();
 
+  // Normalization was required (normalizeEnabled) but didn't run — we refuse to
+  // silently render the original. Almost always a STALE worker image; distinct
+  // code so it's obvious the deploy, not the user's file, is the problem.
+  if (raw.includes("normalize_not_executed")) {
+    return {
+      code: "normalize_not_executed",
+      message: "The export could not be prepared (normalization did not run). Please try again; if it persists the render service needs an update.",
+    };
+  }
+
+  // The render's memory guard tripped — RSS ran away (frames not streamed to
+  // ffmpeg). Surfaced as a distinct code so it's never mistaken for a user-file
+  // problem; the fix is in the renderer, not the upload.
+  if (raw.includes("memory_leak_detected")) {
+    return {
+      code: "memory_leak_detected",
+      message: "The export ran out of memory and was stopped. Please try again — if it keeps happening, contact support.",
+    };
+  }
+
   // Audio the bundled ffmpeg can't decode/transcode, or a filtergraph it can't
   // open — the classic "no decoder found for: none" / "Could not find codec
   // parameters" family produced by codecs like `apac`.

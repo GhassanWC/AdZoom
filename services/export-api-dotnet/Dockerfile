@@ -32,6 +32,10 @@ RUN dotnet publish ExportApi.csproj -c Release -o /out --no-restore
 
 # ── Stage 3: runtime = aspnet + node + render CLI ─────────────────────────────
 FROM mcr.microsoft.com/dotnet/aspnet:8.0
+# Build/version stamp (git sha or tag) — logged at startup + per job by BOTH the
+# C# API and the Node render CLI so a STALE VM image is obvious in the logs.
+ARG BUILD_VERSION=dev
+ENV BUILD_VERSION=${BUILD_VERSION}
 ENV DOTNET_System_Globalization_Invariant=true
 WORKDIR /app
 # Node runtime (dynamically linked against libstdc++6/libgcc-s1/libc6, present

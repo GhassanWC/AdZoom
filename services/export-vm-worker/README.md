@@ -60,12 +60,14 @@ root):
 gcloud builds submit \
   --project="$PROJECT" \
   --config=services/export-api-dotnet/cloudbuild.yaml \
-  --substitutions=_IMAGE="$IMAGE" \
+  --substitutions=_IMAGE="$IMAGE",_BUILD_VERSION="$(git rev-parse --short HEAD)" \
   .
 ```
 
 This image bundles the latest render core, so it includes the always-on
-normalization (the MOV/APAC multi-audio-stream fix).
+normalization (the MOV/APAC multi-audio-stream fix) and the `canvas.data()`
+memory fix. `_BUILD_VERSION` stamps the git sha into the image so the running
+build is verifiable in the logs (see step 5).
 
 ---
 
@@ -132,9 +134,13 @@ gcloud compute ssh framevo-export-worker --zone="$ZONE" \
 ```
 
 Expect:
-- `[vm-worker:startup] mode=firestore-poll runWorker=True ... creds=ADC(metadata SA)`
+- `[vm-worker:startup] build=<git sha> mode=firestore-poll runWorker=True ... creds=ADC(metadata SA)`
 - `[vm-worker:poll] idle` (repeating)
 - `ok` from `/health`
+
+**Confirm the build is current** — the `build=` on the startup line must match the
+sha you deployed. If it shows an older sha (or `unknown`/`dev`), the VM is running
+a stale image: rebuild (step 1) and `docker compose pull` + restart (Operations).
 
 ---
 
@@ -196,18 +202,26 @@ gcloud compute ssh framevo-export-worker --zone="$ZONE" \
   --command="sudo docker logs -f framevo-export-worker"
 ```
 
-Expected milestone sequence per job:
+Expected milestone sequence per job (the `cli-version` + `render-input` lines
+PROVE the latest code ran and exactly what the renderer read):
 
 ```
 [vm-worker:poll] claimable=1
 [vm-worker:claim] uid=… jobId=…
+[vm-worker:cli-version] job=… cliVersion=2025.06-normalize+canvasdata build=<sha>
 [vm-worker:normalize-start] job=…
 [vm-worker:normalize-ready] job=…
+[vm-worker:render-input] job=… input=…/source.mov normalizedFile=…/normalized-source.mp4 wasNormalizationRun=True renderSource=…/normalized-source.mp4
 [vm-worker:render-start] job=…
-[vm-worker:progress] job=… pct=…
+[vm-worker:progress] job=… pct=…          # rssMB stays flat (no leak)
 [vm-worker:upload-start] job=…
 [vm-worker:complete] job=… minutes=… audio=preserved|removed|none
 ```
+
+If `wasNormalizationRun=False` (or `cli-version`/`normalize-start` never appear),
+the worker is **not** normalizing — the job FAILS with `normalize_not_executed`
+rather than silently rendering the original. That almost always means a **stale
+image**: rebuild (step 1) and redeploy (Operations).
 
 Pass criteria: Firestore `exportJobs/{id}.status == "ready"`, the MP4 exists under
 `users/{uid}/projects/{pid}/exports/{jobId}.mp4` in `gs://adzoom-prod.firebasestorage.app`,

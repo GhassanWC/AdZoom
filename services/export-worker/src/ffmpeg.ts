@@ -450,11 +450,13 @@ export async function normalizeSource(opts: NormalizeOptions): Promise<Normalize
  */
 export interface FrameReader {
   next(): Promise<Buffer | null>;
+  /** Whole frames currently buffered from the decode pipe (for the leak guard). */
+  bufferedFrames(): number;
   destroy(): void;
 }
 
 function makeFrameReader(stream: Readable, frameBytes: number): FrameReader {
-  const MAX_BACKLOG = frameBytes * 4; // ~4 frames in flight
+  const MAX_BACKLOG = frameBytes * 3; // ≤3 frames of raw pipe data in flight
   // A QUEUE of raw pipe chunks (not a single growing Buffer). Assembling a frame
   // copies exactly `frameBytes` once across the queued chunks — O(frameBytes) per
   // frame. The old `Buffer.concat([buffered, chunk])` on every ~64 KB pipe chunk
@@ -499,25 +501,30 @@ function makeFrameReader(stream: Readable, frameBytes: number): FrameReader {
     wake();
   });
 
-  /** Copy exactly `frameBytes` out of the head of the chunk queue. */
+  // ONE reusable output buffer — NOT a fresh alloc per frame. The single consumer
+  // (the render loop) copies each frame into the canvas synchronously before
+  // calling next() again, so reusing the same memory is safe and removes an
+  // ~8 MB/frame allocation (a major source of GC pressure / RSS churn at 1080p).
+  const reuse = Buffer.allocUnsafe(frameBytes);
+
+  /** Copy exactly `frameBytes` out of the head of the chunk queue into `reuse`. */
   const takeFrame = (): Buffer => {
-    const frame = Buffer.allocUnsafe(frameBytes);
     let off = 0;
     while (off < frameBytes) {
       const c = chunks[0]!;
       const need = frameBytes - off;
       if (c.length <= need) {
-        c.copy(frame, off);
+        c.copy(reuse, off);
         off += c.length;
         chunks.shift();
       } else {
-        c.copy(frame, off, 0, need);
+        c.copy(reuse, off, 0, need);
         chunks[0] = c.subarray(need);
         off += need;
       }
     }
     bufferedLen -= frameBytes;
-    return frame;
+    return reuse;
   };
 
   return {
@@ -525,7 +532,7 @@ function makeFrameReader(stream: Readable, frameBytes: number): FrameReader {
       for (;;) {
         if (errored) throw errored;
         if (bufferedLen >= frameBytes) {
-          const frame = takeFrame(); // freshly allocated + owned — safe to hand off
+          const frame = takeFrame(); // reused buffer — copy it before the next next()
           if (paused && bufferedLen < MAX_BACKLOG) {
             paused = false;
             stream.resume();
@@ -537,6 +544,9 @@ function makeFrameReader(stream: Readable, frameBytes: number): FrameReader {
           waiter = resolve;
         });
       }
+    },
+    bufferedFrames(): number {
+      return Math.floor(bufferedLen / frameBytes);
     },
     destroy() {
       stream.destroy();

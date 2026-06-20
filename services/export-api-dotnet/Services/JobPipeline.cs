@@ -115,6 +115,17 @@ public sealed class JobPipeline(
                         }
                     }
                     break;
+                case "version":
+                    // Proof the VM is running the latest render core (a stale image
+                    // logs an old value or never emits this event at all).
+                    log.LogInformation("[{Tag}:cli-version] job={JobId} cliVersion={V} build={B} node={N}",
+                        opts.WorkerTag, jobId, ev.CliVersion, ev.Build, ev.Node);
+                    break;
+                case "render-input":
+                    // Required pre-render contract: exactly what the renderer reads.
+                    log.LogInformation("[{Tag}:render-input] job={JobId} input={In} normalizedFile={Norm} wasNormalizationRun={Ran} renderSource={Src}",
+                        opts.WorkerTag, jobId, ev.InputFile, ev.NormalizedFile, ev.WasNormalizationRun, ev.RenderSource);
+                    break;
                 case "first-frame":
                     log.LogInformation("[export:first-frame] job={JobId} afterMs={Ms}", jobId, ev.Ms);
                     break;
@@ -167,6 +178,18 @@ public sealed class JobPipeline(
                 var msg = outcome.Error?.Message ?? "Something went wrong while exporting your video. Please try again.";
                 await fs.FailAndReleaseAsync(uid, jobId, month, estimate, code, msg);
                 log.LogError("[{Tag}:failed] job={JobId} code={Code}", opts.WorkerTag, jobId, code);
+                return;
+            }
+
+            // ── Backstop: never finalize an export that skipped normalization ──
+            // The CLI already guards (normalize_not_executed), but if a job somehow
+            // reports done with normalized=false while normalization was enabled,
+            // fail it rather than ship an export rendered from the raw source.
+            if (opts.NormalizeEnabled && outcome.Done.Normalized == false)
+            {
+                await fs.FailAndReleaseAsync(uid, jobId, month, estimate, "normalize_not_executed",
+                    "The export could not be prepared (normalization did not run). Please try again.");
+                log.LogError("[{Tag}:failed] job={JobId} code=normalize_not_executed (done.normalized=false)", opts.WorkerTag, jobId);
                 return;
             }
 

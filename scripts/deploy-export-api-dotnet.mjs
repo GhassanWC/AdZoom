@@ -85,12 +85,16 @@ await main();
 
 async function main() {
   // ── 1. Build the image (repo-root context via cloudbuild.yaml) ──
+  // Stamp the git sha into the image (BUILD_VERSION) so a stale VM/Cloud Run
+  // image is obvious in the [*:startup]/[*:cli-version] logs.
+  const buildVersion = gitShortSha();
+  console.log(`  Build version:  ${buildVersion}`);
   run(
     [
       "builds", "submit",
       `--project=${PROJECT_ID}`,
       `--config=${CLOUDBUILD_CONFIG}`,
-      `--substitutions=_IMAGE=${IMAGE}`,
+      `--substitutions=_IMAGE=${IMAGE},_BUILD_VERSION=${buildVersion}`,
       ".",
     ],
     "Cloud Build (image)"
@@ -243,6 +247,15 @@ function printManualChecks(url) {
 function env(key, fallback) {
   const v = process.env[key];
   return v && v.trim() ? v.trim() : fallback;
+}
+
+/** Short git sha (+ "-dirty" when the tree has uncommitted changes), "unknown" off-git. */
+function gitShortSha() {
+  const sha = spawnSync("git", ["rev-parse", "--short", "HEAD"], { cwd: root, encoding: "utf-8" });
+  if (sha.status !== 0) return "unknown";
+  const dirty = spawnSync("git", ["status", "--porcelain"], { cwd: root, encoding: "utf-8" });
+  const isDirty = dirty.status === 0 && (dirty.stdout || "").trim().length > 0;
+  return (sha.stdout || "").trim() + (isDirty ? "-dirty" : "");
 }
 
 function run(args, label) {

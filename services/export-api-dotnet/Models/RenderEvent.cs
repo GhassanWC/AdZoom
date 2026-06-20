@@ -36,6 +36,16 @@ public sealed class RenderEvent
     [JsonPropertyName("audioStatus")] public string? AudioStatus { get; set; }
     [JsonPropertyName("preflight")] public JsonElement? Preflight { get; set; }
 
+    // version
+    [JsonPropertyName("cliVersion")] public string? CliVersion { get; set; }
+    [JsonPropertyName("build")] public string? Build { get; set; }
+    [JsonPropertyName("node")] public string? Node { get; set; }
+    // render-input (the pre-render contract)
+    [JsonPropertyName("inputFile")] public string? InputFile { get; set; }
+    [JsonPropertyName("normalizedFile")] public string? NormalizedFile { get; set; }
+    [JsonPropertyName("renderSource")] public string? RenderSource { get; set; }
+    [JsonPropertyName("wasNormalizationRun")] public bool? WasNormalizationRun { get; set; }
+
     public static readonly JsonSerializerOptions JsonOpts = new()
     {
         PropertyNameCaseInsensitive = true,

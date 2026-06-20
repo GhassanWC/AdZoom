@@ -1,11 +1,13 @@
 import { createRequire as _cr } from 'module'; const require = _cr(import.meta.url);
 
 // src/cli.ts
-import { readFileSync } from "node:fs";
+import { existsSync as existsSync2, readFileSync } from "node:fs";
 import { dirname, join as join2 } from "node:path";
 import { createInterface } from "node:readline";
 
 // src/render.ts
+import v8 from "node:v8";
+import vm from "node:vm";
 import { createCanvas, ImageData } from "@napi-rs/canvas";
 
 // ../../src/lib/cv/resample.ts
@@ -1160,7 +1162,7 @@ async function normalizeSource(opts) {
   return hadAudio ? { audioStatus: "removed", warnings: [AUDIO_UNSUPPORTED_WARNING] } : { audioStatus: "none", warnings: [] };
 }
 function makeFrameReader(stream, frameBytes) {
-  const MAX_BACKLOG = frameBytes * 4;
+  const MAX_BACKLOG = frameBytes * 3;
   const chunks = [];
   let bufferedLen = 0;
   let ended = false;
@@ -1194,24 +1196,24 @@ function makeFrameReader(stream, frameBytes) {
     ended = true;
     wake();
   });
+  const reuse = Buffer.allocUnsafe(frameBytes);
   const takeFrame = () => {
-    const frame = Buffer.allocUnsafe(frameBytes);
     let off = 0;
     while (off < frameBytes) {
       const c = chunks[0];
       const need = frameBytes - off;
       if (c.length <= need) {
-        c.copy(frame, off);
+        c.copy(reuse, off);
         off += c.length;
         chunks.shift();
       } else {
-        c.copy(frame, off, 0, need);
+        c.copy(reuse, off, 0, need);
         chunks[0] = c.subarray(need);
         off += need;
       }
     }
     bufferedLen -= frameBytes;
-    return frame;
+    return reuse;
   };
   return {
     async next() {
@@ -1230,6 +1232,9 @@ function makeFrameReader(stream, frameBytes) {
           waiter = resolve;
         });
       }
+    },
+    bufferedFrames() {
+      return Math.floor(bufferedLen / frameBytes);
     },
     destroy() {
       stream.destroy();
@@ -1540,7 +1545,23 @@ var CanceledError = class extends Error {
   }
 };
 var STALL_MS = 9e4;
-var PROGRESS_LOG_EVERY = 500;
+var PROGRESS_LOG_EVERY = 250;
+var GC_EVERY = 50;
+var MAX_RSS_MB = Number(process.env.RENDER_MAX_RSS_MB) || 4096;
+var LEAK_SLOPE_MB = 400;
+function resolveForceGc() {
+  try {
+    const existing = globalThis.gc;
+    if (typeof existing === "function") return existing;
+    v8.setFlagsFromString("--expose-gc");
+    const gc = vm.runInNewContext("gc");
+    v8.setFlagsFromString("--no-expose-gc");
+    return typeof gc === "function" ? gc : null;
+  } catch {
+    return null;
+  }
+}
+var forceGc = resolveForceGc();
 function sourceTimeForOutput(map, outputTime) {
   const segs = map.segments;
   for (const s of segs) {
@@ -1654,6 +1675,7 @@ async function renderToMp4(opts) {
   opts.signal.addEventListener("abort", onAbort);
   let lastPct = -1;
   const renderStartMs = Date.now();
+  const rssSamples = [];
   try {
     if (opts.signal.aborted) throw new CanceledError();
     console.info("[worker:render-start]", {
@@ -1672,16 +1694,34 @@ async function renderToMp4(opts) {
         lastPct = pct;
         opts.onProgress({ stage: "rendering", progress: pct / 100 });
       }
+      if (forceGc && i > 0 && i % GC_EVERY === 0) forceGc();
       if (i > 0 && i % PROGRESS_LOG_EVERY === 0) {
         const mem = process.memoryUsage();
+        const rssMB = Math.round(mem.rss / 1048576);
+        const queueLen = decoder.reader.bufferedFrames();
         console.info("[worker:progress]", {
           frame: i,
           totalFrames,
           pct,
-          rssMB: Math.round(mem.rss / 1048576),
+          queueLen,
+          rssMB,
           heapUsedMB: Math.round(mem.heapUsed / 1048576),
           externalMB: Math.round(mem.external / 1048576)
         });
+        if (rssMB > MAX_RSS_MB) {
+          throw new Error(
+            `memory_leak_detected: RSS ${rssMB}MB exceeded ${MAX_RSS_MB}MB at frame ${i}/${totalFrames} \u2014 frames are not being released to ffmpeg`
+          );
+        }
+        rssSamples.push(rssMB);
+        if (rssSamples.length >= 4) {
+          const [a, b, c, d] = rssSamples.slice(-4);
+          if (b - a > LEAK_SLOPE_MB && c - b > LEAK_SLOPE_MB && d - c > LEAK_SLOPE_MB) {
+            throw new Error(
+              `memory_leak_detected: RSS rising ${a}\u2192${b}\u2192${c}\u2192${d}MB across heartbeats \u2014 frames are not being released to ffmpeg`
+            );
+          }
+        }
       }
       const outputTime = i / fps;
       const sourceTime = sourceTimeForOutput(timelineMap, outputTime);
@@ -1712,10 +1752,8 @@ async function renderToMp4(opts) {
       if (i === 0) {
         console.info("[worker:first-composed-frame]", { afterMs: Date.now() - renderStartMs });
       }
-      const img = outCtx.getImageData(0, 0, canvasW, canvasH);
-      await encoder.writeFrame(
-        Buffer.from(img.data.buffer, img.data.byteOffset, img.data.byteLength)
-      );
+      const composited = outCanvas.data();
+      await encoder.writeFrame(composited);
       if (i === 0) {
         console.info("[worker:first-frame]", { afterMs: Date.now() - renderStartMs });
       }
@@ -1751,6 +1789,18 @@ async function renderToMp4(opts) {
 // src/errors.ts
 function toUserFacingError(err) {
   const raw = (err instanceof Error ? err.message : String(err ?? "")).toLowerCase();
+  if (raw.includes("normalize_not_executed")) {
+    return {
+      code: "normalize_not_executed",
+      message: "The export could not be prepared (normalization did not run). Please try again; if it persists the render service needs an update."
+    };
+  }
+  if (raw.includes("memory_leak_detected")) {
+    return {
+      code: "memory_leak_detected",
+      message: "The export ran out of memory and was stopped. Please try again \u2014 if it keeps happening, contact support."
+    };
+  }
   if (raw.includes("no decoder found") || raw.includes("could not find codec parameters") || raw.includes("initializing a simple filtergraph") || raw.includes("error initializing")) {
     return {
       code: "audio_unsupported",
@@ -1794,6 +1844,7 @@ function toUserFacingError(err) {
 }
 
 // src/cli.ts
+var RENDER_CLI_VERSION = "2025.06-normalize+canvasdata";
 function emit(event) {
   process.stdout.write(JSON.stringify(event) + "\n");
 }
@@ -1808,6 +1859,9 @@ console.debug = toStderr;
 console.warn = toStderr;
 console.error = toStderr;
 async function main() {
+  const build = process.env.BUILD_VERSION ?? "unknown";
+  emit({ type: "version", cliVersion: RENDER_CLI_VERSION, build, node: process.version });
+  toStderr(`[worker:cli] start version=${RENDER_CLI_VERSION} build=${build} node=${process.version}`);
   const specPath = process.argv[2];
   if (!specPath) {
     emit({ type: "error", code: "bad_invocation", message: "Missing job-spec path argument." });
@@ -1859,12 +1913,13 @@ async function main() {
     if (!pf.videoDecodable) {
       throw new Error("unsupported_video: source video could not be decoded");
     }
+    const normPath = join2(dirname(spec.outputPath), "normalized-source.mp4");
+    const expectNormalize = spec.normalizeEnabled !== false;
     let renderSource = spec.sourcePath;
     let audioStatus = pf.info.hasAudio ? pf.needsAudioDrop ? "removed" : "preserved" : "none";
     let normalized = false;
-    if (spec.normalizeEnabled !== false) {
+    if (expectNormalize) {
       emit({ type: "stage", name: "normalizing" });
-      const normPath = join2(dirname(spec.outputPath), "normalized-source.mp4");
       const norm = await normalizeSource({
         sourcePath: spec.sourcePath,
         outputPath: normPath,
@@ -1879,6 +1934,24 @@ async function main() {
     if (spec.audioAlreadyDropped && audioStatus === "preserved") audioStatus = "removed";
     const audioDropped = audioStatus !== "preserved";
     if (audioStatus === "removed") pushWarning(AUDIO_UNSUPPORTED_WARNING);
+    emit({
+      type: "render-input",
+      inputFile: spec.sourcePath,
+      normalizedFile: normPath,
+      renderSource,
+      wasNormalizationRun: normalized
+    });
+    toStderr(
+      `[worker:cli] render-input input=${spec.sourcePath} normalizedFile=${normPath} renderSource=${renderSource} wasNormalizationRun=${normalized}`
+    );
+    if (expectNormalize && (!normalized || renderSource !== normPath)) {
+      throw new Error(
+        `normalize_not_executed: normalizeEnabled but normalization did not run (renderSource=${renderSource})`
+      );
+    }
+    if (normalized && !existsSync2(renderSource)) {
+      throw new Error(`normalize_not_executed: normalized-source.mp4 missing at ${renderSource}`);
+    }
     const startedMs = Date.now();
     let lastStage = "";
     let firstFrameEmitted = false;

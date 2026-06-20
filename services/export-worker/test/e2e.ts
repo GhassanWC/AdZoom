@@ -436,6 +436,44 @@ async function main(): Promise<void> {
     return "apac not reproducible on this build → silent-source path verified (audioStatus=none)";
   });
 
+  // ── Case 10: LONG render → RSS stays bounded (no per-frame memory leak) ──
+  // The reproduction of the VM OOM: render ~1500 frames and assert RSS does NOT
+  // grow ~one frame per output frame. The render's own guard throws
+  // `memory_leak_detected` past the (lowered) ceiling, so a regression FAILS here.
+  await runCase("10. long render (~1500 frames) → RSS bounded", async () => {
+    const W = 720, H = 1280, LONG_DUR = 50; // 1500 frames @30fps, ~3.7MB/frame
+    const longSrc = join(dir, "long.mp4");
+    await ff([
+      "-f", "lavfi", "-i", `testsrc2=size=${W}x${H}:rate=30:duration=${LONG_DUR}`,
+      "-f", "lavfi", "-i", `sine=frequency=440:duration=${LONG_DUR}`,
+      "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", longSrc,
+    ]);
+    const rec: SerializedRenderRecipe = { ...recipe(LONG_DUR), sourceWidth: W, sourceHeight: H };
+    const out = join(dir, "out10.mp4");
+
+    // Trip a regression well before OOM (the real per-frame leak blows past this
+    // in a few hundred frames; a properly-streamed render stays far under).
+    const prevCeiling = process.env.RENDER_MAX_RSS_MB;
+    process.env.RENDER_MAX_RSS_MB = "1800";
+    let peakRssMB = 0;
+    try {
+      await renderToMp4({
+        serialized: rec, sourcePath: longSrc, outputPath: out,
+        crf: 28, preset: "ultrafast", signal: neverAbort,
+        onProgress: () => {
+          const rss = Math.round(process.memoryUsage().rss / 1048576);
+          if (rss > peakRssMB) peakRssMB = rss;
+        },
+      });
+    } finally {
+      if (prevCeiling === undefined) delete process.env.RENDER_MAX_RSS_MB;
+      else process.env.RENDER_MAX_RSS_MB = prevCeiling;
+    }
+    const info = await assertValidMp4(out, "case10");
+    assert(peakRssMB < 1800, `case10: peak RSS ${peakRssMB}MB — not bounded (per-frame leak?)`);
+    return `${Math.round(info.durationSec * 30)} frames @ ${W}x${H}, peak RSS ${peakRssMB}MB (bounded)`;
+  });
+
   await rm(dir, { recursive: true, force: true }).catch(() => {});
 
   // ── Summary ──────────────────────────────────────────────────────────────
