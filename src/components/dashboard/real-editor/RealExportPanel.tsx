@@ -77,6 +77,46 @@ type ExportView = {
 
 const isDev = process.env.NODE_ENV === "development";
 
+type ExportValidatable = { originalVideoUrl?: string | null };
+type ValidationResult = { ok: boolean; error?: string };
+
+/**
+ * CLOUD (VM/server) export validation — deliberately INDEPENDENT of browser
+ * codec limitations. We NEVER call MediaRecorder, canPlayType, AudioContext, or
+ * any client audio/video decode capability here: the VM worker downloads,
+ * ffprobes, normalizes, and decides what's supported. Auth, plan, monthly
+ * minutes, the single-active-export rule, and resolution/fps caps are all
+ * enforced server-side by /api/export/cloud (and surfaced from its response).
+ * The only thing the client must confirm is that a source video exists.
+ */
+function validateForCloudExport(project: ExportValidatable): ValidationResult {
+  if (!project.originalVideoUrl) {
+    return { ok: false, error: "This project has no source video to export." };
+  }
+  return { ok: true };
+}
+
+/**
+ * BROWSER export validation — MAY reject for browser codec / recorder limits.
+ * This is the ONLY place a browser-support block belongs; it must never gate a
+ * cloud export.
+ */
+function validateForBrowserExport(
+  project: ExportValidatable,
+  browserSupported: boolean
+): ValidationResult {
+  if (!project.originalVideoUrl) {
+    return { ok: false, error: "This project has no source video to export." };
+  }
+  if (!browserSupported) {
+    return {
+      ok: false,
+      error: "Browser export needs a Chromium browser (Chrome or Edge).",
+    };
+  }
+  return { ok: true };
+}
+
 export function RealExportPanel({ onClose }: { onClose?: () => void }) {
   const { project, duration, updateEffects, openCanvas } = useEditorReal();
 
@@ -155,15 +195,28 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
   const sView = serverView(cloud);
   const bView = myBrowserJob ? browserView(myBrowserJob) : null;
 
+  // Keep the two engines' UIs COMPLETELY SEPARATE. A browser job only drives this
+  // dialog when we're on the browser path, or when a browser render is genuinely
+  // still running. A TERMINAL browser job (e.g. a prior failed attempt with a
+  // browser codec/audio error) must NEVER leak into the cloud-export UI and show
+  // up as the current export's error — that's the "unsupported audio format on
+  // cloud export" bug.
+  const browserViewForUi =
+    bView && (engine === "browser" || bView.phase === "active") ? bView : null;
+
   // Prefer an ACTIVE export. Otherwise surface a FRESH result: a server job we
   // STARTED/watched this session, or this session's browser job. An OLD completed
   // server export is NOT a result here — it's offered as a manual "previous
   // export" in the settings view, never an auto-downloading "Export ready".
   const activeView =
-    sView?.phase === "active" ? sView : bView?.phase === "active" ? bView : null;
+    sView?.phase === "active"
+      ? sView
+      : browserViewForUi?.phase === "active"
+        ? browserViewForUi
+        : null;
   const serverResult =
     sView && sView.phase !== "active" && cloud.isSessionResult ? sView : null;
-  const resultView = serverResult ?? bView ?? null;
+  const resultView = serverResult ?? browserViewForUi ?? null;
   const view: ExportView | null = activeView ?? resultView;
   const showStatus = !!view;
   const exportingNow = view?.phase === "active";
@@ -189,32 +242,63 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
     visualAnalysis: project.visualAnalysis,
   };
 
+  // Explicit, logged export path. The engine is the single source of truth for
+  // which validation + submit pipeline runs — there is no implicit fallback from
+  // one to the other.
+  const exportPath: "cloud" | "browser" = engine === "server" ? "cloud" : "browser";
+
   const start = () => {
     setBlockedWarning(null);
-    if (!project.originalVideoUrl) {
-      setBlockedWarning("This project has no source video to export.");
+    cloud.clearError();
+    console.log("[export-ui:path]", { path: exportPath });
+
+    if (exportPath === "cloud") {
+      // Cloud export is INDEPENDENT of browser codec limitations. We never run
+      // MediaRecorder / canPlayType / audio-decode checks here — the VM worker
+      // ffprobes, normalizes, and decides support. Auth/plan/minutes/active are
+      // enforced server-side (and surfaced from the job/route response).
+      console.log("[export-ui:browser-validation-skipped]", { reason: "cloud-export" });
+      const v = validateForCloudExport(project);
+      if (!v.ok) {
+        console.log("[export-ui:error]", { source: "cloud", code: "precondition" });
+        setBlockedWarning(v.error!);
+        return;
+      }
+      if (blockedByActive) {
+        setBlockedWarning(cloud.alreadyRunningMessage);
+        return;
+      }
+      // Drop any stale browser job so a prior browser failure (e.g. a codec/audio
+      // error) can't bleed into the cloud-export UI for the new job.
+      if (myBrowserJob) clearJob();
+      void cloud.startCloudExport(serverInput).then((r) => {
+        if (r.ok) {
+          console.log("[export-ui:cloud-submit]", { jobId: r.jobId });
+        } else {
+          console.log("[export-ui:error]", { source: "cloud", code: r.kind ?? "start_failed" });
+          if (r.error) setBlockedWarning(r.error);
+        }
+      });
+      return;
+    }
+
+    // Browser engine — renders the SELECTED container in the browser. MP4 uses
+    // WebCodecs (Chrome/Edge) and auto-falls back to WebM where unsupported.
+    // Browser codec checks live ONLY on this path.
+    const v = validateForBrowserExport(project, supported);
+    if (!v.ok) {
+      console.log("[export-ui:error]", { source: "browser", code: "precondition" });
+      setBlockedWarning(v.error!);
       return;
     }
     if (blockedByActive) {
       setBlockedWarning(cloud.alreadyRunningMessage);
       return;
     }
-    if (engine === "server") {
-      void cloud.startCloudExport(serverInput).then((r) => {
-        if (!r.ok && r.error) setBlockedWarning(r.error);
-      });
-      return;
-    }
-    // Browser engine — renders the SELECTED container in the browser. MP4 uses
-    // WebCodecs (Chrome/Edge) and auto-falls back to WebM where unsupported.
-    if (!supported) {
-      setBlockedWarning("Browser export needs a Chromium browser (Chrome or Edge).");
-      return;
-    }
     const params: ExportRenderParams = {
       projectId: project.id,
       projectTitle: project.title,
-      originalVideoUrl: project.originalVideoUrl,
+      originalVideoUrl: project.originalVideoUrl!,
       duration: sourceDuration,
       moments,
       effects: project.effectsSettings,
@@ -231,9 +315,22 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
 
   const exportAgain = () => {
     cloud.dismiss();
+    cloud.clearError();
     clearJob();
     setBlockedWarning(null);
   };
+
+  // ── Defensive reset on dialog open ────────────────────────────────────────
+  // RealExportPanel remounts each time the dialog opens (EditorSheet only renders
+  // children while open). Clear stale errors + a leftover TERMINAL browser job so
+  // a previous attempt's validation/codec error can't surface on a fresh open. A
+  // genuinely in-flight render is preserved.
+  React.useEffect(() => {
+    setBlockedWarning(null);
+    cloud.clearError();
+    if (bJob && !isExporting && bJob.status !== "completed") clearJob();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Auto-download the browser (WebM) result ONCE — parity with the server path.
   // sessionStorage-guarded so it fires once per job, not on every dialog reopen.
