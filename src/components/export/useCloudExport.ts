@@ -26,10 +26,13 @@ import type {
  * Key behaviors the dialog relies on:
  *   • Follows the EXACT job the user started (`currentJobId`, persisted per
  *     project) — an old/stuck job can never drive the UI or freeze it at a %.
+ *   • Auto-downloads the MP4 ONCE, and ONLY for a job the user started or saw
+ *     running during THIS page load (the `sessionExportJobIds` arming set). An
+ *     old completed export sitting in Firestore is NEVER auto-downloaded on page
+ *     load, dialog open, or Firestore hydration — it's offered as a manual
+ *     "Download previous export" (`previousExport`) instead.
  *   • Enforces ONE active export per user (friendly block message) — backed up
  *     server-side.
- *   • Auto-downloads the MP4 ONCE on completion, with a spam-proof "Download
- *     again" (disabled + "Preparing…" while the bytes fetch).
  *   • Friendly stages (Queued → Preparing → Rendering → Uploading → Ready) and a
  *     heartbeat-based "stuck" state for retry/cancel.
  */
@@ -68,21 +71,24 @@ function currentKey(projectId: string): string {
   return `framevo.export.current.${projectId}`;
 }
 
-/** Once-guards for auto-download, so a completed job downloads exactly once even
- *  across dialog reopens (component remounts). */
-function wasAutoDownloaded(jobId: string): boolean {
-  try {
-    return window.sessionStorage.getItem(`framevo.export.autodl.${jobId}`) === "1";
-  } catch {
-    return false;
-  }
-}
-function markAutoDownloaded(jobId: string): void {
-  try {
-    window.sessionStorage.setItem(`framevo.export.autodl.${jobId}`, "1");
-  } catch {
-    /* ignore */
-  }
+/**
+ * Jobs the user actively STARTED or OBSERVED RUNNING during this page load.
+ *
+ * Module-level on purpose: it survives the dialog closing/reopening (the hook
+ * remounts) but is wiped on a full page reload. This is the core guarantee —
+ * auto-download is "armed" only for jobs in this set, so a completed export
+ * loaded fresh from Firestore (page load / dialog open / hydration) is NEVER
+ * armed and therefore NEVER auto-downloads.
+ */
+const sessionExportJobIds = new Set<string>();
+/** Jobs already auto-downloaded once this page load (the spam guard). */
+const autoDownloadedJobIds = new Set<string>();
+
+/** Fetch + save the job's MP4 under a friendly filename. */
+function downloadJobFile(j: ExportJobView): Promise<void> {
+  if (!j.downloadUrl) return Promise.resolve();
+  const filename = `${(j.projectTitle || "framevo-export").replace(/[^\w.-]+/g, "_")}.mp4`;
+  return downloadFile(j.downloadUrl, filename);
 }
 
 export function useCloudExport(projectId: string) {
@@ -134,17 +140,18 @@ export function useCloudExport(projectId: string) {
     return () => clearInterval(id);
   }, [anyActive]);
 
-  // The followed job: the exact one we started, else the most recent ACTIVE job
-  // for this project (so reopening shows an in-flight export), else the most
-  // recent job for the project (to show the last result). A terminal followed
-  // job is fine — it shows the result and never blocks a new export.
+  // The followed job for the live STATUS view: the exact one we started, else
+  // this project's most-recent ACTIVE job (so reopening shows an in-flight
+  // export). We deliberately do NOT fall back to an old terminal job here — a
+  // finished job we didn't start this session belongs in `previousExport`
+  // (manual download), never the live status view.
   const job = React.useMemo(() => {
     if (currentJobId) {
       const exact = jobs.find((j) => j.id === currentJobId);
       if (exact) return exact;
     }
     const mine = jobs.filter((j) => j.projectId === projectId);
-    return mine.find((j) => ACTIVE_STATUSES.includes(j.status)) ?? mine[0] ?? null;
+    return mine.find((j) => ACTIVE_STATUSES.includes(j.status)) ?? null;
   }, [jobs, currentJobId, projectId]);
 
   const isActive = !!job && ACTIVE_STATUSES.includes(job.status);
@@ -155,12 +162,47 @@ export function useCloudExport(projectId: string) {
       ? job.queuePosition
       : null;
 
+  // Jobs we watched go ACTIVE during THIS dialog mount. Auto-download fires only
+  // for these — so a job that completed while the dialog was CLOSED shows
+  // "Export ready" with a manual download on reopen, and never auto-downloads.
+  // (Distinct from the module-level `sessionExportJobIds`, which survives
+  // remounts and only decides fresh-result vs previous-export styling.)
+  const seenActiveThisMount = React.useRef<Set<string>>(new Set());
+
+  // ARM: any followed job we see RUNNING becomes eligible for a one-time
+  // auto-download when it completes — but only while THIS dialog stays open.
+  React.useEffect(() => {
+    if (job && ACTIVE_STATUSES.includes(job.status)) {
+      sessionExportJobIds.add(job.id); // survives remount → isSessionResult
+      seenActiveThisMount.current.add(job.id); // this mount → auto-download
+    }
+  }, [job]);
+
+  // A terminal followed job that we STARTED/observed this session = the fresh
+  // result to surface in the status view ("Export ready"). A terminal job NOT in
+  // the set (e.g. followed only via a persisted id after reload) is treated as a
+  // previous export instead.
+  const isSessionResult = !!job && !isActive && sessionExportJobIds.has(job.id);
+
   // ONE active export per user — a non-stale active job (any project) blocks a
   // new start. A stale active job does NOT block (the user can cancel & retry).
   const hasActiveExport = React.useMemo(
     () => jobs.some((j) => ACTIVE_STATUSES.includes(j.status) && !isJobStale(j, now)),
     [jobs, now]
   );
+
+  // Most recent COMPLETED export for this project with a usable download URL,
+  // for the manual "Download previous export" affordance. Excluded while it's
+  // the fresh on-screen result (so it isn't offered twice).
+  const previousExport = React.useMemo<ExportJobView | null>(() => {
+    const ready = jobs.filter(
+      (j) => j.projectId === projectId && j.status === "ready" && !!j.downloadUrl
+    );
+    const top = ready[0] ?? null; // subscription is createdAt desc
+    if (!top) return null;
+    if (job && job.id === top.id && isSessionResult) return null;
+    return top;
+  }, [jobs, projectId, job, isSessionResult]);
 
   // ── Frontend logs (poll/complete/error) keyed on the followed job ─────────
   const lastLog = React.useRef<string>("");
@@ -186,47 +228,43 @@ export function useCloudExport(projectId: string) {
     }
   }, [job, uiStage, queuePosition]);
 
-  // ── Auto-download ONCE on completion ──────────────────────────────────────
+  // ── Auto-download ONCE on completion — ONLY for this session's export ──────
   const [downloadStarted, setDownloadStarted] = React.useState(false);
   const [downloading, setDownloading] = React.useState(false);
-  const autoDownloadedFor = React.useRef<string | null>(null);
-
-  const runDownload = React.useCallback(
-    async (j: ExportJobView) => {
-      if (!j.downloadUrl) return;
-      setDownloading(true);
-      const filename = `${(j.projectTitle || "framevo-export").replace(/[^\w.-]+/g, "_")}.mp4`;
-      try {
-        await downloadFile(j.downloadUrl, filename);
-        setDownloadStarted(true);
-      } finally {
-        setDownloading(false);
-      }
-    },
-    []
-  );
 
   React.useEffect(() => {
     if (!job || job.status !== "ready" || !job.downloadUrl) return;
-    if (autoDownloadedFor.current === job.id) return;
-    // Guard across dialog reopens (remounts) so a completed job auto-downloads
-    // EXACTLY once, never every time the panel reopens.
-    if (wasAutoDownloaded(job.id)) {
-      autoDownloadedFor.current = job.id;
-      setDownloadStarted(true);
+    // Gate strictly: only auto-download a job we watched go active→ready in THIS
+    // open dialog. Never for old Firestore exports, hydration, or a job that
+    // finished while the dialog was closed (those get a manual download).
+    if (!seenActiveThisMount.current.has(job.id)) return;
+    if (autoDownloadedJobIds.has(job.id)) {
+      setDownloadStarted(true); // already handled — keep the "ready" copy honest
       return;
     }
-    autoDownloadedFor.current = job.id;
-    markAutoDownloaded(job.id);
-    console.log("[export-ui:complete]", { jobId: job.id, downloadUrl: "(set)" });
-    void runDownload(job);
-  }, [job, runDownload]);
+    autoDownloadedJobIds.add(job.id);
+    console.log("[export-ui:complete]", { jobId: job.id, auto: true });
+    setDownloading(true);
+    setDownloadStarted(true);
+    void downloadJobFile(job).finally(() => setDownloading(false));
+  }, [job]);
 
-  // Manual re-download — spam-proof (disabled + "Preparing…" while it runs).
+  // Manual re-download of the CURRENT result — spam-proof (disabled + "Preparing…"
+  // while the bytes fetch).
   const downloadAgain = React.useCallback(() => {
-    if (!job || downloading) return;
-    void runDownload(job);
-  }, [job, downloading, runDownload]);
+    if (!job || !job.downloadUrl || downloading) return;
+    setDownloading(true);
+    setDownloadStarted(true);
+    void downloadJobFile(job).finally(() => setDownloading(false));
+  }, [job, downloading]);
+
+  // Manual download of a PREVIOUS completed export — always manual, never auto.
+  const [downloadingPrevious, setDownloadingPrevious] = React.useState(false);
+  const downloadPrevious = React.useCallback(() => {
+    if (!previousExport || !previousExport.downloadUrl || downloadingPrevious) return;
+    setDownloadingPrevious(true);
+    void downloadJobFile(previousExport).finally(() => setDownloadingPrevious(false));
+  }, [previousExport, downloadingPrevious]);
 
   const startCloudExport = React.useCallback(
     async (input: StartCloudExportInput): Promise<StartCloudExportResult> => {
@@ -282,7 +320,10 @@ export function useCloudExport(projectId: string) {
         }
         if (data.jobId) {
           console.log("[export-ui:create]", { jobId: data.jobId, projectId: input.projectId });
-          autoDownloadedFor.current = null; // allow auto-download for the new job
+          // ARM this exact job for a one-time auto-download on completion (both
+          // sets: module → "Export ready" styling, mount ref → auto-download).
+          sessionExportJobIds.add(data.jobId);
+          seenActiveThisMount.current.add(data.jobId);
           setCurrent(data.jobId); // FOLLOW exactly this job
         }
         return { ok: true, jobId: data.jobId };
@@ -327,9 +368,11 @@ export function useCloudExport(projectId: string) {
     error,
     queuePosition,
     hasActiveExport,
-    /** True when the user is FOLLOWING a specific job for this project (started
-     *  it this session or has a persisted current job) — vs a passive fallback. */
-    following: currentJobId != null,
+    /** True when the followed terminal job is THIS session's export (a fresh
+     *  result to show as "Export ready") — vs an old completed export. */
+    isSessionResult,
+    /** Most recent completed export for this project (manual download only). */
+    previousExport,
     alreadyRunningMessage: ALREADY_RUNNING_MSG,
     startCloudExport,
     cancelCloudExport,
@@ -339,6 +382,8 @@ export function useCloudExport(projectId: string) {
     downloadStarted,
     downloading,
     downloadAgain,
+    downloadingPrevious,
+    downloadPrevious,
     clearError: React.useCallback(() => setError(null), []),
   };
 }

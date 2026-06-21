@@ -35,7 +35,7 @@ import {
 } from "@/components/export/ExportProvider";
 import { resolveOutputCanvas } from "@/lib/timeline/canvas-layout";
 import { buildTimelineMap } from "@/lib/timeline/crop-speed";
-import type { ExportFormat, FitMode } from "@/lib/firebase/schema";
+import type { ExportFormat, ExportUiStage, FitMode } from "@/lib/firebase/schema";
 import { useStoragePlan } from "@/lib/usage/useStoragePlan";
 import { planMeetsMinimum } from "@/lib/usage/plan";
 import { useCloudMinutes } from "@/lib/usage/useCloudMinutes";
@@ -61,6 +61,8 @@ const FIT_LABEL: Record<FitMode, string> = {
 type ExportView = {
   engine: "server" | "browser";
   phase: "active" | "ready" | "failed" | "canceled";
+  /** Friendly stage for the stepper (Queued → Preparing → Rendering → …). */
+  stage: ExportUiStage;
   stageLabel: string;
   percent: number;
   indeterminate: boolean;
@@ -153,11 +155,15 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
   const sView = serverView(cloud);
   const bView = myBrowserJob ? browserView(myBrowserJob) : null;
 
-  // Prefer an ACTIVE export; else the current result we should surface (a server
-  // job we're following, or this session's browser job). Otherwise → settings.
+  // Prefer an ACTIVE export. Otherwise surface a FRESH result: a server job we
+  // STARTED/watched this session, or this session's browser job. An OLD completed
+  // server export is NOT a result here — it's offered as a manual "previous
+  // export" in the settings view, never an auto-downloading "Export ready".
   const activeView =
     sView?.phase === "active" ? sView : bView?.phase === "active" ? bView : null;
-  const resultView = cloud.following && sView ? sView : bView ?? null;
+  const serverResult =
+    sView && sView.phase !== "active" && cloud.isSessionResult ? sView : null;
+  const resultView = serverResult ?? bView ?? null;
   const view: ExportView | null = activeView ?? resultView;
   const showStatus = !!view;
   const exportingNow = view?.phase === "active";
@@ -256,6 +262,7 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
         <StatusView
           view={view}
           projectId={project.id}
+          estTotalSeconds={estRenderSeconds}
           downloadStarted={view.engine === "server" ? cloud.downloadStarted : true}
           downloading={view.engine === "server" ? cloud.downloading : false}
           onDownloadAgain={
@@ -269,6 +276,15 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
         />
       ) : (
         <>
+          {/* ── Previous export (manual download only — never auto) ────────── */}
+          {cloud.previousExport && (
+            <PreviousExportCard
+              title={cloud.previousExport.projectTitle}
+              downloading={cloud.downloadingPrevious}
+              onDownload={cloud.downloadPrevious}
+            />
+          )}
+
           {/* ── Settings ──────────────────────────────────────────────────── */}
           <div className="grid grid-cols-2 gap-3">
             <Field label="Quality" lockHref={!canExport4k ? "/pricing" : undefined} lockLabel="4K — Pro">
@@ -466,6 +482,7 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
 function StatusView({
   view,
   projectId,
+  estTotalSeconds,
   downloadStarted,
   downloading,
   onDownloadAgain,
@@ -475,6 +492,7 @@ function StatusView({
 }: {
   view: ExportView;
   projectId: string;
+  estTotalSeconds: number;
   downloadStarted: boolean;
   downloading: boolean;
   onDownloadAgain: () => void;
@@ -482,10 +500,21 @@ function StatusView({
   onExportAgain: () => void;
   onClose?: () => void;
 }) {
+  // Rough remaining estimate: scale the total estimate by how much is left. For
+  // an indeterminate stage (queued/preparing) we don't have a % yet, so show the
+  // full estimate.
+  const remainingSeconds =
+    estTotalSeconds > 0
+      ? view.indeterminate
+        ? estTotalSeconds
+        : Math.max(0, Math.round(estTotalSeconds * (1 - view.percent / 100)))
+      : 0;
+
   return (
     <div className="space-y-4">
       {view.phase === "active" && (
         <div className="space-y-3 rounded-xl border border-white/10 bg-white/[0.02] px-4 py-4">
+          <StageSteps current={view.stage} />
           <div className="flex items-center justify-between text-[12.5px]">
             <span className="inline-flex items-center gap-2 font-medium text-white/90">
               <Loader2 size={13} className="animate-spin text-violet-300" />
@@ -497,16 +526,25 @@ function StatusView({
           </div>
           <div className="h-1.5 overflow-hidden rounded-full bg-white/[0.06]">
             {view.indeterminate ? (
-              <div className="h-full w-2/5 animate-pulse rounded-full bg-gradient-to-r from-violet-500 to-cyan-400" />
+              <div className="animate-indeterminate h-full w-2/5 rounded-full bg-gradient-to-r from-violet-500 to-cyan-400" />
             ) : (
               <div
                 className="h-full rounded-full bg-gradient-to-r from-violet-500 to-cyan-400 transition-[width] duration-300"
-                style={{ width: `${view.percent}%` }}
+                style={{ width: `${Math.max(2, view.percent)}%` }}
               />
             )}
           </div>
-          {view.queuePosition != null && (
-            <p className="text-[11px] text-fog">Position in queue: {view.queuePosition}</p>
+          {(view.queuePosition != null || (remainingSeconds > 0 && !view.isStale)) && (
+            <div className="flex items-center justify-between text-[11px] text-fog">
+              <span>
+                {view.queuePosition != null ? `Position in queue: ${view.queuePosition}` : ""}
+              </span>
+              {remainingSeconds > 0 && !view.isStale && (
+                <span className="inline-flex items-center gap-1">
+                  <Clock size={10} className="text-violet-300" />~{fmtDuration(remainingSeconds)} left
+                </span>
+              )}
+            </div>
           )}
           {view.isStale ? (
             <Notice tone="rose">
@@ -553,7 +591,11 @@ function StatusView({
               disabled={downloading}
               leftIcon={downloading ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
             >
-              {downloading ? "Preparing download…" : "Download again"}
+              {downloading
+                ? "Preparing download…"
+                : downloadStarted
+                  ? "Download again"
+                  : "Download"}
             </Button>
             <Button onClick={onExportAgain} variant="ghost" size="lg">
               Export again
@@ -598,6 +640,35 @@ function StatusView({
 // ── View-model builders ────────────────────────────────────────────────────
 const SERVER_ACTIVE: ReadonlyArray<string> = ["queued", "rendering", "uploading"];
 
+/** Stage order for the stepper. */
+const STAGE_ORDER: readonly ExportUiStage[] = [
+  "queued",
+  "preparing",
+  "rendering",
+  "uploading",
+  "ready",
+];
+
+/**
+ * Map the raw 0..100 progress to a display percent that matches the stage's
+ * expectations: rendering shows real progress (1–94 so it never reads 0 or
+ * jumps to done), uploading parks at 95–99, ready is 100. Queued/preparing are
+ * indeterminate, so their number is hidden anyway.
+ */
+function stageDisplayPercent(stage: ExportUiStage, rawPct: number): number {
+  switch (stage) {
+    case "queued":
+    case "preparing":
+      return 0;
+    case "rendering":
+      return Math.min(94, Math.max(1, rawPct));
+    case "uploading":
+      return Math.min(99, 95 + Math.round((rawPct / 100) * 4));
+    case "ready":
+      return 100;
+  }
+}
+
 function serverView(cloud: ReturnType<typeof useCloudExport>): ExportView | null {
   const j = cloud.job;
   if (!j) return null;
@@ -609,11 +680,13 @@ function serverView(cloud: ReturnType<typeof useCloudExport>): ExportView | null
       : j.status === "failed"
         ? "failed"
         : "canceled";
+  const rawPct = Math.round((j.progress ?? 0) * 100);
   return {
     engine: "server",
     phase,
+    stage,
     stageLabel: EXPORT_STAGE_LABEL[stage],
-    percent: Math.round((j.progress ?? 0) * 100),
+    percent: phase === "ready" ? 100 : stageDisplayPercent(stage, rawPct),
     indeterminate: isIndeterminateStage(stage),
     queuePosition: cloud.queuePosition,
     isStale: cloud.isStale,
@@ -627,8 +700,21 @@ function serverView(cloud: ReturnType<typeof useCloudExport>): ExportView | null
 
 const BROWSER_ACTIVE: ReadonlyArray<ExportStatusUI> = ["preparing", "rendering", "uploading"];
 
+function browserUiStage(status: ExportStatusUI): ExportUiStage {
+  switch (status) {
+    case "preparing":
+      return "preparing";
+    case "rendering":
+      return "rendering";
+    case "uploading":
+      return "uploading";
+    default:
+      return "ready"; // completed / failed / canceled
+  }
+}
+
 function browserView(j: ExportJob): ExportView {
-  const stage = browserStage(j.status);
+  const stage = browserUiStage(j.status);
   const phase: ExportView["phase"] = BROWSER_ACTIVE.includes(j.status)
     ? "active"
     : j.status === "completed"
@@ -636,12 +722,14 @@ function browserView(j: ExportJob): ExportView {
       : j.status === "failed"
         ? "failed"
         : "canceled";
+  const rawPct = Math.round((j.progress ?? 0) * 100);
   return {
     engine: "browser",
     phase,
-    stageLabel: stage.label,
-    percent: Math.round((j.progress ?? 0) * 100),
-    indeterminate: stage.indeterminate,
+    stage,
+    stageLabel: EXPORT_STAGE_LABEL[stage],
+    percent: phase === "ready" ? 100 : stageDisplayPercent(stage, rawPct),
+    indeterminate: isIndeterminateStage(stage),
     queuePosition: null,
     isStale: false,
     jobId: j.id && j.id !== "pending" ? j.id : undefined,
@@ -651,24 +739,97 @@ function browserView(j: ExportJob): ExportView {
   };
 }
 
-function browserStage(status: ExportStatusUI): { label: string; indeterminate: boolean } {
-  switch (status) {
-    case "preparing":
-      return { label: "Preparing your video…", indeterminate: true };
-    case "rendering":
-      return { label: "Rendering", indeterminate: false };
-    case "uploading":
-      return { label: "Uploading", indeterminate: false };
-    case "completed":
-      return { label: "Ready", indeterminate: false };
-    case "failed":
-      return { label: "Failed", indeterminate: false };
-    case "canceled":
-      return { label: "Canceled", indeterminate: false };
-  }
+// ── Small building blocks ──────────────────────────────────────────────────
+
+/** Compact labels for the progress stepper. */
+const STAGE_SHORT: Record<ExportUiStage, string> = {
+  queued: "Queued",
+  preparing: "Preparing",
+  rendering: "Rendering",
+  uploading: "Uploading",
+  ready: "Ready",
+};
+
+/** Horizontal Queued → Preparing → Rendering → Uploading → Ready stepper. */
+function StageSteps({ current }: { current: ExportUiStage }) {
+  const currentIdx = STAGE_ORDER.indexOf(current);
+  return (
+    <div className="grid grid-cols-5 gap-1.5">
+      {STAGE_ORDER.map((s, i) => {
+        const done = i < currentIdx;
+        const active = i === currentIdx;
+        return (
+          <div key={s} className="flex flex-col items-center gap-1">
+            <div
+              className={cn(
+                "h-1 w-full rounded-full transition-colors duration-300",
+                done
+                  ? "bg-violet-500"
+                  : active
+                    ? "bg-gradient-to-r from-violet-500 to-cyan-400"
+                    : "bg-white/[0.08]"
+              )}
+            />
+            <span
+              className={cn(
+                "text-[9px] font-medium leading-none transition-colors duration-300",
+                done || active ? "text-violet-200" : "text-fog/60"
+              )}
+            >
+              {STAGE_SHORT[s]}
+            </span>
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
-// ── Small building blocks ──────────────────────────────────────────────────
+/**
+ * "Previous export available" — a previously completed export found in storage.
+ * Manual download ONLY (never auto-downloaded), so opening the dialog can't
+ * spam-download old files. Distinct styling from a freshly-completed export.
+ */
+function PreviousExportCard({
+  title,
+  downloading,
+  onDownload,
+}: {
+  title: string;
+  downloading: boolean;
+  onDownload: () => void;
+}) {
+  return (
+    <div className="flex items-center justify-between gap-3 rounded-xl border border-white/10 bg-white/[0.02] px-4 py-3">
+      <div className="flex min-w-0 items-center gap-2.5">
+        <span className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg border border-emerald-400/20 bg-emerald-500/10 text-emerald-300">
+          <CheckCircle2 size={15} />
+        </span>
+        <div className="min-w-0">
+          <div className="text-[12.5px] font-medium text-white">Previous export available</div>
+          <div className="truncate text-[11px] text-fog">{title || "Your last MP4"}</div>
+        </div>
+      </div>
+      <Button
+        onClick={onDownload}
+        variant="glass"
+        size="sm"
+        disabled={downloading}
+        leftIcon={
+          downloading ? (
+            <Loader2 size={14} className="animate-spin" />
+          ) : (
+            <Download size={14} />
+          )
+        }
+        className="shrink-0 whitespace-nowrap"
+      >
+        {downloading ? "Preparing…" : "Download previous export"}
+      </Button>
+    </div>
+  );
+}
+
 function Field({
   label,
   lockHref,
