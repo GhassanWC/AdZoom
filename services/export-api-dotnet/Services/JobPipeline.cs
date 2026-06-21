@@ -133,6 +133,16 @@ public sealed class JobPipeline(
                 case "first-frame":
                     log.LogInformation("[export:first-frame] job={JobId} afterMs={Ms}", jobId, ev.Ms);
                     break;
+                case "audio-verify":
+                    // Pre-upload audio integrity (ffprobe on the final mp4). A
+                    // `outputHasAudio=false` while `audioStatus=preserved` is the
+                    // signal the CLI fails on as audio_missing_after_render.
+                    log.LogInformation(
+                        "[{Tag}:audio-verify] job={JobId} audioStatus={St} sourceAudio={SA} sourceCodec={SC} normalizedAudio={NA} outputAudio={OA} outputCodec={OC} outDur={OD} vidDur={VD} diff={Diff}",
+                        opts.WorkerTag, jobId, ev.AudioStatus, ev.SourceHasAudio, ev.SourceAudioCodec,
+                        ev.NormalizedHasAudio, ev.OutputHasAudio, ev.OutputAudioCodec,
+                        ev.OutputDurationSec, ev.VideoDurationSec, ev.DurationDiffSec);
+                    break;
                 case "warning":
                     if (!string.IsNullOrEmpty(ev.Message) && !warnings.Contains(ev.Message!))
                         warnings.Add(ev.Message!);

@@ -55,7 +55,7 @@ console.error = toStderr as typeof console.error;
 
 import { renderToMp4 } from "./render.js";
 import { computePreflight, AUDIO_UNSUPPORTED_WARNING } from "./preflight.js";
-import { normalizeSource } from "./ffmpeg.js";
+import { normalizeSource, probeSource } from "./ffmpeg.js";
 import { toUserFacingError } from "./errors.js";
 import type { SerializedRenderRecipe } from "@/lib/firebase/schema";
 
@@ -149,13 +149,21 @@ async function main(): Promise<void> {
     let normalized = false;
     if (expectNormalize) {
       emit({ type: "stage", name: "normalizing" });
-      const norm = await normalizeSource({
-        sourcePath: spec.sourcePath,
-        outputPath: normPath,
-        crf: spec.normalizeCrf ?? 18,
-        preset: spec.normalizePreset ?? "veryfast",
-        signal: controller.signal,
-      });
+      let norm;
+      try {
+        norm = await normalizeSource({
+          sourcePath: spec.sourcePath,
+          outputPath: normPath,
+          crf: spec.normalizeCrf ?? 18,
+          preset: spec.normalizePreset ?? "veryfast",
+          signal: controller.signal,
+        });
+      } catch (err) {
+        if (controller.signal.aborted) throw err; // cancel — handled below
+        // Tag so the failed job records `normalize_failed` (raw detail → stderr/logs).
+        const detail = err instanceof Error ? err.message : String(err);
+        throw new Error(`normalize_failed: ${detail}`);
+      }
       renderSource = normPath;
       normalized = true;
       audioStatus = norm.audioStatus;
@@ -214,6 +222,43 @@ async function main(): Promise<void> {
     });
 
     for (const w of result.warnings) pushWarning(w);
+
+    // 3b. Audio-integrity check — run ffprobe on the FINAL mp4 before the
+    // orchestrator uploads it. If the render source carried usable audio that we
+    // did NOT intentionally drop (apac → silent fallback), the output MUST have
+    // audio. A silent output here is a real bug, not an unsupported codec — fail
+    // with `audio_missing_after_render` so the orchestrator never uploads it.
+    const [renderSrcProbe, outProbe] = await Promise.all([
+      probeSource(renderSource).catch(() => null),
+      probeSource(spec.outputPath).catch(() => null),
+    ]);
+    const outDur = outProbe?.durationSec ?? 0;
+    const srcDur = renderSrcProbe?.durationSec ?? 0;
+    emit({
+      type: "audio-verify",
+      audioStatus,
+      sourceHasAudio: pf.info.hasAudio,
+      sourceAudioCodec: audioCodec || "(none)",
+      normalizedHasAudio: renderSrcProbe?.hasAudio ?? null,
+      outputHasAudio: outProbe?.hasAudio ?? null,
+      outputAudioCodec: outProbe?.audioCodec || "(none)",
+      outputDurationSec: outDur,
+      videoDurationSec: srcDur,
+      durationDiffSec: Math.abs(outDur - srcDur),
+    });
+    toStderr(
+      `[worker:cli] audio-verify audioStatus=${audioStatus} sourceAudio=${pf.info.hasAudio} ` +
+        `normalizedAudio=${renderSrcProbe?.hasAudio} outputAudio=${outProbe?.hasAudio} ` +
+        `outputCodec=${outProbe?.audioCodec || "(none)"} outDur=${outDur.toFixed(2)} ` +
+        `vidDur=${srcDur.toFixed(2)} diff=${Math.abs(outDur - srcDur).toFixed(2)}`
+    );
+    // Only "preserved" means audio should be present (removed/none = silent by design).
+    if (audioStatus === "preserved" && outProbe && !outProbe.hasAudio) {
+      throw new Error(
+        "audio_missing_after_render: render source has audio but final output has none"
+      );
+    }
+
     emit({
       type: "done",
       warnings,

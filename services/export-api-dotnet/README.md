@@ -129,6 +129,42 @@ The Firestore composite index `(status, updatedAt)` collection-group on
 `exportJobs` (already in `firestore.indexes.json`) is reused by both the poller
 and the reconciler — no new index required.
 
+## Build + deploy to the GCE VM worker (production)
+
+Production rendering runs on the **long-lived GCE VM** (`services/export-vm-worker/docker-compose.yml`)
+— the SAME image as Cloud Run, but `EXPORT_WORKER_MODE=firestore-poll` so a 2–3 min
+render is never cut off. Next.js creates the job doc (`EXPORT_BACKEND=vm`); the VM
+poller claims + renders. Deploy a new build with a **unique tag** so a stale image is
+obvious, then recreate the container and confirm the build in the logs:
+
+```bash
+# 1. Build + push a uniquely-tagged image (Cloud Build, repo-root context). The
+#    git sha is baked into BUILD_VERSION AND used as the image tag.
+TAG=$(git rev-parse --short HEAD)
+IMAGE=us-central1-docker.pkg.dev/adzoom-prod/framevo/export-api:$TAG
+gcloud builds submit --project=adzoom-prod \
+  --config=services/export-api-dotnet/cloudbuild.yaml \
+  --substitutions=_IMAGE=$IMAGE,_BUILD_VERSION=$TAG .
+
+# 2. On the VM: point docker-compose at the new tag, pull, recreate.
+gcloud compute ssh framevo-export-vm --zone=<zone> --command "\
+  cd /opt/framevo/export-vm-worker && \
+  sed -i 's#export-api:.*#export-api:$TAG#' .env 2>/dev/null; \
+  EXPORT_IMAGE=$IMAGE docker compose pull && \
+  EXPORT_IMAGE=$IMAGE docker compose up -d --force-recreate"
+
+# 3. Verify the NEW build is running (both lines must show the new $TAG):
+gcloud compute ssh framevo-export-vm --zone=<zone> --command \
+  "docker logs --tail=200 framevo-export-worker 2>&1 | grep -E 'startup|cli-version'"
+#   [export:startup] … build=<TAG> …
+#   [vm-worker:cli-version] job=… build=<TAG> …   (emitted on the first render)
+```
+
+The `[vm-worker:cli-version] build=<TAG>` line is the proof the VM is on the new
+render core; if it shows an old value (or never appears), the image didn't roll.
+No new env vars are required by this change — `BUILD_VERSION` is set by the image
+ARG and `EXPORT_WORKER_ID` defaults to `hostname#pid` (the container id + process).
+
 ## Firestore job schema
 
 Doc: `users/{uid}/exportJobs/{jobId}` (client read-only per `firestore.rules`;
@@ -147,10 +183,21 @@ this API writes via server credentials).
 | `renderRecipe` | map | opaque; stored + forwarded to the CLI |
 | `warnings` | string[] | e.g. unsupported-audio notice |
 | `preflight` | map | `{ videoCodec, audioCodec, risky, normalized }` |
-| `errorCode` / `errorMessage` | string | clean, user-facing on failure |
+| `errorCode` / `errorMessage` | string | clean, user-facing on failure (codes below) |
 | `cancelRequested` | bool | set by cancel |
 | `downloadUrl` | string | set at success |
-| `createdAt`/`updatedAt`/`startedAt`/`completedAt`/`canceledAt` | Timestamp | server timestamps |
+| `exportPath` | string | always `cloud` for this collection (browser exports live in `exports`) |
+| `settingsHash` | string | dedup key (project+source+format/res/fps+recipe) — repeated identical export returns the active job |
+| `workerId` / `buildVersion` | string | which container + image touched the job (claim/fail) — names the producer on a failed row |
+| `claimedAt` / `lastHeartbeatAt` | Timestamp | claim time + liveness beat (every patch/heartbeat); drives stale detection |
+| `progressStage` | string | friendly UI stage: `queued`/`preparing`/`rendering`/`uploading`/`ready` |
+| `createdAt`/`updatedAt`/`startedAt`/`completedAt`/`failedAt`/`canceledAt` | Timestamp | server timestamps (`failedAt` set on failure) |
+
+**Error codes** (`errorCode`, aligned with the Node CLI's `errors.ts`):
+`audio_decode_failed` · `normalize_failed` · `render_failed` · `upload_failed` ·
+`audio_missing_after_render` (source had usable audio but the final mp4 is silent —
+ffprobe-verified before upload) · `stale` (dead worker, swept by the reconciler or
+superseded by a fresh export) · plus `decode_failed`/`unsupported_video`/`render_stalled`.
 
 Ledger: `users/{uid}/usage/{YYYY-MM}` — `cloudMinutesReserved`,
 `cloudMinutesConsumed` (`remaining = limit − reserved − consumed`;

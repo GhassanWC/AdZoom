@@ -76,10 +76,12 @@ public sealed class ExportOptions
     /// BUILD_VERSION. Logged at startup + per job so a STALE VM image is obvious.</summary>
     public string BuildVersion { get; set; } = "unknown";
 
-    /// <summary>Stable id of THIS worker, recorded on claimed jobs so the queue is
-    /// safe across MULTIPLE VM workers (which VM took which job). From
-    /// EXPORT_WORKER_ID; falls back to the machine name.</summary>
-    public string WorkerId { get; set; } = Environment.MachineName;
+    /// <summary>Stable id of THIS worker, recorded on claimed/failed jobs so the
+    /// queue is safe across MULTIPLE VM workers and a failed row can name the exact
+    /// container that produced it. From EXPORT_WORKER_ID; falls back to
+    /// hostname#pid (in Docker the hostname is the container id, so this uniquely
+    /// identifies the VM/container + process).</summary>
+    public string WorkerId { get; set; } = $"{Environment.MachineName}#{Environment.ProcessId}";
 
     /// <summary>Resolve from env with appsettings fallback; env wins (Cloud Run sets env).</summary>
     public static ExportOptions Load(IConfiguration config)

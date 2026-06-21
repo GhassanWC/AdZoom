@@ -34,9 +34,27 @@ public static class JobFields
     public const string MonthlyBucket = "monthlyBucket";
     public const string SourceStoragePath = "sourceStoragePath";
     public const string OutputPath = "outputPath";
+    public const string ProgressStage = "progressStage";
+    public const string FailedAt = "failedAt";
+
+    // Multi-VM attribution / liveness / dedup (mirrors the Node worker + Next.js create)
+    public const string WorkerId = "workerId";
+    public const string BuildVersion = "buildVersion";
+    public const string ClaimedAt = "claimedAt";
+    public const string LastHeartbeatAt = "lastHeartbeatAt";
+    public const string ExportPath = "exportPath";
+    public const string SettingsHash = "settingsHash";
 
     // Usage ledger fields
     public const string CloudMinutesReserved = "cloudMinutesReserved";
     public const string CloudMinutesConsumed = "cloudMinutesConsumed";
     public const string LastCloudExportAt = "lastCloudExportAt";
+
+    // ── Aligned error codes (shared with the Node CLI's errors.ts) ───────────
+    public const string ErrStale = "stale";
+    public const string ErrAudioDecodeFailed = "audio_decode_failed";
+    public const string ErrNormalizeFailed = "normalize_failed";
+    public const string ErrRenderFailed = "render_failed";
+    public const string ErrUploadFailed = "upload_failed";
+    public const string ErrAudioMissingAfterRender = "audio_missing_after_render";
 }

@@ -45,6 +45,15 @@ public sealed class RenderEvent
     [JsonPropertyName("normalizedFile")] public string? NormalizedFile { get; set; }
     [JsonPropertyName("renderSource")] public string? RenderSource { get; set; }
     [JsonPropertyName("wasNormalizationRun")] public bool? WasNormalizationRun { get; set; }
+    // audio-verify (post-render ffprobe of the final mp4 — before upload)
+    [JsonPropertyName("sourceHasAudio")] public bool? SourceHasAudio { get; set; }
+    [JsonPropertyName("sourceAudioCodec")] public string? SourceAudioCodec { get; set; }
+    [JsonPropertyName("normalizedHasAudio")] public bool? NormalizedHasAudio { get; set; }
+    [JsonPropertyName("outputHasAudio")] public bool? OutputHasAudio { get; set; }
+    [JsonPropertyName("outputAudioCodec")] public string? OutputAudioCodec { get; set; }
+    [JsonPropertyName("outputDurationSec")] public double? OutputDurationSec { get; set; }
+    [JsonPropertyName("videoDurationSec")] public double? VideoDurationSec { get; set; }
+    [JsonPropertyName("durationDiffSec")] public double? DurationDiffSec { get; set; }
 
     public static readonly JsonSerializerOptions JsonOpts = new()
     {

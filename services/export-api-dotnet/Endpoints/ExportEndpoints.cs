@@ -107,8 +107,17 @@ public static class ExportEndpoints
             {
                 var resp = await fs.EnqueueAsync(req);
                 signal.Notify(req.Uid!, resp.JobId); // wake the runner now (poll is the fallback)
-                log.LogInformation("[export:enqueue] created job={JobId} uid={Uid}", resp.JobId, req.Uid);
+                log.LogInformation("[export:enqueue] {Verb} job={JobId} uid={Uid} deduped={Deduped}",
+                    resp.Deduped ? "deduped" : "created", resp.JobId, req.Uid, resp.Deduped);
                 return Results.Ok(resp);
+            }
+            catch (ExportAlreadyRunningException)
+            {
+                return Results.Json(new ApiError
+                {
+                    Error = "You already have an export running. Wait for it to finish or cancel it.",
+                    Kind = "export_already_running",
+                }, statusCode: StatusCodes.Status409Conflict);
             }
             catch (PlanNotAllowedException e)
             {

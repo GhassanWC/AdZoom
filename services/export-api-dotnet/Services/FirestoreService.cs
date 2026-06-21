@@ -34,6 +34,34 @@ public sealed class FirestoreService(FirestoreDb db, ExportOptions opts, ILogger
         var outputPath = $"users/{uid}/projects/{req.ProjectId}/exports/{jobId}.mp4";
         var recipe = FirestoreJson.Convert(req.SerializedRecipe);
         var wants4kOr60 = req.Resolution == "4K" || req.Fps == 60;
+        var settingsHash = SettingsHash.Compute(
+            req.ProjectId!, req.SourceStoragePath!, null, req.Resolution, req.Fps, req.SerializedRecipe);
+
+        // ── Dedup + single-flight against the user's active jobs (mirrors
+        //    src/lib/export/create-job.ts). Identical active export → return it;
+        //    a different active export → 409; stale active → fail + release. ──
+        var (dupId, otherActive, staleIds) = await CheckActiveForDedupAsync(uid, req.ProjectId!, settingsHash);
+        if (dupId is not null)
+        {
+            var dupSnap = await JobRef(uid, dupId).GetSnapshotAsync();
+            var dupPlan = GetString(dupSnap, "plan") == Plan.Creator ? Plan.Creator : Plan.Pro;
+            log.LogInformation("[export:enqueue] dedup — returning existing active job uid={Uid} jobId={JobId} settingsHash={Hash}", uid, dupId, settingsHash);
+            return new EnqueueResponse
+            {
+                JobId = dupId,
+                Deduped = true,
+                EstimatedExportMinutes = (int)GetLong(dupSnap, JobFields.EstimatedExportMinutes),
+                Plan = dupPlan,
+                Priority = dupPlan == Plan.Creator ? "priority" : "normal",
+                Limit = Plan.Limit(dupPlan),
+            };
+        }
+        foreach (var staleId in staleIds)
+        {
+            try { await FailStaleAsync(uid, staleId); }
+            catch (Exception ex) { log.LogWarning(ex, "[export:enqueue] fail-stale error (continuing) jobId={JobId}", staleId); }
+        }
+        if (otherActive) throw new ExportAlreadyRunningException();
 
         var livePlan = await db.RunTransactionAsync(async tx =>
         {
@@ -69,6 +97,9 @@ public sealed class FirestoreService(FirestoreDb db, ExportOptions opts, ILogger
                 [JobFields.SourceStoragePath] = req.SourceStoragePath,
                 [JobFields.OutputPath] = outputPath,
                 ["format"] = "mp4",
+                [JobFields.ExportPath] = "cloud",
+                [JobFields.SettingsHash] = settingsHash,
+                [JobFields.BuildVersion] = opts.BuildVersion,
                 ["outputWidth"] = req.OutputWidth,
                 ["outputHeight"] = req.OutputHeight,
                 ["fps"] = req.Fps,
@@ -76,6 +107,7 @@ public sealed class FirestoreService(FirestoreDb db, ExportOptions opts, ILogger
                 [JobFields.EstimatedExportMinutes] = estimate,
                 [JobFields.Progress] = 0,
                 [JobFields.Stage] = JobFields.Queued,
+                [JobFields.ProgressStage] = "queued",
                 [JobFields.MonthlyBucket] = month,
                 ["renderRecipe"] = recipe,
                 ["createdAt"] = FieldValue.ServerTimestamp,
@@ -120,11 +152,12 @@ public sealed class FirestoreService(FirestoreDb db, ExportOptions opts, ILogger
             {
                 [JobFields.Status] = JobFields.Rendering,
                 [JobFields.Stage] = "downloading",
-                ["progressStage"] = "preparing",
-                // Multi-VM attribution + liveness — which worker took the job, when.
-                ["workerId"] = opts.WorkerId,
-                ["claimedAt"] = FieldValue.ServerTimestamp,
-                ["lastHeartbeatAt"] = FieldValue.ServerTimestamp,
+                [JobFields.ProgressStage] = "preparing",
+                // Multi-VM attribution + liveness — which worker + build took the job, when.
+                [JobFields.WorkerId] = opts.WorkerId,
+                [JobFields.BuildVersion] = opts.BuildVersion,
+                [JobFields.ClaimedAt] = FieldValue.ServerTimestamp,
+                [JobFields.LastHeartbeatAt] = FieldValue.ServerTimestamp,
                 [JobFields.Progress] = 0,
                 [JobFields.StartedAt] = FieldValue.ServerTimestamp,
                 [JobFields.UpdatedAt] = FieldValue.ServerTimestamp,
@@ -135,10 +168,13 @@ public sealed class FirestoreService(FirestoreDb db, ExportOptions opts, ILogger
         return (result, result == ClaimResult.Claimed ? claimed : null);
     }
 
-    /// <summary>Merge a patch + bump updatedAt (server timestamp). Used for stage/progress/heartbeat.</summary>
+    /// <summary>Merge a patch + bump updatedAt + lastHeartbeatAt (server timestamps).
+    /// Every stage/progress write doubles as a liveness beat so stale detection only
+    /// fires for a genuinely dead worker.</summary>
     public Task PatchAsync(string uid, string jobId, Dictionary<string, object?> data)
     {
         data[JobFields.UpdatedAt] = FieldValue.ServerTimestamp;
+        data[JobFields.LastHeartbeatAt] = FieldValue.ServerTimestamp;
         return JobRef(uid, jobId).SetAsync(data, SetOptions.MergeAll);
     }
 
@@ -216,11 +252,85 @@ public sealed class FirestoreService(FirestoreDb db, ExportOptions opts, ILogger
                 [JobFields.Status] = JobFields.Failed,
                 [JobFields.ErrorCode] = code,
                 [JobFields.ErrorMessage] = message,
+                [JobFields.WorkerId] = opts.WorkerId,
+                [JobFields.BuildVersion] = opts.BuildVersion,
+                [JobFields.FailedAt] = FieldValue.ServerTimestamp,
                 [JobFields.CompletedAt] = FieldValue.ServerTimestamp,
                 [JobFields.UpdatedAt] = FieldValue.ServerTimestamp,
             }, SetOptions.MergeAll);
             return true;
         });
+    }
+
+    /// <summary>Fail a STALE active job ("stale") + release its reservation, reading
+    /// its month/estimate from the doc. Used by the create-path dedup when an active
+    /// job's heartbeat has expired. Guarded so it never clobbers a terminal job.</summary>
+    public Task<bool> FailStaleAsync(string uid, string jobId)
+    {
+        return db.RunTransactionAsync(async tx =>
+        {
+            var jobRef = JobRef(uid, jobId);
+            var snap = await tx.GetSnapshotAsync(jobRef);
+            if (!snap.Exists || JobFields.IsTerminal(GetString(snap, JobFields.Status))) return false;
+            var month = GetString(snap, JobFields.MonthlyBucket) ?? CurrentMonthKey();
+            var estimate = (int)GetLong(snap, JobFields.EstimatedExportMinutes);
+            if (estimate > 0)
+            {
+                var usageRef = UsageRef(uid, month);
+                var us = await tx.GetSnapshotAsync(usageRef);
+                var reserved = GetLong(us, JobFields.CloudMinutesReserved);
+                tx.Set(usageRef, new Dictionary<string, object?>
+                {
+                    [JobFields.CloudMinutesReserved] = Math.Max(0, reserved - estimate),
+                    [JobFields.UpdatedAt] = NowMs(),
+                }, SetOptions.MergeAll);
+            }
+            tx.Set(jobRef, new Dictionary<string, object?>
+            {
+                [JobFields.Status] = JobFields.Failed,
+                [JobFields.ErrorCode] = JobFields.ErrStale,
+                [JobFields.ErrorMessage] = "This export timed out (the render service stopped responding). Please try again.",
+                [JobFields.WorkerId] = opts.WorkerId,
+                [JobFields.BuildVersion] = opts.BuildVersion,
+                [JobFields.FailedAt] = FieldValue.ServerTimestamp,
+                [JobFields.UpdatedAt] = FieldValue.ServerTimestamp,
+            }, SetOptions.MergeAll);
+            return true;
+        });
+    }
+
+    /// <summary>Find a fresh identical active job (dedup), whether a DIFFERENT export
+    /// is active (single-flight), and any STALE active jobs to clean up. Best-effort:
+    /// a query failure returns "nothing found" so a create is never blocked by it.</summary>
+    private async Task<(string? DuplicateJobId, bool OtherActive, List<string> StaleJobIds)>
+        CheckActiveForDedupAsync(string uid, string projectId, string settingsHash)
+    {
+        var staleIds = new List<string>();
+        string? dup = null;
+        var other = false;
+        try
+        {
+            var snap = await JobsCol(uid)
+                .WhereIn(JobFields.Status, JobFields.ActiveStatuses)
+                .Limit(10)
+                .GetSnapshotAsync();
+            foreach (var d in snap.Documents)
+            {
+                var beatField = d.ContainsField(JobFields.LastHeartbeatAt)
+                    ? JobFields.LastHeartbeatAt
+                    : JobFields.UpdatedAt;
+                if (AgeMs(d, beatField) > opts.HeartbeatStaleSeconds * 1000L) { staleIds.Add(d.Id); continue; }
+                if (GetString(d, "projectId") == projectId && GetString(d, JobFields.SettingsHash) == settingsHash)
+                    dup = d.Id;
+                else
+                    other = true;
+            }
+        }
+        catch (Exception ex)
+        {
+            log.LogWarning(ex, "[export:enqueue] dedup query failed (continuing) uid={Uid}", uid);
+        }
+        return (dup, other, staleIds);
     }
 
     // ── Cancel: authoritative release + canceled (ports cancel/route.ts) ─────
@@ -339,8 +449,11 @@ public sealed class FirestoreService(FirestoreDb db, ExportOptions opts, ILogger
                     tx.Set(doc.Reference, new Dictionary<string, object?>
                     {
                         [JobFields.Status] = JobFields.Failed,
-                        [JobFields.ErrorCode] = "stale_timeout",
+                        [JobFields.ErrorCode] = JobFields.ErrStale,
                         [JobFields.ErrorMessage] = "This export stalled and was stopped. Please try exporting again.",
+                        [JobFields.WorkerId] = opts.WorkerId,
+                        [JobFields.BuildVersion] = opts.BuildVersion,
+                        [JobFields.FailedAt] = FieldValue.ServerTimestamp,
                         [JobFields.CompletedAt] = FieldValue.ServerTimestamp,
                         [JobFields.UpdatedAt] = FieldValue.ServerTimestamp,
                     }, SetOptions.MergeAll);
@@ -372,6 +485,11 @@ public sealed class FirestoreService(FirestoreDb db, ExportOptions opts, ILogger
         Status = GetString(snap, JobFields.Status),
         Stage = GetString(snap, JobFields.Stage),
         Progress = GetDouble(snap, JobFields.Progress),
+        ProgressPercent = (int)Math.Round(GetDouble(snap, JobFields.Progress) * 100),
+        ExportPath = GetString(snap, JobFields.ExportPath) ?? "cloud",
+        SettingsHash = GetString(snap, JobFields.SettingsHash),
+        BuildVersion = GetString(snap, JobFields.BuildVersion),
+        WorkerId = GetString(snap, JobFields.WorkerId),
         DownloadUrl = GetString(snap, JobFields.DownloadUrl),
         ErrorCode = GetString(snap, JobFields.ErrorCode),
         ErrorMessage = GetString(snap, JobFields.ErrorMessage),
@@ -388,6 +506,7 @@ public sealed class FirestoreService(FirestoreDb db, ExportOptions opts, ILogger
         UpdatedAt = TsMs(snap, JobFields.UpdatedAt),
         StartedAt = TsMs(snap, JobFields.StartedAt),
         CompletedAt = TsMs(snap, JobFields.CompletedAt),
+        FailedAt = TsMs(snap, JobFields.FailedAt),
         CanceledAt = TsMs(snap, JobFields.CanceledAt),
     };
 

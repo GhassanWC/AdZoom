@@ -37,6 +37,8 @@ public sealed class EnqueueResponse
 {
     public bool Ok { get; set; } = true;
     public string JobId { get; set; } = "";
+    /// <summary>True when an identical active job already existed (no new job created).</summary>
+    public bool Deduped { get; set; }
     public int EstimatedExportMinutes { get; set; }
     public string Plan { get; set; } = "";
     public string Priority { get; set; } = "";
@@ -61,6 +63,11 @@ public sealed class JobView
     public string? Status { get; set; }
     public string? Stage { get; set; }
     public double Progress { get; set; }
+    public int ProgressPercent { get; set; }
+    public string? ExportPath { get; set; }
+    public string? SettingsHash { get; set; }
+    public string? BuildVersion { get; set; }
+    public string? WorkerId { get; set; }
     public string? DownloadUrl { get; set; }
     public string? ErrorCode { get; set; }
     public string? ErrorMessage { get; set; }
@@ -77,5 +84,6 @@ public sealed class JobView
     public long? UpdatedAt { get; set; }
     public long? StartedAt { get; set; }
     public long? CompletedAt { get; set; }
+    public long? FailedAt { get; set; }
     public long? CanceledAt { get; set; }
 }

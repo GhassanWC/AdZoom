@@ -19,3 +19,6 @@ public sealed class MinutesExhaustedException(int remaining, int requested, stri
     public int Requested { get; } = requested;
     public string Plan { get; } = plan;
 }
+
+/// <summary>A DIFFERENT export is already active for this user. → 409 export_already_running.</summary>
+public sealed class ExportAlreadyRunningException() : Exception("You already have an export running.");
