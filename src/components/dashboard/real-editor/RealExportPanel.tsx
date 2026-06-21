@@ -248,6 +248,9 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
   const exportPath: "cloud" | "browser" = engine === "server" ? "cloud" : "browser";
 
   const start = () => {
+    // Client-side lock: a create request is already in flight — ignore extra
+    // clicks so a double-click can't spawn two jobs (the server dedups too).
+    if (cloud.starting) return;
     setBlockedWarning(null);
     cloud.clearError();
     console.log("[export-ui:path]", { path: exportPath });
@@ -350,8 +353,13 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
     if (!already) downloadCurrent();
   }, [myBrowserJob?.status, myBrowserJob?.id, downloadCurrent]);
 
-  const primaryLabel =
-    engine === "server" ? "Export MP4" : container === "mp4" ? "Export MP4" : "Export WebM";
+  const primaryLabel = cloud.starting
+    ? "Starting export…"
+    : engine === "server"
+      ? "Export MP4"
+      : container === "mp4"
+        ? "Export MP4"
+        : "Export WebM";
 
   return (
     <div className="flex flex-col gap-4 px-5 py-5">
@@ -561,8 +569,14 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
                   onClick={start}
                   variant="primary"
                   size="lg"
-                  leftIcon={<Download size={15} />}
-                  disabled={blockedByActive || (engine === "browser" && !supported)}
+                  leftIcon={
+                    cloud.starting ? (
+                      <Loader2 size={15} className="animate-spin" />
+                    ) : (
+                      <Download size={15} />
+                    )
+                  }
+                  disabled={blockedByActive || cloud.starting || (engine === "browser" && !supported)}
                 >
                   {primaryLabel}
                 </Button>

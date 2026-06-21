@@ -11,16 +11,21 @@
  */
 import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { tmpdir, hostname } from "node:os";
 import { join, extname } from "node:path";
 import { FieldValue, type Firestore } from "firebase-admin/firestore";
 import { getAdmin, bucket } from "./firebase.js";
 import { loadConfig, type WorkerConfig } from "./config.js";
 import { renderToMp4, CanceledError } from "./render.js";
-import { normalizeSource } from "./ffmpeg.js";
+import { normalizeSource, probeSource, isUnsupportedAudioCodec } from "./ffmpeg.js";
 import { computePreflight, AUDIO_UNSUPPORTED_WARNING } from "./preflight.js";
 import { toUserFacingError } from "./errors.js";
 import type { ExportJobDoc, ProjectDoc } from "@/lib/firebase/schema";
+
+/** Identity of THIS worker process, stamped on every job it touches (so a failed
+ *  row can name the worker + build that produced it). */
+const WORKER_ID = process.env.EXPORT_WORKER_ID || hostname() || "worker";
+const BUILD_VERSION = process.env.BUILD_VERSION ?? "unknown";
 
 /**
  * A claimed job is "owned" only while its owner is HEARTBEATING. The worker bumps
@@ -89,7 +94,11 @@ async function claimJob(
       status: "rendering",
       stage: "downloading",
       progress: 0,
+      workerId: WORKER_ID,
+      buildVersion: BUILD_VERSION,
       startedAt: FieldValue.serverTimestamp(),
+      claimedAt: FieldValue.serverTimestamp(),
+      lastHeartbeatAt: Date.now(),
       updatedAt: FieldValue.serverTimestamp(),
     });
     return { action: "claimed", job };
@@ -205,7 +214,11 @@ async function prepareSource(args: {
     audioDropped = norm.audioStatus === "removed";
   } catch (err) {
     if (signal.aborted) throw new CanceledError();
-    throw err;
+    // Tag so the failed job records a precise `normalize_failed` code (the raw
+    // ffmpeg detail still goes to the worker logs via the handler's catch).
+    const detail = err instanceof Error ? err.message : String(err);
+    console.error("[worker:normalize] failed", { jobId, detail: detail.slice(-2000) });
+    throw new Error(`normalize_failed: ${detail}`);
   }
   if (signal.aborted) throw new CanceledError();
 
@@ -281,7 +294,10 @@ export async function processJob(uid: string, jobId: string): Promise<string> {
   }, 1000);
 
   const patch = (data: Record<string, unknown>) =>
-    jobRef.set({ ...data, updatedAt: FieldValue.serverTimestamp() }, { merge: true });
+    jobRef.set(
+      { ...data, lastHeartbeatAt: Date.now(), updatedAt: FieldValue.serverTimestamp() },
+      { merge: true }
+    );
 
   // Heartbeat: bump `updatedAt` every 60s while THIS instance is alive, so the
   // stale-job reconciler (which fails jobs whose updatedAt is too old) only ever
@@ -348,16 +364,43 @@ export async function processJob(uid: string, jobId: string): Promise<string> {
     // Preparation warnings (audio-dropped) + render warnings, de-duplicated.
     const warnings = Array.from(new Set([...prepared.warnings, ...result.warnings]));
 
+    // ── Audio-integrity check ───────────────────────────────────────────
+    // If the RENDER SOURCE had a usable audio track that we did NOT intentionally
+    // drop (unsupported codec → silent fallback + warning), the output MUST carry
+    // audio. A silent output here is a real bug — fail explicitly rather than
+    // ship a video the user expected to have sound.
+    const audioIntentionallyDropped =
+      prepared.audioDropped || warnings.includes(AUDIO_UNSUPPORTED_WARNING);
+    if (!audioIntentionallyDropped) {
+      const [srcInfo, outInfo] = await Promise.all([
+        probeSource(prepared.renderSourcePath).catch(() => null),
+        probeSource(outPath).catch(() => null),
+      ]);
+      const expectedAudio =
+        !!srcInfo?.hasAudio &&
+        !isUnsupportedAudioCodec(srcInfo.audioCodec, srcInfo.audioCodecTag);
+      if (expectedAudio && outInfo && !outInfo.hasAudio) {
+        throw new Error(
+          "audio_missing_after_render: source has audio but rendered output has none"
+        );
+      }
+    }
+
     // ── Upload + Firebase download URL ──────────────────────────────────
     await patch({ stage: "uploading", progress: 0.98 });
     const token = randomUUID();
-    await bucket().upload(outPath, {
-      destination: job.outputPath,
-      metadata: {
-        contentType: "video/mp4",
-        metadata: { firebaseStorageDownloadTokens: token },
-      },
-    });
+    try {
+      await bucket().upload(outPath, {
+        destination: job.outputPath,
+        metadata: {
+          contentType: "video/mp4",
+          metadata: { firebaseStorageDownloadTokens: token },
+        },
+      });
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      throw new Error(`upload_failed: ${detail}`);
+    }
     const downloadUrl = `https://firebasestorage.googleapis.com/v0/b/${bucketName}/o/${encodeURIComponent(
       job.outputPath
     )}?alt=media&token=${token}`;
@@ -461,7 +504,9 @@ export async function processJob(uid: string, jobId: string): Promise<string> {
             status: "failed",
             errorCode: friendly.code,
             errorMessage: friendly.message,
-            completedAt: FieldValue.serverTimestamp(),
+            workerId: WORKER_ID,
+            buildVersion: BUILD_VERSION,
+            failedAt: FieldValue.serverTimestamp(),
             updatedAt: FieldValue.serverTimestamp(),
           },
           { merge: true }

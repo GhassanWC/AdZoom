@@ -135,13 +135,34 @@ export function materializeExportJob(
     claimedAt: millis(data.claimedAt) ?? (data.claimedAt as number | undefined),
     lastHeartbeatAt: millis(data.lastHeartbeatAt) ?? (data.lastHeartbeatAt as number | undefined),
     queuePosition: data.queuePosition as number | undefined,
+    exportPath: (data.exportPath as "cloud" | "browser" | undefined) ?? "cloud",
+    settingsHash: data.settingsHash as string | undefined,
+    buildVersion: data.buildVersion as string | undefined,
     monthlyBucket: (data.monthlyBucket as string) ?? "",
     createdAt: millis(data.createdAt) ?? Date.now(),
     updatedAt: millis(data.updatedAt) ?? Date.now(),
     startedAt: millis(data.startedAt),
     completedAt: millis(data.completedAt),
+    failedAt: millis(data.failedAt),
     canceledAt: millis(data.canceledAt),
   };
+}
+
+/** Statuses that count as an active (in-flight) export — the dedup + single-flight
+ *  set. `claimed`/`normalizing` are sub-stages of `rendering`, so they're covered. */
+export const EXPORT_ACTIVE_STATUSES: ExportJobView["status"][] = [
+  "queued",
+  "rendering",
+  "uploading",
+];
+
+export function isActiveJob(job: Pick<ExportJobView, "status">): boolean {
+  return EXPORT_ACTIVE_STATUSES.includes(job.status);
+}
+
+/** Display progress 0..100 from the stored 0..1 `progress`. */
+export function progressPercent(job: Pick<ExportJobView, "progress">): number {
+  return Math.round((job.progress ?? 0) * 100);
 }
 
 export function subscribeExportJobs(

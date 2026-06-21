@@ -42,17 +42,47 @@ export function toUserFacingError(err: unknown): UserFacingError {
     };
   }
 
+  // The render finished but the final MP4 unexpectedly has NO audio while the
+  // source had a usable track (a genuine bug, not an unsupported codec which is
+  // handled by dropping audio + a warning). Surfaced as its own code so it's
+  // never confused with the silent-fallback path.
+  if (raw.includes("audio_missing_after_render")) {
+    return {
+      code: "audio_missing_after_render",
+      message:
+        "The export finished but its audio went missing. Please try again — if it keeps happening, contact support.",
+    };
+  }
+
+  // The normalization (pre-transcode) pass itself failed.
+  if (raw.includes("normalize_failed")) {
+    return {
+      code: "normalize_failed",
+      message:
+        "We couldn't prepare this video for export. Please try again, or re-upload the file.",
+    };
+  }
+
+  // Uploading the finished MP4 to storage failed.
+  if (raw.includes("upload_failed")) {
+    return {
+      code: "upload_failed",
+      message: "The export rendered but couldn't be saved. Please try again.",
+    };
+  }
+
   // Audio the bundled ffmpeg can't decode/transcode, or a filtergraph it can't
   // open — the classic "no decoder found for: none" / "Could not find codec
   // parameters" family produced by codecs like `apac`.
   if (
+    raw.includes("audio_decode_failed") ||
     raw.includes("no decoder found") ||
     raw.includes("could not find codec parameters") ||
     raw.includes("initializing a simple filtergraph") ||
     raw.includes("error initializing")
   ) {
     return {
-      code: "audio_unsupported",
+      code: "audio_decode_failed",
       message:
         "This video's audio is in a format we can't process. Please try exporting again — if it keeps failing, the audio track may be unsupported.",
     };

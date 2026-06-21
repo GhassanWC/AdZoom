@@ -1478,10 +1478,27 @@ export interface ExportJobDoc {
    *  "queued" | "preparing" | "rendering" | "uploading" | "ready". The raw
    *  `stage` stays for diagnostics; this is what the dialog renders. */
   progressStage?: ExportUiStage;
+  /**
+   * Which engine produced this job. Always "cloud" for docs in this collection
+   * (browser exports live in the separate `exports` collection), but stamped
+   * explicitly so the two paths can never be confused in the UI or logs.
+   */
+  exportPath?: "cloud" | "browser";
+  /**
+   * Deterministic dedup key (see `computeSettingsHash`): project + source +
+   * format/resolution/fps + canvas + vignette + timeline content. Used to detect
+   * a repeated export of identical settings and return the existing ACTIVE job
+   * instead of creating a duplicate.
+   */
+  settingsHash?: string;
+  /** Worker build/version that last touched this job (observability + bug reports). */
+  buildVersion?: string;
   createdAt: number;
   updatedAt: number;
   startedAt?: number;
   completedAt?: number;
+  /** When the job entered `failed` (distinct from completedAt for success). */
+  failedAt?: number;
   canceledAt?: number;
 }
 
