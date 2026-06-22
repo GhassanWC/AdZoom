@@ -19,10 +19,11 @@ public sealed class RenderSubprocess(ExportOptions opts, LogBuffer logs, ILogger
         Dictionary<string, object?> spec,
         string workDir,
         Action<RenderEvent> onEvent,
-        CancellationToken cancel)
+        CancellationToken cancel,
+        string specName = "spec.json")
     {
         Directory.CreateDirectory(workDir);
-        var specPath = Path.Combine(workDir, "spec.json");
+        var specPath = Path.Combine(workDir, specName);
         await File.WriteAllTextAsync(specPath, JsonSerializer.Serialize(spec), CancellationToken.None);
 
         var psi = new ProcessStartInfo

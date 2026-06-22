@@ -58,7 +58,7 @@ async function verifyRequestAuth(req, cfg) {
 // src/handler.ts
 import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir as tmpdir2 } from "node:os";
+import { tmpdir as tmpdir2, hostname } from "node:os";
 import { join as join2, extname } from "node:path";
 import { FieldValue } from "firebase-admin/firestore";
 
@@ -1330,7 +1330,8 @@ function makeFrameReader(stream, frameBytes) {
     }
   };
 }
-function spawnDecoder(path, fps, width, height) {
+function spawnDecoder(path, fps, width, height, startSec) {
+  const seekArgs = typeof startSec === "number" && startSec > 0 ? ["-ss", String(startSec)] : [];
   const child = spawn(
     ffmpegBin(),
     [
@@ -1340,6 +1341,8 @@ function spawnDecoder(path, fps, width, height) {
       // The decoder emits ONLY video — skip opening/analyzing the audio stream
       // so input setup (and the first frame) isn't delayed by it.
       "-an",
+      // Input seek (fast) for chunked renders — placed BEFORE -i.
+      ...seekArgs,
       "-i",
       path,
       // Force exact dims so each frame is exactly `width*height*4` bytes (the
@@ -1382,7 +1385,7 @@ function spawnDecoder(path, fps, width, height) {
   };
 }
 async function spawnEncoder(opts) {
-  const { width, height, fps, outputPath, sourcePath, audio, crf, preset } = opts;
+  const { width, height, fps, outputPath, sourcePath, audio, crf, preset, audioWindow } = opts;
   let scriptPath = null;
   const args = [
     "-hide_banner",
@@ -1423,6 +1426,9 @@ async function spawnEncoder(opts) {
       "192k"
     );
   } else if (audio.kind === "direct") {
+    if (audioWindow && audioWindow.startSec > 0) {
+      args.push("-ss", String(audioWindow.startSec));
+    }
     args.push(
       "-i",
       sourcePath,
@@ -1695,9 +1701,21 @@ async function renderToMp4(opts) {
   const outCanvas = createCanvas(canvasW, canvasH);
   const outCtx = outCanvas.getContext("2d");
   outCtx.imageSmoothingEnabled = true;
-  const decoder = spawnDecoder(opts.sourcePath, fps, sourceWidth, sourceHeight);
+  const chunkStartSec = opts.chunk ? Math.max(0, opts.chunk.startSec) : 0;
+  const decoder = spawnDecoder(
+    opts.sourcePath,
+    fps,
+    sourceWidth,
+    sourceHeight,
+    opts.chunk ? chunkStartSec : void 0
+  );
   const hasSpeed = recipe.moments.some((m) => m.effectType === "speed-up");
   const hasCuts = timelineMap.totalRemoved > 0;
+  if (opts.chunk && (hasSpeed || hasCuts)) {
+    throw new Error(
+      "chunk_unsupported_timeline: cannot chunk a render with cuts or speed changes"
+    );
+  }
   let audio;
   if (!hasAudio) {
     audio = { kind: "none" };
@@ -1719,6 +1737,10 @@ async function renderToMp4(opts) {
     segments: timelineMap.segments.length,
     sampleRate: info.audioSampleRate
   });
+  const totalFrames = Math.max(1, Math.round(outputDuration * fps));
+  const startFrame = opts.chunk ? Math.min(totalFrames, Math.round(chunkStartSec * fps)) : 0;
+  const endFrame = opts.chunk ? Math.min(totalFrames, Math.round(opts.chunk.endSec * fps)) : totalFrames;
+  const windowFrames = Math.max(1, endFrame - startFrame);
   const encoder = await spawnEncoder({
     width: canvasW,
     height: canvasH,
@@ -1727,11 +1749,13 @@ async function renderToMp4(opts) {
     sourcePath: opts.sourcePath,
     audio,
     crf: opts.crf,
-    preset: opts.preset
+    preset: opts.preset,
+    // Direct audio + a chunk window ⇒ seek the source audio to the chunk so it
+    // aligns with the stdin video (which starts at PTS 0).
+    ...opts.chunk && audio.kind === "direct" ? { audioWindow: { startSec: chunkStartSec, durSec: opts.chunk.endSec - chunkStartSec } } : {}
   });
-  const totalFrames = Math.max(1, Math.round(outputDuration * fps));
   const frameBytes = sourceWidth * sourceHeight * 4;
-  let decodedIndex = -1;
+  let decodedIndex = startFrame - 1;
   let currentFrame = null;
   let eof = false;
   async function frameForSourceTime(sourceTime) {
@@ -1776,9 +1800,9 @@ async function renderToMp4(opts) {
     });
     opts.onProgress({ stage: "decoding", progress: 0.01 });
     armWatchdog();
-    for (let i = 0; i < totalFrames; i++) {
+    for (let i = startFrame; i < endFrame; i++) {
       if (opts.signal.aborted) throw new CanceledError();
-      const pct = Math.floor(i / totalFrames * 95);
+      const pct = Math.floor((i - startFrame) / windowFrames * 95);
       if (pct !== lastPct) {
         lastPct = pct;
         opts.onProgress({ stage: "rendering", progress: pct / 100 });
@@ -1890,9 +1914,27 @@ function toUserFacingError(err) {
       message: "The export ran out of memory and was stopped. Please try again \u2014 if it keeps happening, contact support."
     };
   }
-  if (raw.includes("no decoder found") || raw.includes("could not find codec parameters") || raw.includes("initializing a simple filtergraph") || raw.includes("error initializing")) {
+  if (raw.includes("audio_missing_after_render")) {
     return {
-      code: "audio_unsupported",
+      code: "audio_missing_after_render",
+      message: "The export finished but its audio went missing. Please try again \u2014 if it keeps happening, contact support."
+    };
+  }
+  if (raw.includes("normalize_failed")) {
+    return {
+      code: "normalize_failed",
+      message: "We couldn't prepare this video for export. Please try again, or re-upload the file."
+    };
+  }
+  if (raw.includes("upload_failed")) {
+    return {
+      code: "upload_failed",
+      message: "The export rendered but couldn't be saved. Please try again."
+    };
+  }
+  if (raw.includes("audio_decode_failed") || raw.includes("no decoder found") || raw.includes("could not find codec parameters") || raw.includes("initializing a simple filtergraph") || raw.includes("error initializing")) {
+    return {
+      code: "audio_decode_failed",
       message: "This video's audio is in a format we can't process. Please try exporting again \u2014 if it keeps failing, the audio track may be unsupported."
     };
   }
@@ -1933,6 +1975,8 @@ function toUserFacingError(err) {
 }
 
 // src/handler.ts
+var WORKER_ID = process.env.EXPORT_WORKER_ID || hostname() || "worker";
+var BUILD_VERSION = process.env.BUILD_VERSION ?? "unknown";
 var HEARTBEAT_STALE_MS = 3 * 60 * 1e3;
 function toMs(v) {
   const t = v;
@@ -1963,7 +2007,11 @@ async function claimJob(db, uid, jobId) {
       status: "rendering",
       stage: "downloading",
       progress: 0,
+      workerId: WORKER_ID,
+      buildVersion: BUILD_VERSION,
       startedAt: FieldValue.serverTimestamp(),
+      claimedAt: FieldValue.serverTimestamp(),
+      lastHeartbeatAt: Date.now(),
       updatedAt: FieldValue.serverTimestamp()
     });
     return { action: "claimed", job };
@@ -2029,7 +2077,9 @@ async function prepareSource(args) {
     audioDropped = norm.audioStatus === "removed";
   } catch (err) {
     if (signal.aborted) throw new CanceledError();
-    throw err;
+    const detail = err instanceof Error ? err.message : String(err);
+    console.error("[worker:normalize] failed", { jobId, detail: detail.slice(-2e3) });
+    throw new Error(`normalize_failed: ${detail}`);
   }
   if (signal.aborted) throw new CanceledError();
   await bucket().upload(normPath, {
@@ -2082,7 +2132,10 @@ async function processJob(uid, jobId) {
       polling = false;
     });
   }, 1e3);
-  const patch = (data) => jobRef.set({ ...data, updatedAt: FieldValue.serverTimestamp() }, { merge: true });
+  const patch = (data) => jobRef.set(
+    { ...data, lastHeartbeatAt: Date.now(), updatedAt: FieldValue.serverTimestamp() },
+    { merge: true }
+  );
   const heartbeat = setInterval(() => {
     void patch({}).catch(() => {
     });
@@ -2132,15 +2185,33 @@ async function processJob(uid, jobId) {
       }
     });
     const warnings = Array.from(/* @__PURE__ */ new Set([...prepared.warnings, ...result.warnings]));
+    const audioIntentionallyDropped = prepared.audioDropped || warnings.includes(AUDIO_UNSUPPORTED_WARNING);
+    if (!audioIntentionallyDropped) {
+      const [srcInfo, outInfo] = await Promise.all([
+        probeSource(prepared.renderSourcePath).catch(() => null),
+        probeSource(outPath).catch(() => null)
+      ]);
+      const expectedAudio = !!srcInfo?.hasAudio && !isUnsupportedAudioCodec(srcInfo.audioCodec, srcInfo.audioCodecTag);
+      if (expectedAudio && outInfo && !outInfo.hasAudio) {
+        throw new Error(
+          "audio_missing_after_render: source has audio but rendered output has none"
+        );
+      }
+    }
     await patch({ stage: "uploading", progress: 0.98 });
     const token = randomUUID();
-    await bucket().upload(outPath, {
-      destination: job.outputPath,
-      metadata: {
-        contentType: "video/mp4",
-        metadata: { firebaseStorageDownloadTokens: token }
-      }
-    });
+    try {
+      await bucket().upload(outPath, {
+        destination: job.outputPath,
+        metadata: {
+          contentType: "video/mp4",
+          metadata: { firebaseStorageDownloadTokens: token }
+        }
+      });
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      throw new Error(`upload_failed: ${detail}`);
+    }
     const downloadUrl = `https://firebasestorage.googleapis.com/v0/b/${bucketName}/o/${encodeURIComponent(
       job.outputPath
     )}?alt=media&token=${token}`;
@@ -2215,7 +2286,9 @@ async function processJob(uid, jobId) {
           status: "failed",
           errorCode: friendly.code,
           errorMessage: friendly.message,
-          completedAt: FieldValue.serverTimestamp(),
+          workerId: WORKER_ID,
+          buildVersion: BUILD_VERSION,
+          failedAt: FieldValue.serverTimestamp(),
           updatedAt: FieldValue.serverTimestamp()
         },
         { merge: true }

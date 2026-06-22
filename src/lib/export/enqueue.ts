@@ -5,6 +5,7 @@ import "server-only";
 // runtime rather than bundled by webpack.
 import { CloudTasksClient } from "@google-cloud/tasks";
 import { exportBackend, dotnetEnqueueSignal } from "./dotnet-backend";
+import { submitBatchJob } from "./batch-backend";
 
 /**
  * Export-job dispatch — hands a created `exportJobs/{jobId}` doc to the Cloud
@@ -34,6 +35,15 @@ export interface EnqueueParams {
  *  can fail the job + release its minute reservation. */
 export async function enqueueExportJob(params: EnqueueParams): Promise<void> {
   const backend = exportBackend();
+
+  // EXPORT_BACKEND=batch → submit a one-shot Google Cloud Batch task running the
+  // .NET worker in single-job mode (claim one job, render, exit). This is the
+  // production path: near-zero idle cost. Throws on failure so the caller rolls
+  // back the reservation + fails the job (same contract as the other backends).
+  if (backend === "batch") {
+    await submitBatchJob(params);
+    return;
+  }
 
   // EXPORT_BACKEND=vm → rendering runs on the long-lived GCE VM worker, which
   // POLLS Firestore for queued jobs. Next.js already CREATED + reserved the job

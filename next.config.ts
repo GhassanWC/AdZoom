@@ -19,6 +19,7 @@ const nextConfig: NextConfig = {
   // Firestore path works without being listed here.)
   serverExternalPackages: [
     "@google-cloud/tasks",
+    "@google-cloud/batch",
     "google-gax",
     "@grpc/grpc-js",
     "@grpc/proto-loader",
@@ -34,8 +35,17 @@ const nextConfig: NextConfig = {
   //   Cannot find module '.../@google-cloud/tasks/build/protos/protos.json'
   // Force the proto assets into the trace for the route that enqueues tasks.
   outputFileTracingIncludes: {
+    // Both routes call createCloudExportJob → enqueueExportJob, which can dispatch
+    // via Cloud Tasks AND/OR Cloud Batch depending on EXPORT_BACKEND. Trace both
+    // clients' proto assets so whichever backend is configured resolves at runtime.
     "/api/export/cloud": [
       "./node_modules/@google-cloud/tasks/build/protos/**",
+      "./node_modules/@google-cloud/batch/build/protos/**",
+      "./node_modules/google-gax/build/protos/**",
+    ],
+    "/api/export/retry": [
+      "./node_modules/@google-cloud/tasks/build/protos/**",
+      "./node_modules/@google-cloud/batch/build/protos/**",
       "./node_modules/google-gax/build/protos/**",
     ],
   },

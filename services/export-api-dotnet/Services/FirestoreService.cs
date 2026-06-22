@@ -130,7 +130,13 @@ public sealed class FirestoreService(FirestoreDb db, ExportOptions opts, ILogger
     // ── Claim: heartbeat-lease (ports handler.ts:claimJob) ───────────────────
     public enum ClaimResult { Missing, Terminal, Leased, Claimed }
 
-    public async Task<(ClaimResult Result, DocumentSnapshot? Snap)> TryClaimAsync(string uid, string jobId)
+    /// <param name="forceReclaim">When true, re-claim an in-flight job even if its
+    /// lease is still fresh. Safe (and used) ONLY in single-job/Batch mode: Batch
+    /// starts a retry attempt only after the previous attempt's container has fully
+    /// exited, so the prior owner is provably dead and there is no concurrent
+    /// claimant for this dedicated job.</param>
+    public async Task<(ClaimResult Result, DocumentSnapshot? Snap)> TryClaimAsync(
+        string uid, string jobId, bool forceReclaim = false)
     {
         var jobRef = JobRef(uid, jobId);
         DocumentSnapshot? claimed = null;
@@ -142,7 +148,7 @@ public sealed class FirestoreService(FirestoreDb db, ExportOptions opts, ILogger
             if (JobFields.IsTerminal(status)) return ClaimResult.Terminal;
 
             var inFlight = status is JobFields.Rendering or JobFields.Uploading;
-            if (inFlight && AgeMs(snap, JobFields.UpdatedAt) < opts.HeartbeatStaleSeconds * 1000L)
+            if (inFlight && !forceReclaim && AgeMs(snap, JobFields.UpdatedAt) < opts.HeartbeatStaleSeconds * 1000L)
                 return ClaimResult.Leased;
 
             if (inFlight)
@@ -475,6 +481,15 @@ public sealed class FirestoreService(FirestoreDb db, ExportOptions opts, ILogger
     {
         var snap = await JobRef(uid, jobId).GetSnapshotAsync();
         return snap.Exists ? snap : null;
+    }
+
+    /// <summary>Read just the job's current status (null if the doc is gone). Used by
+    /// the single-job runner to derive its process exit code after the pipeline has
+    /// already written the terminal state.</summary>
+    public async Task<string?> GetJobStatusAsync(string uid, string jobId)
+    {
+        var snap = await JobRef(uid, jobId).GetSnapshotAsync();
+        return snap.Exists ? GetString(snap, JobFields.Status) : null;
     }
 
     public JobView ToView(DocumentSnapshot snap) => new()

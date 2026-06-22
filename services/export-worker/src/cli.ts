@@ -23,7 +23,8 @@
  *
  * Exit codes: 0 = done, 1 = error, 2 = canceled.
  */
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 
@@ -55,7 +56,7 @@ console.error = toStderr as typeof console.error;
 
 import { renderToMp4 } from "./render.js";
 import { computePreflight, AUDIO_UNSUPPORTED_WARNING } from "./preflight.js";
-import { normalizeSource, probeSource } from "./ffmpeg.js";
+import { normalizeSource, probeSource, ffmpegBin } from "./ffmpeg.js";
 import { toUserFacingError } from "./errors.js";
 import type { SerializedRenderRecipe } from "@/lib/firebase/schema";
 
@@ -69,6 +70,70 @@ interface JobSpec {
   normalizePreset?: string;
   normalizeEnabled?: boolean;
   audioAlreadyDropped?: boolean;
+  /** Chunked render: render ONLY this OUTPUT window [startSec, endSec) (see
+   *  RenderOptions.chunk). Omitted ⇒ whole-video render (default). */
+  chunk?: { startSec: number; endSec: number };
+  /** "concat" ⇒ losslessly join `inputs` (rendered chunks) into `outputPath`. */
+  mode?: "render" | "concat";
+  /** concat mode: ordered chunk file paths to join. */
+  inputs?: string[];
+}
+
+/**
+ * Concat mode — losslessly join pre-rendered chunk MP4s (identical codecs/params)
+ * into the final MP4 via ffmpeg's concat demuxer (`-c copy`, no re-encode).
+ */
+async function runConcat(spec: JobSpec): Promise<void> {
+  const inputs = spec.inputs ?? [];
+  if (inputs.length === 0) {
+    emit({ type: "error", code: "concat_no_inputs", message: "No chunk inputs to concat." });
+    process.exit(1);
+  }
+  for (const f of inputs) {
+    if (!existsSync(f)) {
+      emit({ type: "error", code: "concat_missing_chunk", message: `Chunk missing: ${f}` });
+      process.exit(1);
+    }
+  }
+  emit({ type: "stage", name: "merging" });
+  const listPath = join(dirname(spec.outputPath), "concat-list.txt");
+  // ffmpeg concat demuxer: one `file '<path>'` per line; single-quotes escaped.
+  const list = inputs.map((f) => `file '${f.replace(/'/g, "'\\''")}'`).join("\n");
+  writeFileSync(listPath, list, "utf8");
+
+  const args = [
+    "-hide_banner",
+    "-loglevel",
+    "warning",
+    "-f",
+    "concat",
+    "-safe",
+    "0",
+    "-i",
+    listPath,
+    "-c",
+    "copy",
+    "-movflags",
+    "+faststart",
+    "-y",
+    spec.outputPath,
+  ];
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(ffmpegBin(), args, { stdio: ["ignore", "ignore", "pipe"] });
+    let tail = "";
+    child.stderr.on("data", (d: Buffer) => {
+      tail = (tail + d.toString()).slice(-4000);
+      const t = d.toString().trim();
+      if (t) toStderr("[worker:concat]", t);
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`concat_failed: ffmpeg exited ${code}: ${tail.trim().slice(-800)}`));
+    });
+  });
+  emit({ type: "done", warnings: [], merged: inputs.length });
+  process.exit(0);
 }
 
 async function main(): Promise<void> {
@@ -93,6 +158,19 @@ async function main(): Promise<void> {
       message: "Unreadable job spec: " + (err as Error).message,
     });
     process.exit(1);
+  }
+
+  // Concat mode (chunked render finalize) — join chunks, no decode/normalize.
+  if (spec.mode === "concat") {
+    try {
+      await runConcat(spec);
+    } catch (err) {
+      const friendly = toUserFacingError(err);
+      toStderr("[worker:cli] concat failed:", (err as Error)?.message ?? String(err));
+      emit({ type: "error", code: friendly.code, message: friendly.message });
+      process.exit(1);
+    }
+    return;
   }
 
   // Cooperative cancel: orchestrator writes the line `cancel` to stdin.
@@ -208,6 +286,7 @@ async function main(): Promise<void> {
       preset,
       signal: controller.signal,
       audioAlreadyDropped: audioDropped,
+      chunk: spec.chunk,
       onProgress: ({ stage, progress }) => {
         if (stage !== lastStage) {
           lastStage = stage;

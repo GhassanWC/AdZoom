@@ -31,12 +31,20 @@ builder.Services.AddSingleton<RenderSubprocess>();
 builder.Services.AddSingleton<JobPipeline>();
 builder.Services.AddSingleton<JobSignal>();
 builder.Services.AddSingleton<LogBuffer>();
-// Background poll/claim/render loop — ONLY when this instance is a worker. On the
-// GCE VM, EXPORT_WORKER_MODE=firestore-poll runs it (long-lived, no request
-// lifecycle). On Cloud Run set EXPORT_WORKER_MODE=disabled so the control-plane
-// instance never claims a job (no double-claim, no mid-render shutdown). The HTTP
-// endpoints (health/enqueue-signal/cancel/status) stay available either way.
-if (opts.RunWorker)
+// Execution role:
+//   • Single-job (Google Cloud Batch): EXPORT_JOB_ID set ⇒ claim that ONE job,
+//     render it, and EXIT (0 success / non-zero failure). No poll loop, no
+//     reconciler — zero idle cost. Stale jobs are swept by the
+//     /api/cron/reconcile-exports Cloud Scheduler.
+//   • Firestore-poll (GCE VM): long-lived poll/claim/render loop + reconciler.
+//   • disabled (Cloud Run control plane): HTTP endpoints only, never claims a job.
+// The HTTP endpoints (health/enqueue-signal/cancel/status) stay available in all
+// modes; the SingleJobRunner stops the host as soon as its one job is done.
+if (opts.SingleJob)
+{
+    builder.Services.AddHostedService<SingleJobRunner>();
+}
+else if (opts.RunWorker)
 {
     builder.Services.AddHostedService<ExportRunner>();
     builder.Services.AddHostedService<Reconciler>();

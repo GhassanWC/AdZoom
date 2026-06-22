@@ -35,8 +35,14 @@ const TONE: Record<string, string> = {
   uploading: "border-cyan-400/30 bg-cyan-400/10 text-cyan-300",
   permitted: "border-violet-400/20 bg-violet-400/[0.06] text-fog",
   queued: "border-white/10 bg-white/[0.03] text-fog",
+  batch_submitted: "border-white/10 bg-white/[0.03] text-fog",
   failed: "border-rose-400/30 bg-rose-400/10 text-rose-300",
   canceled: "border-white/10 bg-white/[0.03] text-fog/70",
+};
+
+/** Friendly label for the status pill (raw status → human text). */
+const STATUS_LABEL: Record<string, string> = {
+  batch_submitted: "preparing",
 };
 
 /** A browser export or a cloud export job, normalized for the unified table. */
@@ -458,13 +464,14 @@ function RowItem({
                 row.status === "ready" && "bg-emerald-400",
                 (row.status === "exporting" ||
                   row.status === "rendering" ||
-                  row.status === "uploading") &&
+                  row.status === "uploading" ||
+                  row.status === "batch_submitted") &&
                   "animate-pulse bg-violet-400",
                 (row.status === "queued" || row.status === "canceled") && "bg-fog",
                 row.status === "failed" && "bg-rose-400"
               )}
             />
-            {row.status}
+            {STATUS_LABEL[row.status] ?? row.status}
             {row.active && row.source === "cloud" && row.progress > 0
               ? ` ${progressPercent(row)}%`
               : ""}

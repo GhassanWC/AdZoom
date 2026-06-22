@@ -5,11 +5,13 @@ import { currentMonthKey } from "@/lib/usage/usage";
 import { normalizePlan, planMeetsMinimum } from "@/lib/usage/plan";
 import {
   CLOUD_EXPORT_MINUTES,
+  CLOUD_EXPORT_MAX_DURATION_SECONDS,
   CloudExportNotAllowedError,
   CloudMinutesError,
   canCloudExport,
   cloudMinutesRemaining,
   estimateExportMinutes,
+  exceedsCloudExportDuration,
   planAllowsCloudExport,
 } from "@/lib/usage/cloud-minutes";
 import { buildRenderRecipe } from "@/lib/render/recipe";
@@ -52,7 +54,7 @@ import type {
  *  client's STALE_UI_MS and the reconciler window). */
 const HEARTBEAT_STALE_MS = 12 * 60 * 1000;
 
-const ACTIVE_STATUSES = ["queued", "rendering", "uploading"] as const;
+const ACTIVE_STATUSES = ["queued", "batch_submitted", "rendering", "uploading"] as const;
 
 export interface CreateCloudExportInput {
   uid: string;
@@ -260,6 +262,22 @@ export async function createCloudExportJob(
   });
   const outputDurationSeconds = recipe.outputDuration;
   const estimate = estimateExportMinutes(outputDurationSeconds);
+
+  // ── Max video length gate (per plan) ─────────────────────────────────────
+  // Pro ≤ 30 min, Creator ≤ 60 min of OUTPUT. Bounds per-job render/Batch time;
+  // distinct from the monthly minutes quota checked in the transaction below.
+  if (exceedsCloudExportDuration(plan, outputDurationSeconds)) {
+    const maxMin = Math.round(CLOUD_EXPORT_MAX_DURATION_SECONDS[plan] / 60);
+    return {
+      ok: false,
+      status: 413,
+      error:
+        plan === "creator"
+          ? `Cloud export supports videos up to ${maxMin} minutes.`
+          : `The Pro plan supports cloud exports up to ${maxMin} minutes. Upgrade to Creator for up to 60 minutes.`,
+      kind: "cloud_export_too_long",
+    };
+  }
 
   const serializedRecipe: SerializedRenderRecipe = {
     sourceWidth,

@@ -569,8 +569,14 @@ export function spawnDecoder(
   path: string,
   fps: number,
   width: number,
-  height: number
+  height: number,
+  /** Chunked render: input-seek to this OUTPUT second before decoding (the chunk
+   *  start). Only used on linear timelines (no cuts/speed), so output time ==
+   *  source time and the seek lands on the chunk's first frame. */
+  startSec?: number
 ): Decoder {
+  const seekArgs =
+    typeof startSec === "number" && startSec > 0 ? ["-ss", String(startSec)] : [];
   const child = spawn(
     ffmpegBin(),
     [
@@ -580,6 +586,8 @@ export function spawnDecoder(
       // The decoder emits ONLY video — skip opening/analyzing the audio stream
       // so input setup (and the first frame) isn't delayed by it.
       "-an",
+      // Input seek (fast) for chunked renders — placed BEFORE -i.
+      ...seekArgs,
       "-i",
       path,
       // Force exact dims so each frame is exactly `width*height*4` bytes (the
@@ -666,6 +674,13 @@ export interface EncoderOptions {
   audio: EncoderAudio;
   crf: number;
   preset: string;
+  /**
+   * Chunked render (linear timeline only): window the source AUDIO to this
+   * [startSec, startSec+durSec] so the chunk's audio aligns with its video (which
+   * arrives on stdin starting at PTS 0). Only honoured for `audio.kind==="direct"`
+   * — the chunker refuses cuts/speed timelines, so "filter" audio never chunks.
+   */
+  audioWindow?: { startSec: number; durSec: number };
 }
 
 /**
@@ -675,7 +690,7 @@ export interface EncoderOptions {
  * fits without hitting command-line length limits.
  */
 export async function spawnEncoder(opts: EncoderOptions): Promise<Encoder> {
-  const { width, height, fps, outputPath, sourcePath, audio, crf, preset } = opts;
+  const { width, height, fps, outputPath, sourcePath, audio, crf, preset, audioWindow } = opts;
 
   let scriptPath: string | null = null;
   const args: string[] = [
@@ -722,6 +737,11 @@ export async function spawnEncoder(opts: EncoderOptions): Promise<Encoder> {
     // — the normalized input has exactly one clean AAC track, and pinning the
     // index means a stray extra stream can never reach the encoder. `?` tolerates
     // a (shouldn't-happen) absence rather than failing the whole job.
+    // Chunked render: input-seek the audio (`-ss` BEFORE -i, fast) so it starts
+    // at the chunk's source offset and lines up with the stdin video at PTS 0.
+    if (audioWindow && audioWindow.startSec > 0) {
+      args.push("-ss", String(audioWindow.startSec));
+    }
     args.push(
       "-i",
       sourcePath,

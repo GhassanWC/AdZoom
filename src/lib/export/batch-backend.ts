@@ -1,0 +1,228 @@
+import "server-only";
+// Static, server-only import (same constraint as @google-cloud/tasks in
+// enqueue.ts): the Batch client pulls in google-gax + gRPC, which do dynamic
+// require()s for proto/native loading that webpack can't statically resolve.
+// Keep it external (next.config.ts serverExternalPackages) so it's require()d
+// from node_modules at runtime, and force its proto assets into the trace for
+// the routes that submit jobs (next.config.ts outputFileTracingIncludes).
+import { BatchServiceClient, protos } from "@google-cloud/batch";
+import { getAdmin } from "@/lib/firebase/admin";
+import { FieldValue } from "firebase-admin/firestore";
+
+/**
+ * Google Cloud Batch dispatch for paid cloud export (EXPORT_BACKEND=batch).
+ *
+ * Next.js already CREATED + reserved the `exportJobs/{jobId}` doc (the
+ * /api/export/cloud transaction). This submits a one-shot Batch task running the
+ * SAME container image as the VM worker, but in single-job mode: the container
+ * reads EXPORT_JOB_ID/EXPORT_JOB_UID, claims that one job, renders, uploads,
+ * writes the terminal Firestore status, and EXITS. No instance stays running —
+ * idle compute cost is ~zero between exports.
+ *
+ * On success the job doc flips `queued → batch_submitted` with the Batch job
+ * name/id recorded; the worker then flips it to `rendering` when it claims.
+ *
+ * Required server env:
+ *   BATCH_REGION              GCP region (e.g. "us-central1")
+ *   BATCH_IMAGE               Artifact Registry image URI for the worker
+ *   BATCH_SERVICE_ACCOUNT     email of the SA the Batch task runs AS
+ * Optional (sane defaults):
+ *   BATCH_PROJECT_ID          (falls back to GCLOUD_PROJECT / GOOGLE_CLOUD_PROJECT
+ *                              / NEXT_PUBLIC_FIREBASE_PROJECT_ID)
+ *   BATCH_MACHINE_TYPE        default "e2-standard-4" (4 vCPU / 16 GB)
+ *   BATCH_CPU_MILLI           default 4000
+ *   BATCH_MEMORY_MIB          default 16384
+ *   BATCH_BOOT_DISK_GB        default 100
+ *   BATCH_MAX_RUN_SECONDS     default 7200 (2h ceiling per export)
+ *   BATCH_MAX_RETRY_COUNT     default 1
+ *   BATCH_PROVISIONING_MODEL  "STANDARD" (default) | "SPOT"
+ *   BATCH_CHUNKED_RENDER      "1" to enable the worker's chunked render path
+ */
+
+export interface SubmitBatchParams {
+  uid: string;
+  jobId: string;
+  priority: "normal" | "priority";
+}
+
+function projectId(): string | undefined {
+  return (
+    process.env.BATCH_PROJECT_ID ||
+    process.env.GCLOUD_PROJECT ||
+    process.env.GOOGLE_CLOUD_PROJECT ||
+    process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID ||
+    undefined
+  );
+}
+
+function intEnv(key: string, fallback: number): number {
+  const n = Number.parseInt(process.env[key] ?? "", 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+/**
+ * RFC1035-safe Batch job id derived from the Firestore job id (lowercase letters,
+ * digits, hyphens; starts with a letter; ≤63 chars). The Firestore id is mixed
+ * case, so we lowercase it and append a short unique suffix to avoid the (rare)
+ * case-collision and to keep retries from clashing with a prior submission.
+ */
+function batchJobId(jobId: string): string {
+  const lower = jobId.toLowerCase().replace(/[^a-z0-9-]/g, "");
+  const suffix = Date.now().toString(36).slice(-6);
+  const base = `export-${lower}`.slice(0, 56);
+  return `${base}-${suffix}`;
+}
+
+/** Build the Batch job spec. One task, one container, the env the worker needs. */
+function buildBatchJob(
+  image: string,
+  serviceAccount: string | undefined,
+  env: Record<string, string>,
+  priority: "normal" | "priority"
+): protos.google.cloud.batch.v1.IJob {
+  const machineType = process.env.BATCH_MACHINE_TYPE || "e2-standard-4";
+  const cpuMilli = intEnv("BATCH_CPU_MILLI", 4000);
+  const memoryMib = intEnv("BATCH_MEMORY_MIB", 16384);
+  const bootDiskGb = intEnv("BATCH_BOOT_DISK_GB", 100);
+  const maxRunSeconds = intEnv("BATCH_MAX_RUN_SECONDS", 7200);
+  const maxRetryCount = intEnv("BATCH_MAX_RETRY_COUNT", 1);
+  const provisioningModel = (process.env.BATCH_PROVISIONING_MODEL || "STANDARD").toUpperCase();
+
+  return {
+    priority: priority === "priority" ? 1 : 0,
+    taskGroups: [
+      {
+        taskCount: 1,
+        parallelism: 1,
+        taskSpec: {
+          // Per-container env (EXPORT_JOB_ID etc.) — shared by all runnables.
+          environment: { variables: env },
+          computeResource: { cpuMilli, memoryMib },
+          // Hard ceiling so a wedged render can't run (and bill) forever.
+          maxRunDuration: { seconds: maxRunSeconds },
+          // Whole-task retries: a crash/preemption re-runs the container, which
+          // re-claims the (still non-terminal) job via forceReclaim.
+          maxRetryCount,
+          runnables: [
+            {
+              container: {
+                imageUri: image,
+                // No commands/entrypoint override — the image ENTRYPOINT
+                // (`dotnet ExportApi.dll`) auto-selects single-job mode from
+                // EXPORT_JOB_ID.
+              },
+            },
+          ],
+        },
+      },
+    ],
+    allocationPolicy: {
+      instances: [
+        {
+          policy: {
+            machineType,
+            provisioningModel:
+              provisioningModel === "SPOT"
+                ? protos.google.cloud.batch.v1.AllocationPolicy.ProvisioningModel.SPOT
+                : protos.google.cloud.batch.v1.AllocationPolicy.ProvisioningModel.STANDARD,
+            bootDisk: { sizeGb: bootDiskGb },
+          },
+        },
+      ],
+      ...(serviceAccount ? { serviceAccount: { email: serviceAccount } } : {}),
+    },
+    // Stream stdout/stderr to Cloud Logging (jobId/userId/chunk lines, ffmpeg).
+    logsPolicy: { destination: protos.google.cloud.batch.v1.LogsPolicy.Destination.CLOUD_LOGGING },
+    labels: { app: "framevo", kind: "export", priority },
+  };
+}
+
+/**
+ * Submit a Batch job for an already-created export and record the Batch ids on
+ * the doc (status → batch_submitted). Throws on misconfig / submit failure so the
+ * caller (createCloudExportJob) rolls back the reservation and fails the job.
+ */
+export async function submitBatchJob({ uid, jobId, priority }: SubmitBatchParams): Promise<void> {
+  const project = projectId();
+  const region = process.env.BATCH_REGION?.trim();
+  const image = process.env.BATCH_IMAGE?.trim();
+  const serviceAccount = process.env.BATCH_SERVICE_ACCOUNT?.trim();
+
+  if (!project || !region || !image) {
+    const missing = [
+      !project && "BATCH_PROJECT_ID (or GCLOUD_PROJECT / GOOGLE_CLOUD_PROJECT / NEXT_PUBLIC_FIREBASE_PROJECT_ID)",
+      !region && "BATCH_REGION",
+      !image && "BATCH_IMAGE",
+    ].filter(Boolean);
+    const msg = `Cloud Batch dispatch is misconfigured — missing env: ${missing.join(", ")}.`;
+    console.error(`[export-enqueue] ${msg}`, { jobId });
+    throw new Error(msg);
+  }
+
+  const bucket = process.env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET ?? "";
+  const env: Record<string, string> = {
+    EXPORT_JOB_ID: jobId,
+    EXPORT_JOB_UID: uid,
+    EXPORT_WORKER_MODE: "single-job",
+    NODE_ENV: "production",
+    // The worker reads NEXT_PUBLIC_* for project/bucket; also pass the names the
+    // task spec calls out (FIREBASE_*) so either is honoured.
+    FIREBASE_PROJECT_ID: project,
+    GOOGLE_CLOUD_PROJECT: project,
+    NEXT_PUBLIC_FIREBASE_PROJECT_ID: project,
+    FIREBASE_STORAGE_BUCKET: bucket,
+    NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET: bucket,
+    ...(process.env.BUILD_VERSION ? { BUILD_VERSION: process.env.BUILD_VERSION } : {}),
+    ...(process.env.BATCH_CHUNKED_RENDER ? { EXPORT_CHUNKED_RENDER: process.env.BATCH_CHUNKED_RENDER } : {}),
+  };
+
+  const id = batchJobId(jobId);
+  const parent = `projects/${project}/locations/${region}`;
+  const client = new BatchServiceClient();
+
+  let jobName: string;
+  try {
+    const [created] = await client.createJob({
+      parent,
+      jobId: id,
+      job: buildBatchJob(image, serviceAccount, env, priority),
+    });
+    jobName = created.name ?? `${parent}/jobs/${id}`;
+    console.log(`[export-enqueue] backend=batch submitted job=${jobId} batchJob=${jobName} (${priority})`);
+  } catch (err) {
+    const code = (err as { code?: unknown })?.code;
+    console.error(`[export-enqueue] createJob failed for job ${jobId}`, {
+      jobId,
+      priority,
+      project,
+      region,
+      image,
+      serviceAccount,
+      grpcCode: code,
+      message: err instanceof Error ? err.message : String(err),
+    });
+    throw err instanceof Error ? err : new Error(`Cloud Batch createJob failed: ${String(err)}`);
+  }
+
+  // Record the Batch ids + flip to batch_submitted. Best-effort: the render is
+  // already on its way, so a failed status write must NOT roll back the export.
+  try {
+    const { db } = getAdmin();
+    await db.doc(`users/${uid}/exportJobs/${jobId}`).set(
+      {
+        status: "batch_submitted",
+        progressStage: "preparing",
+        batchJobId: id,
+        batchJobName: jobName,
+        batchSubmittedAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+  } catch (err) {
+    console.warn("[export-enqueue] backend=batch status write failed (job still submitted)", {
+      jobId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}

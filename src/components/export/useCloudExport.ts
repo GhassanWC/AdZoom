@@ -61,7 +61,12 @@ export interface StartCloudExportResult {
   requested?: number;
 }
 
-const ACTIVE_STATUSES: ExportJobView["status"][] = ["queued", "rendering", "uploading"];
+const ACTIVE_STATUSES: ExportJobView["status"][] = [
+  "queued",
+  "batch_submitted",
+  "rendering",
+  "uploading",
+];
 
 const ALREADY_RUNNING_MSG =
   "You already have an export running. Wait for it to finish or cancel it.";

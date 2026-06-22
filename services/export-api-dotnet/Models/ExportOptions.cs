@@ -64,10 +64,44 @@ public sealed class ExportOptions
     public bool RunWorker { get; set; } = true;
 
     /// <summary>Log-tag prefix for lifecycle milestones — "vm-worker" in VM poll
-    /// mode, else "export". Used as a structured {Tag} field in log templates so
-    /// the VM emits the [vm-worker:*] lines the runbook greps for.</summary>
+    /// mode, "batch" in one-shot Batch mode, else "export". Used as a structured
+    /// {Tag} field in log templates so each deploy emits greppable lifecycle lines.</summary>
     public string WorkerTag =>
-        WorkerMode.Equals("firestore-poll", StringComparison.OrdinalIgnoreCase) ? "vm-worker" : "export";
+        WorkerMode.Equals("firestore-poll", StringComparison.OrdinalIgnoreCase) ? "vm-worker"
+        : WorkerMode.Equals("single-job", StringComparison.OrdinalIgnoreCase) ? "batch"
+        : "export";
+
+    // ── Single-job (Google Cloud Batch) mode ─────────────────────────────────
+    /// <summary>When set (EXPORT_JOB_ID), the process claims EXACTLY this job,
+    /// renders it, writes the terminal status, and EXITS (0 success / non-zero
+    /// failure). This is the Cloud Batch execution model: one container per export,
+    /// near-zero idle cost. No poll loop, no in-process reconciler — the existing
+    /// /api/cron/reconcile-exports Cloud Scheduler sweeps stale jobs instead.</summary>
+    public string? JobId { get; set; }
+
+    /// <summary>Owning user id for the single job (EXPORT_JOB_UID). Required in
+    /// single-job mode because jobs live at users/{uid}/exportJobs/{jobId}.</summary>
+    public string? JobUid { get; set; }
+
+    /// <summary>True when running as a one-shot Batch task (EXPORT_JOB_ID present or
+    /// EXPORT_WORKER_MODE=single-job).</summary>
+    public bool SingleJob { get; set; }
+
+    // ── Chunked rendering (FLAGGED OFF until render-parity is verified) ───────
+    /// <summary>Split long videos into independently-rendered chunks merged with
+    /// ffmpeg. OFF by default (EXPORT_CHUNKED_RENDER) — it touches the parity-gated
+    /// render core. When off, the whole video renders in one pass (today's path).</summary>
+    public bool ChunkedRenderEnabled { get; set; } = false;
+
+    /// <summary>Target chunk length in seconds (60–90 recommended).</summary>
+    public int ChunkSeconds { get; set; } = 75;
+
+    /// <summary>Only chunk videos longer than this many OUTPUT seconds. Shorter
+    /// videos always render in a single pass.</summary>
+    public int ChunkMinDurationSeconds { get; set; } = 180;
+
+    /// <summary>Per-chunk render retries before the whole job fails.</summary>
+    public int ChunkMaxRetries { get; set; } = 2;
 
     /// <summary>Local scratch dir for downloads + render output.</summary>
     public string WorkDir { get; set; } = Path.Combine(Path.GetTempPath(), "export-api");
@@ -115,9 +149,24 @@ public sealed class ExportOptions
         o.BuildVersion = Env("BUILD_VERSION") ?? o.BuildVersion;
         o.WorkerId = Env("EXPORT_WORKER_ID") ?? o.WorkerId;
         o.WorkerMode = (Env("EXPORT_WORKER_MODE") ?? o.WorkerMode).Trim().ToLowerInvariant();
-        // Don't run the worker loop when explicitly disabled (Cloud Run control
-        // plane) or when EXPORT_RUN_WORKER=false.
-        o.RunWorker = !o.WorkerMode.Equals("disabled", StringComparison.OrdinalIgnoreCase)
+
+        // ── Single-job (Batch) mode ──────────────────────────────────────────
+        o.JobId = Env("EXPORT_JOB_ID");
+        o.JobUid = Env("EXPORT_JOB_UID");
+        o.SingleJob = !string.IsNullOrWhiteSpace(o.JobId)
+                      || o.WorkerMode.Equals("single-job", StringComparison.OrdinalIgnoreCase);
+        if (o.SingleJob) o.WorkerMode = "single-job";
+
+        // ── Chunked render flag (off by default) ─────────────────────────────
+        o.ChunkedRenderEnabled = EnvBool("EXPORT_CHUNKED_RENDER", o.ChunkedRenderEnabled);
+        o.ChunkSeconds = EnvInt("EXPORT_CHUNK_SECONDS", o.ChunkSeconds);
+        o.ChunkMinDurationSeconds = EnvInt("EXPORT_CHUNK_MIN_SECONDS", o.ChunkMinDurationSeconds);
+        o.ChunkMaxRetries = EnvInt("EXPORT_CHUNK_MAX_RETRIES", o.ChunkMaxRetries);
+
+        // Don't run the poll loop / reconciler when in single-job mode, when
+        // explicitly disabled (Cloud Run control plane), or EXPORT_RUN_WORKER=false.
+        o.RunWorker = !o.SingleJob
+                      && !o.WorkerMode.Equals("disabled", StringComparison.OrdinalIgnoreCase)
                       && EnvBool("EXPORT_RUN_WORKER", true);
         return o;
     }

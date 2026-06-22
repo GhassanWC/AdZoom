@@ -29,6 +29,7 @@ export const EXPORT_STAGE_LABEL: Record<ExportUiStage, string> = {
   queued: "Queued",
   preparing: "Preparing your video…",
   rendering: "Rendering",
+  merging: "Merging",
   uploading: "Uploading",
   ready: "Ready",
 };
@@ -46,6 +47,10 @@ export function exportUiStage(
   switch (job.status) {
     case "queued":
       return "queued";
+    case "batch_submitted":
+      // Batch task submitted; the container is provisioning. No render % yet, so
+      // show the animated "Preparing…" rather than a frozen bar.
+      return "preparing";
     case "uploading":
       return "uploading";
     case "ready":
@@ -54,6 +59,7 @@ export function exportUiStage(
       return "ready";
     case "rendering":
     default:
+      if (job.stage === "merging") return "merging";
       // download + normalize are the "preparing" phase (no real % yet) — show an
       // animated "Preparing…" rather than a stuck bar.
       return job.stage === "normalizing" ||
@@ -65,10 +71,10 @@ export function exportUiStage(
   }
 }
 
-/** True while the UI should show an indeterminate (animated) bar — queued or the
- *  preparing phase, where the worker emits no real percentage yet. */
+/** True while the UI should show an indeterminate (animated) bar — queued, the
+ *  preparing phase, or merging, where the worker emits no real percentage yet. */
 export function isIndeterminateStage(stage: ExportUiStage): boolean {
-  return stage === "queued" || stage === "preparing";
+  return stage === "queued" || stage === "preparing" || stage === "merging";
 }
 
 /**
@@ -80,6 +86,7 @@ export const STALE_UI_MS = 12 * 60_000;
 
 const ACTIVE_FOR_STALE: ExportJobView["status"][] = [
   "queued",
+  "batch_submitted",
   "rendering",
   "uploading",
 ];
@@ -138,6 +145,11 @@ export function materializeExportJob(
     exportPath: (data.exportPath as "cloud" | "browser" | undefined) ?? "cloud",
     settingsHash: data.settingsHash as string | undefined,
     buildVersion: data.buildVersion as string | undefined,
+    batchJobId: data.batchJobId as string | undefined,
+    batchJobName: data.batchJobName as string | undefined,
+    batchSubmittedAt: millis(data.batchSubmittedAt) ?? (data.batchSubmittedAt as number | undefined),
+    chunkIndex: data.chunkIndex as number | undefined,
+    chunkTotal: data.chunkTotal as number | undefined,
     monthlyBucket: (data.monthlyBucket as string) ?? "",
     createdAt: millis(data.createdAt) ?? Date.now(),
     updatedAt: millis(data.updatedAt) ?? Date.now(),
@@ -149,9 +161,11 @@ export function materializeExportJob(
 }
 
 /** Statuses that count as an active (in-flight) export — the dedup + single-flight
- *  set. `claimed`/`normalizing` are sub-stages of `rendering`, so they're covered. */
+ *  set. `batch_submitted` is the Batch provisioning state; `claimed`/`normalizing`
+ *  are sub-stages of `rendering`, so they're covered. */
 export const EXPORT_ACTIVE_STATUSES: ExportJobView["status"][] = [
   "queued",
+  "batch_submitted",
   "rendering",
   "uploading",
 ];

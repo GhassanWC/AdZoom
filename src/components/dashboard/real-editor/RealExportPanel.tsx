@@ -356,7 +356,7 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
   const primaryLabel = cloud.starting
     ? "Starting export…"
     : engine === "server"
-      ? "Export MP4"
+      ? "Cloud Export"
       : container === "mp4"
         ? "Export MP4"
         : "Export WebM";
@@ -536,6 +536,15 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
           )}
           {blockedWarning && <Notice tone="rose">{blockedWarning}</Notice>}
 
+          {/* Cloud export expectation-setting — it runs server-side and the user
+              is free to leave the page while it renders. */}
+          {engine === "server" && !mp4NeedsUpgrade && (
+            <p className="text-[11px] leading-relaxed text-fog/80">
+              Cloud export renders on our servers and may take a few minutes. You can
+              leave this page — it keeps running and appears under Exports when ready.
+            </p>
+          )}
+
           {/* ── Bottom action area ────────────────────────────────────────── */}
           <div className="mt-1 flex items-center justify-between gap-3 border-t border-white/[0.06] pt-4">
             <div className="min-w-0 text-[11px] leading-tight text-fog">
@@ -663,7 +672,9 @@ function StatusView({
             </Notice>
           ) : (
             <p className="text-[11px] text-fog">
-              Runs in the background — you can close this and keep editing.
+              {view.engine === "server"
+                ? "Cloud export runs on our servers — it can take a few minutes. You can close this or leave the page; it keeps going and appears under Exports when ready."
+                : "Runs in the background — you can close this and keep editing."}
             </p>
           )}
           <div className="flex items-center gap-2">
@@ -749,13 +760,19 @@ function StatusView({
 }
 
 // ── View-model builders ────────────────────────────────────────────────────
-const SERVER_ACTIVE: ReadonlyArray<string> = ["queued", "rendering", "uploading"];
+const SERVER_ACTIVE: ReadonlyArray<string> = [
+  "queued",
+  "batch_submitted",
+  "rendering",
+  "uploading",
+];
 
 /** Stage order for the stepper. */
 const STAGE_ORDER: readonly ExportUiStage[] = [
   "queued",
   "preparing",
   "rendering",
+  "merging",
   "uploading",
   "ready",
 ];
@@ -770,7 +787,8 @@ function stageDisplayPercent(stage: ExportUiStage, rawPct: number): number {
   switch (stage) {
     case "queued":
     case "preparing":
-      return 0;
+    case "merging":
+      return 0; // indeterminate — number is hidden anyway
     case "rendering":
       return Math.min(94, Math.max(1, rawPct));
     case "uploading":
@@ -792,11 +810,18 @@ function serverView(cloud: ReturnType<typeof useCloudExport>): ExportView | null
         ? "failed"
         : "canceled";
   const rawPct = Math.round((j.progress ?? 0) * 100);
+  // Long-video chunked render: surface "Rendering chunk X/Y" instead of the plain
+  // "Rendering" label so the user sees per-chunk progress.
+  const chunked =
+    stage === "rendering" && (j.chunkTotal ?? 0) > 1 && (j.chunkIndex ?? 0) > 0;
+  const stageLabel = chunked
+    ? `Rendering chunk ${j.chunkIndex}/${j.chunkTotal}`
+    : EXPORT_STAGE_LABEL[stage];
   return {
     engine: "server",
     phase,
     stage,
-    stageLabel: EXPORT_STAGE_LABEL[stage],
+    stageLabel,
     percent: phase === "ready" ? 100 : stageDisplayPercent(stage, rawPct),
     indeterminate: isIndeterminateStage(stage),
     queuePosition: cloud.queuePosition,
@@ -857,15 +882,19 @@ const STAGE_SHORT: Record<ExportUiStage, string> = {
   queued: "Queued",
   preparing: "Preparing",
   rendering: "Rendering",
+  merging: "Merging",
   uploading: "Uploading",
   ready: "Ready",
 };
 
-/** Horizontal Queued → Preparing → Rendering → Uploading → Ready stepper. */
+/** Horizontal Queued → Preparing → Rendering → Merging → Uploading → Ready stepper. */
 function StageSteps({ current }: { current: ExportUiStage }) {
   const currentIdx = STAGE_ORDER.indexOf(current);
   return (
-    <div className="grid grid-cols-5 gap-1.5">
+    <div
+      className="grid gap-1.5"
+      style={{ gridTemplateColumns: `repeat(${STAGE_ORDER.length}, minmax(0,1fr))` }}
+    >
       {STAGE_ORDER.map((s, i) => {
         const done = i < currentIdx;
         const active = i === currentIdx;

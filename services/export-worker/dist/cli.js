@@ -1,7 +1,8 @@
 import { createRequire as _cr } from 'module'; const require = _cr(import.meta.url);
 
 // src/cli.ts
-import { existsSync as existsSync2, readFileSync } from "node:fs";
+import { existsSync as existsSync2, readFileSync, writeFileSync } from "node:fs";
+import { spawn as spawn2 } from "node:child_process";
 import { dirname, join as join2 } from "node:path";
 import { createInterface } from "node:readline";
 
@@ -1241,7 +1242,8 @@ function makeFrameReader(stream, frameBytes) {
     }
   };
 }
-function spawnDecoder(path, fps, width, height) {
+function spawnDecoder(path, fps, width, height, startSec) {
+  const seekArgs = typeof startSec === "number" && startSec > 0 ? ["-ss", String(startSec)] : [];
   const child = spawn(
     ffmpegBin(),
     [
@@ -1251,6 +1253,8 @@ function spawnDecoder(path, fps, width, height) {
       // The decoder emits ONLY video — skip opening/analyzing the audio stream
       // so input setup (and the first frame) isn't delayed by it.
       "-an",
+      // Input seek (fast) for chunked renders — placed BEFORE -i.
+      ...seekArgs,
       "-i",
       path,
       // Force exact dims so each frame is exactly `width*height*4` bytes (the
@@ -1293,7 +1297,7 @@ function spawnDecoder(path, fps, width, height) {
   };
 }
 async function spawnEncoder(opts) {
-  const { width, height, fps, outputPath, sourcePath, audio, crf, preset } = opts;
+  const { width, height, fps, outputPath, sourcePath, audio, crf, preset, audioWindow } = opts;
   let scriptPath = null;
   const args = [
     "-hide_banner",
@@ -1334,6 +1338,9 @@ async function spawnEncoder(opts) {
       "192k"
     );
   } else if (audio.kind === "direct") {
+    if (audioWindow && audioWindow.startSec > 0) {
+      args.push("-ss", String(audioWindow.startSec));
+    }
     args.push(
       "-i",
       sourcePath,
@@ -1606,9 +1613,21 @@ async function renderToMp4(opts) {
   const outCanvas = createCanvas(canvasW, canvasH);
   const outCtx = outCanvas.getContext("2d");
   outCtx.imageSmoothingEnabled = true;
-  const decoder = spawnDecoder(opts.sourcePath, fps, sourceWidth, sourceHeight);
+  const chunkStartSec = opts.chunk ? Math.max(0, opts.chunk.startSec) : 0;
+  const decoder = spawnDecoder(
+    opts.sourcePath,
+    fps,
+    sourceWidth,
+    sourceHeight,
+    opts.chunk ? chunkStartSec : void 0
+  );
   const hasSpeed = recipe.moments.some((m) => m.effectType === "speed-up");
   const hasCuts = timelineMap.totalRemoved > 0;
+  if (opts.chunk && (hasSpeed || hasCuts)) {
+    throw new Error(
+      "chunk_unsupported_timeline: cannot chunk a render with cuts or speed changes"
+    );
+  }
   let audio;
   if (!hasAudio) {
     audio = { kind: "none" };
@@ -1630,6 +1649,10 @@ async function renderToMp4(opts) {
     segments: timelineMap.segments.length,
     sampleRate: info.audioSampleRate
   });
+  const totalFrames = Math.max(1, Math.round(outputDuration * fps));
+  const startFrame = opts.chunk ? Math.min(totalFrames, Math.round(chunkStartSec * fps)) : 0;
+  const endFrame = opts.chunk ? Math.min(totalFrames, Math.round(opts.chunk.endSec * fps)) : totalFrames;
+  const windowFrames = Math.max(1, endFrame - startFrame);
   const encoder = await spawnEncoder({
     width: canvasW,
     height: canvasH,
@@ -1638,11 +1661,13 @@ async function renderToMp4(opts) {
     sourcePath: opts.sourcePath,
     audio,
     crf: opts.crf,
-    preset: opts.preset
+    preset: opts.preset,
+    // Direct audio + a chunk window ⇒ seek the source audio to the chunk so it
+    // aligns with the stdin video (which starts at PTS 0).
+    ...opts.chunk && audio.kind === "direct" ? { audioWindow: { startSec: chunkStartSec, durSec: opts.chunk.endSec - chunkStartSec } } : {}
   });
-  const totalFrames = Math.max(1, Math.round(outputDuration * fps));
   const frameBytes = sourceWidth * sourceHeight * 4;
-  let decodedIndex = -1;
+  let decodedIndex = startFrame - 1;
   let currentFrame = null;
   let eof = false;
   async function frameForSourceTime(sourceTime) {
@@ -1687,9 +1712,9 @@ async function renderToMp4(opts) {
     });
     opts.onProgress({ stage: "decoding", progress: 0.01 });
     armWatchdog();
-    for (let i = 0; i < totalFrames; i++) {
+    for (let i = startFrame; i < endFrame; i++) {
       if (opts.signal.aborted) throw new CanceledError();
-      const pct = Math.floor(i / totalFrames * 95);
+      const pct = Math.floor((i - startFrame) / windowFrames * 95);
       if (pct !== lastPct) {
         lastPct = pct;
         opts.onProgress({ stage: "rendering", progress: pct / 100 });
@@ -1801,9 +1826,27 @@ function toUserFacingError(err) {
       message: "The export ran out of memory and was stopped. Please try again \u2014 if it keeps happening, contact support."
     };
   }
-  if (raw.includes("no decoder found") || raw.includes("could not find codec parameters") || raw.includes("initializing a simple filtergraph") || raw.includes("error initializing")) {
+  if (raw.includes("audio_missing_after_render")) {
     return {
-      code: "audio_unsupported",
+      code: "audio_missing_after_render",
+      message: "The export finished but its audio went missing. Please try again \u2014 if it keeps happening, contact support."
+    };
+  }
+  if (raw.includes("normalize_failed")) {
+    return {
+      code: "normalize_failed",
+      message: "We couldn't prepare this video for export. Please try again, or re-upload the file."
+    };
+  }
+  if (raw.includes("upload_failed")) {
+    return {
+      code: "upload_failed",
+      message: "The export rendered but couldn't be saved. Please try again."
+    };
+  }
+  if (raw.includes("audio_decode_failed") || raw.includes("no decoder found") || raw.includes("could not find codec parameters") || raw.includes("initializing a simple filtergraph") || raw.includes("error initializing")) {
+    return {
+      code: "audio_decode_failed",
       message: "This video's audio is in a format we can't process. Please try exporting again \u2014 if it keeps failing, the audio track may be unsupported."
     };
   }
@@ -1858,6 +1901,56 @@ console.info = toStderr;
 console.debug = toStderr;
 console.warn = toStderr;
 console.error = toStderr;
+async function runConcat(spec) {
+  const inputs = spec.inputs ?? [];
+  if (inputs.length === 0) {
+    emit({ type: "error", code: "concat_no_inputs", message: "No chunk inputs to concat." });
+    process.exit(1);
+  }
+  for (const f of inputs) {
+    if (!existsSync2(f)) {
+      emit({ type: "error", code: "concat_missing_chunk", message: `Chunk missing: ${f}` });
+      process.exit(1);
+    }
+  }
+  emit({ type: "stage", name: "merging" });
+  const listPath = join2(dirname(spec.outputPath), "concat-list.txt");
+  const list = inputs.map((f) => `file '${f.replace(/'/g, "'\\''")}'`).join("\n");
+  writeFileSync(listPath, list, "utf8");
+  const args = [
+    "-hide_banner",
+    "-loglevel",
+    "warning",
+    "-f",
+    "concat",
+    "-safe",
+    "0",
+    "-i",
+    listPath,
+    "-c",
+    "copy",
+    "-movflags",
+    "+faststart",
+    "-y",
+    spec.outputPath
+  ];
+  await new Promise((resolve, reject) => {
+    const child = spawn2(ffmpegBin(), args, { stdio: ["ignore", "ignore", "pipe"] });
+    let tail = "";
+    child.stderr.on("data", (d) => {
+      tail = (tail + d.toString()).slice(-4e3);
+      const t = d.toString().trim();
+      if (t) toStderr("[worker:concat]", t);
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`concat_failed: ffmpeg exited ${code}: ${tail.trim().slice(-800)}`));
+    });
+  });
+  emit({ type: "done", warnings: [], merged: inputs.length });
+  process.exit(0);
+}
 async function main() {
   const build = process.env.BUILD_VERSION ?? "unknown";
   emit({ type: "version", cliVersion: RENDER_CLI_VERSION, build, node: process.version });
@@ -1877,6 +1970,17 @@ async function main() {
       message: "Unreadable job spec: " + err.message
     });
     process.exit(1);
+  }
+  if (spec.mode === "concat") {
+    try {
+      await runConcat(spec);
+    } catch (err) {
+      const friendly = toUserFacingError(err);
+      toStderr("[worker:cli] concat failed:", err?.message ?? String(err));
+      emit({ type: "error", code: friendly.code, message: friendly.message });
+      process.exit(1);
+    }
+    return;
   }
   const controller = new AbortController();
   const rl = createInterface({ input: process.stdin });
@@ -1920,13 +2024,20 @@ async function main() {
     let normalized = false;
     if (expectNormalize) {
       emit({ type: "stage", name: "normalizing" });
-      const norm = await normalizeSource({
-        sourcePath: spec.sourcePath,
-        outputPath: normPath,
-        crf: spec.normalizeCrf ?? 18,
-        preset: spec.normalizePreset ?? "veryfast",
-        signal: controller.signal
-      });
+      let norm;
+      try {
+        norm = await normalizeSource({
+          sourcePath: spec.sourcePath,
+          outputPath: normPath,
+          crf: spec.normalizeCrf ?? 18,
+          preset: spec.normalizePreset ?? "veryfast",
+          signal: controller.signal
+        });
+      } catch (err) {
+        if (controller.signal.aborted) throw err;
+        const detail = err instanceof Error ? err.message : String(err);
+        throw new Error(`normalize_failed: ${detail}`);
+      }
       renderSource = normPath;
       normalized = true;
       audioStatus = norm.audioStatus;
@@ -1963,6 +2074,7 @@ async function main() {
       preset,
       signal: controller.signal,
       audioAlreadyDropped: audioDropped,
+      chunk: spec.chunk,
       onProgress: ({ stage, progress }) => {
         if (stage !== lastStage) {
           lastStage = stage;
@@ -1976,6 +2088,32 @@ async function main() {
       }
     });
     for (const w of result.warnings) pushWarning(w);
+    const [renderSrcProbe, outProbe] = await Promise.all([
+      probeSource(renderSource).catch(() => null),
+      probeSource(spec.outputPath).catch(() => null)
+    ]);
+    const outDur = outProbe?.durationSec ?? 0;
+    const srcDur = renderSrcProbe?.durationSec ?? 0;
+    emit({
+      type: "audio-verify",
+      audioStatus,
+      sourceHasAudio: pf.info.hasAudio,
+      sourceAudioCodec: audioCodec || "(none)",
+      normalizedHasAudio: renderSrcProbe?.hasAudio ?? null,
+      outputHasAudio: outProbe?.hasAudio ?? null,
+      outputAudioCodec: outProbe?.audioCodec || "(none)",
+      outputDurationSec: outDur,
+      videoDurationSec: srcDur,
+      durationDiffSec: Math.abs(outDur - srcDur)
+    });
+    toStderr(
+      `[worker:cli] audio-verify audioStatus=${audioStatus} sourceAudio=${pf.info.hasAudio} normalizedAudio=${renderSrcProbe?.hasAudio} outputAudio=${outProbe?.hasAudio} outputCodec=${outProbe?.audioCodec || "(none)"} outDur=${outDur.toFixed(2)} vidDur=${srcDur.toFixed(2)} diff=${Math.abs(outDur - srcDur).toFixed(2)}`
+    );
+    if (audioStatus === "preserved" && outProbe && !outProbe.hasAudio) {
+      throw new Error(
+        "audio_missing_after_render: render source has audio but final output has none"
+      );
+    }
     emit({
       type: "done",
       warnings,

@@ -8,8 +8,8 @@
  *
  * Quota model (per the product spec):
  *   • Free    — 0 cloud minutes. Cloud export is blocked; browser export only.
- *   • Pro     — 150 minutes / month.
- *   • Creator — 600 minutes / month.
+ *   • Pro     — 150 minutes / month, max video length 30 minutes.
+ *   • Creator — 500 minutes / month, max video length 60 minutes.
  *
  * Minutes are billed on OUTPUT duration (post cuts/speed) — the deliverable —
  * not source length, and not scaled by resolution (keeps the meter intuitive).
@@ -31,12 +31,42 @@ import type { MonthlyUsage } from "@/lib/firebase/schema";
 export const CLOUD_EXPORT_MINUTES: Record<PlanTier, number> = {
   free: 0,
   pro: 150,
-  creator: 600,
+  creator: 500,
+};
+
+/**
+ * Max OUTPUT video length (seconds) a single cloud export may produce, per plan.
+ * Free has no cloud export; Pro caps at 30 min, Creator at 60 min. This bounds
+ * the worst-case render time (and Batch run duration) per job — separate from the
+ * monthly minutes quota. `0` ⇒ no cloud export allowed.
+ */
+export const CLOUD_EXPORT_MAX_DURATION_SECONDS: Record<PlanTier, number> = {
+  free: 0,
+  pro: 30 * 60,
+  creator: 60 * 60,
 };
 
 /** True when the plan includes ANY cloud-export minutes (i.e. is paid). */
 export function planAllowsCloudExport(plan: PlanTier): boolean {
   return CLOUD_EXPORT_MINUTES[plan] > 0;
+}
+
+/**
+ * True when a cloud export of `outputDurationSeconds` exceeds the plan's max
+ * length. Paid plans only (Free is gated by `planAllowsCloudExport`); an unknown
+ * duration is never blocked here.
+ */
+export function exceedsCloudExportDuration(
+  plan: PlanTier,
+  outputDurationSeconds: number | null | undefined
+): boolean {
+  const limit = CLOUD_EXPORT_MAX_DURATION_SECONDS[plan];
+  if (!(limit > 0)) return false;
+  return (
+    typeof outputDurationSeconds === "number" &&
+    Number.isFinite(outputDurationSeconds) &&
+    outputDurationSeconds > limit
+  );
 }
 
 /**
@@ -92,6 +122,22 @@ export class CloudExportNotAllowedError extends Error {
     super(`Cloud export requires a paid plan (current: ${plan}).`);
     this.name = "CloudExportNotAllowedError";
     this.plan = plan;
+  }
+}
+
+/** Thrown when a cloud export's output length exceeds the plan's max video length. */
+export class CloudExportDurationError extends Error {
+  readonly plan: PlanTier;
+  readonly maxSeconds: number;
+  readonly actualSeconds: number;
+  constructor(plan: PlanTier, maxSeconds: number, actualSeconds: number) {
+    super(
+      `Cloud export length ${Math.round(actualSeconds)}s exceeds the ${plan} limit of ${maxSeconds}s.`
+    );
+    this.name = "CloudExportDurationError";
+    this.plan = plan;
+    this.maxSeconds = maxSeconds;
+    this.actualSeconds = actualSeconds;
   }
 }
 

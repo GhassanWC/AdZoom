@@ -50,6 +50,15 @@ export interface RenderOptions {
    * AUDIO_UNSUPPORTED_WARNING in that case (avoids a wrong/duplicate warning).
    */
   audioAlreadyDropped?: boolean;
+  /**
+   * Chunked render of a long video: render ONLY the OUTPUT window
+   * [startSec, endSec) to `outputPath`. Requires a LINEAR timeline (no cuts /
+   * speed) so output time == source time and a single input-seek lands on the
+   * chunk's first frame + audio. Throws `chunk_unsupported_timeline` when the
+   * recipe HAS cuts/speed AND audio (the orchestrator then falls back to a
+   * single whole-video render). Undefined ⇒ render the whole video (default).
+   */
+  chunk?: { startSec: number; endSec: number };
   onProgress: (p: { stage: RenderStage; progress: number }) => void;
 }
 
@@ -180,7 +189,15 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
   // leaves smoothing at its enabled default; mirror that here.
   outCtx.imageSmoothingEnabled = true;
 
-  const decoder = spawnDecoder(opts.sourcePath, fps, sourceWidth, sourceHeight);
+  // Chunk window (output seconds). Whole-video render leaves these at the full span.
+  const chunkStartSec = opts.chunk ? Math.max(0, opts.chunk.startSec) : 0;
+  const decoder = spawnDecoder(
+    opts.sourcePath,
+    fps,
+    sourceWidth,
+    sourceHeight,
+    opts.chunk ? chunkStartSec : undefined
+  );
 
   // Choose how to source audio. Cuts/speed remap the timeline, so the audio has
   // to be rebuilt from the segments (filter). With NEITHER, the video is the
@@ -189,6 +206,19 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
   // the common case (e.g. zoom-only edits don't touch the timeline).
   const hasSpeed = recipe.moments.some((m) => m.effectType === "speed-up");
   const hasCuts = timelineMap.totalRemoved > 0;
+
+  // ── Chunked render guard ───────────────────────────────────────────────────
+  // A chunk renders a sub-window of OUTPUT time. That only stays correct on a
+  // LINEAR timeline (output time == source time) — a single input-seek then lands
+  // on the chunk's first frame AND its audio window. With cuts/speed the mapping
+  // is non-linear, so windowing audio per chunk would desync. Refuse loudly so the
+  // C# orchestrator falls back to a single whole-video render for this job.
+  if (opts.chunk && (hasSpeed || hasCuts)) {
+    throw new Error(
+      "chunk_unsupported_timeline: cannot chunk a render with cuts or speed changes"
+    );
+  }
+
   let audio: EncoderAudio;
   if (!hasAudio) {
     audio = { kind: "none" };
@@ -211,6 +241,14 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
     sampleRate: info.audioSampleRate,
   });
 
+  const totalFrames = Math.max(1, Math.round(outputDuration * fps));
+  // Frame window for this render: whole video, or just the chunk's output span.
+  const startFrame = opts.chunk ? Math.min(totalFrames, Math.round(chunkStartSec * fps)) : 0;
+  const endFrame = opts.chunk
+    ? Math.min(totalFrames, Math.round(opts.chunk.endSec * fps))
+    : totalFrames;
+  const windowFrames = Math.max(1, endFrame - startFrame);
+
   const encoder = await spawnEncoder({
     width: canvasW,
     height: canvasH,
@@ -220,12 +258,18 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
     audio,
     crf: opts.crf,
     preset: opts.preset,
+    // Direct audio + a chunk window ⇒ seek the source audio to the chunk so it
+    // aligns with the stdin video (which starts at PTS 0).
+    ...(opts.chunk && audio.kind === "direct"
+      ? { audioWindow: { startSec: chunkStartSec, durSec: opts.chunk.endSec - chunkStartSec } }
+      : {}),
   });
 
-  const totalFrames = Math.max(1, Math.round(outputDuration * fps));
   const frameBytes = sourceWidth * sourceHeight * 4;
 
-  let decodedIndex = -1;
+  // The decoder was input-seeked to the chunk start, so its FIRST emitted frame
+  // is the chunk's first output frame (== index startFrame on a linear timeline).
+  let decodedIndex = startFrame - 1;
   let currentFrame: Buffer | null = null;
   let eof = false;
 
@@ -280,10 +324,12 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
     // the first rendered frame.
     opts.onProgress({ stage: "decoding", progress: 0.01 });
     armWatchdog();
-    for (let i = 0; i < totalFrames; i++) {
+    for (let i = startFrame; i < endFrame; i++) {
       if (opts.signal.aborted) throw new CanceledError();
 
-      const pct = Math.floor((i / totalFrames) * 95);
+      // Progress is reported RELATIVE to this render's window (0..95), so a chunk
+      // reads 0→95% over its own frames (the orchestrator scales it across chunks).
+      const pct = Math.floor(((i - startFrame) / windowFrames) * 95);
       if (pct !== lastPct) {
         lastPct = pct;
         opts.onProgress({ stage: "rendering", progress: pct / 100 });

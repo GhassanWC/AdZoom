@@ -6,13 +6,14 @@ public static class JobFields
 {
     // Status
     public const string Queued = "queued";
+    public const string BatchSubmitted = "batch_submitted";
     public const string Rendering = "rendering";
     public const string Uploading = "uploading";
     public const string Ready = "ready";
     public const string Failed = "failed";
     public const string Canceled = "canceled";
 
-    public static readonly string[] ActiveStatuses = { Queued, Rendering, Uploading };
+    public static readonly string[] ActiveStatuses = { Queued, BatchSubmitted, Rendering, Uploading };
     public static bool IsTerminal(string? status) => status is Ready or Failed or Canceled;
 
     // Job doc fields

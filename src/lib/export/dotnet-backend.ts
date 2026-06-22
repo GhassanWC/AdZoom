@@ -17,12 +17,16 @@ import "server-only";
  * metadata server is unreachable → no bearer (a local C# instance isn't gated).
  */
 
-export function exportBackend(): "vm" | "dotnet" | "cloudtasks" {
+export function exportBackend(): "batch" | "vm" | "dotnet" | "cloudtasks" {
   const b = (process.env.EXPORT_BACKEND ?? "cloudtasks").toLowerCase();
+  // "batch"   → rendering runs as a one-shot Google Cloud Batch task (the .NET
+  //             worker in single-job mode). Next.js CREATES the job, then submits
+  //             a Batch job; zero idle compute cost. This is the production path.
   // "vm"      → rendering runs on the GCE VM worker, which POLLS Firestore. Next.js
   //             only CREATES the job; there is no HTTP dispatch (the poller delivers).
   // "dotnet"  → the C# export API (Cloud Run) renders; we send a best-effort signal.
   // otherwise → the legacy Node Cloud-Run worker via Cloud Tasks.
+  if (b === "batch") return "batch";
   if (b === "vm") return "vm";
   if (b === "dotnet") return "dotnet";
   return "cloudtasks";

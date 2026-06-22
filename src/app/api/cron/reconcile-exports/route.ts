@@ -23,7 +23,12 @@ export const dynamic = "force-dynamic";
  * closed when the secret isn't configured.
  */
 const STALE_MS = 10 * 60_000;
-const ACTIVE_STATUSES: ExportJobDoc["status"][] = ["queued", "rendering", "uploading"];
+const ACTIVE_STATUSES: ExportJobDoc["status"][] = [
+  "queued",
+  "batch_submitted",
+  "rendering",
+  "uploading",
+];
 /** Bound the per-run work; the cron re-runs and drains over multiple ticks. */
 const BATCH = 200;
 

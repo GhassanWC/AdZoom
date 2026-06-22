@@ -1,10 +1,16 @@
-# Framevo export API (C#) — Cloud Run image.
+# Framevo export worker (C#) — ONE image, three run modes (chosen by env):
+#   • Google Cloud Batch (production paid export): EXPORT_JOB_ID + EXPORT_JOB_UID
+#     ⇒ claim that one job, render, upload, write terminal status, EXIT 0/non-zero.
+#     One container per export → near-zero idle compute cost.
+#   • GCE VM (legacy): EXPORT_WORKER_MODE=firestore-poll ⇒ long-lived poll loop.
+#   • Cloud Run control plane: EXPORT_WORKER_MODE=disabled ⇒ HTTP endpoints only.
 #
 # BUILD CONTEXT MUST BE THE REPO ROOT (the render-CLI bundle inlines shared code
 # from ../../src via the "@" alias):
-#   docker build -f services/export-api-dotnet/Dockerfile -t export-api .
+#   docker build -f services/export-api-dotnet/Dockerfile \
+#     --build-arg BUILD_VERSION=$(git rev-parse --short HEAD) -t export-api .
 #
-# Multi-runtime: the final image runs the .NET API AND a Node render CLI
+# Multi-runtime: the final image runs the .NET worker AND a Node render CLI
 # (the existing worker render core) that owns ffmpeg/ffprobe (bundled static
 # binaries) + the @napi-rs/canvas compositor.
 

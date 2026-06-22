@@ -22,6 +22,7 @@ public sealed class JobPipeline(
     {
         var month = Str(claim, JobFields.MonthlyBucket) ?? FirestoreService.CurrentMonthKey();
         var estimate = (int)Long(claim, JobFields.EstimatedExportMinutes);
+        var durationSeconds = Dbl(claim, "durationSeconds");
         var projectId = Str(claim, "projectId") ?? "";
         var sourcePath = Str(claim, JobFields.SourceStoragePath) ?? "";
         var outputPath = Str(claim, JobFields.OutputPath) ?? "";
@@ -159,6 +160,21 @@ public sealed class JobPipeline(
             await storage.DownloadAsync(sourcePath, srcFile, cancelCts.Token);
             log.LogInformation("[export:download] job={JobId} done ms={Ms}", jobId, (int)(DateTime.UtcNow - dl).TotalMilliseconds);
 
+            // ── Chunked render (long videos) — OFF unless EXPORT_CHUNKED_RENDER ──
+            // For videos longer than the threshold, render in independent chunks
+            // (retried per-chunk) and concat. On success it uploads + settles and
+            // RETURNS, so the monolithic block below stays the untouched default
+            // path. It FALLS BACK to that block when chunking can't apply (too
+            // short, or the timeline has cuts/speed → chunk_unsupported_timeline).
+            if (opts.ChunkedRenderEnabled && durationSeconds > opts.ChunkMinDurationSeconds)
+            {
+                var chunkResult = await RunChunkedAsync(
+                    uid, jobId, month, estimate, projectId, recipe, srcFile, outFile, outputPath,
+                    workDir, durationSeconds, warnings, cancelCts);
+                if (chunkResult != ChunkOutcome.FallBack) return; // done / failed / canceled — finalized inside
+                log.LogInformation("[{Tag}:chunk-fallback] job={JobId} — rendering whole video in one pass", opts.WorkerTag, jobId);
+            }
+
             // ── Render (Node CLI subprocess) ─────────────────────────────────
             var spec = new Dictionary<string, object?>
             {
@@ -209,7 +225,7 @@ public sealed class JobPipeline(
 
             // ── Upload + settle ──────────────────────────────────────────────
             await fs.PatchAsync(uid, jobId, new() { [JobFields.Stage] = "uploading", ["progressStage"] = "uploading", [JobFields.Progress] = 0.98 });
-            log.LogInformation("[{Tag}:upload-start] job={JobId}", opts.WorkerTag, jobId);
+            log.LogInformation("[{Tag}:upload-start] job={JobId} uid={Uid} project={Pid} output={Out}", opts.WorkerTag, jobId, uid, projectId, outputPath);
             var downloadUrl = await storage.UploadMp4Async(outFile, outputPath, cancelCts.Token);
 
             // Reflect the post-normalization audio outcome on the stored preflight
@@ -257,6 +273,208 @@ public sealed class JobPipeline(
         {
             try { Directory.Delete(workDir, recursive: true); } catch { /* best effort */ }
         }
+    }
+
+    // ── Chunked render (flagged) ───────────────────────────────────────────────
+    private enum ChunkOutcome { Done, Failed, Canceled, FallBack }
+
+    /// <summary>
+    /// Render a long video as independent OUTPUT-time chunks, retry each chunk on
+    /// failure, concat into the final MP4, then upload + settle. Returns FallBack
+    /// (doing nothing) when chunking can't apply — too few chunks, or the first
+    /// chunk reports `chunk_unsupported_timeline` (cuts/speed) — so the caller runs
+    /// the normal whole-video render instead. Done/Failed/Canceled are fully
+    /// finalized here (status + ledger written), mirroring the monolithic path.
+    /// </summary>
+    private async Task<ChunkOutcome> RunChunkedAsync(
+        string uid, string jobId, string month, int estimate, string projectId,
+        Dictionary<string, object> recipe, string srcFile, string outFile, string outputPath,
+        string workDir, double durationSeconds, List<string> warnings,
+        CancellationTokenSource cancelCts)
+    {
+        var chunkLen = Math.Max(1, opts.ChunkSeconds);
+        var chunkCount = (int)Math.Ceiling(durationSeconds / chunkLen);
+        if (chunkCount <= 1) return ChunkOutcome.FallBack; // nothing to gain — render whole
+
+        var normalizedPath = Path.Combine(workDir, "normalized-source.mp4");
+        var chunkFiles = new List<string>();
+        Dictionary<string, object?>? preflight = null;
+        string? audioStatus = null;
+        var normalizedRan = false;
+
+        log.LogInformation("[{Tag}:chunk-start] job={JobId} duration={Dur}s chunks={N} chunkLen={Len}s",
+            opts.WorkerTag, jobId, (int)durationSeconds, chunkCount, chunkLen);
+
+        for (var i = 0; i < chunkCount; i++)
+        {
+            var startSec = i * chunkLen;
+            var endSec = Math.Min((i + 1) * chunkLen, durationSeconds);
+            var chunkOut = Path.Combine(workDir, $"chunk_{i:D3}.mp4");
+            var first = i == 0;
+
+            await fs.PatchAsync(uid, jobId, new()
+            {
+                [JobFields.Stage] = "rendering_chunks",
+                ["progressStage"] = "rendering",
+                ["chunkIndex"] = i + 1,
+                ["chunkTotal"] = chunkCount,
+                [JobFields.Progress] = (double)i / chunkCount,
+            });
+
+            var spec = new Dictionary<string, object?>
+            {
+                // Chunk 0 reads the original (and normalizes once → normalized-source.mp4);
+                // later chunks read that normalized file. If normalization is globally
+                // off, there is no normalized file, so every chunk reads the original.
+                ["sourcePath"] = first || !opts.NormalizeEnabled ? srcFile : normalizedPath,
+                ["outputPath"] = chunkOut,
+                ["serializedRecipe"] = recipe,
+                ["crf"] = opts.X264Crf,
+                ["preset"] = opts.X264Preset,
+                ["normalizeCrf"] = opts.NormalizeCrf,
+                ["normalizePreset"] = opts.NormalizePreset,
+                // Normalize ONCE (chunk 0) → normalized-source.mp4; later chunks
+                // render straight from it (skip the expensive re-transcode).
+                ["normalizeEnabled"] = first && opts.NormalizeEnabled,
+                ["chunk"] = new Dictionary<string, object?> { ["startSec"] = startSec, ["endSec"] = endSec },
+            };
+
+            var lastOverallPct = -1;
+            void OnChunkEvent(RenderEvent ev)
+            {
+                switch (ev.Type)
+                {
+                    case "preflight" when first:
+                        audioStatus = ev.AudioStatus ?? audioStatus;
+                        preflight = new Dictionary<string, object?>
+                        {
+                            ["videoCodec"] = ev.VideoCodec ?? "",
+                            ["audioCodec"] = ev.AudioCodec ?? "",
+                            ["risky"] = ev.Risky ?? false,
+                            ["normalized"] = ev.Normalized ?? false,
+                        };
+                        break;
+                    case "progress" when ev.Value is { } v:
+                        // Map chunk-local 0..1 onto the overall job progress.
+                        var overall = (i + Math.Clamp(v, 0, 1)) / chunkCount;
+                        var pct = (int)Math.Round(overall * 100);
+                        if (pct != lastOverallPct)
+                        {
+                            lastOverallPct = pct;
+                            FireForget(fs.PatchAsync(uid, jobId, new() { [JobFields.Progress] = overall }));
+                        }
+                        break;
+                    case "warning" when !string.IsNullOrEmpty(ev.Message) && !warnings.Contains(ev.Message!):
+                        warnings.Add(ev.Message!);
+                        break;
+                }
+            }
+
+            RenderOutcome? outcome = null;
+            var ok = false;
+            for (var attempt = 0; attempt <= Math.Max(0, opts.ChunkMaxRetries); attempt++)
+            {
+                if (attempt > 0)
+                    log.LogWarning("[{Tag}:chunk-retry] job={JobId} chunk={Idx}/{N} attempt={Att}",
+                        opts.WorkerTag, jobId, i + 1, chunkCount, attempt + 1);
+
+                outcome = await render.RunAsync(jobId, spec, workDir, OnChunkEvent, cancelCts.Token,
+                    specName: $"spec-chunk-{i}.json");
+
+                if (cancelCts.IsCancellationRequested || outcome.Canceled || outcome.ExitCode == 2)
+                {
+                    log.LogInformation("[export:canceled] job={JobId} (chunk {Idx})", jobId, i + 1);
+                    return ChunkOutcome.Canceled;
+                }
+                // First chunk says this timeline can't be chunked → abandon chunking.
+                if (first && outcome.Error?.Code == "chunk_unsupported_timeline")
+                {
+                    log.LogInformation("[{Tag}:chunk-unsupported] job={JobId} — timeline has cuts/speed", opts.WorkerTag, jobId);
+                    return ChunkOutcome.FallBack;
+                }
+                if (outcome.ExitCode == 0 && outcome.Done is not null) { ok = true; break; }
+                log.LogWarning("[{Tag}:chunk-fail] job={JobId} chunk={Idx}/{N} code={Code}",
+                    opts.WorkerTag, jobId, i + 1, chunkCount, outcome.Error?.Code ?? "render_failed");
+            }
+
+            if (!ok)
+            {
+                var code = outcome?.Error?.Code ?? "render_failed";
+                var msg = outcome?.Error?.Message ?? "Something went wrong while exporting your video. Please try again.";
+                await fs.FailAndReleaseAsync(uid, jobId, month, estimate, code, msg);
+                log.LogError("[{Tag}:failed] job={JobId} chunk={Idx}/{N} code={Code}", opts.WorkerTag, jobId, i + 1, chunkCount, code);
+                return ChunkOutcome.Failed;
+            }
+
+            // Backstop on chunk 0 — never finalize an export that skipped normalization.
+            if (first)
+            {
+                normalizedRan = outcome!.Done!.Normalized ?? false;
+                audioStatus = outcome.Done.AudioStatus ?? audioStatus;
+                if (opts.NormalizeEnabled && outcome.Done.Normalized == false)
+                {
+                    await fs.FailAndReleaseAsync(uid, jobId, month, estimate, "normalize_not_executed",
+                        "The export could not be prepared (normalization did not run). Please try again.");
+                    log.LogError("[{Tag}:failed] job={JobId} code=normalize_not_executed (chunk0)", opts.WorkerTag, jobId);
+                    return ChunkOutcome.Failed;
+                }
+            }
+            if (outcome!.Done!.Warnings is { Length: > 0 } cw)
+                foreach (var w in cw) if (!warnings.Contains(w)) warnings.Add(w);
+
+            chunkFiles.Add(chunkOut);
+            log.LogInformation("[{Tag}:chunk-done] job={JobId} chunk={Idx}/{N}", opts.WorkerTag, jobId, i + 1, chunkCount);
+        }
+
+        // ── Merge ────────────────────────────────────────────────────────────
+        await fs.PatchAsync(uid, jobId, new()
+        {
+            [JobFields.Stage] = "merging",
+            ["progressStage"] = "merging",
+            [JobFields.Progress] = 0.97,
+        });
+        log.LogInformation("[{Tag}:merge-start] job={JobId} chunks={N}", opts.WorkerTag, jobId, chunkFiles.Count);
+        var concatSpec = new Dictionary<string, object?>
+        {
+            ["mode"] = "concat",
+            ["inputs"] = chunkFiles,
+            ["outputPath"] = outFile,
+        };
+        var concat = await render.RunAsync(jobId, concatSpec, workDir, _ => { }, cancelCts.Token, specName: "spec-concat.json");
+        if (cancelCts.IsCancellationRequested || concat.Canceled || concat.ExitCode == 2)
+            return ChunkOutcome.Canceled;
+        if (concat.ExitCode != 0 || concat.Done is null)
+        {
+            var code = concat.Error?.Code ?? "concat_failed";
+            await fs.FailAndReleaseAsync(uid, jobId, month, estimate, code,
+                "Couldn't assemble the exported video. Please try again.");
+            log.LogError("[{Tag}:failed] job={JobId} code={Code} (merge)", opts.WorkerTag, jobId, code);
+            return ChunkOutcome.Failed;
+        }
+
+        // ── Upload + settle ──────────────────────────────────────────────────
+        await fs.PatchAsync(uid, jobId, new() { [JobFields.Stage] = "uploading", ["progressStage"] = "uploading", [JobFields.Progress] = 0.98 });
+        log.LogInformation("[{Tag}:upload-start] job={JobId} uid={Uid} project={Pid} output={Out} (chunked)", opts.WorkerTag, jobId, uid, projectId, outputPath);
+        var downloadUrl = await storage.UploadMp4Async(outFile, outputPath, cancelCts.Token);
+
+        if (preflight is not null)
+        {
+            preflight["normalized"] = normalizedRan;
+            if (!string.IsNullOrEmpty(audioStatus)) preflight["audioStatus"] = audioStatus!;
+        }
+        var settled = await fs.SettleSuccessAsync(uid, jobId, month, estimate, downloadUrl, warnings.Distinct().ToList(), preflight);
+        if (settled)
+        {
+            try { await fs.MirrorProjectExportUrlAsync(uid, projectId, downloadUrl); }
+            catch (Exception ex) { log.LogWarning(ex, "[export] project exportUrl mirror failed job={JobId}", jobId); }
+            log.LogInformation("[{Tag}:complete] job={JobId} minutes={Min} chunks={N} audio={Audio}",
+                opts.WorkerTag, jobId, estimate, chunkFiles.Count, audioStatus ?? "(n/a)");
+        }
+        else
+        {
+            log.LogInformation("[export:complete] job={JobId} already finalized (skipped settle)", jobId);
+        }
+        return ChunkOutcome.Done;
     }
 
     private IDisposable StartHeartbeat(string uid, string jobId, CancellationToken ct)
@@ -324,4 +542,7 @@ public sealed class JobPipeline(
 
     private static long Long(DocumentSnapshot s, string f) =>
         s.ContainsField(f) ? s.GetValue<object>(f) switch { long l => l, int i => i, double d => (long)d, _ => 0 } : 0;
+
+    private static double Dbl(DocumentSnapshot s, string f) =>
+        s.ContainsField(f) ? s.GetValue<object>(f) switch { double d => d, long l => l, int i => i, _ => 0 } : 0;
 }

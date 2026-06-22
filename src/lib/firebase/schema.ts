@@ -1386,17 +1386,25 @@ export interface SerializedRenderRecipe {
 
 /**
  * Cloud-export job lifecycle:
- *   queued → rendering → uploading → ready   (happy path)
- *   queued|rendering → failed                (worker error; minutes refunded)
- *   queued|rendering → canceled              (cancelRequested honored; refunded)
+ *   queued → batch_submitted → rendering → uploading → ready   (Batch happy path)
+ *   queued → rendering → uploading → ready                     (VM/Cloud Run path)
+ *   queued|batch_submitted|rendering → failed   (system error; minutes refunded)
+ *   queued|rendering → canceled                 (cancelRequested honored; refunded)
  *
- * Created by `POST /api/export/cloud` with `status:"queued"` AFTER plan +
- * minutes gating. Every status/progress transition after that is written by the
- * worker (Admin SDK). The client only ever sets `cancelRequested` via
+ * `batch_submitted` is the Google Cloud Batch transition: the job doc is created
+ * (`queued`) inside the reserve+create transaction, then a Batch task is submitted
+ * and the doc flips to `batch_submitted` (container is provisioning, not yet
+ * rendering). The one-shot worker claims it → `rendering`. On the legacy VM/poll
+ * path the job goes straight `queued → rendering` (no Batch step).
+ *
+ * Created by `POST /api/export/cloud` with `status:"queued"` AFTER plan + minutes
+ * gating. Every transition after that is written server-side (worker / Batch
+ * submitter, Admin SDK). The client only ever sets `cancelRequested` via
  * `POST /api/export/cancel`.
  */
 export type ExportJobStatus =
   | "queued"
+  | "batch_submitted"
   | "rendering"
   | "uploading"
   | "ready"
@@ -1410,6 +1418,10 @@ export type ExportJobStage =
   | "normalizing"
   | "decoding"
   | "rendering"
+  /** Long-video chunked render in progress (see `chunkIndex`/`chunkTotal`). */
+  | "rendering_chunks"
+  /** Concatenating rendered chunks into the final MP4. */
+  | "merging"
   | "encoding"
   | "uploading";
 
@@ -1493,6 +1505,19 @@ export interface ExportJobDoc {
   settingsHash?: string;
   /** Worker build/version that last touched this job (observability + bug reports). */
   buildVersion?: string;
+  // ── Google Cloud Batch attribution (paid export runs as a one-shot Batch task) ─
+  /** Batch job id we submitted (`export-<jobId>-<suffix>`, RFC1035). */
+  batchJobId?: string;
+  /** Fully-qualified Batch job resource name
+   *  (`projects/{p}/locations/{region}/jobs/{batchJobId}`). */
+  batchJobName?: string;
+  /** Epoch ms when the Batch task was submitted (status → batch_submitted). */
+  batchSubmittedAt?: number;
+  // ── Chunked render progress (long videos; only when chunking is enabled) ──────
+  /** 1-based index of the chunk currently rendering. */
+  chunkIndex?: number;
+  /** Total number of chunks for this export (1 when not chunked). */
+  chunkTotal?: number;
   createdAt: number;
   updatedAt: number;
   startedAt?: number;
@@ -1503,4 +1528,10 @@ export interface ExportJobDoc {
 }
 
 /** Friendly progress stages the export dialog shows (maps from status + stage). */
-export type ExportUiStage = "queued" | "preparing" | "rendering" | "uploading" | "ready";
+export type ExportUiStage =
+  | "queued"
+  | "preparing"
+  | "rendering"
+  | "merging"
+  | "uploading"
+  | "ready";
