@@ -21,6 +21,7 @@ import type {
   DetectedMoment,
   EffectsSettings,
   ExportFormat,
+  ExportJobDoc,
   MonthlyUsage,
   ProjectDoc,
   SerializedRenderRecipe,
@@ -155,6 +156,15 @@ export async function createCloudExportJob(
   });
 
   // ── Dedup + single-flight against the user's active jobs ─────────────────
+  // Defensive guard: NEVER reuse a canceled / failed / completed / cancel-requested
+  // job — reusing one makes the Batch worker claim a terminal job and abort. The
+  // active-status query already excludes terminal jobs; we additionally skip any
+  // cancel-requested job and RE-VALIDATE a dedup candidate with a fresh read, so a
+  // job that was canceled in the cancel→re-export race is not reused (we create a
+  // fresh job instead). This is a tightening of the existing dedup only — a genuine
+  // identical active export is still deduped (double-click guard) and a different
+  // active export still blocks (one export at a time).
+  console.log("[export-create] export request received", { uid, projectId, settingsHash });
   try {
     const activeSnap = await db
       .collection(`users/${uid}/exportJobs`)
@@ -169,10 +179,16 @@ export async function createCloudExportJob(
 
     for (const d of activeSnap.docs) {
       const data = d.data();
-      const beat = tsToMs(data.lastHeartbeatAt) ?? tsToMs(data.updatedAt) ?? 0;
+      const beat =
+        tsToMs(data.lastHeartbeatAt) ?? tsToMs(data.heartbeatAt) ?? tsToMs(data.updatedAt) ?? 0;
       const stale = now - beat > HEARTBEAT_STALE_MS;
       if (stale) {
         staleIds.push(d.id);
+        continue;
+      }
+      // Guard: a job already asked to cancel is NOT a reuse candidate (and isn't a
+      // "different active export" that should block either — it's on its way out).
+      if (data.cancelRequested === true) {
         continue;
       }
       if (data.projectId === projectId && data.settingsHash === settingsHash) {
@@ -182,27 +198,42 @@ export async function createCloudExportJob(
       }
     }
 
-    // Identical active export → return it, do not create a duplicate.
+    // Identical active export → return it, do not create a duplicate. Re-validate
+    // with a fresh read first: if it was canceled/failed between the query and now,
+    // do NOT reuse it — fall through and create a fresh job.
     if (freshDuplicateId) {
       const dupSnap = await db.doc(`users/${uid}/exportJobs/${freshDuplicateId}`).get();
-      const dup = dupSnap.data() ?? {};
-      const plan = await getUserPlan(uid);
-      const paidPlan = plan === "creator" ? "creator" : "pro";
-      console.log("[export-create] dedup — returning existing active job", {
+      const dup = (dupSnap.data() ?? {}) as Partial<ExportJobDoc>;
+      const reusable =
+        !!dup.status &&
+        (ACTIVE_STATUSES as readonly string[]).includes(dup.status) &&
+        dup.cancelRequested !== true;
+      if (reusable) {
+        const plan = await getUserPlan(uid);
+        const paidPlan = plan === "creator" ? "creator" : "pro";
+        console.log("[export-create] dedup — returning existing active job", {
+          uid,
+          jobId: freshDuplicateId,
+          settingsHash,
+        });
+        return {
+          ok: true,
+          jobId: freshDuplicateId,
+          deduped: true,
+          estimatedExportMinutes: (dup.estimatedExportMinutes as number) ?? 0,
+          outputDurationSeconds: (dup.durationSeconds as number) ?? 0,
+          plan: paidPlan,
+          priority: paidPlan === "creator" ? "priority" : "normal",
+          limit: CLOUD_EXPORT_MINUTES[paidPlan],
+        };
+      }
+      // Candidate is no longer reusable (terminal/canceled in the race) → ignore it
+      // and create a fresh job below.
+      console.log("[export-create] previous job not reusable — creating a fresh job", {
         uid,
         jobId: freshDuplicateId,
-        settingsHash,
+        status: dup.status,
       });
-      return {
-        ok: true,
-        jobId: freshDuplicateId,
-        deduped: true,
-        estimatedExportMinutes: (dup.estimatedExportMinutes as number) ?? 0,
-        outputDurationSeconds: (dup.durationSeconds as number) ?? 0,
-        plan: paidPlan,
-        priority: paidPlan === "creator" ? "priority" : "normal",
-        limit: CLOUD_EXPORT_MINUTES[paidPlan],
-      };
     }
 
     // Stale active jobs (dead worker) → fail them + release minutes, then continue.
@@ -417,7 +448,12 @@ export async function createCloudExportJob(
     };
   }
 
-  console.log("[export-create] created", { uid, jobId, settingsHash });
+  console.log("[export-create] new export job created", {
+    uid,
+    jobId,
+    settingsHash,
+    status: "queued",
+  });
   return {
     ok: true,
     jobId,
