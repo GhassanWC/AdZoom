@@ -141,6 +141,7 @@ export function materializeExportJob(
     workerId: data.workerId as string | undefined,
     claimedAt: millis(data.claimedAt) ?? (data.claimedAt as number | undefined),
     lastHeartbeatAt: millis(data.lastHeartbeatAt) ?? (data.lastHeartbeatAt as number | undefined),
+    heartbeatAt: millis(data.heartbeatAt) ?? (data.heartbeatAt as number | undefined),
     queuePosition: data.queuePosition as number | undefined,
     exportPath: (data.exportPath as "cloud" | "browser" | undefined) ?? "cloud",
     settingsHash: data.settingsHash as string | undefined,

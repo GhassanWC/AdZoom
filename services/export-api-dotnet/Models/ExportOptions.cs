@@ -37,6 +37,13 @@ public sealed class ExportOptions
     /// <summary>How often the per-job cancel poll reads cancelRequested.</summary>
     public int CancelPollSeconds { get; set; } = 1;
 
+    /// <summary>Single-job (Batch) startup watchdog: if the worker hasn't advanced
+    /// the job out of queued/batch_submitted (i.e. claimed → rendering) within this
+    /// many seconds of the container starting, it FAILS the job with a clear error
+    /// and hard-exits so a wedged container can't run (and bill) forever. From
+    /// BATCH_STARTUP_TIMEOUT_SECONDS / STARTUP_TIMEOUT_SECONDS; default 120s.</summary>
+    public int StartupTimeoutSeconds { get; set; } = 120;
+
     // ── Render CLI (Node subprocess) ─────────────────────────────────────────
     /// <summary>Path to the node binary (set in the image).</summary>
     public string RenderCliNode { get; set; } = "node";
@@ -136,6 +143,8 @@ public sealed class ExportOptions
         o.WorkerConcurrency = EnvInt("WORKER_CONCURRENCY", o.WorkerConcurrency);
         o.PollIntervalSeconds = EnvInt("POLL_INTERVAL_SECONDS", o.PollIntervalSeconds);
         o.HeartbeatSeconds = EnvInt("HEARTBEAT_SECONDS", o.HeartbeatSeconds);
+        o.StartupTimeoutSeconds = EnvInt("BATCH_STARTUP_TIMEOUT_SECONDS",
+            EnvInt("STARTUP_TIMEOUT_SECONDS", o.StartupTimeoutSeconds));
         o.HeartbeatStaleSeconds = EnvInt("HEARTBEAT_STALE_SECONDS", o.HeartbeatStaleSeconds);
         o.ReconcileStaleSeconds = EnvInt("RECONCILE_STALE_SECONDS", o.ReconcileStaleSeconds);
         o.ReconcileIntervalSeconds = EnvInt("RECONCILE_INTERVAL_SECONDS", o.ReconcileIntervalSeconds);
@@ -155,7 +164,14 @@ public sealed class ExportOptions
         o.JobUid = Env("EXPORT_JOB_UID");
         o.SingleJob = !string.IsNullOrWhiteSpace(o.JobId)
                       || o.WorkerMode.Equals("single-job", StringComparison.OrdinalIgnoreCase);
-        if (o.SingleJob) o.WorkerMode = "single-job";
+        if (o.SingleJob)
+        {
+            o.WorkerMode = "single-job";
+            // Batch tasks are short-lived; heartbeat every 30s (requirement) so a
+            // wedged container is flagged stale sooner. An explicit HEARTBEAT_SECONDS
+            // still wins.
+            o.HeartbeatSeconds = EnvInt("HEARTBEAT_SECONDS", 30);
+        }
 
         // ── Chunked render flag (off by default) ─────────────────────────────
         o.ChunkedRenderEnabled = EnvBool("EXPORT_CHUNKED_RENDER", o.ChunkedRenderEnabled);

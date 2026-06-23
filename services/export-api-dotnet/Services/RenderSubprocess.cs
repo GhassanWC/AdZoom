@@ -38,6 +38,8 @@ public sealed class RenderSubprocess(ExportOptions opts, LogBuffer logs, ILogger
         psi.ArgumentList.Add(specPath);
 
         using var proc = new Process { StartInfo = psi };
+        if (opts.SingleJob)
+            BatchLog.Line($"renderer start job={jobId} cmd={opts.RenderCliNode} {opts.RenderCliEntry} {specName}");
         proc.Start();
 
         RenderEvent? doneEvent = null;

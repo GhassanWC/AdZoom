@@ -226,3 +226,80 @@ export async function submitBatchJob({ uid, jobId, priority }: SubmitBatchParams
     });
   }
 }
+
+/** Reconstruct the fully-qualified Batch job resource name when only the id was
+ *  recorded (older docs / a partial write). Needs BATCH_REGION + a project id. */
+function batchJobResourceName(batchJobId: string): string | null {
+  const project = projectId();
+  const region = process.env.BATCH_REGION?.trim();
+  if (!project || !region) return null;
+  return `projects/${project}/locations/${region}/jobs/${batchJobId}`;
+}
+
+/**
+ * Stop a running Batch job so its VM is torn down and STOPS BILLING — called when
+ * the user cancels an export. Without this, marking the Firestore job `canceled`
+ * leaves the Batch task RUNNING (and charging) until it finishes or hits
+ * BATCH_MAX_RUN_SECONDS.
+ *
+ * Best-effort + bounded: tries the graceful CancelJob first (leaves the job as
+ * CANCELLED for inspection), falling back to DeleteJob. A NOT_FOUND (already gone
+ * / finished) counts as success. Never throws — the worker's own 1s cancel-poll
+ * is the backstop that makes it exit; this only ensures the VM doesn't keep
+ * charging after Firestore says canceled. Returns true when Batch acknowledged
+ * the stop (or the job was already gone).
+ */
+export async function cancelBatchJob({
+  jobName,
+  batchJobId,
+}: {
+  jobName?: string | null;
+  batchJobId?: string | null;
+}): Promise<boolean> {
+  const name =
+    jobName?.trim() || (batchJobId ? batchJobResourceName(batchJobId.trim()) : null);
+  if (!name) {
+    console.warn("[export-cancel] backend=batch no batchJobName/batchJobId to stop");
+    return false;
+  }
+
+  const client = new BatchServiceClient();
+  // Bound the initial RPC so a slow Batch control plane can't hang the cancel
+  // route. We do NOT await the long-running operation to completion — initiating
+  // the cancel/delete is enough for Batch to tear the VM down.
+  const callOpts = { timeout: 10_000 };
+  const notFound = (err: unknown) => (err as { code?: unknown })?.code === 5; // gRPC NOT_FOUND
+
+  // 1) Graceful cancel — preferred; keeps the job record as CANCELLED.
+  try {
+    await client.cancelJob({ name }, callOpts);
+    console.log(`[export-cancel] backend=batch cancelJob initiated name=${name}`);
+    return true;
+  } catch (err) {
+    if (notFound(err)) {
+      console.log(`[export-cancel] backend=batch job already gone name=${name}`);
+      return true;
+    }
+    console.warn(`[export-cancel] backend=batch cancelJob failed — trying deleteJob name=${name}`, {
+      grpcCode: (err as { code?: unknown })?.code,
+      message: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  // 2) Fallback — delete the job (also tears down the VM / stops billing).
+  try {
+    await client.deleteJob({ name }, callOpts);
+    console.log(`[export-cancel] backend=batch deleteJob initiated name=${name}`);
+    return true;
+  } catch (err) {
+    if (notFound(err)) {
+      console.log(`[export-cancel] backend=batch job already gone (delete) name=${name}`);
+      return true;
+    }
+    console.error(`[export-cancel] backend=batch deleteJob failed name=${name}`, {
+      grpcCode: (err as { code?: unknown })?.code,
+      message: err instanceof Error ? err.message : String(err),
+    });
+    return false;
+  }
+}

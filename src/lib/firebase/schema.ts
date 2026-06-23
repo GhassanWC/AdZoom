@@ -1483,6 +1483,9 @@ export interface ExportJobDoc {
   /** Epoch ms of the worker's last heartbeat — drives the "taking longer than
    *  expected" / stale detection in the UI (independent of `updatedAt`). */
   lastHeartbeatAt?: number;
+  /** Epoch ms the single-job (Batch) worker bumps every 30s. Mirrors
+   *  `lastHeartbeatAt`; kept distinct for the Batch liveness contract. */
+  heartbeatAt?: number;
   /** Best-effort queue position recorded at enqueue (active jobs created before
    *  this one). Shown while `status === "queued"`; not updated live. */
   queuePosition?: number;

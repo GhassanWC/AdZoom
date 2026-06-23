@@ -157,8 +157,10 @@ public sealed class JobPipeline(
             await fs.PatchAsync(uid, jobId, new() { [JobFields.Stage] = "downloading", ["progressStage"] = "preparing", [JobFields.Progress] = 0.02 });
             var dl = DateTime.UtcNow;
             log.LogInformation("[export:download] job={JobId} src={Src}", jobId, sourcePath);
+            Batch($"downloading source video job={jobId} src={sourcePath}");
             await storage.DownloadAsync(sourcePath, srcFile, cancelCts.Token);
             log.LogInformation("[export:download] job={JobId} done ms={Ms}", jobId, (int)(DateTime.UtcNow - dl).TotalMilliseconds);
+            Batch($"download complete job={jobId} ms={(int)(DateTime.UtcNow - dl).TotalMilliseconds}");
 
             // ── Chunked render (long videos) — OFF unless EXPORT_CHUNKED_RENDER ──
             // For videos longer than the threshold, render in independent chunks
@@ -187,6 +189,7 @@ public sealed class JobPipeline(
                 ["normalizePreset"] = opts.NormalizePreset,
                 ["normalizeEnabled"] = opts.NormalizeEnabled,
             };
+            Batch($"starting render job={jobId}");
             var outcome = await render.RunAsync(jobId, spec, workDir, OnEvent, cancelCts.Token);
 
             // ── Cancellation (user cancel or shutdown) — do NOT finalize ─────
@@ -198,6 +201,7 @@ public sealed class JobPipeline(
                 // re-claim. Either way the runner must NOT touch the ledger.
                 log.LogInformation("[export:canceled] job={JobId} (cancel or shutdown)", jobId);
                 log.LogInformation("[{Tag}:lease-released] job={JobId} (cancel or shutdown)", opts.WorkerTag, jobId);
+                Batch($"render canceled — stopping job={jobId}");
                 return;
             }
 
@@ -208,6 +212,7 @@ public sealed class JobPipeline(
                 var msg = outcome.Error?.Message ?? "Something went wrong while exporting your video. Please try again.";
                 await fs.FailAndReleaseAsync(uid, jobId, month, estimate, code, msg);
                 log.LogError("[{Tag}:failed] job={JobId} code={Code}", opts.WorkerTag, jobId, code);
+                Batch($"job settle FAILED job={jobId} code={code}");
                 return;
             }
 
@@ -226,7 +231,9 @@ public sealed class JobPipeline(
             // ── Upload + settle ──────────────────────────────────────────────
             await fs.PatchAsync(uid, jobId, new() { [JobFields.Stage] = "uploading", ["progressStage"] = "uploading", [JobFields.Progress] = 0.98 });
             log.LogInformation("[{Tag}:upload-start] job={JobId} uid={Uid} project={Pid} output={Out}", opts.WorkerTag, jobId, uid, projectId, outputPath);
+            Batch($"upload start job={jobId} output={outputPath}");
             var downloadUrl = await storage.UploadMp4Async(outFile, outputPath, cancelCts.Token);
+            Batch($"upload complete job={jobId}");
 
             // Reflect the post-normalization audio outcome on the stored preflight
             // (observability — `audio_removed_unsupported` already rides warnings[]).
@@ -247,10 +254,12 @@ public sealed class JobPipeline(
                 try { await fs.MirrorProjectExportUrlAsync(uid, projectId, downloadUrl); }
                 catch (Exception ex) { log.LogWarning(ex, "[export] project exportUrl mirror failed job={JobId}", jobId); }
                 log.LogInformation("[{Tag}:complete] job={JobId} minutes={Min} audio={Audio}", opts.WorkerTag, jobId, estimate, audioStatus ?? "(n/a)");
+                Batch($"job settle SUCCESS job={jobId} minutes={estimate}");
             }
             else
             {
                 log.LogInformation("[export:complete] job={JobId} already finalized (skipped settle)", jobId);
+                Batch($"job already finalized (skipped settle) job={jobId}");
             }
         }
         catch (OperationCanceledException)
@@ -487,7 +496,7 @@ public sealed class JobPipeline(
             {
                 while (await timer.WaitForNextTickAsync(cts.Token))
                 {
-                    try { await fs.HeartbeatAsync(uid, jobId); }
+                    try { await fs.HeartbeatAsync(uid, jobId); Batch($"heartbeat job={jobId}"); }
                     catch (Exception ex) { log.LogWarning(ex, "[export] heartbeat failed job={JobId}", jobId); }
                 }
             }
@@ -511,6 +520,7 @@ public sealed class JobPipeline(
                         if (await fs.IsCancelRequestedAsync(uid, jobId))
                         {
                             log.LogInformation("[export:cancel] job={JobId} cancel requested", jobId);
+                            Batch($"cancel requested (status=canceled) — aborting render job={jobId}");
                             cancelCts.Cancel();
                             return;
                         }
@@ -526,6 +536,14 @@ public sealed class JobPipeline(
     private void FireForget(Task t) =>
         t.ContinueWith(x => log.LogWarning(x.Exception, "[export] patch failed"),
             TaskContinuationOptions.OnlyOnFaulted);
+
+    /// <summary>Raw, auto-flushed [batch-worker] stdout milestone — emitted ONLY in
+    /// single-job (Batch) mode so the VM/poll deploys aren't polluted, and so the
+    /// Batch lifecycle is greppable as a Cloud Logging textPayload (see BatchLog).</summary>
+    private void Batch(string message)
+    {
+        if (opts.SingleJob) BatchLog.Line(message);
+    }
 
     /// <summary>Map the raw worker stage to the friendly UI stage the dialog shows
     /// (download + normalize read as "preparing" so the bar is never frozen).</summary>

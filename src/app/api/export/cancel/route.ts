@@ -2,6 +2,7 @@ import { NextResponse, type NextRequest } from "next/server";
 import { FieldValue } from "firebase-admin/firestore";
 import { getAdmin } from "@/lib/firebase/admin";
 import { exportBackend, dotnetCancel } from "@/lib/export/dotnet-backend";
+import { cancelBatchJob } from "@/lib/export/batch-backend";
 import type { ExportJobDoc } from "@/lib/firebase/schema";
 
 export const runtime = "nodejs";
@@ -82,10 +83,17 @@ export async function POST(req: NextRequest) {
       const snap = await tx.get(jobRef);
       if (!snap.exists) return { status: 404 as const };
       const job = snap.data() as ExportJobDoc;
+      // Captured for the post-txn Batch teardown (stop the VM so it can't keep
+      // charging after we mark the job canceled).
+      const batch = {
+        priorStatus: job.status,
+        batchJobName: job.batchJobName ?? null,
+        batchJobId: job.batchJobId ?? null,
+      };
 
       // Already terminal — nothing to do (idempotent).
       if (job.status === "ready" || job.status === "failed" || job.status === "canceled") {
-        return { status: 200 as const, state: job.status };
+        return { status: 200 as const, state: job.status, ...batch };
       }
 
       // The cancel route is AUTHORITATIVE for cancellation: for ANY non-terminal
@@ -119,7 +127,7 @@ export async function POST(req: NextRequest) {
         },
         { merge: true }
       );
-      return { status: 200 as const, state: "canceled" as const };
+      return { status: 200 as const, state: "canceled" as const, ...batch };
     });
 
     console.log(
@@ -128,6 +136,37 @@ export async function POST(req: NextRequest) {
     if (result.status === 404) {
       return NextResponse.json({ error: "Export job not found." }, { status: 404 });
     }
+
+    // Stop the Google Cloud Batch VM so a canceled export stops billing. The
+    // Firestore flag alone doesn't stop Batch — without this the task keeps
+    // RUNNING (and charging) until it finishes or hits BATCH_MAX_RUN_SECONDS.
+    // Only when a Batch job exists AND the worker could still be running it:
+    // skip ready/failed (the worker already exited → VM gone), but DO try for a
+    // job that was already `canceled` (a prior cancel may not have stopped it).
+    if (
+      (result.batchJobName || result.batchJobId) &&
+      result.priorStatus !== "ready" &&
+      result.priorStatus !== "failed"
+    ) {
+      try {
+        const stopped = await cancelBatchJob({
+          jobName: result.batchJobName,
+          batchJobId: result.batchJobId,
+        });
+        console.log(
+          `[export-cancel] batch teardown job=${jobId} priorStatus=${result.priorStatus} stopped=${stopped}`
+        );
+      } catch (err) {
+        // Never fail the user's cancel on a Batch teardown error — the worker's
+        // cancel-poll still exits, and the stale reconciler/max-run ceiling is the
+        // final backstop. Surface it for ops.
+        console.error("[export-cancel] batch teardown threw (job already canceled in Firestore)", {
+          jobId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
     return NextResponse.json({ ok: true, state: result.state });
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Cancel failed.";

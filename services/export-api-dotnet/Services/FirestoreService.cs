@@ -164,6 +164,7 @@ public sealed class FirestoreService(FirestoreDb db, ExportOptions opts, ILogger
                 [JobFields.BuildVersion] = opts.BuildVersion,
                 [JobFields.ClaimedAt] = FieldValue.ServerTimestamp,
                 [JobFields.LastHeartbeatAt] = FieldValue.ServerTimestamp,
+                [JobFields.HeartbeatAt] = FieldValue.ServerTimestamp,
                 [JobFields.Progress] = 0,
                 [JobFields.StartedAt] = FieldValue.ServerTimestamp,
                 [JobFields.UpdatedAt] = FieldValue.ServerTimestamp,
@@ -181,6 +182,7 @@ public sealed class FirestoreService(FirestoreDb db, ExportOptions opts, ILogger
     {
         data[JobFields.UpdatedAt] = FieldValue.ServerTimestamp;
         data[JobFields.LastHeartbeatAt] = FieldValue.ServerTimestamp;
+        data[JobFields.HeartbeatAt] = FieldValue.ServerTimestamp;
         return JobRef(uid, jobId).SetAsync(data, SetOptions.MergeAll);
     }
 
@@ -188,7 +190,8 @@ public sealed class FirestoreService(FirestoreDb db, ExportOptions opts, ILogger
         JobRef(uid, jobId).SetAsync(new Dictionary<string, object>
         {
             [JobFields.UpdatedAt] = FieldValue.ServerTimestamp,
-            ["lastHeartbeatAt"] = FieldValue.ServerTimestamp,
+            [JobFields.LastHeartbeatAt] = FieldValue.ServerTimestamp,
+            [JobFields.HeartbeatAt] = FieldValue.ServerTimestamp,
         }, SetOptions.MergeAll);
 
     // ── Settle on success (ports handler.ts success txn) ─────────────────────
@@ -299,6 +302,53 @@ public sealed class FirestoreService(FirestoreDb db, ExportOptions opts, ILogger
                 [JobFields.WorkerId] = opts.WorkerId,
                 [JobFields.BuildVersion] = opts.BuildVersion,
                 [JobFields.FailedAt] = FieldValue.ServerTimestamp,
+                [JobFields.UpdatedAt] = FieldValue.ServerTimestamp,
+            }, SetOptions.MergeAll);
+            return true;
+        });
+    }
+
+    /// <summary>
+    /// Startup-watchdog fail: mark a job failed + release its reservation ONLY while
+    /// it is still pre-render (queued / batch_submitted). If a worker has already
+    /// claimed it (rendering/uploading) or it's terminal, this is a no-op (returns
+    /// false) — so it can never abort a render that legitimately got going. Returns
+    /// true iff it actually failed the job.
+    /// </summary>
+    public Task<bool> FailIfNotStartedAsync(string uid, string jobId, string code, string message)
+    {
+        return db.RunTransactionAsync(async tx =>
+        {
+            var jobRef = JobRef(uid, jobId);
+            var snap = await tx.GetSnapshotAsync(jobRef);
+            if (!snap.Exists) return false;
+            var status = GetString(snap, JobFields.Status);
+            // Only intervene before a worker has claimed the job. rendering/uploading
+            // (claimed) and terminal states are left untouched.
+            if (status is not (JobFields.Queued or JobFields.BatchSubmitted)) return false;
+
+            var month = GetString(snap, JobFields.MonthlyBucket) ?? CurrentMonthKey();
+            var estimate = (int)GetLong(snap, JobFields.EstimatedExportMinutes);
+            if (estimate > 0)
+            {
+                var usageRef = UsageRef(uid, month);
+                var us = await tx.GetSnapshotAsync(usageRef);
+                var reserved = GetLong(us, JobFields.CloudMinutesReserved);
+                tx.Set(usageRef, new Dictionary<string, object?>
+                {
+                    [JobFields.CloudMinutesReserved] = Math.Max(0, reserved - estimate),
+                    [JobFields.UpdatedAt] = NowMs(),
+                }, SetOptions.MergeAll);
+            }
+            tx.Set(jobRef, new Dictionary<string, object?>
+            {
+                [JobFields.Status] = JobFields.Failed,
+                [JobFields.ErrorCode] = code,
+                [JobFields.ErrorMessage] = message,
+                [JobFields.WorkerId] = opts.WorkerId,
+                [JobFields.BuildVersion] = opts.BuildVersion,
+                [JobFields.FailedAt] = FieldValue.ServerTimestamp,
+                [JobFields.CompletedAt] = FieldValue.ServerTimestamp,
                 [JobFields.UpdatedAt] = FieldValue.ServerTimestamp,
             }, SetOptions.MergeAll);
             return true;

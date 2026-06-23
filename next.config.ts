@@ -48,6 +48,12 @@ const nextConfig: NextConfig = {
       "./node_modules/@google-cloud/batch/build/protos/**",
       "./node_modules/google-gax/build/protos/**",
     ],
+    // Cancel stops the running Batch job (cancelBatchJob → @google-cloud/batch), so
+    // its standalone bundle needs the Batch + gax proto assets traced in too.
+    "/api/export/cancel": [
+      "./node_modules/@google-cloud/batch/build/protos/**",
+      "./node_modules/google-gax/build/protos/**",
+    ],
   },
 };
 

@@ -43,6 +43,10 @@ public static class JobFields
     public const string BuildVersion = "buildVersion";
     public const string ClaimedAt = "claimedAt";
     public const string LastHeartbeatAt = "lastHeartbeatAt";
+    /// <summary>Epoch-ms heartbeat the single-job (Batch) worker bumps every 30s
+    /// (mirrors <see cref="LastHeartbeatAt"/>; kept as a distinct field for the
+    /// Batch liveness contract).</summary>
+    public const string HeartbeatAt = "heartbeatAt";
     public const string ExportPath = "exportPath";
     public const string SettingsHash = "settingsHash";
 
@@ -53,6 +57,7 @@ public static class JobFields
 
     // ── Aligned error codes (shared with the Node CLI's errors.ts) ───────────
     public const string ErrStale = "stale";
+    public const string ErrStartupTimeout = "startup_timeout";
     public const string ErrAudioDecodeFailed = "audio_decode_failed";
     public const string ErrNormalizeFailed = "normalize_failed";
     public const string ErrRenderFailed = "render_failed";

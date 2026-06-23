@@ -6,11 +6,33 @@ using ExportApi.Services;
 using Google.Cloud.Firestore;
 using Google.Cloud.Storage.V1;
 
+// ── Earliest-possible diagnostics ─────────────────────────────────────────────
+// Prove the container started and dump the run-defining env BEFORE any DI,
+// Firebase/Firestore client, or Google ADC initialization. These are raw,
+// auto-flushed stdout writes (a Cloud Logging `textPayload`, not the structured
+// `jsonPayload` the ILogger provider emits) so they appear within seconds of a
+// Batch task entering RUNNING even if the logger/credentials never come up.
+static string EnvOr(string fallbackLabel, params string[] keys) =>
+    keys.Select(Environment.GetEnvironmentVariable).FirstOrDefault(v => !string.IsNullOrWhiteSpace(v)) ?? fallbackLabel;
+
+BatchLog.Line("container started");
+BatchLog.Line($"build={EnvOr("(unset)", "BUILD_VERSION")}");
+BatchLog.Line($"EXPORT_WORKER_MODE={EnvOr("(unset)", "EXPORT_WORKER_MODE")}");
+BatchLog.Line($"EXPORT_JOB_ID={EnvOr("(unset)", "EXPORT_JOB_ID")}");
+BatchLog.Line($"EXPORT_JOB_UID={EnvOr("(unset)", "EXPORT_JOB_UID")}");
+BatchLog.Line($"FIREBASE_PROJECT_ID={EnvOr("(unset)", "FIREBASE_PROJECT_ID", "NEXT_PUBLIC_FIREBASE_PROJECT_ID", "GCLOUD_PROJECT", "GOOGLE_CLOUD_PROJECT")}");
+BatchLog.Line($"FIREBASE_STORAGE_BUCKET={EnvOr("(unset)", "FIREBASE_STORAGE_BUCKET", "NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET")}");
+
 var builder = WebApplication.CreateBuilder(args);
 
-// Structured JSON logs for Cloud Logging.
+// Structured JSON logs for Cloud Logging. NOTE: this emits each entry as a
+// `jsonPayload` — the at-a-glance lifecycle milestones are ALSO mirrored to plain
+// stdout via BatchLog (a `textPayload`) so they're greppable in single-job mode.
 builder.Logging.ClearProviders();
 builder.Logging.AddJsonConsole(o => o.IncludeScopes = false);
+builder.Logging.SetMinimumLevel(LogLevel.Information);
+
+BatchLog.Line("loading config");
 
 // Listen on Cloud Run's $PORT (default 8080).
 var port = Environment.GetEnvironmentVariable("PORT") ?? "8080";
@@ -19,6 +41,7 @@ builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
 // Effective config (env wins, appsettings fallback).
 var opts = ExportOptions.Load(builder.Configuration);
 builder.Services.AddSingleton(opts);
+BatchLog.Line($"config loaded singleJob={opts.SingleJob} mode={opts.WorkerMode} project={opts.ProjectId ?? "(ADC default)"} bucket={opts.StorageBucket ?? "(MISSING)"} heartbeat={opts.HeartbeatSeconds}s startupTimeout={opts.StartupTimeoutSeconds}s");
 
 // Google clients via ADC (Cloud Run) or GOOGLE_APPLICATION_CREDENTIALS (local).
 builder.Services.AddSingleton(_ => new FirestoreDbBuilder { ProjectId = opts.ProjectId }.Build());
@@ -58,6 +81,28 @@ var app = builder.Build();
 
 // Startup config block + loud warnings (mirrors the Node worker's [worker:startup]).
 LogStartup(app.Services.GetRequiredService<ILogger<Program>>(), opts);
+
+// In single-job (Batch) mode, eagerly construct the Google clients so credential
+// (ADC) init happens NOW, with a clear log on both sides. A missing/denied SA is
+// the most common Batch misconfig; failing here surfaces it as an explicit
+// startup error instead of a silent hang deep inside the first Firestore call.
+if (opts.SingleJob)
+{
+    BatchLog.Line("initializing Firebase/Google credentials (ADC)");
+    try
+    {
+        app.Services.GetRequiredService<FirestoreDb>();
+        app.Services.GetRequiredService<StorageClient>();
+        BatchLog.Line("Firebase/Google credentials ready");
+    }
+    catch (Exception ex)
+    {
+        BatchLog.Error($"FATAL: Google credential/client init failed: {ex.Message}");
+        // Non-zero exit so the Batch task is marked failed and the VM is torn
+        // down (no idle billing). The stale-job reconciler refunds the minutes.
+        Environment.Exit(1);
+    }
+}
 
 app.UseMiddleware<InternalSecretMiddleware>();
 app.MapExportEndpoints();
