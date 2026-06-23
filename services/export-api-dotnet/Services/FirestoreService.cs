@@ -194,6 +194,175 @@ public sealed class FirestoreService(FirestoreDb db, ExportOptions opts, ILogger
             [JobFields.HeartbeatAt] = FieldValue.ServerTimestamp,
         }, SetOptions.MergeAll);
 
+    // ── Parallel chunked render coordination ─────────────────────────────────
+    public enum ChunkRecordResult { AlreadyTerminal, AlreadyCounted, Counted, AllComplete }
+    public enum MergeClaim { NotReady, Lost, Won }
+
+    private int EffectiveChunkCount(DocumentSnapshot snap)
+    {
+        var c = (int)GetLong(snap, JobFields.ChunkCount);
+        return c > 0 ? c : Math.Max(1, opts.ChunkCount);
+    }
+
+    /// <summary>Idempotently flip a chunked job to rendering on the FIRST task that
+    /// arrives. Safe for N concurrent callers (never clobbers terminal); does NOT
+    /// take the exclusive single-job lease (N tasks share this job).</summary>
+    public async Task EnsureChunkedRenderingAsync(string uid, string jobId)
+    {
+        await db.RunTransactionAsync(async tx =>
+        {
+            var jobRef = JobRef(uid, jobId);
+            var snap = await tx.GetSnapshotAsync(jobRef);
+            if (!snap.Exists) return false;
+            var status = GetString(snap, JobFields.Status);
+            if (JobFields.IsTerminal(status) || status == JobFields.Rendering) return false;
+            tx.Update(jobRef, new Dictionary<string, object>
+            {
+                [JobFields.Status] = JobFields.Rendering,
+                [JobFields.Stage] = "rendering_chunks",
+                [JobFields.ProgressStage] = "rendering",
+                [JobFields.ChunkedStartedAt] = FieldValue.ServerTimestamp,
+                [JobFields.StartedAt] = FieldValue.ServerTimestamp,
+                [JobFields.BuildVersion] = opts.BuildVersion,
+                [JobFields.UpdatedAt] = FieldValue.ServerTimestamp,
+                [JobFields.LastHeartbeatAt] = FieldValue.ServerTimestamp,
+                [JobFields.HeartbeatAt] = FieldValue.ServerTimestamp,
+            });
+            return true;
+        });
+    }
+
+    /// <summary>Record that chunk <paramref name="index"/> uploaded, EXACTLY ONCE.
+    /// A per-chunk marker doc gates the chunksCompleted increment, so a Batch task
+    /// retry that re-uploads cannot double-count. Returns AllComplete only to the
+    /// single caller whose increment reaches chunkCount (the merge leader).</summary>
+    public Task<ChunkRecordResult> RecordChunkDoneAsync(
+        string uid, string jobId, int index, string outputPath, bool sourceHasAudio, int taskIndex)
+    {
+        return db.RunTransactionAsync(async tx =>
+        {
+            var jobRef = JobRef(uid, jobId);
+            var jobSnap = await tx.GetSnapshotAsync(jobRef);
+            if (!jobSnap.Exists || JobFields.IsTerminal(GetString(jobSnap, JobFields.Status)))
+                return ChunkRecordResult.AlreadyTerminal;
+
+            var chunkRef = jobRef.Collection(JobFields.ChunksCollection).Document(index.ToString());
+            var chunkSnap = await tx.GetSnapshotAsync(chunkRef);
+            if (chunkSnap.Exists && GetString(chunkSnap, "status") == "done")
+                return ChunkRecordResult.AlreadyCounted; // retry re-upload → do NOT re-increment
+
+            var chunkCount = EffectiveChunkCount(jobSnap);
+            var completed = (int)GetLong(jobSnap, JobFields.ChunksCompleted) + 1;
+
+            tx.Set(chunkRef, new Dictionary<string, object?>
+            {
+                ["index"] = index,
+                ["status"] = "done",
+                ["outputPath"] = outputPath,
+                ["sourceHasAudio"] = sourceHasAudio,
+                ["workerId"] = opts.WorkerId,
+                ["taskIndex"] = taskIndex,
+                ["completedAt"] = FieldValue.ServerTimestamp,
+            });
+            tx.Update(jobRef, new Dictionary<string, object>
+            {
+                [JobFields.ChunksCompleted] = completed,
+                [JobFields.UpdatedAt] = FieldValue.ServerTimestamp,
+                [JobFields.LastHeartbeatAt] = FieldValue.ServerTimestamp,
+                [JobFields.HeartbeatAt] = FieldValue.ServerTimestamp,
+            });
+            return completed >= chunkCount ? ChunkRecordResult.AllComplete : ChunkRecordResult.Counted;
+        });
+    }
+
+    /// <summary>Claim the single merge slot (leader election). Won only when all
+    /// chunks are done AND no live lease is held by another worker. A stale lease
+    /// (no heartbeat past MergeLeaseSeconds) is re-claimable so a dead leader's
+    /// merge can be retried. Flips the UI stage to "merging".</summary>
+    public Task<MergeClaim> TryClaimMergeAsync(string uid, string jobId)
+    {
+        return db.RunTransactionAsync(async tx =>
+        {
+            var jobRef = JobRef(uid, jobId);
+            var snap = await tx.GetSnapshotAsync(jobRef);
+            if (!snap.Exists || JobFields.IsTerminal(GetString(snap, JobFields.Status)))
+                return MergeClaim.Lost;
+            if ((int)GetLong(snap, JobFields.ChunksCompleted) < EffectiveChunkCount(snap))
+                return MergeClaim.NotReady;
+
+            var holder = GetString(snap, JobFields.MergeWorkerId);
+            if (!string.IsNullOrEmpty(holder) && holder != opts.WorkerId
+                && AgeMs(snap, JobFields.MergeClaimedAt) < opts.MergeLeaseSeconds * 1000L)
+                return MergeClaim.Lost;
+
+            tx.Update(jobRef, new Dictionary<string, object>
+            {
+                [JobFields.MergeWorkerId] = opts.WorkerId,
+                [JobFields.MergeClaimedAt] = FieldValue.ServerTimestamp,
+                [JobFields.MergeStartedAt] = FieldValue.ServerTimestamp,
+                [JobFields.Stage] = "merging",
+                [JobFields.ProgressStage] = "merging",
+                [JobFields.UpdatedAt] = FieldValue.ServerTimestamp,
+                [JobFields.LastHeartbeatAt] = FieldValue.ServerTimestamp,
+                [JobFields.HeartbeatAt] = FieldValue.ServerTimestamp,
+            });
+            return MergeClaim.Won;
+        });
+    }
+
+    /// <summary>Fail the whole job from a permanently-failed chunk: release minutes
+    /// once (terminal-guarded), set failed + chunksFailed++ + cancelRequested (so
+    /// live sibling tasks' cancel-poll stops them fast).</summary>
+    public Task<bool> FailJobFromChunkAsync(string uid, string jobId, string code, string message)
+    {
+        return db.RunTransactionAsync(async tx =>
+        {
+            var jobRef = JobRef(uid, jobId);
+            var snap = await tx.GetSnapshotAsync(jobRef);
+            if (!snap.Exists || JobFields.IsTerminal(GetString(snap, JobFields.Status))) return false;
+            var month = GetString(snap, JobFields.MonthlyBucket) ?? CurrentMonthKey();
+            var estimate = (int)GetLong(snap, JobFields.EstimatedExportMinutes);
+            var failed = (int)GetLong(snap, JobFields.ChunksFailed) + 1;
+            if (estimate > 0)
+            {
+                var usageRef = UsageRef(uid, month);
+                var us = await tx.GetSnapshotAsync(usageRef);
+                var reserved = GetLong(us, JobFields.CloudMinutesReserved);
+                tx.Set(usageRef, new Dictionary<string, object?>
+                {
+                    [JobFields.CloudMinutesReserved] = Math.Max(0, reserved - estimate),
+                    [JobFields.UpdatedAt] = NowMs(),
+                }, SetOptions.MergeAll);
+            }
+            tx.Set(jobRef, new Dictionary<string, object?>
+            {
+                [JobFields.Status] = JobFields.Failed,
+                [JobFields.ErrorCode] = code,
+                [JobFields.ErrorMessage] = message,
+                [JobFields.CancelRequested] = true,
+                [JobFields.ChunksFailed] = failed,
+                [JobFields.WorkerId] = opts.WorkerId,
+                [JobFields.BuildVersion] = opts.BuildVersion,
+                [JobFields.FailedAt] = FieldValue.ServerTimestamp,
+                [JobFields.CompletedAt] = FieldValue.ServerTimestamp,
+                [JobFields.UpdatedAt] = FieldValue.ServerTimestamp,
+            }, SetOptions.MergeAll);
+            return true;
+        });
+    }
+
+    /// <summary>Read all chunk markers (for the merge leader). Returns the snapshots
+    /// keyed by index; missing indices are simply absent.</summary>
+    public async Task<IReadOnlyDictionary<int, DocumentSnapshot>> GetChunkMarkersAsync(string uid, string jobId)
+    {
+        var col = JobRef(uid, jobId).Collection(JobFields.ChunksCollection);
+        var snap = await col.GetSnapshotAsync();
+        var map = new Dictionary<int, DocumentSnapshot>();
+        foreach (var d in snap.Documents)
+            if (int.TryParse(d.Id, out var i)) map[i] = d;
+        return map;
+    }
+
     // ── Settle on success (ports handler.ts success txn) ─────────────────────
     public Task<bool> SettleSuccessAsync(string uid, string jobId, string month, int estimate,
         string downloadUrl, IReadOnlyList<string> warnings, Dictionary<string, object?>? preflight)

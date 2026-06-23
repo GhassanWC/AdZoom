@@ -50,6 +50,29 @@ public static class JobFields
     public const string ExportPath = "exportPath";
     public const string SettingsHash = "settingsHash";
 
+    // ── Parallel chunked render (one Batch job, N parallel chunk tasks) ───────
+    public const string RenderMode = "renderMode";
+    public const string ChunkCount = "chunkCount";
+    public const string ChunkSeconds = "chunkSeconds";
+    public const string ChunkParallelism = "chunkParallelism";
+    public const string ChunksCompleted = "chunksCompleted";
+    public const string ChunksFailed = "chunksFailed";
+    public const string ChunkedStartedAt = "chunkedStartedAt";
+    public const string ChunkedCompletedAt = "chunkedCompletedAt";
+    public const string MergeWorkerId = "mergeWorkerId";
+    public const string MergeClaimedAt = "mergeClaimedAt";
+    public const string MergeStartedAt = "mergeStartedAt";
+    public const string MergeCompletedAt = "mergeCompletedAt";
+    // Diagnostics
+    public const string ColdStartSeconds = "coldStartSeconds";
+    public const string ChunkRenderSeconds = "chunkRenderSeconds";
+    public const string MergeSeconds = "mergeSeconds";
+    public const string TotalSeconds = "totalSeconds";
+    public const string MachineType = "machineType";
+    public const string WorkerImage = "workerImage";
+    /// <summary>Per-chunk completion marker subcollection under the job doc.</summary>
+    public const string ChunksCollection = "chunks";
+
     // Usage ledger fields
     public const string CloudMinutesReserved = "cloudMinutesReserved";
     public const string CloudMinutesConsumed = "cloudMinutesConsumed";
@@ -58,6 +81,8 @@ public static class JobFields
     // ── Aligned error codes (shared with the Node CLI's errors.ts) ───────────
     public const string ErrStale = "stale";
     public const string ErrStartupTimeout = "startup_timeout";
+    public const string ErrChunkFailed = "chunk_failed";
+    public const string ErrMergeFailed = "merge_failed";
     public const string ErrAudioDecodeFailed = "audio_decode_failed";
     public const string ErrNormalizeFailed = "normalize_failed";
     public const string ErrRenderFailed = "render_failed";

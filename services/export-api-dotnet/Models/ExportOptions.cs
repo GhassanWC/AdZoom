@@ -94,6 +94,39 @@ public sealed class ExportOptions
     /// EXPORT_WORKER_MODE=single-job).</summary>
     public bool SingleJob { get; set; }
 
+    // ── Parallel chunked render (one Batch job, N parallel chunk tasks) ───────
+    /// <summary>"chunked" ⇒ this is one of N parallel chunk tasks (leader-merge);
+    /// anything else ⇒ the proven single render. From EXPORT_RENDER_MODE.</summary>
+    public string RenderMode { get; set; } = "single";
+
+    /// <summary>This task's chunk index within the task group (Batch injects
+    /// BATCH_TASK_INDEX). 0-based.</summary>
+    public int TaskIndex { get; set; }
+
+    /// <summary>Total tasks in the group (Batch injects BATCH_TASK_COUNT).</summary>
+    public int TaskCount { get; set; } = 1;
+
+    /// <summary>Authoritative chunk count from the submitter (EXPORT_CHUNK_COUNT) —
+    /// do NOT recompute in the worker (must match the app's window math).</summary>
+    public int ChunkCount { get; set; }
+
+    /// <summary>Merge-leader lease window: a merge claim older than this is
+    /// re-claimable by a Batch-retried task (so a dead leader's merge can be
+    /// re-driven). From EXPORT_MERGE_LEASE_SECONDS. MUST sit BETWEEN the worst-case
+    /// merge time and the stale-reconcile window (~300s &lt; 600s cron) so a dead
+    /// leader is re-claimed BEFORE the reconciler fails the whole job as stale.</summary>
+    public int MergeLeaseSeconds { get; set; } = 300;
+
+    /// <summary>Optional symmetric boundary padding (seconds) rendered on each side
+    /// of a chunk window. Default 0 — boundaries are frame-deterministic +
+    /// keyframe-aligned, so exact windows concat cleanly. From
+    /// EXPORT_CHUNK_BOUNDARY_PADDING_SECONDS.</summary>
+    public double ChunkBoundaryPaddingSeconds { get; set; }
+
+    /// <summary>True when this process is a parallel chunk task (not the single path).</summary>
+    public bool IsChunkedTask =>
+        SingleJob && RenderMode.Equals("chunked", StringComparison.OrdinalIgnoreCase);
+
     // ── Chunked rendering (FLAGGED OFF until render-parity is verified) ───────
     /// <summary>Split long videos into independently-rendered chunks merged with
     /// ffmpeg. OFF by default (EXPORT_CHUNKED_RENDER) — it touches the parity-gated
@@ -178,6 +211,16 @@ public sealed class ExportOptions
         o.ChunkSeconds = EnvInt("EXPORT_CHUNK_SECONDS", o.ChunkSeconds);
         o.ChunkMinDurationSeconds = EnvInt("EXPORT_CHUNK_MIN_SECONDS", o.ChunkMinDurationSeconds);
         o.ChunkMaxRetries = EnvInt("EXPORT_CHUNK_MAX_RETRIES", o.ChunkMaxRetries);
+
+        // ── Parallel chunked render (one Batch job, N parallel tasks) ─────────
+        o.RenderMode = (Env("EXPORT_RENDER_MODE") ?? o.RenderMode).Trim().ToLowerInvariant();
+        o.TaskIndex = EnvInt("BATCH_TASK_INDEX", o.TaskIndex);
+        o.TaskCount = EnvInt("BATCH_TASK_COUNT", o.TaskCount);
+        o.ChunkCount = EnvInt("EXPORT_CHUNK_COUNT", o.ChunkCount);
+        o.MergeLeaseSeconds = EnvInt("EXPORT_MERGE_LEASE_SECONDS", o.MergeLeaseSeconds);
+        if (double.TryParse(Environment.GetEnvironmentVariable("EXPORT_CHUNK_BOUNDARY_PADDING_SECONDS"),
+                System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var pad))
+            o.ChunkBoundaryPaddingSeconds = Math.Max(0, pad);
 
         // Don't run the poll loop / reconciler when in single-job mode, when
         // explicitly disabled (Cloud Run control plane), or EXPORT_RUN_WORKER=false.

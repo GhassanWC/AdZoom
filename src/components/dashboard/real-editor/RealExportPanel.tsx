@@ -45,6 +45,7 @@ import {
   EXPORT_STAGE_LABEL,
   exportUiStage,
   isIndeterminateStage,
+  type ExportJobView,
 } from "@/lib/firebase/export-jobs";
 
 const resolutions = ["1080p", "4K"] as const;
@@ -366,6 +367,7 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
       {showStatus && view ? (
         <StatusView
           view={view}
+          cloudJob={view.engine === "server" ? cloud.job : null}
           projectId={project.id}
           estTotalSeconds={estRenderSeconds}
           downloadStarted={view.engine === "server" ? cloud.downloadStarted : true}
@@ -601,6 +603,7 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
 // ── Status view (active / ready / failed / canceled) ───────────────────────
 function StatusView({
   view,
+  cloudJob,
   projectId,
   estTotalSeconds,
   downloadStarted,
@@ -611,6 +614,7 @@ function StatusView({
   onClose,
 }: {
   view: ExportView;
+  cloudJob?: ExportJobView | null;
   projectId: string;
   estTotalSeconds: number;
   downloadStarted: boolean;
@@ -755,7 +759,44 @@ function StatusView({
           </Button>
         </div>
       )}
+
+      {isDev && cloudJob && <ExportDiagnostics job={cloudJob} />}
     </div>
+  );
+}
+
+/** Dev-only diagnostics for a cloud export — render mode, chunk progress, and the
+ *  cold-start / render / merge timings the worker records. */
+function ExportDiagnostics({ job }: { job: ExportJobView }) {
+  const rows: Array<[string, string | number | undefined]> = [
+    ["renderMode", job.renderMode],
+    ["chunkCount", job.chunkCount],
+    ["chunksCompleted", job.chunkCount != null ? `${job.chunksCompleted ?? 0} / ${job.chunkCount}` : undefined],
+    ["chunksFailed", job.chunksFailed],
+    ["chunkParallelism", job.chunkParallelism],
+    ["coldStartSeconds", job.coldStartSeconds],
+    ["chunkRenderSeconds", job.chunkRenderSeconds],
+    ["mergeSeconds", job.mergeSeconds],
+    ["totalSeconds", job.totalSeconds],
+    ["batchJobName", job.batchJobName],
+    ["workerImage", job.workerImage],
+    ["machineType", job.machineType],
+    ["jobId", job.id],
+  ];
+  const visible = rows.filter(([, v]) => v !== undefined && v !== null && v !== "");
+  if (visible.length === 0) return null;
+  return (
+    <details className="rounded-lg border border-white/10 bg-white/[0.02] px-3 py-2 text-[10.5px] text-fog/70">
+      <summary className="cursor-pointer select-none font-medium text-fog/80">Diagnostics</summary>
+      <dl className="mt-2 space-y-1">
+        {visible.map(([k, v]) => (
+          <div key={k} className="flex gap-2">
+            <dt className="w-36 shrink-0 text-fog/50">{k}</dt>
+            <dd className="min-w-0 break-words font-mono text-fog/80">{String(v)}</dd>
+          </div>
+        ))}
+      </dl>
+    </details>
   );
 }
 
@@ -809,14 +850,25 @@ function serverView(cloud: ReturnType<typeof useCloudExport>): ExportView | null
       : j.status === "failed"
         ? "failed"
         : "canceled";
-  const rawPct = Math.round((j.progress ?? 0) * 100);
-  // Long-video chunked render: surface "Rendering chunk X/Y" instead of the plain
-  // "Rendering" label so the user sees per-chunk progress.
-  const chunked =
-    stage === "rendering" && (j.chunkTotal ?? 0) > 1 && (j.chunkIndex ?? 0) > 0;
-  const stageLabel = chunked
-    ? `Rendering chunk ${j.chunkIndex}/${j.chunkTotal}`
-    : EXPORT_STAGE_LABEL[stage];
+  // Parallel chunked render: the worker writes `chunksCompleted` (not per-frame
+  // progress), so drive both the label and the bar from chunks-done. Falls back to
+  // the legacy sequential "chunk X/Y" and then to plain raw progress.
+  const isChunked = j.renderMode === "chunked";
+  const chunkTot = j.chunkCount ?? j.chunkTotal ?? 0;
+  const chunkDone = j.chunksCompleted ?? 0;
+  const chunkedRendering = stage === "rendering" && isChunked && chunkTot > 1;
+  const rawPct =
+    chunkedRendering && chunkTot > 0
+      ? Math.round((chunkDone / chunkTot) * 100)
+      : Math.round((j.progress ?? 0) * 100);
+  const stageLabel =
+    stage === "merging"
+      ? "Merging chunks"
+      : chunkedRendering
+        ? `Rendering chunks: ${chunkDone} / ${chunkTot}`
+        : (j.chunkTotal ?? 0) > 1 && (j.chunkIndex ?? 0) > 0
+          ? `Rendering chunk ${j.chunkIndex}/${j.chunkTotal}` // legacy sequential
+          : EXPORT_STAGE_LABEL[stage];
   return {
     engine: "server",
     phase,

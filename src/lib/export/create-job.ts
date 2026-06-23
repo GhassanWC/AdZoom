@@ -16,6 +16,7 @@ import {
 } from "@/lib/usage/cloud-minutes";
 import { buildRenderRecipe } from "@/lib/render/recipe";
 import { enqueueExportJob } from "@/lib/export/enqueue";
+import { planChunking } from "@/lib/export/chunk-plan";
 import { computeSettingsHash } from "@/lib/export/settings-hash";
 import type {
   DetectedMoment,
@@ -332,6 +333,38 @@ export async function createCloudExportJob(
   const outputPath = `users/${uid}/projects/${projectId}/exports/${jobId}.mp4`;
   const buildVersion = process.env.BUILD_VERSION ?? "unknown";
 
+  // ── Single vs chunked render decision ────────────────────────────────────
+  // Chunked = N parallel Batch tasks merged into one MP4 (faster for long videos);
+  // requires a LINEAR timeline (no cuts/speed — the render CLI refuses to chunk
+  // those). Anything ineligible falls back to the proven single-worker path.
+  // Mirror the render CLI's chunk_unsupported_timeline predicate EXACTLY
+  // (services/export-worker/src/render.ts): hasSpeed is moment-type based and
+  // multiplier-agnostic (buildTimelineMap clamps multiplier to >=1, so a speed-up
+  // moment with multiplier<=1 still yields speedMultiplier===1 — checking segments
+  // would wrongly pass it as linear, then the CLI would hard-refuse the chunk).
+  const hasSpeed = input.moments.some((m) => m.effectType === "speed-up");
+  const hasCuts = recipe.timelineMap.totalRemoved > 0;
+  const timelineLinear = !hasSpeed && !hasCuts;
+  const chunk = planChunking({
+    outputDurationSeconds,
+    format: "mp4",
+    linear: timelineLinear,
+    plan: paidPlan,
+    env: process.env,
+  });
+  console.log("[export-create] render mode decided", {
+    uid,
+    jobId,
+    renderMode: chunk.renderMode,
+    reason: chunk.reason,
+    ...(chunk.renderMode === "chunked"
+      ? { chunkCount: chunk.chunkCount, chunkSeconds: chunk.chunkSeconds, chunkParallelism: chunk.chunkParallelism }
+      : {}),
+  });
+
+  // Best-effort global active-export count → queue position + a hard capacity cap
+  // (cost guard so we never fan out more concurrent Batch VMs than intended).
+  const maxActive = Number.parseInt(process.env.EXPORT_MAX_ACTIVE_BATCH_EXPORTS ?? "", 10);
   let queuePosition: number | undefined;
   try {
     const ahead = await db
@@ -340,9 +373,18 @@ export async function createCloudExportJob(
       .count()
       .get();
     const n = ahead.data().count ?? 0;
+    if (Number.isFinite(maxActive) && maxActive > 0 && n >= maxActive) {
+      console.warn("[export-create] global active-export cap reached — rejecting", { n, maxActive });
+      return {
+        ok: false,
+        status: 429,
+        error: "The export service is at capacity right now. Please try again in a few minutes.",
+        kind: "export_capacity",
+      };
+    }
     if (n > 0) queuePosition = n + 1;
   } catch {
-    /* no index → omit; UI shows "Queued" without a number */
+    /* no index → omit position + skip cap (fail open) */
   }
 
   // ── Transaction: re-check + reserve minutes + create the job ─────────────
@@ -400,6 +442,16 @@ export async function createCloudExportJob(
         stage: "queued",
         progressStage: "queued",
         ...(queuePosition ? { queuePosition } : {}),
+        renderMode: chunk.renderMode,
+        ...(chunk.renderMode === "chunked"
+          ? {
+              chunkCount: chunk.chunkCount,
+              chunkSeconds: chunk.chunkSeconds,
+              chunkParallelism: chunk.chunkParallelism,
+              chunksCompleted: 0,
+              chunksFailed: 0,
+            }
+          : {}),
         monthlyBucket: monthKey,
         renderRecipe: serializedRecipe,
         createdAt: FieldValue.serverTimestamp(),
@@ -434,6 +486,15 @@ export async function createCloudExportJob(
       uid,
       jobId,
       priority: paidPlan === "creator" ? "priority" : "normal",
+      renderMode: chunk.renderMode,
+      ...(chunk.renderMode === "chunked"
+        ? {
+            chunkCount: chunk.chunkCount,
+            chunkSeconds: chunk.chunkSeconds,
+            chunkParallelism: chunk.chunkParallelism,
+            durationSeconds: outputDurationSeconds,
+          }
+        : {}),
     });
   } catch (err) {
     console.error("[export-create] enqueue failed — rolling back", err);

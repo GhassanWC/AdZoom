@@ -1521,6 +1521,36 @@ export interface ExportJobDoc {
   chunkIndex?: number;
   /** Total number of chunks for this export (1 when not chunked). */
   chunkTotal?: number;
+  // ── Parallel chunked render (one Batch job, N parallel chunk tasks) ───────────
+  /** Render strategy chosen at creation: "single" (one task) or "chunked" (N tasks). */
+  renderMode?: "single" | "chunked";
+  /** Number of parallel chunk tasks (== Batch taskCount) when chunked. */
+  chunkCount?: number;
+  /** Output seconds per chunk; each task renders window [i*chunkSeconds, …]. */
+  chunkSeconds?: number;
+  /** Max chunk tasks running at once (Batch parallelism; pro 2, creator 4). */
+  chunkParallelism?: number;
+  /** How many chunks have rendered + uploaded (exactly-once via per-chunk markers). */
+  chunksCompleted?: number;
+  /** How many chunks permanently failed (a single failure fails the whole job). */
+  chunksFailed?: number;
+  /** Epoch ms when the first chunk task flipped the job to rendering. */
+  chunkedStartedAt?: number;
+  /** Epoch ms when all chunks finished (before merge). */
+  chunkedCompletedAt?: number;
+  /** Merge-leader election lease: the worker that claimed the merge + when. */
+  mergeWorkerId?: string;
+  mergeClaimedAt?: number;
+  /** Epoch ms bracketing the concat/merge step. */
+  mergeStartedAt?: number;
+  mergeCompletedAt?: number;
+  // ── Diagnostics (shown in the export panel's dev/diagnostics view) ────────────
+  coldStartSeconds?: number;
+  chunkRenderSeconds?: number;
+  mergeSeconds?: number;
+  totalSeconds?: number;
+  machineType?: string;
+  workerImage?: string;
   createdAt: number;
   updatedAt: number;
   startedAt?: number;
@@ -1528,6 +1558,26 @@ export interface ExportJobDoc {
   /** When the job entered `failed` (distinct from completedAt for success). */
   failedAt?: number;
   canceledAt?: number;
+}
+
+/**
+ * Per-chunk completion marker at `users/{uid}/exportJobs/{jobId}/chunks/{index}`
+ * (doc id = chunk index). Written exactly once by the chunk task that uploads
+ * chunk `index`; gates the `chunksCompleted` increment so a Batch task RETRY can't
+ * double-count. Server-only writes; owner-readable for diagnostics.
+ */
+export interface ExportChunkMarkerDoc {
+  /** Chunk index (0-based) — mirrors the doc id. */
+  index: number;
+  status: "done" | "failed";
+  /** Storage path of the uploaded chunk MP4. */
+  outputPath?: string;
+  /** Whether the source had audio (carried from chunk 0's preflight for merge validation). */
+  sourceHasAudio?: boolean;
+  /** Id of the worker/task that produced this chunk. */
+  workerId?: string;
+  taskIndex?: number;
+  completedAt?: number;
 }
 
 /** Friendly progress stages the export dialog shows (maps from status + stage). */

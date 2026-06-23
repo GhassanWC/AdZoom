@@ -52,6 +52,8 @@ builder.Services.AddSingleton<FirestoreService>();
 builder.Services.AddSingleton<StorageService>();
 builder.Services.AddSingleton<RenderSubprocess>();
 builder.Services.AddSingleton<JobPipeline>();
+builder.Services.AddSingleton<MergeStep>();
+builder.Services.AddSingleton<ChunkTaskRunner>();
 builder.Services.AddSingleton<JobSignal>();
 builder.Services.AddSingleton<LogBuffer>();
 // Execution role:
@@ -134,6 +136,12 @@ static void LogStartup(ILogger logger, ExportOptions o)
     if (o.ReconcileStaleSeconds <= o.HeartbeatStaleSeconds)
         logger.LogWarning("[export:startup] ⚠ ReconcileStaleSeconds ({R}) should exceed HeartbeatStaleSeconds ({H}).",
             o.ReconcileStaleSeconds, o.HeartbeatStaleSeconds);
+    // Chunked-export invariant: the merge lease must expire BEFORE the stale-reconcile
+    // window (the cron's 600s), so a dead merge leader's merge is re-claimed by a
+    // Batch-retried task before the reconciler fails the whole job as stale.
+    if (o.SingleJob && o.MergeLeaseSeconds >= o.ReconcileStaleSeconds)
+        logger.LogWarning("[export:startup] ⚠ EXPORT_MERGE_LEASE_SECONDS ({M}) should be < the stale-reconcile window ({R}s) so a dead merge leader is re-claimable before the job is failed as stale.",
+            o.MergeLeaseSeconds, o.ReconcileStaleSeconds);
 }
 
 // Exposed for completeness (top-level statements generate an internal Program).

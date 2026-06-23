@@ -168,19 +168,59 @@ It sweeps `queued | batch_submitted | rendering | uploading` jobs.
 
 ---
 
-## 5. Chunked rendering (long videos) — OFF by default
+## 5. Parallel chunked rendering (long videos) — gated, default OFF
 
-For videos longer than `EXPORT_CHUNK_MIN_SECONDS` (default 180s), the worker can
-render in independent 60–90s chunks (retried per-chunk) and concat them into one
-MP4 — so a single failed chunk retries instead of restarting the whole video.
+For eligible long videos, one Batch job renders **N chunks in parallel** then merges
+them — same architecture (one job per export), faster wall-clock, low cost.
 
-This is **gated off** (`EXPORT_CHUNKED_RENDER=0`) until render parity is verified:
-it touches the shared render core (`services/export-worker`) and currently only
-chunks LINEAR timelines (no cuts/speed); a timeline with cuts/speed transparently
-falls back to a single whole-video render (`chunk_unsupported_timeline`). To trial
-it, set `BATCH_CHUNKED_RENDER=1` on the Next.js runtime (passed through as the
-container's `EXPORT_CHUNKED_RENDER`). Tunables: `EXPORT_CHUNK_SECONDS`,
-`EXPORT_CHUNK_MIN_SECONDS`, `EXPORT_CHUNK_MAX_RETRIES`.
+```
+createCloudExportJob: planChunking() decides single vs chunked (renderMode on the doc)
+  → submitBatchJob: ONE Batch job, taskGroup { taskCount=N, parallelism=plan-cap }
+      → N chunk tasks (BATCH_TASK_INDEX): render window → upload chunk to GCS →
+        RecordChunkDoneAsync (per-chunk marker gates an exactly-once counter)
+      → the task that records the LAST chunk wins TryClaimMergeAsync → downloads all
+        chunks, ffmpeg -f concat -c copy, uploads final, SettleSuccessAsync
+  → every other task exits 0; cancel/fail → cancelBatchJob deletes the one job
+```
+
+**Eligibility (app-side, `chunk-plan.ts`):** kill switch ON, MP4, output ≥
+`EXPORT_CHUNK_MIN_VIDEO_SECONDS` (360s), a **LINEAR** timeline (no cuts/speed — the
+render CLI throws `chunk_unsupported_timeline` otherwise), valid metadata. Anything
+ineligible → the proven single path. `chunkCount = clamp(ceil(dur/EXPORT_CHUNK_SECONDS),
+2, EXPORT_CHUNK_MAX_TOTAL_CHUNKS)`; parallelism = Pro 2 / Creator 4 (capped at count).
+
+**Kill switch / rollout:** ship with `EXPORT_CHUNKED_RENDER` unset/`0` (single only).
+Set `EXPORT_CHUNKED_RENDER=1` on the **Next.js** runtime to enable; the submitter
+injects `EXPORT_RENDER_MODE=chunked` + `EXPORT_CHUNK_COUNT`/`EXPORT_CHUNK_SECONDS`
+into the chunk tasks (you do not set those by hand). Per-task Batch timeout is
+**dynamic** (from chunk length + plan), not the flat 7200s.
+
+Next.js runtime env:
+
+```ini
+EXPORT_CHUNKED_RENDER=1                 # master switch (0/unset = single only)
+EXPORT_CHUNK_MIN_VIDEO_SECONDS=360
+EXPORT_CHUNK_SECONDS=120
+EXPORT_CHUNK_MAX_TOTAL_CHUNKS=30
+EXPORT_CHUNK_MAX_PARALLEL_PRO=2
+EXPORT_CHUNK_MAX_PARALLEL_CREATOR=4
+EXPORT_CHUNK_MAX_RETRY_COUNT=1          # per-chunk Batch task retries
+EXPORT_MERGE_LEASE_SECONDS=300          # worst-case merge < this < 600s reconcile window
+EXPORT_MAX_ACTIVE_BATCH_EXPORTS=...     # global concurrency cap (optional)
+# Dynamic per-task timeout tunables (optional): EXPORT_TASK_COLD_START_SECONDS,
+# EXPORT_TASK_DOWNLOAD_SECONDS, EXPORT_CHUNK_RUNTIME_FACTOR, EXPORT_MERGE_BASE_SECONDS,
+# EXPORT_MERGE_FACTOR, EXPORT_CHUNK_TASK_MIN_SECONDS
+EXPORT_CHUNK_BOUNDARY_PADDING_SECONDS=0 # exact windows (boundaries are deterministic)
+```
+
+> Legacy in-container SEQUENTIAL chunking (`BATCH_CHUNKED_RENDER=1` →
+> `EXPORT_CHUNKED_RENDER` on a single job) still exists as a fallback and is NOT used
+> when `EXPORT_RENDER_MODE=chunked`.
+
+**Idempotency invariant:** per-chunk markers gate the `chunksCompleted` increment, so
+a Batch task retry re-uploads its chunk without double-counting; exactly one task
+sees the count reach `chunkCount` and merges. Minutes are reserved once, settled once
+(merge leader), released once (fail/cancel/reconcile).
 
 ---
 

@@ -115,6 +115,13 @@ service cloud.firestore {
       match /exportJobs/{jobId} {
         allow read: if isOwner(uid);
         allow create, update, delete: if false;
+
+        // Per-chunk completion markers for parallel chunked exports. Server-only
+        // writes (worker via Admin SDK); owner-readable for diagnostics.
+        match /chunks/{chunkId} {
+          allow read: if isOwner(uid);
+          allow create, update, delete: if false;
+        }
       }
 
       // ── Monthly usage counters ────────────────────────────────────────

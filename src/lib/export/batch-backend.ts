@@ -43,6 +43,14 @@ export interface SubmitBatchParams {
   uid: string;
   jobId: string;
   priority: "normal" | "priority";
+  /** "chunked" → ONE Batch job with N parallel chunk tasks (leader-merge). Anything
+   *  else (default) → the proven single-task job, untouched. */
+  renderMode?: "single" | "chunked";
+  chunkCount?: number;
+  chunkSeconds?: number;
+  chunkParallelism?: number;
+  /** OUTPUT duration (seconds) — drives the dynamic per-task Batch timeout. */
+  durationSeconds?: number;
 }
 
 function projectId(): string | undefined {
@@ -58,6 +66,31 @@ function projectId(): string | undefined {
 function intEnv(key: string, fallback: number): number {
   const n = Number.parseInt(process.env[key] ?? "", 10);
   return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+function numEnv(key: string, fallback: number): number {
+  const n = Number.parseFloat(process.env[key] ?? "");
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+/**
+ * Dynamic per-task Batch timeout for chunked render (NOT the flat single-job
+ * 7200s). Every chunk task gets the same budget because ANY task may become the
+ * merge leader and so needs render + merge headroom; Batch bills actual runtime,
+ * so non-leaders that finish early cost nothing extra. Bounded so a wedged task
+ * can't bill forever.
+ */
+function chunkedTaskMaxRunSeconds(chunkSeconds: number, durationSeconds: number): number {
+  const coldStart = intEnv("EXPORT_TASK_COLD_START_SECONDS", 180);
+  const download = intEnv("EXPORT_TASK_DOWNLOAD_SECONDS", 300);
+  const renderFactor = numEnv("EXPORT_CHUNK_RUNTIME_FACTOR", 8); // realtime multiple (incl. retry headroom)
+  const mergeBase = intEnv("EXPORT_MERGE_BASE_SECONDS", 120);
+  const mergeFactor = numEnv("EXPORT_MERGE_FACTOR", 0.5); // per output second (concat -c copy is cheap)
+  const min = intEnv("EXPORT_CHUNK_TASK_MIN_SECONDS", 600);
+  const max = intEnv("BATCH_MAX_RUN_SECONDS", 7200); // hard ceiling, shared with single
+  const perChunkRender = Math.ceil(Math.max(1, chunkSeconds) * renderFactor);
+  const mergeBudget = mergeBase + Math.ceil(Math.max(0, durationSeconds) * mergeFactor);
+  return Math.min(max, Math.max(min, coldStart + download + perChunkRender + mergeBudget));
 }
 
 /**
@@ -138,15 +171,90 @@ function buildBatchJob(
 }
 
 /**
+ * Build the CHUNKED Batch job: ONE job, ONE task group with `taskCount = chunkCount`
+ * parallel tasks capped at `parallelism`. Each task reads the runtime-injected
+ * BATCH_TASK_INDEX to render its window; the task that finishes the LAST chunk
+ * (leader election in Firestore) merges. Identical machine/SA/logging/labels to the
+ * single job — only the task fan-out + a dynamic, tighter per-task timeout differ.
+ */
+function buildChunkedBatchJob(
+  image: string,
+  serviceAccount: string | undefined,
+  env: Record<string, string>,
+  priority: "normal" | "priority",
+  chunkCount: number,
+  chunkParallelism: number,
+  chunkSeconds: number,
+  durationSeconds: number
+): protos.google.cloud.batch.v1.IJob {
+  const machineType = process.env.BATCH_MACHINE_TYPE || "e2-standard-4";
+  const cpuMilli = intEnv("BATCH_CPU_MILLI", 4000);
+  const memoryMib = intEnv("BATCH_MEMORY_MIB", 16384);
+  const bootDiskGb = intEnv("BATCH_BOOT_DISK_GB", 100);
+  const maxRetryCount = intEnv("EXPORT_CHUNK_MAX_RETRY_COUNT", 1);
+  const provisioningModel = (process.env.BATCH_PROVISIONING_MODEL || "STANDARD").toUpperCase();
+  const maxRunSeconds = chunkedTaskMaxRunSeconds(chunkSeconds, durationSeconds);
+
+  return {
+    priority: priority === "priority" ? 1 : 0,
+    taskGroups: [
+      {
+        taskCount: chunkCount,
+        parallelism: Math.max(1, Math.min(chunkParallelism, chunkCount)),
+        taskSpec: {
+          // SHARED env for every task. The runtime injects BATCH_TASK_INDEX /
+          // BATCH_TASK_COUNT per task, so each derives its own chunk window — no
+          // per-task taskEnvironments needed.
+          environment: { variables: env },
+          computeResource: { cpuMilli, memoryMib },
+          maxRunDuration: { seconds: maxRunSeconds },
+          // Per-CHUNK Batch retry (a crashed/preempted chunk task re-runs on a fresh
+          // VM; the re-run re-uploads its chunk idempotently and re-checks merge).
+          maxRetryCount,
+          runnables: [{ container: { imageUri: image } }],
+        },
+      },
+    ],
+    allocationPolicy: {
+      instances: [
+        {
+          policy: {
+            machineType,
+            provisioningModel:
+              provisioningModel === "SPOT"
+                ? protos.google.cloud.batch.v1.AllocationPolicy.ProvisioningModel.SPOT
+                : protos.google.cloud.batch.v1.AllocationPolicy.ProvisioningModel.STANDARD,
+            bootDisk: { sizeGb: bootDiskGb },
+          },
+        },
+      ],
+      ...(serviceAccount ? { serviceAccount: { email: serviceAccount } } : {}),
+    },
+    logsPolicy: { destination: protos.google.cloud.batch.v1.LogsPolicy.Destination.CLOUD_LOGGING },
+    labels: { app: "framevo", kind: "export-chunked", priority },
+  };
+}
+
+/**
  * Submit a Batch job for an already-created export and record the Batch ids on
  * the doc (status → batch_submitted). Throws on misconfig / submit failure so the
  * caller (createCloudExportJob) rolls back the reservation and fails the job.
  */
-export async function submitBatchJob({ uid, jobId, priority }: SubmitBatchParams): Promise<void> {
+export async function submitBatchJob({
+  uid,
+  jobId,
+  priority,
+  renderMode,
+  chunkCount,
+  chunkSeconds,
+  chunkParallelism,
+  durationSeconds,
+}: SubmitBatchParams): Promise<void> {
   const project = projectId();
   const region = process.env.BATCH_REGION?.trim();
   const image = process.env.BATCH_IMAGE?.trim();
   const serviceAccount = process.env.BATCH_SERVICE_ACCOUNT?.trim();
+  const chunked = renderMode === "chunked" && (chunkCount ?? 0) >= 2;
 
   if (!project || !region || !image) {
     const missing = [
@@ -173,22 +281,52 @@ export async function submitBatchJob({ uid, jobId, priority }: SubmitBatchParams
     FIREBASE_STORAGE_BUCKET: bucket,
     NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET: bucket,
     ...(process.env.BUILD_VERSION ? { BUILD_VERSION: process.env.BUILD_VERSION } : {}),
-    ...(process.env.BATCH_CHUNKED_RENDER ? { EXPORT_CHUNKED_RENDER: process.env.BATCH_CHUNKED_RENDER } : {}),
+    // CHUNKED mode is selected by EXPORT_RENDER_MODE (the new parallel path), NOT
+    // the legacy EXPORT_CHUNKED_RENDER (which drove in-container sequential
+    // chunking). Only pass the legacy flag for single jobs, to preserve behavior.
+    ...(chunked
+      ? {
+          EXPORT_RENDER_MODE: "chunked",
+          EXPORT_CHUNK_COUNT: String(chunkCount),
+          EXPORT_CHUNK_SECONDS: String(chunkSeconds ?? 120),
+          EXPORT_CHUNK_BOUNDARY_PADDING_SECONDS:
+            process.env.EXPORT_CHUNK_BOUNDARY_PADDING_SECONDS ?? "0",
+          ...(process.env.EXPORT_MERGE_LEASE_SECONDS
+            ? { EXPORT_MERGE_LEASE_SECONDS: process.env.EXPORT_MERGE_LEASE_SECONDS }
+            : {}),
+          ...(process.env.EXPORT_CHUNK_MAX_RETRIES
+            ? { EXPORT_CHUNK_MAX_RETRIES: process.env.EXPORT_CHUNK_MAX_RETRIES }
+            : {}),
+        }
+      : process.env.BATCH_CHUNKED_RENDER
+        ? { EXPORT_CHUNKED_RENDER: process.env.BATCH_CHUNKED_RENDER }
+        : {}),
   };
 
   const id = batchJobId(jobId);
   const parent = `projects/${project}/locations/${region}`;
   const client = new BatchServiceClient();
 
+  const job = chunked
+    ? buildChunkedBatchJob(
+        image,
+        serviceAccount,
+        env,
+        priority,
+        chunkCount!,
+        chunkParallelism ?? 1,
+        chunkSeconds ?? 120,
+        durationSeconds ?? 0
+      )
+    : buildBatchJob(image, serviceAccount, env, priority);
+
   let jobName: string;
   try {
-    const [created] = await client.createJob({
-      parent,
-      jobId: id,
-      job: buildBatchJob(image, serviceAccount, env, priority),
-    });
+    const [created] = await client.createJob({ parent, jobId: id, job });
     jobName = created.name ?? `${parent}/jobs/${id}`;
-    console.log(`[export-enqueue] backend=batch submitted job=${jobId} batchJob=${jobName} (${priority})`);
+    console.log(
+      `[export-enqueue] backend=batch submitted job=${jobId} batchJob=${jobName} (${priority}) mode=${chunked ? `chunked×${chunkCount}@${chunkParallelism}` : "single"}`
+    );
   } catch (err) {
     const code = (err as { code?: unknown })?.code;
     console.error(`[export-enqueue] createJob failed for job ${jobId}`, {

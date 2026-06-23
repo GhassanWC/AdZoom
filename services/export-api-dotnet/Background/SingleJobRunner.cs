@@ -16,6 +16,7 @@ namespace ExportApi.Background;
 public sealed class SingleJobRunner(
     FirestoreService fs,
     JobPipeline pipeline,
+    ChunkTaskRunner chunkRunner,
     ExportOptions opts,
     IHostApplicationLifetime lifetime,
     ILogger<SingleJobRunner> log) : BackgroundService
@@ -82,6 +83,19 @@ public sealed class SingleJobRunner(
 
         log.LogInformation("[batch:single-job] start uid={Uid} jobId={JobId} build={Build} chunked={Chunked}",
             uid, jobId, opts.BuildVersion, opts.ChunkedRenderEnabled);
+
+        // ── Parallel chunked task ────────────────────────────────────────────
+        // N tasks share ONE job: do NOT take the exclusive single-job lease. Each
+        // renders its chunk; the last to finish merges. The startup watchdog is left
+        // running — it stands down once any task flips the job to "rendering"
+        // (EnsureChunkedRenderingAsync), and still fires if NOTHING starts in time.
+        if (opts.IsChunkedTask)
+        {
+            log.LogInformation("[batch:single-job] chunked task uid={Uid} jobId={JobId} index={Idx}/{Cnt}",
+                uid, jobId, opts.TaskIndex, opts.TaskCount);
+            return await chunkRunner.RunAsync(uid, jobId, stopping);
+        }
+
         BatchLog.Line($"claiming Firestore job uid={uid} jobId={jobId}");
 
         // forceReclaim: this container is the SOLE designated worker for this job.

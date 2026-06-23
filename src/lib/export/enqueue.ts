@@ -29,6 +29,15 @@ export interface EnqueueParams {
   uid: string;
   jobId: string;
   priority: ExportPriority;
+  /** Render strategy decided at creation. Only "chunked" changes Batch dispatch
+   *  (one job, N parallel tasks); "single"/undefined keeps the proven one-task job. */
+  renderMode?: "single" | "chunked";
+  /** Chunked-only: parallel task count, output seconds per chunk, parallelism cap,
+   *  and the OUTPUT duration (for the dynamic Batch timeout). */
+  chunkCount?: number;
+  chunkSeconds?: number;
+  chunkParallelism?: number;
+  durationSeconds?: number;
 }
 
 /** Dispatch a created export job to the worker. Throws on failure so the caller

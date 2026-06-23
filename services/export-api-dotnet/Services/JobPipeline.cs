@@ -168,7 +168,11 @@ public sealed class JobPipeline(
             // RETURNS, so the monolithic block below stays the untouched default
             // path. It FALLS BACK to that block when chunking can't apply (too
             // short, or the timeline has cuts/speed → chunk_unsupported_timeline).
-            if (opts.ChunkedRenderEnabled && durationSeconds > opts.ChunkMinDurationSeconds)
+            // NOTE: the NEW parallel chunked path runs via ChunkTaskRunner (one task
+            // per chunk), NOT here. This legacy in-container SEQUENTIAL chunking only
+            // engages for a non-chunked-task job that explicitly opts in via
+            // EXPORT_CHUNKED_RENDER/BATCH_CHUNKED_RENDER — never for a chunk task.
+            if (opts.ChunkedRenderEnabled && !opts.IsChunkedTask && durationSeconds > opts.ChunkMinDurationSeconds)
             {
                 var chunkResult = await RunChunkedAsync(
                     uid, jobId, month, estimate, projectId, recipe, srcFile, outFile, outputPath,

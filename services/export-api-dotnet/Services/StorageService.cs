@@ -108,4 +108,20 @@ public sealed class StorageService(StorageClient client, ExportOptions opts, ILo
         var encoded = Uri.EscapeDataString(objectPath);
         return $"https://firebasestorage.googleapis.com/v0/b/{Bucket}/o/{encoded}?alt=media&token={token}";
     }
+
+    /// <summary>Best-effort delete of an object (e.g. an intermediate chunk MP4 after
+    /// a successful merge). Swallows NotFound + any error — cleanup must never fail
+    /// the export.</summary>
+    public async Task DeleteAsync(string objectPath, CancellationToken ct)
+    {
+        try
+        {
+            await client.DeleteObjectAsync(Bucket, objectPath, options: null, cancellationToken: ct);
+        }
+        catch (Exception ex)
+        {
+            log.LogWarning("[export:storage-delete] best-effort delete failed object={Object} err={Err}",
+                objectPath, ex.Message);
+        }
+    }
 }
