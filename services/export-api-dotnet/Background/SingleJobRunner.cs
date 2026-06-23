@@ -133,40 +133,64 @@ public sealed class SingleJobRunner(
 
             if (string.IsNullOrWhiteSpace(uid) || string.IsNullOrWhiteSpace(jobId)) return;
 
-            // Past the window without a claim. Either the worker is wedged
-            // (credentials / Firestore / network) or — narrow race — the claim
-            // just landed. Read the status to tell which.
-            string? status = null;
-            try { status = await fs.GetJobStatusAsync(uid!, jobId!); }
-            catch (Exception ex) { BatchLog.Error($"startup-watchdog: status read threw: {ex.Message}"); }
+            log.LogError("[batch:single-job] startup timeout — no render within {Timeout}s job={JobId}", timeout, jobId);
+            BatchLog.Error($"startup-watchdog: no claim within {timeout}s — failing job + exiting");
 
-            if (status is JobFields.Rendering or JobFields.Uploading or JobFields.Ready
-                       or JobFields.Failed or JobFields.Canceled)
+            // CRITICAL: bound the remediation. The likeliest reason we're here is that
+            // Firestore/credentials are unreachable — which is exactly what would also
+            // HANG these remediation reads/writes. WaitAsync caps them so we ALWAYS
+            // reach Environment.Exit and the Batch VM stops (instead of billing to the
+            // BATCH_MAX_RUN_SECONDS ceiling). standDown is true ONLY when we positively
+            // confirmed the render already started (so a healthy late claim isn't killed).
+            var standDown = false;
+            try
             {
-                BatchLog.Line($"startup-watchdog: already progressed (status={status}) — standing down");
+                standDown = await RemediateStartupTimeoutAsync(uid!, jobId!)
+                    .WaitAsync(TimeSpan.FromSeconds(Math.Min(30, timeout)));
+            }
+            catch (TimeoutException)
+            {
+                BatchLog.Error("startup-watchdog: remediation timed out (Firestore unreachable?) — exiting anyway");
+            }
+            catch (Exception ex)
+            {
+                BatchLog.Error($"startup-watchdog: remediation error: {ex.Message} — exiting anyway");
+            }
+
+            if (standDown)
+            {
+                BatchLog.Line("startup-watchdog: render already started — standing down");
                 return;
             }
 
-            BatchLog.Error($"startup-watchdog: no render within {timeout}s (status={status ?? "unknown"}) — failing job + exiting");
-            log.LogError("[batch:single-job] startup timeout — job never started rendering job={JobId} status={Status}", jobId, status ?? "unknown");
-
-            var failed = false;
-            try
-            {
-                failed = await fs.FailIfNotStartedAsync(uid!, jobId!, JobFields.ErrStartupTimeout,
-                    "The export couldn't start in time (the render worker didn't begin within the startup window). Please try again.");
-            }
-            catch (Exception ex) { BatchLog.Error($"startup-watchdog: fail-write threw: {ex.Message}"); }
-
-            // Hard-exit when we actually failed it, or when Firestore was unreachable
-            // (status unknown) — either way the VM must stop. If the claim won the
-            // race (status was pre-render but the fail txn found it rendering), leave
-            // the live render alone.
-            if (failed || status is null)
-                Environment.Exit(1);
-            else
-                BatchLog.Line("startup-watchdog: claim won the race — standing down");
+            BatchLog.Error("startup-watchdog: hard-exit(1) so the Batch VM stops billing");
+            Environment.Exit(1);
         });
+    }
+
+    /// <summary>
+    /// Watchdog remediation. Returns TRUE only when the render has positively already
+    /// started (claimed → rendering/uploading) or the job is already terminal — i.e.
+    /// the watchdog should STAND DOWN. Otherwise it atomically fails the still-pre-render
+    /// job and returns FALSE so the caller hard-exits. A claim that won the race between
+    /// the status read and the fail txn returns TRUE (FailIfNotStartedAsync no-ops), so
+    /// a healthy late claim is never killed. Every Firestore call here is bounded by the
+    /// caller's WaitAsync, so a wedged Firestore can't keep the container (and bill) alive.
+    /// </summary>
+    private async Task<bool> RemediateStartupTimeoutAsync(string uid, string jobId)
+    {
+        var status = await fs.GetJobStatusAsync(uid, jobId);
+        if (status is JobFields.Rendering or JobFields.Uploading or JobFields.Ready
+                   or JobFields.Failed or JobFields.Canceled)
+            return true; // a worker claimed it / it finished — leave it alone
+        if (status is null)
+            return false; // doc gone but claim apparently hung → exit to stop the VM
+
+        // Still pre-render on read. Fail ONLY if still pre-render at commit; if the
+        // claim landed in between, FailIfNotStartedAsync returns false → stand down.
+        var failed = await fs.FailIfNotStartedAsync(uid, jobId, JobFields.ErrStartupTimeout,
+            "The export couldn't start in time (the render worker didn't begin within the startup window). Please try again.");
+        return !failed;
     }
 
     /// <summary>Best-effort "fail the job if it never got claimed" — used by the

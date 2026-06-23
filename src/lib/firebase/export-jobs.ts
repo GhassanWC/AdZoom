@@ -98,9 +98,10 @@ const ACTIVE_FOR_STALE: ExportJobView["status"][] = [
  * `updatedAt` stops changing once the worker is gone.
  */
 export function isJobStale(job: ExportJobView, now: number = Date.now()): boolean {
-  // Prefer the worker heartbeat (lastHeartbeatAt) — it's the truest liveness
-  // signal; fall back to updatedAt for jobs/workers that don't write it yet.
-  const beat = job.lastHeartbeatAt ?? job.updatedAt;
+  // Prefer the worker heartbeat — it's the truest liveness signal. The single-job
+  // (Batch) worker writes `heartbeatAt`; the VM worker writes `lastHeartbeatAt`
+  // (both are bumped together when present). Fall back to updatedAt for older docs.
+  const beat = job.heartbeatAt ?? job.lastHeartbeatAt ?? job.updatedAt;
   return ACTIVE_FOR_STALE.includes(job.status) && now - beat > STALE_UI_MS;
 }
 

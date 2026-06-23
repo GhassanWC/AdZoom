@@ -206,15 +206,37 @@ finish. Constants live in `src/lib/usage/cloud-minutes.ts`.
 gcloud batch jobs list --location="$REGION" --project="$PROJECT"
 gcloud batch jobs describe export-<jobid>-<suffix> --location="$REGION"
 
-# Worker logs (single-job lifecycle: [batch:single-job] start/finished, [batch:*])
+# Worker lifecycle logs. The single-job worker writes RAW stdout lines tagged
+# [batch-worker] (a Cloud Logging textPayload) for every milestone — container
+# started, env, claim, download, render, upload, settle, heartbeat, exit code.
+# (The ILogger [batch:*] / [export:*] lines are structured jsonPayload instead, so
+# grepping textPayload for those returns NOTHING — that was the old "no logs" trap.)
 gcloud logging read \
-  'resource.type="batch.googleapis.com/Job" AND textPayload:"batch:single-job"' \
-  --limit=50 --project="$PROJECT"
+  'resource.type="batch.googleapis.com/Job" AND textPayload:"[batch-worker]"' \
+  --limit=100 --order=asc --project="$PROJECT"
 ```
 
 - Free user → `/api/export/cloud` returns 402 (no Batch job created).
 - Pro/Creator → a Batch job appears; the container runs once and exits 0.
+- `[batch-worker] container started` appears within ~30s of the task entering
+  RUNNING (it's the first thing the container prints, before any Firebase/ADC init).
 - Final MP4 lands at `users/{uid}/projects/{pid}/exports/{jobId}.mp4`.
 - Job doc transitions `queued → batch_submitted → rendering → uploading → ready`.
 - `gcloud batch jobs list` shows the job SUCCEEDED, then the VM is gone — no
   instance stays running, idle cost ~zero.
+
+### Cancellation + hang protection
+
+- **Cancel stops the VM.** `/api/export/cancel` marks the job `canceled` (releasing
+  minutes) AND calls Google Batch `cancelJob` (falling back to `deleteJob`) so the
+  running VM is torn down and STOPS BILLING. The worker also polls `cancelRequested`
+  every 1s and exits on its own, so the render stops even if the Batch teardown call
+  fails. Verify: after canceling, `gcloud batch jobs describe …` shows the job
+  heading to `CANCELLED`/`DELETION_IN_PROGRESS` and the VM disappears.
+- **Startup watchdog.** If the container doesn't claim the job (→ `rendering`) within
+  `BATCH_STARTUP_TIMEOUT_SECONDS` (default 120s), it fails the job with
+  `errorCode: "startup_timeout"` and hard-exits (so a wedged VM can't bill to the
+  `BATCH_MAX_RUN_SECONDS` ceiling). The remediation is itself time-bounded, so even a
+  total Firestore outage still results in a process exit.
+- **Heartbeat.** While rendering, the worker bumps `heartbeatAt` (+ `lastHeartbeatAt`,
+  `updatedAt`) every 30s; the stale reconciler and the UI use it to detect a dead VM.
