@@ -16,6 +16,11 @@ import {
 } from "@/lib/usage/cloud-minutes";
 import { buildRenderRecipe } from "@/lib/render/recipe";
 import { enqueueExportJob } from "@/lib/export/enqueue";
+import {
+  BatchCapacityError,
+  BATCH_CAPACITY_ERROR_CODE,
+  BATCH_CAPACITY_ERROR_MESSAGE,
+} from "@/lib/export/batch-backend";
 import { planChunking } from "@/lib/export/chunk-plan";
 import { computeSettingsHash } from "@/lib/export/settings-hash";
 import type {
@@ -498,6 +503,21 @@ export async function createCloudExportJob(
     });
   } catch (err) {
     console.error("[export-create] enqueue failed — rolling back", err);
+    // Region had no capacity at submit time → retryable capacity failure, not a
+    // generic dispatch error. (The common exhaustion case is the ASYNC cancel
+    // caught by the reconciler; this is the synchronous safety net.)
+    if (err instanceof BatchCapacityError) {
+      await releaseAndFail(db, uid, jobId, monthKey, estimate, {
+        errorCode: BATCH_CAPACITY_ERROR_CODE,
+        errorMessage: BATCH_CAPACITY_ERROR_MESSAGE,
+      }).catch((e) => console.error("[export-create] rollback failed", e));
+      return {
+        ok: false,
+        status: 503,
+        error: BATCH_CAPACITY_ERROR_MESSAGE,
+        kind: BATCH_CAPACITY_ERROR_CODE,
+      };
+    }
     await releaseAndFail(db, uid, jobId, monthKey, estimate).catch((e) =>
       console.error("[export-create] rollback failed", e)
     );
@@ -581,7 +601,11 @@ async function releaseAndFail(
   uid: string,
   jobId: string,
   monthKey: string,
-  estimate: number
+  estimate: number,
+  fail: { errorCode: string; errorMessage: string } = {
+    errorCode: "dispatch_failed",
+    errorMessage: "Couldn't queue the export for rendering. Please try again.",
+  }
 ): Promise<void> {
   const usageRef = db.doc(`users/${uid}/usage/${monthKey}`);
   const jobRef = db.doc(`users/${uid}/exportJobs/${jobId}`);
@@ -598,8 +622,8 @@ async function releaseAndFail(
       jobRef,
       {
         status: "failed",
-        errorCode: "dispatch_failed",
-        errorMessage: "Couldn't queue the export for rendering. Please try again.",
+        errorCode: fail.errorCode,
+        errorMessage: fail.errorMessage,
         failedAt: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
         completedAt: FieldValue.serverTimestamp(),

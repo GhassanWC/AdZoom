@@ -54,6 +54,13 @@ const nextConfig: NextConfig = {
       "./node_modules/@google-cloud/batch/build/protos/**",
       "./node_modules/google-gax/build/protos/**",
     ],
+    // The reconciler polls Batch job status (inspectBatchJob → @google-cloud/batch)
+    // to detect jobs Google canceled before render (zone capacity), so it needs the
+    // Batch + gax proto assets traced in as well.
+    "/api/cron/reconcile-exports": [
+      "./node_modules/@google-cloud/batch/build/protos/**",
+      "./node_modules/google-gax/build/protos/**",
+    ],
   },
 };
 

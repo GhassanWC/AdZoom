@@ -8,6 +8,22 @@ import "server-only";
 import { BatchServiceClient, protos } from "@google-cloud/batch";
 import { getAdmin } from "@/lib/firebase/admin";
 import { FieldValue } from "firebase-admin/firestore";
+import {
+  BatchCapacityError,
+  RESOURCE_POOL_EXHAUSTED_RE,
+  batchAllowedLocations,
+  classifyBatchJobStatus,
+  type BatchJobInspection,
+} from "@/lib/export/batch-status";
+
+// Re-export the pure capacity symbols so existing server-only importers can keep
+// importing them from this module.
+export {
+  BatchCapacityError,
+  BATCH_CAPACITY_ERROR_CODE,
+  BATCH_CAPACITY_ERROR_MESSAGE,
+} from "@/lib/export/batch-status";
+export type { BatchJobInspection } from "@/lib/export/batch-status";
 
 /**
  * Google Cloud Batch dispatch for paid cloud export (EXPORT_BACKEND=batch).
@@ -37,6 +53,12 @@ import { FieldValue } from "firebase-admin/firestore";
  *   BATCH_MAX_RETRY_COUNT     default 1
  *   BATCH_PROVISIONING_MODEL  "STANDARD" (default) | "SPOT"
  *   BATCH_CHUNKED_RENDER      "1" to enable the worker's chunked render path
+ *   BATCH_ALLOWED_LOCATIONS   comma-separated allocation locations. Default
+ *                             "regions/$BATCH_REGION" so Batch can place VMs in
+ *                             ANY zone of the region (not pinned to one zone that
+ *                             can be CODE_GCE_ZONE_RESOURCE_POOL_EXHAUSTED). Set to
+ *                             "zones/us-central1-a,zones/us-central1-c,..." to pin
+ *                             to a specific zone subset.
  */
 
 export interface SubmitBatchParams {
@@ -111,7 +133,8 @@ function buildBatchJob(
   image: string,
   serviceAccount: string | undefined,
   env: Record<string, string>,
-  priority: "normal" | "priority"
+  priority: "normal" | "priority",
+  allowedLocations: string[]
 ): protos.google.cloud.batch.v1.IJob {
   const machineType = process.env.BATCH_MACHINE_TYPE || "e2-standard-4";
   const cpuMilli = intEnv("BATCH_CPU_MILLI", 4000);
@@ -150,6 +173,9 @@ function buildBatchJob(
       },
     ],
     allocationPolicy: {
+      // Whole-region (or env-overridden zone subset) placement so Batch isn't
+      // pinned to one zone that can be CODE_GCE_ZONE_RESOURCE_POOL_EXHAUSTED.
+      location: { allowedLocations },
       instances: [
         {
           policy: {
@@ -185,7 +211,8 @@ function buildChunkedBatchJob(
   chunkCount: number,
   chunkParallelism: number,
   chunkSeconds: number,
-  durationSeconds: number
+  durationSeconds: number,
+  allowedLocations: string[]
 ): protos.google.cloud.batch.v1.IJob {
   const machineType = process.env.BATCH_MACHINE_TYPE || "e2-standard-4";
   const cpuMilli = intEnv("BATCH_CPU_MILLI", 4000);
@@ -216,6 +243,9 @@ function buildChunkedBatchJob(
       },
     ],
     allocationPolicy: {
+      // Whole-region (or env-overridden zone subset) placement so the N chunk
+      // tasks aren't pinned to one zone that can be exhausted.
+      location: { allowedLocations },
       instances: [
         {
           policy: {
@@ -306,6 +336,7 @@ export async function submitBatchJob({
   const id = batchJobId(jobId);
   const parent = `projects/${project}/locations/${region}`;
   const client = new BatchServiceClient();
+  const allowedLocations = batchAllowedLocations(region);
 
   const job = chunked
     ? buildChunkedBatchJob(
@@ -316,9 +347,23 @@ export async function submitBatchJob({
         chunkCount!,
         chunkParallelism ?? 1,
         chunkSeconds ?? 120,
-        durationSeconds ?? 0
+        durationSeconds ?? 0,
+        allowedLocations
       )
-    : buildBatchJob(image, serviceAccount, env, priority);
+    : buildBatchJob(image, serviceAccount, env, priority, allowedLocations);
+
+  // Effective fan-out (mirrors the builders) — logged so a capacity failure can
+  // be correlated to the allocation/region/fan-out without reading the spec.
+  const machineType = process.env.BATCH_MACHINE_TYPE || "e2-standard-4";
+  const taskCount = chunked ? chunkCount! : 1;
+  const parallelism = chunked
+    ? Math.max(1, Math.min(chunkParallelism ?? 1, chunkCount!))
+    : 1;
+  console.log(
+    `[export-enqueue] backend=batch config job=${jobId} ` +
+      `allowedLocations=${allowedLocations.join("|")} machineType=${machineType} ` +
+      `taskCount=${taskCount} parallelism=${parallelism}`
+  );
 
   let jobName: string;
   try {
@@ -329,6 +374,7 @@ export async function submitBatchJob({
     );
   } catch (err) {
     const code = (err as { code?: unknown })?.code;
+    const message = err instanceof Error ? err.message : String(err);
     console.error(`[export-enqueue] createJob failed for job ${jobId}`, {
       jobId,
       priority,
@@ -337,8 +383,15 @@ export async function submitBatchJob({
       image,
       serviceAccount,
       grpcCode: code,
-      message: err instanceof Error ? err.message : String(err),
+      message,
     });
+    // gRPC RESOURCE_EXHAUSTED (8) or a *_RESOURCE_POOL_EXHAUSTED message means the
+    // region had no capacity at submit time — surface as a retryable capacity
+    // failure rather than a generic dispatch error. (The common case is the ASYNC
+    // cancel handled by inspectBatchJob; this is the synchronous safety net.)
+    if (code === 8 || RESOURCE_POOL_EXHAUSTED_RE.test(message)) {
+      throw new BatchCapacityError();
+    }
     throw err instanceof Error ? err : new Error(`Cloud Batch createJob failed: ${String(err)}`);
   }
 
@@ -372,6 +425,46 @@ function batchJobResourceName(batchJobId: string): string | null {
   const region = process.env.BATCH_REGION?.trim();
   if (!project || !region) return null;
   return `projects/${project}/locations/${region}/jobs/${batchJobId}`;
+}
+
+/**
+ * Read a Batch job's current status to detect the ASYNC failure mode the
+ * reconciler can't otherwise see: createJob succeeded (doc → batch_submitted) but
+ * Batch later cancels/fails the job before any container starts — most often
+ * because the region ran out of capacity (CODE_GCE_ZONE_RESOURCE_POOL_EXHAUSTED),
+ * which surfaces in `status.statusEvents[].description`.
+ *
+ * Best-effort + bounded (10s). Returns null when the job can't be resolved
+ * (no name, NOT_FOUND, or any RPC error) so the caller falls back to the
+ * time-based stale sweep rather than mislabeling. Never throws.
+ */
+export async function inspectBatchJob({
+  jobName,
+  batchJobId,
+}: {
+  jobName?: string | null;
+  batchJobId?: string | null;
+}): Promise<BatchJobInspection | null> {
+  const name =
+    jobName?.trim() || (batchJobId ? batchJobResourceName(batchJobId.trim()) : null);
+  if (!name) return null;
+
+  const client = new BatchServiceClient();
+  try {
+    const [job] = await client.getJob({ name }, { timeout: 10_000 });
+    return classifyBatchJobStatus(job.status?.state, job.status?.statusEvents);
+  } catch (err) {
+    // NOT_FOUND (5) → job already gone; any other error → control-plane blip.
+    // Either way, let the stale sweep handle it instead of guessing.
+    if ((err as { code?: unknown })?.code !== 5) {
+      console.warn("[reconcile-exports] backend=batch getJob failed", {
+        name,
+        grpcCode: (err as { code?: unknown })?.code,
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
+    return null;
+  }
 }
 
 /**
