@@ -19,7 +19,13 @@ import {
   type Unsubscribe,
 } from "firebase/firestore";
 import { getFirebase } from "./client";
+import {
+  QUEUE_REASON_WAITING_FOR_SLOT,
+  WAITING_FOR_SLOT_MESSAGE,
+} from "@/lib/export/batch-capacity";
 import type { ExportJobDoc, ExportUiStage } from "./schema";
+
+export { WAITING_FOR_SLOT_MESSAGE };
 
 /** The UI-facing view of an export job — everything except `renderRecipe`. */
 export type ExportJobView = Omit<ExportJobDoc, "renderRecipe">;
@@ -144,6 +150,7 @@ export function materializeExportJob(
     lastHeartbeatAt: millis(data.lastHeartbeatAt) ?? (data.lastHeartbeatAt as number | undefined),
     heartbeatAt: millis(data.heartbeatAt) ?? (data.heartbeatAt as number | undefined),
     queuePosition: data.queuePosition as number | undefined,
+    queueReason: data.queueReason as ExportJobDoc["queueReason"],
     exportPath: (data.exportPath as "cloud" | "browser" | undefined) ?? "cloud",
     settingsHash: data.settingsHash as string | undefined,
     buildVersion: data.buildVersion as string | undefined,
@@ -191,6 +198,14 @@ export const EXPORT_ACTIVE_STATUSES: ExportJobView["status"][] = [
 
 export function isActiveJob(job: Pick<ExportJobView, "status">): boolean {
   return EXPORT_ACTIVE_STATUSES.includes(job.status);
+}
+
+/** True when a job is deferred waiting for a global Batch export slot (the cap was
+ *  hit at creation; the queue cron will submit it when a slot opens). */
+export function isWaitingForSlot(
+  job: Pick<ExportJobView, "status" | "queueReason">
+): boolean {
+  return job.status === "queued" && job.queueReason === QUEUE_REASON_WAITING_FOR_SLOT;
 }
 
 /** Display progress 0..100 from the stored 0..1 `progress`. */

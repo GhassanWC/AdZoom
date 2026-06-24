@@ -45,6 +45,8 @@ import {
   EXPORT_STAGE_LABEL,
   exportUiStage,
   isIndeterminateStage,
+  isWaitingForSlot,
+  WAITING_FOR_SLOT_MESSAGE,
   type ExportJobView,
 } from "@/lib/firebase/export-jobs";
 
@@ -861,8 +863,9 @@ function serverView(cloud: ReturnType<typeof useCloudExport>): ExportView | null
     chunkedRendering && chunkTot > 0
       ? Math.round((chunkDone / chunkTot) * 100)
       : Math.round((j.progress ?? 0) * 100);
-  const stageLabel =
-    stage === "merging"
+  const stageLabel = isWaitingForSlot(j)
+    ? WAITING_FOR_SLOT_MESSAGE
+    : stage === "merging"
       ? "Merging chunks"
       : chunkedRendering
         ? `Rendering chunks: ${chunkDone} / ${chunkTot}`

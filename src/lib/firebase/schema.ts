@@ -1489,6 +1489,17 @@ export interface ExportJobDoc {
   /** Best-effort queue position recorded at enqueue (active jobs created before
    *  this one). Shown while `status === "queued"`; not updated live. */
   queuePosition?: number;
+  /**
+   * Why a job is sitting in `queued` without a Batch job yet. "waiting_for_slot"
+   * means the global active-Batch-export cap (EXPORT_MAX_ACTIVE_BATCH_JOBS) was
+   * hit at creation, so dispatch was deferred; the reconcile/queue cron submits
+   * it when a slot opens. Drives the "Waiting for cloud export slot" UI.
+   */
+  queueReason?: "waiting_for_slot";
+  /** Epoch ms when the queue-promotion cron claimed a deferred `queued` job for
+   *  dispatch — prevents two overlapping cron runs from double-submitting it.
+   *  A claim older than the cron's stale window is retried. */
+  promotionClaimedAt?: number;
   /** Friendly, UI-facing stage label written by the worker alongside `stage`:
    *  "queued" | "preparing" | "rendering" | "uploading" | "ready". The raw
    *  `stage` stays for diagnostics; this is what the dialog renders. */

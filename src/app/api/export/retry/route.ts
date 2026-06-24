@@ -93,6 +93,7 @@ export async function POST(req: NextRequest) {
       ok: true,
       jobId: result.jobId,
       deduped: result.deduped,
+      queuedForSlot: result.queuedForSlot ?? false,
       estimatedExportMinutes: result.estimatedExportMinutes,
       outputDurationSeconds: result.outputDurationSeconds,
       plan: result.plan,

@@ -21,6 +21,12 @@ import {
   BATCH_CAPACITY_ERROR_CODE,
   BATCH_CAPACITY_ERROR_MESSAGE,
 } from "@/lib/export/batch-backend";
+import { exportBackend } from "@/lib/export/dotnet-backend";
+import {
+  BATCH_SLOT_STATUSES,
+  QUEUE_REASON_WAITING_FOR_SLOT,
+  maxActiveBatchJobs,
+} from "@/lib/export/batch-capacity";
 import { planChunking } from "@/lib/export/chunk-plan";
 import { computeSettingsHash } from "@/lib/export/settings-hash";
 import type {
@@ -85,6 +91,9 @@ export type CreateCloudExportResult =
       jobId: string;
       /** True when an identical active job already existed (no new job created). */
       deduped: boolean;
+      /** True when the global Batch cap was hit: the job is queued (waiting for a
+       *  slot) and was NOT submitted to Batch — the queue cron submits it later. */
+      queuedForSlot?: boolean;
       estimatedExportMinutes: number;
       outputDurationSeconds: number;
       plan: "pro" | "creator";
@@ -367,29 +376,45 @@ export async function createCloudExportJob(
       : {}),
   });
 
-  // Best-effort global active-export count → queue position + a hard capacity cap
-  // (cost guard so we never fan out more concurrent Batch VMs than intended).
-  const maxActive = Number.parseInt(process.env.EXPORT_MAX_ACTIVE_BATCH_EXPORTS ?? "", 10);
+  // ── Global active-Batch-export cap (cost guard) ──────────────────────────
+  // Count how many jobs are currently SUBMITTED to Batch (occupying a slot —
+  // queued jobs are WAITING, not occupying one). If we're at the cap, DEFER:
+  // create the job as `queued` with `queueReason: waiting_for_slot` and DON'T
+  // submit a Batch job now; the reconcile/queue cron submits it when a slot
+  // opens. Only applies to the Batch backend (other backends manage their own
+  // concurrency). Best-effort: a missing index fails open (dispatch normally).
+  const capApplies = exportBackend() === "batch";
+  const maxActive = maxActiveBatchJobs();
+  let deferred = false;
   let queuePosition: number | undefined;
-  try {
-    const ahead = await db
-      .collectionGroup("exportJobs")
-      .where("status", "in", [...ACTIVE_STATUSES])
-      .count()
-      .get();
-    const n = ahead.data().count ?? 0;
-    if (Number.isFinite(maxActive) && maxActive > 0 && n >= maxActive) {
-      console.warn("[export-create] global active-export cap reached — rejecting", { n, maxActive });
-      return {
-        ok: false,
-        status: 429,
-        error: "The export service is at capacity right now. Please try again in a few minutes.",
-        kind: "export_capacity",
-      };
+  if (capApplies) {
+    try {
+      const slotSnap = await db
+        .collectionGroup("exportJobs")
+        .where("status", "in", [...BATCH_SLOT_STATUSES])
+        .count()
+        .get();
+      const activeBatchJobs = slotSnap.data().count ?? 0;
+      deferred = activeBatchJobs >= maxActive;
+      console.log("[export-create] batch capacity check", {
+        jobId,
+        activeBatchJobs,
+        maxActiveBatchJobs: maxActive,
+        deferred,
+      });
+      if (deferred) {
+        // Only when deferring: count those already waiting, so we can show a
+        // position behind everything submitted + waiting (+1 for this job).
+        const waitingSnap = await db
+          .collectionGroup("exportJobs")
+          .where("status", "==", "queued")
+          .count()
+          .get();
+        queuePosition = activeBatchJobs + (waitingSnap.data().count ?? 0) + 1;
+      }
+    } catch {
+      /* no index → skip cap (fail open: dispatch immediately) */
     }
-    if (n > 0) queuePosition = n + 1;
-  } catch {
-    /* no index → omit position + skip cap (fail open) */
   }
 
   // ── Transaction: re-check + reserve minutes + create the job ─────────────
@@ -447,6 +472,7 @@ export async function createCloudExportJob(
         stage: "queued",
         progressStage: "queued",
         ...(queuePosition ? { queuePosition } : {}),
+        ...(deferred ? { queueReason: QUEUE_REASON_WAITING_FOR_SLOT } : {}),
         renderMode: chunk.renderMode,
         ...(chunk.renderMode === "chunked"
           ? {
@@ -485,7 +511,29 @@ export async function createCloudExportJob(
     throw err;
   }
 
-  // ── Dispatch ─────────────────────────────────────────────────────────────
+  // ── Dispatch (or defer when the global Batch cap is hit) ──────────────────
+  // When deferred, the job stays `queued` (waiting_for_slot) and is NOT submitted
+  // to Batch now; the reconcile/queue cron promotes it once a slot frees up.
+  if (deferred) {
+    console.log("[export-create] queued due to cap (waiting for slot)", {
+      uid,
+      jobId,
+      maxActiveBatchJobs: maxActive,
+      queuePosition,
+    });
+    return {
+      ok: true,
+      jobId,
+      deduped: false,
+      queuedForSlot: true,
+      estimatedExportMinutes: estimate,
+      outputDurationSeconds,
+      plan: paidPlan,
+      priority: paidPlan === "creator" ? "priority" : "normal",
+      limit: CLOUD_EXPORT_MINUTES[paidPlan],
+    };
+  }
+
   try {
     await enqueueExportJob({
       uid,

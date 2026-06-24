@@ -20,7 +20,9 @@ import { subscribeExports } from "@/lib/firebase/exports";
 import {
   subscribeExportJobs,
   isActiveJob,
+  isWaitingForSlot,
   progressPercent,
+  WAITING_FOR_SLOT_MESSAGE,
   type ExportJobView,
 } from "@/lib/firebase/export-jobs";
 import { useExport } from "@/components/export/ExportProvider";
@@ -64,6 +66,8 @@ interface UnifiedRow {
   cancelable: boolean;
   /** Cloud terminal failures can be retried into a fresh job. */
   retryable: boolean;
+  /** Deferred waiting for a global Batch export slot (status pill shows it). */
+  waitingForSlot?: boolean;
   // ── Failure diagnostics (cloud) ──
   errorCode?: string;
   errorMessage?: string;
@@ -140,6 +144,7 @@ function cloudRow(j: ExportJobView): UnifiedRow {
     priority: j.priority === "priority",
     cancelable: active,
     retryable: j.status === "failed" || j.status === "canceled",
+    waitingForSlot: isWaitingForSlot(j),
     errorCode: j.errorCode,
     errorMessage: j.errorMessage,
     failedAt: j.failedAt,
@@ -471,7 +476,7 @@ function RowItem({
                 row.status === "failed" && "bg-rose-400"
               )}
             />
-            {STATUS_LABEL[row.status] ?? row.status}
+            {row.waitingForSlot ? WAITING_FOR_SLOT_MESSAGE : STATUS_LABEL[row.status] ?? row.status}
             {row.active && row.source === "cloud" && row.progress > 0
               ? ` ${progressPercent(row)}%`
               : ""}

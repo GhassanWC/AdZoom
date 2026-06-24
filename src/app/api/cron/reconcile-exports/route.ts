@@ -5,9 +5,17 @@ import { getAdmin } from "@/lib/firebase/admin";
 import { isIndexError, tsComparand, uidFromSubDoc } from "@/lib/admin/query";
 import {
   inspectBatchJob,
+  BatchCapacityError,
   BATCH_CAPACITY_ERROR_CODE,
   BATCH_CAPACITY_ERROR_MESSAGE,
 } from "@/lib/export/batch-backend";
+import { enqueueExportJob } from "@/lib/export/enqueue";
+import { exportBackend } from "@/lib/export/dotnet-backend";
+import {
+  BATCH_SLOT_STATUSES,
+  QUEUE_REASON_WAITING_FOR_SLOT,
+  maxActiveBatchJobs,
+} from "@/lib/export/batch-capacity";
 import type { ExportJobDoc, MonthlyUsage } from "@/lib/firebase/schema";
 
 export const runtime = "nodejs";
@@ -30,8 +38,17 @@ export const dynamic = "force-dynamic";
  *     a non-terminal state ("Rendering 0%") forever AND leaks its reserved
  *     minutes. No `updatedAt` write within STALE_MS (the worker heartbeats every
  *     60s, so a 10-min gap means a dead instance) → mark failed + release.
+ *     (Jobs intentionally waiting for a Batch slot are EXEMPT — see #3.)
  *
  * Both paths idempotently release the job's reserved minutes.
+ *
+ * It ALSO promotes the global Batch export queue:
+ *
+ *  3. PROMOTE — jobs deferred at creation because the global active-Batch-export
+ *     cap (EXPORT_MAX_ACTIVE_BATCH_JOBS) was hit sit in `queued` with
+ *     `queueReason: waiting_for_slot` and were never submitted to Batch. When the
+ *     active (submitted/running) count drops below the cap, submit the oldest
+ *     waiting jobs to fill the freed slots.
  *
  * Auth: a shared secret in the `x-cron-secret` header (set on the Scheduler
  * job), compared in constant time against `EXPORT_RECONCILE_SECRET`. Fails
@@ -43,6 +60,9 @@ const STALE_MS = 10 * 60_000;
  *  waiting out STALE_MS. Smaller cutoff ⇒ the stale set is a subset, so a single
  *  query (reusing the existing (status, updatedAt) index) feeds both passes. */
 const PROVISION_STALL_MS = 90_000;
+/** A promotion claim older than this is treated as abandoned (the prior cron run
+ *  died mid-dispatch) and is retried, so a job can't get stuck "claimed". */
+const PROMOTION_CLAIM_STALE_MS = 5 * 60_000;
 const ACTIVE_STATUSES: ExportJobDoc["status"][] = [
   "queued",
   "batch_submitted",
@@ -118,6 +138,146 @@ async function failJobAndRefund(
   });
 }
 
+/**
+ * Promote deferred jobs (status `queued`, `queueReason: waiting_for_slot`) by
+ * submitting them to Batch when the global active count is below the cap. Counts
+ * SUBMITTED/running jobs (queued ones don't occupy a slot), then dispatches the
+ * oldest waiting jobs to fill the freed slots. Each is claimed transactionally so
+ * two overlapping cron runs can't double-submit the same job. Best-effort: index
+ * errors / per-job dispatch errors are swallowed so the cron keeps draining.
+ */
+async function promoteQueuedJobs(
+  db: FirebaseFirestore.Firestore
+): Promise<{ submitted: number; activeBatchJobs: number; max: number }> {
+  const max = maxActiveBatchJobs();
+
+  let activeBatchJobs: number;
+  try {
+    const slotSnap = await db
+      .collectionGroup("exportJobs")
+      .where("status", "in", [...BATCH_SLOT_STATUSES])
+      .count()
+      .get();
+    activeBatchJobs = slotSnap.data().count ?? 0;
+  } catch (err) {
+    if (isIndexError(err)) return { submitted: 0, activeBatchJobs: 0, max };
+    throw err;
+  }
+
+  const available = max - activeBatchJobs;
+  console.info("[reconcile-exports] queue promotion check", {
+    activeBatchJobs,
+    maxActiveBatchJobs: max,
+    available,
+  });
+  if (available <= 0) return { submitted: 0, activeBatchJobs, max };
+
+  // Fetch deferred queued jobs and pick the oldest in memory — a plain
+  // `status == "queued"` collection-group query reuses the single-field index the
+  // cap already needs, avoiding a new (status, createdAt) composite index.
+  let candidates: FirebaseFirestore.QueryDocumentSnapshot[];
+  try {
+    const snap = await db
+      .collectionGroup("exportJobs")
+      .where("status", "==", "queued")
+      .limit(BATCH)
+      .get();
+    candidates = snap.docs;
+  } catch (err) {
+    if (isIndexError(err)) return { submitted: 0, activeBatchJobs, max };
+    throw err;
+  }
+
+  const now = Date.now();
+  const waiting = candidates
+    .map((d) => ({ d, job: d.data() as ExportJobDoc }))
+    .filter(
+      ({ job }) =>
+        job.queueReason === QUEUE_REASON_WAITING_FOR_SLOT &&
+        job.cancelRequested !== true &&
+        now - toMillis(job.promotionClaimedAt) > PROMOTION_CLAIM_STALE_MS
+    )
+    .sort((a, b) => toMillis(a.job.createdAt) - toMillis(b.job.createdAt));
+
+  let submitted = 0;
+  for (const { d, job } of waiting) {
+    if (submitted >= available) break;
+    const uid = uidFromSubDoc(d.ref);
+    if (!uid) continue;
+
+    // Claim transactionally — overlapping cron runs see the fresh claim and skip.
+    const claimed = await db.runTransaction(async (tx) => {
+      const snap = await tx.get(d.ref);
+      if (!snap.exists) return false;
+      const j = snap.data() as ExportJobDoc;
+      if (
+        j.status !== "queued" ||
+        j.queueReason !== QUEUE_REASON_WAITING_FOR_SLOT ||
+        j.cancelRequested === true
+      ) {
+        return false;
+      }
+      if (j.promotionClaimedAt && now - toMillis(j.promotionClaimedAt) <= PROMOTION_CLAIM_STALE_MS) {
+        return false; // freshly claimed by another run
+      }
+      tx.set(
+        d.ref,
+        { promotionClaimedAt: FieldValue.serverTimestamp(), updatedAt: FieldValue.serverTimestamp() },
+        { merge: true }
+      );
+      return true;
+    });
+    if (!claimed) continue;
+
+    try {
+      await enqueueExportJob({
+        uid,
+        jobId: d.id,
+        priority: job.priority === "priority" ? "priority" : "normal",
+        renderMode: job.renderMode,
+        ...(job.renderMode === "chunked"
+          ? {
+              chunkCount: job.chunkCount,
+              chunkSeconds: job.chunkSeconds,
+              chunkParallelism: job.chunkParallelism,
+              durationSeconds: job.durationSeconds,
+            }
+          : {}),
+      });
+      submitted++;
+      console.info("[reconcile-exports] submitted after slot opened", {
+        jobId: d.id,
+        uid,
+        activeBatchJobs: activeBatchJobs + submitted,
+        maxActiveBatchJobs: max,
+      });
+    } catch (err) {
+      if (err instanceof BatchCapacityError) {
+        // Whole region is out of capacity — fail this one cleanly + refund, and
+        // STOP (further submits this tick would hit the same wall).
+        await failJobAndRefund(db, d.ref, uid, {
+          errorCode: BATCH_CAPACITY_ERROR_CODE,
+          errorMessage: BATCH_CAPACITY_ERROR_MESSAGE,
+        }).catch(() => {});
+        console.warn("[reconcile-exports] promotion hit capacity — stopping this tick", {
+          jobId: d.id,
+        });
+        break;
+      }
+      // Transient dispatch error — release the claim so it retries next tick.
+      await d.ref
+        .set(
+          { promotionClaimedAt: FieldValue.delete(), updatedAt: FieldValue.serverTimestamp() },
+          { merge: true }
+        )
+        .catch(() => {});
+      console.error("[reconcile-exports] promotion dispatch failed", { jobId: d.id, err });
+    }
+  }
+
+  return { submitted, activeBatchJobs, max };
+}
+
 export async function POST(req: NextRequest) {
   if (!authorized(req)) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
@@ -182,7 +342,11 @@ export async function POST(req: NextRequest) {
       }
 
       // 2) Stale mid-render sweep (unchanged): worker started then died.
-      if (Date.now() - toMillis(job.updatedAt) >= STALE_MS) {
+      //    EXEMPT jobs intentionally waiting for a Batch slot — they have no
+      //    progress BY DESIGN (not submitted yet); the promotion pass owns them.
+      const waitingForSlot =
+        job.status === "queued" && job.queueReason === QUEUE_REASON_WAITING_FOR_SLOT;
+      if (!waitingForSlot && Date.now() - toMillis(job.updatedAt) >= STALE_MS) {
         const didFail = await failJobAndRefund(
           db,
           d.ref,
@@ -207,5 +371,18 @@ export async function POST(req: NextRequest) {
       capacityFailed,
     });
   }
-  return NextResponse.json({ ok: true, checked: docs.length, failed, capacityFailed });
+
+  // Promote deferred jobs into any freed Batch slots (Batch backend only — other
+  // backends manage their own concurrency / claiming).
+  let promoted = 0;
+  try {
+    if (exportBackend() === "batch") {
+      const res = await promoteQueuedJobs(db);
+      promoted = res.submitted;
+    }
+  } catch (err) {
+    console.error("[reconcile-exports] promotion failed", err);
+  }
+
+  return NextResponse.json({ ok: true, checked: docs.length, failed, capacityFailed, promoted });
 }
