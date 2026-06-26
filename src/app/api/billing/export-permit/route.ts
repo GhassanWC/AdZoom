@@ -34,7 +34,7 @@ interface PermitBody {
  * jobs in one transaction:
  *
  *   1. Verify the user's plan allows the requested resolution.
- *      4K requires a paid plan (Pro $19+); 1080p is universal.
+ *      4K requires a paid plan (Pro $25+); 1080p is universal.
  *
  *   2. Verify the user is under their monthly export cap.
  *      Free: 5 / both paid tiers: Infinity. Read + increment in a
@@ -97,7 +97,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // 1. Plan vs output tier. 4K and 60fps require a paid plan (Pro $19 and up);
+    // 1. Plan vs output tier. 4K and 60fps require a paid plan (Pro $25 and up);
     //    1080p/30 is universal.
     if (!(await canExportResolution(uid, resolution)) || !(await canExportFps(uid, fps))) {
       const plan = await getUserPlan(uid);

@@ -79,7 +79,7 @@ export async function GET(req: NextRequest) {
   const subs = { active: 0, cancelled: 0, creator: 0, pro: 0 };
   let mrr = 0;
   // Monthly price per paid tier (USD) — see pricing tiers in mockData.ts.
-  const PLAN_PRICE: Record<string, number> = { pro: 19, creator: 49 };
+  const PLAN_PRICE: Record<string, number> = { pro: 25, creator: 49 };
   try {
     const subSnap = await subscriptions.get();
     for (const d of subSnap.docs) {

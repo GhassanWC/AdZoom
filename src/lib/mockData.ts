@@ -147,7 +147,7 @@ export const pricingTiers: PricingTier[] = [
   {
     name: "Pro",
     tagline: "For serious creators.",
-    price: "$19",
+    price: "$25",
     priceUnit: "per month",
     features: [
       "Unlimited exports",

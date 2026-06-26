@@ -81,10 +81,10 @@ export default function PricingPage() {
           }
         />
 
-        {/* Pro — featured / most popular ($19, mid paid tier). */}
+        {/* Pro — featured / most popular ($25, mid paid tier). */}
         <PlanCard
           name="Pro"
-          price="$19"
+          price="$25"
           cadence="per month"
           tagline="For serious creators."
           features={PRO_FEATURES}

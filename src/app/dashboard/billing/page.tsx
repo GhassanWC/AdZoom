@@ -35,8 +35,8 @@ const PLAN_COPY: Record<PlanTier, PlanCopy> = {
     ],
   },
   pro: {
-    // "Pro" — the $19 "For serious creators" tier.
-    price: "$19",
+    // "Pro" — the $25 "For serious creators" tier.
+    price: "$25",
     cadence: "month",
     features: [
       "Unlimited exports",
@@ -150,7 +150,7 @@ export default function BillingPage() {
       );
     }
     if (tier === "pro") {
-      // On the $19 Pro plan → upgrade to the $49 Creator (top) tier.
+      // On the $25 Pro plan → upgrade to the $49 Creator (top) tier.
       return (
         <div className="mt-6 flex flex-wrap gap-2">
           <CheckoutButton plan="creator" label="Upgrade to Creator" variant="primary" />

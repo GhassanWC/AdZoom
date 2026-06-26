@@ -17,7 +17,7 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 // Monthly price per paid tier (USD) — keep in sync with pricing tiers.
-const PLAN_PRICE: Record<string, number> = { pro: 19, creator: 49 };
+const PLAN_PRICE: Record<string, number> = { pro: 25, creator: 49 };
 const PAID_STATUSES: SubscriptionStatus[] = ["active", "on_trial", "past_due"];
 
 export async function GET(req: NextRequest) {

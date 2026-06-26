@@ -65,7 +65,7 @@ front, then review and adjust everything before exporting.
 
 - FREE — $0. Upload videos up to 3 minutes (longer videos need an upgrade). Full
   AI editor, 1080p exports with a watermark.
-- PRO — $19/month. Longer videos, unlimited exports, 4K + 60fps, no watermark,
+- PRO — $25/month. Longer videos, unlimited exports, 4K + 60fps, no watermark,
   vertical & TikTok reframes, priority render.
 - CREATOR — $49/month. Everything in Pro + team workspace (5 seats), brand
   presets, API access, priority support, custom export formats.

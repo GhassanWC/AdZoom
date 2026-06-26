@@ -107,7 +107,7 @@ export function softwareApplicationLd() {
     url: SITE.url,
     offers: [
       { "@type": "Offer", name: "Free", price: "0", priceCurrency: "USD" },
-      { "@type": "Offer", name: "Pro", price: "19", priceCurrency: "USD" },
+      { "@type": "Offer", name: "Pro", price: "25", priceCurrency: "USD" },
       { "@type": "Offer", name: "Creator", price: "49", priceCurrency: "USD" },
     ],
   };

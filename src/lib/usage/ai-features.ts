@@ -26,7 +26,7 @@ export type AiFeatureKey =
   | "brand-presets"         // Future brand-kit feature (placeholder)
   | "ai-visual-moments";    // Gemini vision moment-detection for uploads
 
-// Boundaries follow the marketing tiers: the $19 "Pro" plan unlocks 4K,
+// Boundaries follow the marketing tiers: the $25 "Pro" plan unlocks 4K,
 // priority rendering, and all premium presets; the $49 "Creator" plan is the
 // top team tier and additionally unlocks brand-kit presets.
 export const AI_FEATURE_MIN_PLAN: Record<AiFeatureKey, PlanTier> = {

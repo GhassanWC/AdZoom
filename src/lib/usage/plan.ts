@@ -5,7 +5,7 @@
  * keys 1:1, and each key binds to the like-named LS variant
  * (`pro` → PRO_VARIANT_ID, `creator` → CREATOR_VARIANT_ID):
  *   • Free   — onboarding / try-the-product. 5 GB storage.
- *   • Pro    — main paid plan (~$19/mo), "most popular". 50 GB storage.
+ *   • Pro    — main paid plan (~$25/mo), "most popular". 50 GB storage.
  *              Unlimited exports, no watermark, 4K + 60fps, advanced AI
  *              editing, priority rendering, all premium presets.
  *   • Creator — team / agency plan (~$49/mo). 500 GB storage. "Everything in
@@ -38,7 +38,7 @@ export const PLAN_DEFS: Record<PlanTier, PlanDef> = {
     storageBytes: 5 * GB,
     ctaLabel: "Upgrade",
   },
-  // Pro is the mid paid tier ($19); Creator is the top team tier ($49).
+  // Pro is the mid paid tier ($25); Creator is the top team tier ($49).
   pro: {
     tier: "pro",
     name: "Pro plan",

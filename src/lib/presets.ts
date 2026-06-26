@@ -246,7 +246,7 @@ export const BUILTIN_PRESETS: Preset[] = [
     id: "preset-live-demo",
     name: "Live Demo",
     category: "Product Demo",
-    // Premium preset — unlocked by the $19 Pro tier and above.
+    // Premium preset — unlocked by the $25 Pro tier and above.
     requiredPlan: "pro",
     description:
       "Real-time pacing for live calls. Minimal post-production feel.",
