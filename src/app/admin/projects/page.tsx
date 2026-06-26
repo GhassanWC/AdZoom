@@ -13,6 +13,10 @@ import {
   IndexBuildingPanel,
 } from "@/components/admin/StatePanels";
 import { useAdminList } from "@/components/admin/useAdminList";
+import {
+  VideoPreviewModal,
+  type VideoPreviewTarget,
+} from "@/components/admin/VideoPreviewModal";
 import { fmtBytes, fmtDate, fmtDuration, truncateMiddle } from "@/components/admin/format";
 
 interface ProjectRow {
@@ -39,6 +43,7 @@ const STATUS_OPTIONS = [
 
 export default function AdminProjectsPage() {
   const [status, setStatus] = React.useState("");
+  const [preview, setPreview] = React.useState<VideoPreviewTarget | null>(null);
   const list = useAdminList<ProjectRow>("/api/admin/projects", { status: status || undefined });
 
   const columns: Column<ProjectRow>[] = [
@@ -105,7 +110,13 @@ export default function AdminProjectsPage() {
         <EmptyPanel label="No projects yet" />
       ) : (
         <>
-          <DataTable columns={columns} rows={list.rows} rowKey={(r) => r.id} minWidth={820} />
+          <DataTable
+            columns={columns}
+            rows={list.rows}
+            rowKey={(r) => r.id}
+            minWidth={820}
+            onRowClick={(r) => setPreview({ id: r.id, uid: r.uid, title: r.title })}
+          />
           <LoadMore
             hasMore={list.hasMore}
             loading={list.loadingMore}
@@ -114,6 +125,8 @@ export default function AdminProjectsPage() {
           />
         </>
       )}
+
+      <VideoPreviewModal target={preview} onClose={() => setPreview(null)} />
     </div>
   );
 }

@@ -23,12 +23,15 @@ export function DataTable<T>({
   rowKey,
   minWidth = 640,
   className,
+  onRowClick,
 }: {
   columns: Column<T>[];
   rows: T[];
   rowKey: (row: T, index: number) => string;
   minWidth?: number;
   className?: string;
+  /** When set, rows become clickable (cursor + click handler). */
+  onRowClick?: (row: T) => void;
 }) {
   return (
     <div className={cn("glass overflow-hidden rounded-2xl", className)}>
@@ -57,7 +60,11 @@ export function DataTable<T>({
             {rows.map((row, i) => (
               <tr
                 key={rowKey(row, i)}
-                className="border-b border-white/[0.04] transition-colors duration-150 last:border-0 hover:bg-white/[0.02]"
+                onClick={onRowClick ? () => onRowClick(row) : undefined}
+                className={cn(
+                  "border-b border-white/[0.04] transition-colors duration-150 last:border-0 hover:bg-white/[0.02]",
+                  onRowClick && "cursor-pointer"
+                )}
               >
                 {columns.map((c) => (
                   <td
