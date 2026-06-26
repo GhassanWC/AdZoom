@@ -155,6 +155,27 @@ export async function GET(req: NextRequest, { params }: RouteContext) {
       );
     }
 
+    const edits = summarizeEdits(
+      data.analysis,
+      data.effectsSettings,
+      data.sourceCrop,
+      data.selectedPresetId
+    );
+
+    // Raw inputs for the live "edited" preview — only when there are edits to
+    // show AND effects settings exist to build the render recipe from. The
+    // client feeds these to `buildRenderRecipe` + `composeFrame` (the shared
+    // export render core) to play the edited result without an export.
+    const render =
+      edits.hasEdits && data.effectsSettings
+        ? {
+            moments: data.analysis?.detectedMoments ?? [],
+            effects: data.effectsSettings,
+            visualAnalysis: data.visualAnalysis ?? null,
+            sourceCrop: data.sourceCrop ?? null,
+          }
+        : null;
+
     return NextResponse.json({
       id,
       uid,
@@ -164,12 +185,8 @@ export async function GET(req: NextRequest, { params }: RouteContext) {
       // Exported render — has every edit baked in. Null until first export.
       editedVideoUrl: data.exportUrl ?? null,
       mimeType: data.mimeType ?? null,
-      edits: summarizeEdits(
-        data.analysis,
-        data.effectsSettings,
-        data.sourceCrop,
-        data.selectedPresetId
-      ),
+      edits,
+      render,
     });
   } catch (err) {
     console.error("[admin/projects/:id] failed", err);

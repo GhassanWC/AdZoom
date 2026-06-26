@@ -13,9 +13,13 @@
 import * as React from "react";
 import { createPortal } from "react-dom";
 import { AnimatePresence, motion } from "framer-motion";
-import { X, Sparkles, UserRound, Crop, Wand2 } from "lucide-react";
+import { X, Sparkles, UserRound, Crop, Wand2, Download } from "lucide-react";
 import { useAuth } from "@/lib/firebase/AuthProvider";
 import { cn } from "@/lib/cn";
+import {
+  AdminEditedPreview,
+  type RenderInputs,
+} from "./AdminEditedPreview";
 
 export interface VideoPreviewTarget {
   id: string;
@@ -45,6 +49,8 @@ interface VideoMeta {
   editedVideoUrl: string | null;
   mimeType: string | null;
   edits: EditsSummary;
+  /** Raw inputs to live-render the edited result; null when there are no edits. */
+  render: RenderInputs | null;
 }
 
 type Source = "original" | "edited";
@@ -92,9 +98,9 @@ export function VideoPreviewModal({
         const json = (await res.json()) as VideoMeta;
         if (!cancelled) {
           setMeta(json);
-          // Default to the edited render when one exists — that's the
+          // Default to the edited view when edits exist — that's the
           // edits-applied result the admin most likely wants to inspect.
-          setSource(json.editedVideoUrl ? "edited" : "original");
+          setSource(json.render || json.editedVideoUrl ? "edited" : "original");
         }
       } catch (err) {
         if (!cancelled)
@@ -134,10 +140,10 @@ export function VideoPreviewModal({
 
   if (!mounted) return null;
 
-  const playingUrl =
-    source === "edited" && meta?.editedVideoUrl
-      ? meta.editedVideoUrl
-      : meta?.videoUrl;
+  // The "edited" view is available when we can live-render the edits, or when
+  // an exported render exists to play back.
+  const canShowEdited = !!meta && (!!meta.render || !!meta.editedVideoUrl);
+  const showLiveEdited = source === "edited" && !!meta?.render;
 
   return createPortal(
     <AnimatePresence>
@@ -180,8 +186,10 @@ export function VideoPreviewModal({
               </button>
             </div>
 
-            {/* Original / Edited toggle — Edited plays the exported render with
-                all edits baked in (disabled until the project is exported). */}
+            {/* Original / Edited toggle — Edited renders the project's edits
+                live (AI + user moments, crop, canvas, vignette), or plays the
+                exported render when one exists. Disabled only for raw uploads
+                with no edits. */}
             {meta && (
               <div className="flex items-center gap-2 px-5 pt-3">
                 <SourceTab
@@ -192,13 +200,13 @@ export function VideoPreviewModal({
                 </SourceTab>
                 <SourceTab
                   active={source === "edited"}
-                  disabled={!meta.editedVideoUrl}
+                  disabled={!canShowEdited}
                   title={
-                    meta.editedVideoUrl
+                    canShowEdited
                       ? undefined
-                      : "No exported render yet — edits are listed below"
+                      : "No edits on this video — nothing to preview"
                   }
-                  onClick={() => meta.editedVideoUrl && setSource("edited")}
+                  onClick={() => canShowEdited && setSource("edited")}
                 >
                   Edited
                 </SourceTab>
@@ -206,27 +214,77 @@ export function VideoPreviewModal({
             )}
 
             <div className="px-5 py-3">
-              <div className="flex aspect-video items-center justify-center overflow-hidden rounded-xl border border-white/[0.06] bg-black">
-                {loading ? (
+              {loading ? (
+                <div className="flex aspect-video items-center justify-center overflow-hidden rounded-xl border border-white/[0.06] bg-black">
                   <span className="text-sm text-fog">Loading video…</span>
-                ) : error ? (
+                </div>
+              ) : error ? (
+                <div className="flex aspect-video items-center justify-center overflow-hidden rounded-xl border border-white/[0.06] bg-black">
                   <span className="px-6 text-center text-sm text-rose-300">
                     {error}
                   </span>
-                ) : playingUrl ? (
-                  <video
-                    key={playingUrl}
-                    src={playingUrl}
-                    controls
-                    autoPlay
-                    playsInline
-                    className="h-full w-full bg-black"
-                  />
-                ) : null}
-              </div>
+                </div>
+              ) : showLiveEdited && meta?.render ? (
+                <AdminEditedPreview
+                  key={meta.videoUrl}
+                  videoUrl={meta.videoUrl}
+                  render={meta.render}
+                />
+              ) : (
+                // Original, or the exported render when "edited" is selected but
+                // we have no live-render inputs.
+                <div className="flex aspect-video items-center justify-center overflow-hidden rounded-xl border border-white/[0.06] bg-black">
+                  {meta ? (
+                    <video
+                      key={
+                        source === "edited" && meta.editedVideoUrl
+                          ? meta.editedVideoUrl
+                          : meta.videoUrl
+                      }
+                      src={
+                        source === "edited" && meta.editedVideoUrl
+                          ? meta.editedVideoUrl
+                          : meta.videoUrl
+                      }
+                      controls
+                      autoPlay
+                      playsInline
+                      className="h-full w-full bg-black"
+                    />
+                  ) : null}
+                </div>
+              )}
+
+              {/* Exported render download — a real baked artifact, when present. */}
+              {meta?.editedVideoUrl && (
+                <div className="mt-2 text-right">
+                  <a
+                    href={meta.editedVideoUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center gap-1.5 text-xs text-violet-300 transition-colors hover:text-violet-200"
+                  >
+                    <Download size={12} />
+                    Exported render
+                  </a>
+                </div>
+              )}
             </div>
 
-            {meta && <EditsPanel edits={meta.edits} source={source} />}
+            {meta && (
+              <EditsPanel
+                edits={meta.edits}
+                editedMode={
+                  source !== "edited"
+                    ? null
+                    : meta.render
+                      ? "live"
+                      : meta.editedVideoUrl
+                        ? "exported"
+                        : null
+                }
+              />
+            )}
           </motion.div>
         </motion.div>
       )}
@@ -270,10 +328,10 @@ function SourceTab({
 /** Edits summary — what was applied and by whom (AI vs user). */
 function EditsPanel({
   edits,
-  source,
+  editedMode,
 }: {
   edits: EditsSummary;
-  source: Source;
+  editedMode: "live" | "exported" | null;
 }) {
   const effects = Object.entries(edits.effectBreakdown).sort(
     (a, b) => b[1] - a[1]
@@ -301,10 +359,12 @@ function EditsPanel({
             )}
           </>
         )}
-        {source === "edited" && (
+        {editedMode && (
           <span className="inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-white/[0.03] px-2.5 py-1 text-xs text-fog">
             <Wand2 size={12} />
-            Showing exported render
+            {editedMode === "live"
+              ? "Live edited preview"
+              : "Showing exported render"}
           </span>
         )}
       </div>
