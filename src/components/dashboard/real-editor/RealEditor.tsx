@@ -7,11 +7,6 @@ import {
   Sparkles,
   Loader2,
   AlertCircle,
-  RefreshCcw,
-  Download,
-  SlidersHorizontal,
-  Frame,
-  Crop,
   Pencil,
 } from "lucide-react";
 import { useToast } from "@/components/ui/Toast";
@@ -34,6 +29,9 @@ import { RealProcessingOverlay } from "./RealProcessingOverlay";
 import { PresetsRail } from "./PresetsRail";
 import { RecommendedPresets } from "./RecommendedPresets";
 import { ProcessingMiniPill } from "./ProcessingMiniPill";
+import { EditorActions } from "./EditorActions";
+import { AIConfidencePanel } from "./AIConfidencePanel";
+import { SuggestionsPanel } from "./SuggestionsPanel";
 import { WorkflowStepper, type WorkflowStep } from "./WorkflowStepper";
 import { DebugOverlay } from "./DebugOverlay";
 import { ClickPipelinePanel } from "./ClickPipelinePanel";
@@ -155,15 +153,21 @@ function Body() {
     ? "export"
     : "refine";
 
+  const analyzeTitle = isFailed
+    ? "The previous analysis failed — try again."
+    : !hasAnalysis && project.analysis?.status === "complete"
+      ? "No moments were produced — re-run to try again."
+      : undefined;
+
   return (
-    <div className="space-y-7 pb-12">
-      {/* ── 1. Header ────────────────────────────────────────────────────────
-          Four calm rows inside one block: a thin utility bar (back link +
-          actions), the editable title with a lightweight status, the AI
-          summary, then metadata chips. Open layout (no card) keeps it
-          compact and premium — structure comes from spacing, not borders. */}
+    <div className="space-y-6 pb-12">
+      {/* ── 1. Top bar ───────────────────────────────────────────────────────
+          A real editor top bar: back link + actions on one utility row, then
+          the editable title, status, summary, and metadata chips. Export is
+          the single primary action; all project tools live in one grouped,
+          visually-secondary cluster (`EditorActions`). */}
       <header className="space-y-4">
-        {/* Utility bar — back link (left) + page actions (right). */}
+        {/* Utility row — back link (left) + actions (right). */}
         <div className="flex flex-wrap items-center justify-between gap-3">
           <Link
             href="/dashboard/projects"
@@ -173,81 +177,18 @@ function Body() {
             All projects
           </Link>
 
-          <div className="flex flex-wrap items-center gap-2">
-            {!hasAnalysis ? (
-              <Button
-                onClick={() => setAnalysisOptionsOpen(true)}
-                variant="primary"
-                size="sm"
-                leftIcon={
-                  isAnalyzingNow ? (
-                    <Loader2 size={14} className="animate-spin" />
-                  ) : (
-                    <Sparkles size={14} />
-                  )
-                }
-                disabled={!canAnalyze}
-                title={
-                  isFailed
-                    ? "The previous analysis failed — try again."
-                    : project.analysis?.status === "complete"
-                      ? "No moments were produced — re-run to try again."
-                      : undefined
-                }
-              >
-                {isAnalyzingNow ? "Analyzing…" : "Analyze with AI"}
-              </Button>
-            ) : (
-              <Button
-                onClick={() => setAnalysisOptionsOpen(true)}
-                variant="ghost"
-                size="sm"
-                leftIcon={
-                  isAnalyzingNow ? (
-                    <Loader2 size={14} className="animate-spin" />
-                  ) : (
-                    <RefreshCcw size={13} />
-                  )
-                }
-                disabled={isAnalyzingNow}
-              >
-                Re-analyze
-              </Button>
-            )}
-            <Button
-              onClick={cropEditing ? closeCropEditor : openCropEditor}
-              variant="ghost"
-              size="sm"
-              leftIcon={<Crop size={14} />}
-              title="Crop the source frame (applies to the whole video)"
-            >
-              {cropEditing ? "Done cropping" : "Crop Frame"}
-            </Button>
-            <Button
-              onClick={openCanvas}
-              variant="ghost"
-              size="sm"
-              leftIcon={<Frame size={14} />}
-            >
-              Canvas
-            </Button>
-            <Button
-              onClick={() => setEffectsOpen(true)}
-              variant="ghost"
-              size="sm"
-              leftIcon={<SlidersHorizontal size={14} />}
-            >
-              Effects
-            </Button>
-            <Button
-              onClick={() => setExportOpen(true)}
-              variant="primary"
-              size="sm"
-              leftIcon={<Download size={14} />}
-            >
-              Export
-            </Button>
-          </div>
+          <EditorActions
+            hasAnalysis={hasAnalysis}
+            isAnalyzingNow={isAnalyzingNow}
+            canAnalyze={canAnalyze}
+            analyzeTitle={analyzeTitle}
+            cropEditing={cropEditing}
+            onAnalyze={() => setAnalysisOptionsOpen(true)}
+            onToggleCrop={cropEditing ? closeCropEditor : openCropEditor}
+            onCanvas={openCanvas}
+            onEffects={() => setEffectsOpen(true)}
+            onExport={() => setExportOpen(true)}
+          />
         </div>
 
         {/* Title + lightweight status, then summary + chips. */}
@@ -304,36 +245,47 @@ function Body() {
         </div>
       )}
 
-      {/* ── 3. Hero: cinematic preview spanning full width ──────────────── */}
+      {/* ── 3. Pre-analysis hero — the first-run call to action. Export is the
+              header's primary, so Analyze gets a prominent home in the work
+              area until a first-draft edit exists. */}
       {!hasAnalysis && (
-        <p className="text-sm text-fog">
-          Run <strong className="text-white">Analyze with AI</strong> to generate a
-          first-draft edit you can refine.
-        </p>
+        <PreAnalysisHero
+          analyzing={isAnalyzingNow}
+          canAnalyze={canAnalyze}
+          title={analyzeTitle}
+          onAnalyze={() => setAnalysisOptionsOpen(true)}
+        />
       )}
-      {/* ── 3b. Preview (full width) ─────────────────────────────────────
-          The video preview gets the full content width — no reserved side
-          rail. Moment settings open in a compact floating dialog
-          (`MomentInspectorModal`) on Edit, so the player stays large and the
-          crop box stays visible while editing. */}
+
+      {/* ── 4. Preview — full width, centered, owns the row. Moment editing
+              opens in the centered floating inspector (no backdrop), so the
+              player stays large and visible while you edit. */}
       <div className="space-y-4">
         <RealVideoPlayer />
       </div>
 
-      {/* ── 4. Full-width timeline ───────────────────────────────────────── */}
+      {/* ── 5. Full-width timeline ───────────────────────────────────────── */}
       <RealTimeline />
 
-      {/* ── 4b. Click pipeline diagnostics — dev-visible; in production
+      {/* ── 5b. AI analysis — directly under the timeline, full width: the
+              engagement summary + the accept/dismiss suggestions, on every
+              screen. */}
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <AIConfidencePanel />
+        <SuggestionsPanel />
+      </div>
+
+      {/* ── 6. Click pipeline diagnostics — dev-visible; in production
               hidden unless ?debug=1 / Ctrl+Shift+D. ─────────────────────── */}
       <ClickPipelinePanel />
 
-      {/* ── 4c. Edit-coverage funnel — internal/dev-only (?debug=1). ────── */}
+      {/* ── 6b. Edit-coverage funnel — internal/dev-only (?debug=1). ────── */}
       <EditDiagnosticsPanel />
 
-      {/* ── 4d. CV tuning panel — internal/dev-only (?debug=1). ─────────── */}
+      {/* ── 6c. CV tuning panel — internal/dev-only (?debug=1). ─────────── */}
       <CvDebugPanel />
 
-      {/* ── 5. Presets — recommended hero + full rail ─────────────────────── */}
+      {/* ── 7. Presets — recommended hero + full rail ─────────────────────── */}
       <RecommendedPresets />
       <PresetsRail />
 
@@ -358,6 +310,67 @@ function Body() {
 
       {/* Debug overlay — Ctrl+Shift+D in dev / ?debug=1 anywhere. */}
       <DebugOverlay />
+    </div>
+  );
+}
+
+/**
+ * First-run hero. Export owns the header's single primary slot, so the
+ * Analyze call-to-action gets a prominent, self-explanatory home in the work
+ * area until a first-draft edit exists.
+ */
+function PreAnalysisHero({
+  analyzing,
+  canAnalyze,
+  title,
+  onAnalyze,
+}: {
+  analyzing: boolean;
+  canAnalyze: boolean;
+  title?: string;
+  onAnalyze: () => void;
+}) {
+  return (
+    <div className="glass relative overflow-hidden rounded-2xl p-6 sm:p-7">
+      <div
+        aria-hidden
+        className="pointer-events-none absolute -right-10 -top-14 h-48 w-72 bg-[radial-gradient(ellipse_at_top_right,rgba(139,92,246,0.18),transparent_65%)] blur-2xl"
+      />
+      <div className="relative flex flex-col gap-5 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex items-start gap-4">
+          <span className="inline-flex size-11 shrink-0 items-center justify-center rounded-2xl bg-violet-500/15 text-violet-200 ring-1 ring-violet-400/25 shadow-[0_8px_24px_-12px_rgba(139,92,246,0.6)]">
+            <Sparkles size={20} />
+          </span>
+          <div className="min-w-0">
+            <h2 className="font-display text-lg font-semibold tracking-tight text-white">
+              Generate your first-draft edit
+            </h2>
+            <p className="mt-1 max-w-xl text-[13px] leading-relaxed text-fog">
+              Framevo&apos;s AI finds the moments that matter — clicks, reveals,
+              and focus shifts — and builds cinematic zooms you can refine on the
+              timeline.
+            </p>
+          </div>
+        </div>
+        <div className="shrink-0">
+          <Button
+            onClick={onAnalyze}
+            variant="primary"
+            size="md"
+            disabled={!canAnalyze}
+            title={title}
+            leftIcon={
+              analyzing ? (
+                <Loader2 size={16} className="animate-spin" />
+              ) : (
+                <Sparkles size={16} />
+              )
+            }
+          >
+            {analyzing ? "Analyzing…" : "Analyze with AI"}
+          </Button>
+        </div>
+      </div>
     </div>
   );
 }

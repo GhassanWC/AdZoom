@@ -1,9 +1,9 @@
 import {
-  MousePointerClick,
-  Scissors,
-  FastForward,
-  Frame,
+  ZoomIn,
+  Target,
+  Lightbulb,
   SlidersHorizontal,
+  MonitorPlay,
   Download,
   type LucideIcon,
 } from "lucide-react";
@@ -19,38 +19,40 @@ interface FeatureCard {
 
 export const FEATURE_CARDS: FeatureCard[] = [
   {
-    Icon: MousePointerClick,
-    title: "AI Camera Edits",
+    Icon: ZoomIn,
+    title: "AI-powered zooms",
     description:
-      "Automatically add zooms, click highlights, and focus moments when something important happens on screen.",
+      "Cinematic zooms that follow the cursor and frame whatever matters on screen — added automatically, then yours to retime.",
   },
   {
-    Icon: Scissors,
-    title: "AI Cuts",
+    Icon: Target,
+    title: "Click & focus emphasis",
     description:
-      "Remove boring, idle, or dead sections so the final video feels tighter.",
+      "Highlight every click and softly focus attention so viewers always know exactly where to look.",
   },
   {
-    Icon: FastForward,
-    title: "Smart Speed-ups",
-    description: "Speed up slow parts without cutting them completely.",
-  },
-  {
-    Icon: Frame,
-    title: "Canvas Fit",
+    Icon: Lightbulb,
+    title: "AI suggestions",
     description:
-      "Prepare videos for YouTube, TikTok, Reels, Shorts, square, or portrait formats.",
+      "Framevo flags edits worth making — add a zoom here, trim idle time there. Accept or dismiss each one; the AI assists, never dictates.",
   },
   {
     Icon: SlidersHorizontal,
-    title: "Manual Timeline",
+    title: "Manual timeline editing",
     description:
-      "Drag, resize, delete, restore, and fine-tune every AI edit.",
+      "Drag, resize, duplicate, delete, and restore any edit — with undo/redo and keyboard shortcuts. The AI drafts; you ship the final cut.",
+  },
+  {
+    Icon: MonitorPlay,
+    title: "Clean, true-to-export preview",
+    description:
+      "A WYSIWYG preview where the camera follows the action — what you see is exactly what the exported file looks like.",
   },
   {
     Icon: Download,
-    title: "Background Export",
-    description: "Keep working while Framevo renders your video.",
+    title: "Flexible export",
+    description:
+      "Render in your browser on the free plan, or unlock 4K and watermark-free exports on Pro — and reframe the same edit for every platform.",
   },
 ];
 
@@ -66,7 +68,7 @@ export function Features() {
           do.
         </>
       }
-      subtitle="Six systems work together to turn your video into a finished edit — each one editable, none of them required."
+      subtitle="The AI builds a first-draft edit from your recording — every piece editable, none of it required."
     >
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
         {FEATURE_CARDS.map((f, i) => (

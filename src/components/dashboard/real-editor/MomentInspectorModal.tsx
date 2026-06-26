@@ -89,6 +89,7 @@ export function MomentInspectorModal() {
             // no dim or scroll-lock. `bg-panel` is opaque in both themes so
             // nothing bleeds through; strong border + shadow read as a real
             // floating inspector.
+            //
             className="fixed left-1/2 top-1/2 z-[115] flex max-h-[80vh] w-[440px] max-w-[calc(100vw-1.5rem)] -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-2xl border border-white/[0.12] bg-panel shadow-cinematic"
           >
             <button

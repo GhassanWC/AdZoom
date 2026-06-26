@@ -504,6 +504,16 @@ html.light .border-rose-400\/40 { border-color: rgba(225, 29, 72, 0.55); }
 html.light .border-rose-400\/45 { border-color: rgba(225, 29, 72, 0.6); }
 html.light .border-rose-400\/70 { border-color: rgba(225, 29, 72, 0.75); }
 
+/* Fuchsia — used for the "click highlight" effect tone (editor + landing
+   timeline pills). Same shape as rose: darken text, strengthen tint + border
+   so the chip stays a legible colored surface on white. */
+html.light .text-fuchsia-100 { color: #86198F; }
+html.light .text-fuchsia-200 { color: #A21CAF; }
+html.light .text-fuchsia-300 { color: #C026D3; }
+html.light .bg-fuchsia-500\/15 { background-color: rgba(217, 70, 239, 0.18); }
+html.light .bg-fuchsia-500\/20 { background-color: rgba(217, 70, 239, 0.22); }
+html.light .border-fuchsia-400\/40 { border-color: rgba(192, 38, 211, 0.45); }
+
 /* ----------------------------------------------------------------------------
    Brand accent palettes — violet / emerald / cyan
    Dark theme uses the ultra-light end of each ramp (`text-violet-200`,

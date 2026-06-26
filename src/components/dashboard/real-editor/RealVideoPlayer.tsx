@@ -12,6 +12,7 @@ import {
   Eye,
   EyeOff,
   Move3D,
+  RefreshCcw,
 } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { useEditorReal } from "./context";
@@ -353,6 +354,9 @@ export function RealVideoPlayer() {
   const [muted, setMuted] = React.useState(false);
   const [volume, setVolume] = React.useState(1);
   const [isFullscreen, setIsFullscreen] = React.useState(false);
+  // True when the source <video> failed to load — surfaced as a clear overlay
+  // (with Retry) instead of a silent black frame.
+  const [loadError, setLoadError] = React.useState(false);
   // Intrinsic (full) size of the loaded recording. The EFFECTIVE source aspect
   // (the Frame Crop sub-rectangle) is derived from this + the project's
   // `sourceCrop` below, so the preview frame is shown WYSIWYG with the export
@@ -417,6 +421,7 @@ export function RealVideoPlayer() {
     if (!v) return;
     const onTime = () => setCurrentTime(v.currentTime);
     const onLoaded = () => {
+      setLoadError(false);
       if (Number.isFinite(v.duration)) setDuration(v.duration);
       if (v.videoWidth > 0 && v.videoHeight > 0) {
         setNaturalSize({ w: v.videoWidth, h: v.videoHeight });
@@ -424,6 +429,9 @@ export function RealVideoPlayer() {
     };
     const onPlay = () => setPlaying(true);
     const onPause = () => setPlaying(false);
+    // A real load failure (bad/expired URL, network, or a CORS-tainted
+    // cross-origin request) — surface it instead of a silent black frame.
+    const onError = () => setLoadError(true);
     // Dev-only: once a real frame is decoded, sample the SOURCE video's
     // bottom rows. This proves whether the green strip the user sees in
     // the preview is baked into the recorded pixels (capture-time, e.g.
@@ -453,14 +461,28 @@ export function RealVideoPlayer() {
     v.addEventListener("loadeddata", onData);
     v.addEventListener("play", onPlay);
     v.addEventListener("pause", onPause);
+    v.addEventListener("error", onError);
     return () => {
       v.removeEventListener("timeupdate", onTime);
       v.removeEventListener("loadedmetadata", onLoaded);
       v.removeEventListener("loadeddata", onData);
       v.removeEventListener("play", onPlay);
       v.removeEventListener("pause", onPause);
+      v.removeEventListener("error", onError);
     };
   }, [videoRef, setCurrentTime, setDuration, setPlaying]);
+
+  // Reload the source after a load failure (e.g. a transient network blip).
+  const retryLoad = React.useCallback(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    setLoadError(false);
+    try {
+      v.load();
+    } catch {
+      /* ignore — the error handler re-fires if it fails again */
+    }
+  }, [videoRef]);
 
   const togglePlay = () => {
     const v = videoRef.current;
@@ -576,6 +598,75 @@ export function RealVideoPlayer() {
           y: srcRect!.sy / naturalSize.h,
         }
       : null;
+
+  // Validated crop projection — how the <video> is zoomed to reveal only the
+  // crop rect. We do this with a CSS `transform: scale()` on a wrapper-sized
+  // element (NOT by laying the element out at e.g. 2000%×2000%): a layout-sized
+  // sprite forces the browser to rasterize the full video at that pixel size,
+  // and a small crop (the editor floor is 5% → 20× → tens of thousands of px,
+  // worse on HiDPI) blows past the GPU max-texture size, so the layer fails to
+  // paint and the preview goes BLACK. A `transform` scale reuses the normal,
+  // wrapper-sized texture, so the crop can be arbitrarily tight without blanking.
+  //
+  // The numbers are validated so a degenerate/non-finite projection (e.g. a
+  // near-zero crop dimension, or a value computed before the intrinsic size
+  // settles) falls back to the full frame (object-contain) — never black.
+  const cropProjection = React.useMemo(() => {
+    if (!cropRectPct) return null;
+    const { w, h, x, y } = cropRectPct;
+    const scaleX = 1 / w;
+    const scaleY = 1 / h;
+    // translate is a % of the element's OWN (wrapper) size, applied before the
+    // scale: full-frame fraction f maps to (f - x)/w of the wrapper. So the
+    // crop rect [x, x+w] fills [0, 1] of the visible (overflow-clipped) box.
+    const translateXPct = -x * 100;
+    const translateYPct = -y * 100;
+    const valid =
+      w > 0.001 &&
+      h > 0.001 &&
+      Number.isFinite(scaleX) &&
+      Number.isFinite(scaleY) &&
+      Number.isFinite(translateXPct) &&
+      Number.isFinite(translateYPct) &&
+      scaleX <= 80 &&
+      scaleY <= 80;
+    return { scaleX, scaleY, translateXPct, translateYPct, valid };
+  }, [cropRectPct]);
+  const cropRenderActive = cropActive && !!cropProjection?.valid;
+
+  // TEMPORARY crop diagnostics — dev-only. Logs the full crop math each time the
+  // crop (or intrinsic size) changes so a "black after crop" report is
+  // immediately attributable: source-of-truth dims, container size, crop rect,
+  // unit, the computed transform, and whether the crop rendered or fell back.
+  React.useEffect(() => {
+    if (process.env.NODE_ENV === "production") return;
+    const v = videoRef.current;
+    const box = aspectRef.current?.getBoundingClientRect();
+    console.info("[crop-preview]", {
+      cropUnit: "normalized 0..1",
+      sourceCrop: project.sourceCrop ?? null,
+      naturalWidth: v?.videoWidth || naturalSize?.w || 0,
+      naturalHeight: v?.videoHeight || naturalSize?.h || 0,
+      containerWidth: box ? Math.round(box.width) : 0,
+      containerHeight: box ? Math.round(box.height) : 0,
+      srcRect,
+      cropRectPct,
+      transform: cropProjection,
+      cropActive,
+      cropRenderActive,
+      reset: cropActive && !cropRenderActive,
+    });
+  }, [
+    project.sourceCrop,
+    srcRect,
+    cropRectPct,
+    cropProjection,
+    cropActive,
+    cropRenderActive,
+    naturalSize,
+    videoRef,
+    aspectRef,
+  ]);
 
   // ── Global output canvas (Canvas Fit / Resize) ───────────────────────────
   // The chosen aspect / fit mode / background. Reflected in the preview
@@ -820,7 +911,7 @@ export function RealVideoPlayer() {
                 ref={transformWrapRef}
                 className={cn(
                   "absolute inset-0 origin-center will-change-transform",
-                  cropActive && "overflow-hidden"
+                  cropRenderActive && "overflow-hidden"
                 )}
               >
                 <video
@@ -828,28 +919,57 @@ export function RealVideoPlayer() {
                   src={project.originalVideoUrl || undefined}
                   className={cn(
                     "w-full",
-                    // With a crop the element box no longer has the source
-                    // aspect (we scale W/H independently), so object-fill is
-                    // required — cover/contain would re-crop/letterbox.
-                    cropActive ? "absolute object-fill" : cn("h-full", videoObjectFit)
+                    // Crop: a wrapper-sized element (inset-0) zoomed to the crop
+                    // rect via `transform: scale()` below — `object-fill` so the
+                    // independent X/Y scale lands the crop without letterboxing.
+                    // Falls back to a normal contained frame when the projection
+                    // is unsafe, so the preview is never blank.
+                    cropRenderActive
+                      ? "absolute inset-0 h-full object-fill"
+                      : cn("h-full", videoObjectFit)
                   )}
                   style={
-                    cropActive && cropRectPct
+                    cropRenderActive && cropProjection
                       ? {
-                          width: `${(100 / cropRectPct.w).toFixed(4)}%`,
-                          height: `${(100 / cropRectPct.h).toFixed(4)}%`,
-                          left: `${(-(cropRectPct.x / cropRectPct.w) * 100).toFixed(4)}%`,
-                          top: `${(-(cropRectPct.y / cropRectPct.h) * 100).toFixed(4)}%`,
+                          transformOrigin: "0 0",
+                          transform: `scale(${cropProjection.scaleX.toFixed(5)}, ${cropProjection.scaleY.toFixed(5)}) translate(${cropProjection.translateXPct.toFixed(4)}%, ${cropProjection.translateYPct.toFixed(4)}%)`,
                         }
                       : undefined
                   }
                   playsInline
-                  crossOrigin="anonymous"
+                  // NO crossOrigin: the preview only DISPLAYS the video (CSS
+                  // transforms, never a canvas readback), so it must not require
+                  // a CORS-approved cross-origin response — otherwise a source
+                  // whose bucket CORS doesn't list the current origin fails to
+                  // load and the preview goes black. Export uses its OWN
+                  // offscreen `crossOrigin` video for canvas readback, so this
+                  // is display-only and safe.
                   preload="metadata"
                 />
                 {!project.originalVideoUrl && (
                   <div className="pointer-events-none absolute inset-0 grid place-items-center text-sm text-fog">
                     No video loaded.
+                  </div>
+                )}
+                {loadError && project.originalVideoUrl && (
+                  <div className="absolute inset-0 z-10 grid place-items-center bg-black/55 px-6 text-center backdrop-blur-sm">
+                    <div className="max-w-xs">
+                      <p className="text-sm font-medium text-white">
+                        Couldn&apos;t load the video preview
+                      </p>
+                      <p className="mt-1 text-xs leading-relaxed text-fog">
+                        The file may still be processing, or your network or
+                        storage permissions blocked it.
+                      </p>
+                      <button
+                        type="button"
+                        onClick={retryLoad}
+                        className="mt-3 inline-flex items-center gap-1.5 rounded-full border border-white/15 bg-white/[0.06] px-3.5 py-1.5 text-[12px] font-medium text-white/90 transition-colors duration-150 hover:border-white/30 hover:bg-white/[0.1]"
+                      >
+                        <RefreshCcw size={12} />
+                        Retry
+                      </button>
+                    </div>
                   </div>
                 )}
 

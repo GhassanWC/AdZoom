@@ -2,6 +2,7 @@ import { Navbar } from "@/components/landing/Navbar";
 import { Hero } from "@/components/landing/Hero";
 import { Problem } from "@/components/landing/Problem";
 import { Solution } from "@/components/landing/Solution";
+import { ProductTour } from "@/components/landing/ProductTour";
 import { Features } from "@/components/landing/Features";
 import { HowItWorks } from "@/components/landing/HowItWorks";
 import { UseCases } from "@/components/landing/UseCases";
@@ -42,15 +43,18 @@ export default function HomePage() {
       />
       <Navbar />
       <main className="relative">
+        {/* Conversion narrative: hook → why → how → see it → proof → depth →
+            steps → control → audience → formats → price → objections → close. */}
         <Hero />
         <Problem />
         <Solution />
+        <ProductTour />
+        <BeforeAfterSection />
         <Features />
         <HowItWorks />
-        <UseCases />
-        <BeforeAfterSection />
-        <CanvasExport />
         <Control />
+        <UseCases />
+        <CanvasExport />
         <Pricing />
         <FAQ />
         <FinalCTA />

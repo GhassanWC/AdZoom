@@ -1,5 +1,6 @@
 import type { Metadata, Viewport } from "next";
 import { Inter, Sora } from "next/font/google";
+import { MotionConfig } from "framer-motion";
 import "./globals.css";
 import { NoiseOverlay } from "@/components/ui/NoiseOverlay";
 import { AuthProvider } from "@/lib/firebase/AuthProvider";
@@ -98,8 +99,12 @@ export default function RootLayout({
             <AnalyticsProvider>
               <ToastProvider>
                 <ConfirmProvider>
-                  {children}
-                  <ChatWidget />
+                  {/* Respect prefers-reduced-motion across all framer-motion
+                      animations (landing loops, overlays, transitions). */}
+                  <MotionConfig reducedMotion="user">
+                    {children}
+                    <ChatWidget />
+                  </MotionConfig>
                 </ConfirmProvider>
               </ToastProvider>
             </AnalyticsProvider>

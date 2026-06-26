@@ -6,18 +6,18 @@ import { RevealOnView } from "@/components/ui/RevealOnView";
 const PAINS = [
   {
     Icon: Hourglass,
-    title: "Your videos run too long",
-    body: "Dead time, loading screens, and idle pauses bury the parts that actually matter.",
+    title: "Videos run too long",
+    body: "Dead time, idle pauses, and slow stretches bury the parts that actually matter.",
   },
   {
     Icon: EyeOff,
-    title: "Flat footage is hard to watch",
-    body: "No zooms, no emphasis, no pacing — viewers don't know where to look and drop off.",
+    title: "Flat footage is hard to follow",
+    body: "No zooms, no emphasis, no pacing — viewers can't tell where to look, and drop off.",
   },
   {
     Icon: Clock,
     title: "Manual editing eats hours",
-    body: "Cutting, zooming, speeding up, and reformatting for each platform takes longer than the recording did.",
+    body: "Cutting, zooming, speeding up, and reformatting for each platform takes longer than the video itself.",
   },
 ];
 
@@ -32,7 +32,7 @@ export function Problem() {
           <span className="text-gradient-violet">a finished video.</span>
         </>
       }
-      subtitle="The video is there — but it's long, flat, and slow, and polishing it by hand is the part nobody enjoys."
+      subtitle="The footage is there — but it's long, flat, and hard to follow, and polishing it by hand is the part nobody enjoys."
     >
       <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
         {PAINS.map((p, i) => (

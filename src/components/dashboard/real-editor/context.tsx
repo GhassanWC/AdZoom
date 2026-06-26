@@ -61,6 +61,8 @@ import {
   remapRegion,
   croppedToSource,
   sourceToCropped,
+  sanitizeSourceCrop,
+  FULL_FRAME_CROP,
 } from "@/lib/timeline/source-crop";
 import { quantize, dequantize } from "@/lib/cv/resample";
 import type {
@@ -855,7 +857,12 @@ export function EditorRealProvider({
   // auto-generated edits keep pointing at the same content (best-effort).
   const setSourceCrop: EditorRealContextValue["setSourceCrop"] =
     React.useCallback(
-      async (crop) => {
+      async (rawCrop) => {
+        // Clamp/repair before persisting: an out-of-range or non-finite crop is
+        // reset to the full frame so a bad rect can never blank the preview or
+        // export. The editor already floors crop size, but this guards every
+        // writer (and any legacy/imported value).
+        const crop = sanitizeSourceCrop(rawCrop) ?? FULL_FRAME_CROP;
         const oldCrop = project.sourceCrop;
         const patch: Record<string, unknown> = {
           sourceCrop: crop,

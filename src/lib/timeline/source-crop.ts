@@ -24,8 +24,65 @@ export interface SourceRect {
   cropActive: boolean;
 }
 
+function clamp(v: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, v));
+}
 function clamp01(v: number): number {
-  return Math.max(0, Math.min(1, v));
+  return clamp(v, 0, 1);
+}
+
+/**
+ * Smallest crop dimension we'll persist/render (normalized). Below this a crop
+ * scales the preview `<video>` so far past its clip box that it reads as black,
+ * so we never let a crop dimension collapse toward zero. The editor enforces a
+ * larger floor (0.05); this is the defensive backstop for any other writer.
+ */
+export const MIN_CROP_SIZE = 0.02;
+
+/**
+ * Clamp / repair a `SourceCrop` to safe NORMALIZED values BEFORE it is persisted
+ * or rendered — the single guard that keeps a bad crop from blanking the
+ * preview or the export.
+ *
+ * Guarantees for an enabled crop: finite x/y/width/height, width/height in
+ * `[MIN_CROP_SIZE, 1]`, and the rect fully inside the frame
+ * (`x + width ≤ 1`, `y + height ≤ 1`). A non-finite or non-positive
+ * width/height can't be repaired into a meaningful rect, so it safely RESETS to
+ * the full-frame disabled crop (full video shown) instead of rendering black.
+ * Disabled crops are normalized to the full frame. Provenance fields
+ * (`aspectLock`, `reason`, `confidence`) are preserved.
+ */
+export function sanitizeSourceCrop(
+  crop?: SourceCrop | null
+): SourceCrop | undefined {
+  if (!crop) return undefined;
+  if (!crop.enabled) {
+    return { ...crop, enabled: false, x: 0, y: 0, width: 1, height: 1 };
+  }
+  const finite = (v: unknown): v is number =>
+    typeof v === "number" && Number.isFinite(v);
+  if (
+    !finite(crop.x) ||
+    !finite(crop.y) ||
+    !finite(crop.width) ||
+    !finite(crop.height) ||
+    crop.width <= 0 ||
+    crop.height <= 0
+  ) {
+    // Unrepairable rect → reset to full frame (disabled), keep provenance.
+    return {
+      ...FULL_FRAME_CROP,
+      aspectLock: crop.aspectLock,
+      reason: crop.reason,
+    };
+  }
+  const width = clamp(crop.width, MIN_CROP_SIZE, 1);
+  const height = clamp(crop.height, MIN_CROP_SIZE, 1);
+  let x = clamp01(crop.x);
+  let y = clamp01(crop.y);
+  if (x + width > 1) x = 1 - width;
+  if (y + height > 1) y = 1 - height;
+  return { ...crop, enabled: true, x: clamp01(x), y: clamp01(y), width, height };
 }
 
 /** A normalized point/region pair the remap helpers operate on. */

@@ -1,6 +1,5 @@
 import {
-  Upload,
-  SlidersHorizontal,
+  UploadCloud,
   Wand2,
   Download,
   type LucideIcon,
@@ -18,27 +17,21 @@ interface Step {
 const steps: Step[] = [
   {
     n: "01",
-    Icon: Upload,
-    title: "Upload or record a video",
-    body: "Drop in an existing video or screen recording (MP4, MOV, WebM), or capture a new one right in the browser. No extension, no plugin.",
+    Icon: UploadCloud,
+    title: "Upload any video",
+    body: "Drop in any video (MP4, MOV, WebM) — or record your screen right in the browser. No extension, no plugin, nothing to install.",
   },
   {
     n: "02",
-    Icon: SlidersHorizontal,
-    title: "Choose what to generate",
-    body: "Pick which edits Framevo should make — camera edits, cuts, speed-ups — and how detailed the analysis should be.",
+    Icon: Wand2,
+    title: "AI builds the first-draft edit",
+    body: "Framevo cuts the dead air, speeds up slow stretches, and adds cinematic zooms, click highlights, and focus on the moments that matter.",
   },
   {
     n: "03",
-    Icon: Wand2,
-    title: "AI creates the edits",
-    body: "Cuts on the dead sections, speed-ups on the slow parts, and camera edits — zooms, click highlights, focus — on the moments that matter.",
-  },
-  {
-    n: "04",
     Icon: Download,
-    title: "Review & export",
-    body: "Adjust anything on the timeline, pick your format with Canvas Fit, and export — rendered in your browser, preview matching the file.",
+    title: "Adjust and export a polished video",
+    body: "Refine anything on the timeline, reframe for any platform with Canvas Fit, and export a clean MP4 — the preview matches the file exactly.",
   },
 ];
 
@@ -53,22 +46,22 @@ export function HowItWorks() {
           <span className="text-gradient-violet">finished edit.</span>
         </>
       }
-      subtitle="Four steps. You pick what to generate and review the result — Framevo does the editing in between, and you stay in control."
+      subtitle="Three steps. You upload and review — Framevo does the editing in between, and you stay in control of the result."
     >
       <div className="relative">
         <div
           aria-hidden
-          className="pointer-events-none absolute left-[5%] right-[5%] top-[44px] hidden h-px lg:block"
+          className="pointer-events-none absolute left-[8%] right-[8%] top-[44px] hidden h-px lg:block"
           style={{
             background:
               "linear-gradient(90deg, transparent 0%, rgba(139,92,246,0.45) 50%, transparent 100%)",
           }}
         />
 
-        <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-4">
+        <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-3">
           {steps.map((s, i) => (
             <RevealOnView key={s.n} delay={i * 0.06}>
-              <div className="glass relative h-full rounded-2xl p-6">
+              <div className="glass relative h-full rounded-2xl p-6 lg:p-7">
                 <div className="flex items-center gap-3">
                   <span className="inline-flex size-11 items-center justify-center rounded-xl border border-violet-500/30 bg-violet-500/10 text-violet-300">
                     <s.Icon size={19} />

@@ -1,23 +1,31 @@
 import {
   ArrowRight,
-  UploadCloud,
+  Play,
+  ZoomIn,
   Scissors,
   MousePointerClick,
-  Frame,
-  SlidersHorizontal,
+  UploadCloud,
 } from "lucide-react";
 import { Container } from "@/components/ui/Container";
-import { HeroMockup } from "./HeroMockup";
+import { EditorPreviewMock } from "./EditorPreviewMock";
 import { BRAND } from "@/lib/branding";
 import { TrackedCtaButton } from "@/components/analytics/TrackedCtaButton";
 import { EVENTS } from "@/lib/analytics/events";
 
 const PROOF = [
-  { Icon: UploadCloud, label: "Upload or record" },
-  { Icon: Scissors, label: "AI cuts boring parts" },
-  { Icon: MousePointerClick, label: "Adds zooms, clicks & focus moments" },
-  { Icon: Frame, label: "Exports for every major format" },
-  { Icon: SlidersHorizontal, label: "You stay in control" },
+  { Icon: UploadCloud, label: "Upload any video" },
+  { Icon: ZoomIn, label: "AI adds cinematic zooms" },
+  { Icon: MousePointerClick, label: "Click & focus emphasis" },
+  { Icon: Scissors, label: "Clean cuts, no dead air" },
+];
+
+// Who Framevo is for — honest audience targeting (no fabricated logos/counts).
+const AUDIENCES = [
+  "Founders",
+  "Creators",
+  "SaaS teams",
+  "Educators",
+  "Product demos",
 ];
 
 export function Hero() {
@@ -47,14 +55,15 @@ export function Hero() {
           </div>
 
           <h1 className="font-display text-[clamp(2.75rem,7.5vw,5.75rem)] font-semibold leading-[0.95] tracking-[-0.05em] text-white">
-            Turn your videos into{" "}
-            <span className="text-gradient-violet">polished edits with AI.</span>
+            Turn any video into{" "}
+            <span className="text-gradient-violet">a polished, finished edit.</span>
           </h1>
 
           <p className="mx-auto mt-7 max-w-[700px] text-[17.5px] leading-relaxed text-fog">
-            Framevo helps you cut boring parts, add zooms, highlight clicks,
-            focus attention, speed up slow sections, and export for YouTube,
-            TikTok, Reels, Shorts, and more.
+            Framevo&apos;s AI watches your video and builds the edit — cinematic
+            zooms, click &amp; focus emphasis, clean cuts, and the right pacing —
+            then exports for every platform. Built for founders, creators, SaaS
+            teams, educators, and anyone who makes videos.
           </p>
 
           <div className="mt-10 flex flex-wrap items-center justify-center gap-3">
@@ -69,13 +78,14 @@ export function Hero() {
               Start editing free
             </TrackedCtaButton>
             <TrackedCtaButton
-              href="#demo"
+              href="#how-it-works"
               variant="glass"
               size="lg"
+              leftIcon={<Play size={14} />}
               event={EVENTS.DEMO_CLICKED}
               eventParams={{ location: "hero" }}
             >
-              Watch demo
+              See how it works
             </TrackedCtaButton>
           </div>
 
@@ -89,6 +99,19 @@ export function Hero() {
             ))}
           </ul>
 
+          {/* Audience targeting — honest, no fake logos */}
+          <div className="mt-7 flex flex-wrap items-center justify-center gap-x-2.5 gap-y-2 text-[11px] text-fog/80">
+            <span className="uppercase tracking-[0.18em]">Built for</span>
+            {AUDIENCES.map((a) => (
+              <span
+                key={a}
+                className="rounded-full border border-white/10 bg-white/[0.02] px-2.5 py-1 font-medium text-white/80"
+              >
+                {a}
+              </span>
+            ))}
+          </div>
+
           <div className="mt-6 flex flex-wrap items-center justify-center gap-x-7 gap-y-2 text-xs text-fog/80">
             <span>No credit card</span>
             <span>Runs in your browser</span>
@@ -97,7 +120,7 @@ export function Hero() {
         </div>
 
         <div id="demo" className="relative mx-auto mt-20 max-w-[1180px] scroll-mt-28 lg:mt-24">
-          <HeroMockup />
+          <EditorPreviewMock />
         </div>
       </Container>
     </section>
