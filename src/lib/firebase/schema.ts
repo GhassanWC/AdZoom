@@ -1533,18 +1533,39 @@ export interface ExportJobDoc {
   /** Total number of chunks for this export (1 when not chunked). */
   chunkTotal?: number;
   // ── Parallel chunked render (one Batch job, N parallel chunk tasks) ───────────
-  /** Render strategy chosen at creation: "single" (one task) or "chunked" (N tasks). */
+  /** Render strategy chosen at creation: "single" (one task) or "chunked" (sharded). */
   renderMode?: "single" | "chunked";
-  /** Number of parallel chunk tasks (== Batch taskCount) when chunked. */
+  /** TOTAL number of output chunks (NOT the task count). The UI shows
+   *  chunksCompleted / chunkCount. */
   chunkCount?: number;
-  /** Output seconds per chunk; each task renders window [i*chunkSeconds, …]. */
+  /** Output seconds per chunk; the worker derives each window via chunk-window. */
   chunkSeconds?: number;
-  /** Max chunk tasks running at once (Batch parallelism; pro 2, creator 4). */
+  /** Number of SHARD WORKERS = Batch taskCount = parallelism (pro 4, creator 6).
+   *  Each worker renders chunks [workerIndex, +workerCount, …]. */
+  workerCount?: number;
+  /** Deprecated alias of {@link workerCount} (kept = workerCount for diagnostics). */
   chunkParallelism?: number;
   /** How many chunks have rendered + uploaded (exactly-once via per-chunk markers). */
   chunksCompleted?: number;
   /** How many chunks permanently failed (a single failure fails the whole job). */
   chunksFailed?: number;
+  // ── Progress summary (worker updates these after every completed chunk) ───────
+  /** Total chunks (mirror of chunkCount). */
+  totalChunks?: number;
+  /** Chunks completed so far (mirror of chunksCompleted). */
+  completedChunks?: number;
+  /** Chunks failed so far (mirror of chunksFailed). */
+  failedChunks?: number;
+  /** Chunks currently being rendered (approx; workers in flight). */
+  activeChunks?: number;
+  /** Output frames rendered so far (approx; completedChunks/chunkCount × expected). */
+  framesRendered?: number;
+  /** Total output frames expected (round(durationSeconds × fps)). */
+  framesExpected?: number;
+  /** Render progress 0..100 (reserves the last few % for merge). */
+  progressPercent?: number;
+  /** Coarse pipeline phase for the UI ("rendering" | "merging" | …). */
+  phase?: string;
   /** Epoch ms when the first chunk task flipped the job to rendering. */
   chunkedStartedAt?: number;
   /** Epoch ms when all chunks finished (before merge). */

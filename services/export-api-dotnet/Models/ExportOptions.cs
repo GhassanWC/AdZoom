@@ -103,12 +103,19 @@ public sealed class ExportOptions
     /// BATCH_TASK_INDEX). 0-based.</summary>
     public int TaskIndex { get; set; }
 
-    /// <summary>Total tasks in the group (Batch injects BATCH_TASK_COUNT).</summary>
+    /// <summary>Total tasks in the group (Batch injects BATCH_TASK_COUNT). With
+    /// sharding this == WorkerCount.</summary>
     public int TaskCount { get; set; } = 1;
 
-    /// <summary>Authoritative chunk count from the submitter (EXPORT_CHUNK_COUNT) —
-    /// do NOT recompute in the worker (must match the app's window math).</summary>
+    /// <summary>Authoritative TOTAL chunk count from the submitter (EXPORT_CHUNK_COUNT)
+    /// — do NOT recompute in the worker (must match the app's window math). This is
+    /// the number of output chunks, NOT the task count.</summary>
     public int ChunkCount { get; set; }
+
+    /// <summary>Number of SHARD WORKERS = Batch taskCount (EXPORT_WORKER_COUNT). Each
+    /// worker renders chunks [workerIndex, workerIndex+WorkerCount, …]. Falls back to
+    /// TaskCount when unset (older submitters).</summary>
+    public int WorkerCount { get; set; }
 
     /// <summary>Merge-leader lease window: a merge claim older than this is
     /// re-claimable by a Batch-retried task (so a dead leader's merge can be
@@ -217,6 +224,7 @@ public sealed class ExportOptions
         o.TaskIndex = EnvInt("BATCH_TASK_INDEX", o.TaskIndex);
         o.TaskCount = EnvInt("BATCH_TASK_COUNT", o.TaskCount);
         o.ChunkCount = EnvInt("EXPORT_CHUNK_COUNT", o.ChunkCount);
+        o.WorkerCount = EnvInt("EXPORT_WORKER_COUNT", o.WorkerCount);
         o.MergeLeaseSeconds = EnvInt("EXPORT_MERGE_LEASE_SECONDS", o.MergeLeaseSeconds);
         if (double.TryParse(Environment.GetEnvironmentVariable("EXPORT_CHUNK_BOUNDARY_PADDING_SECONDS"),
                 System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var pad))

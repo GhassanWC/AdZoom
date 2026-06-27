@@ -58,12 +58,16 @@ export interface ChunkTimelineSummary {
 
 export interface ChunkPlan {
   renderMode: RenderMode;
-  /** Number of parallel chunk tasks (>=2 when chunked; 1 when single). */
+  /** TOTAL number of output chunks (NOT the Batch task count). Each shard worker
+   *  renders a contiguous range of chunks. >=2 when chunked; 1 when single. */
   chunkCount: number;
   /** Output seconds per chunk; the worker derives windows via chunk-window.ts. */
   chunkSeconds: number;
-  /** Max chunks rendering at once (plan-capped); 1 when single. */
-  chunkParallelism: number;
+  /** Number of Batch tasks (shard workers) = taskCount = parallelism. Each worker
+   *  renders a CONTIGUOUS range of chunks (ceil(chunkCount/workerCount) each).
+   *  1 when single. This is what EXPORT_CHUNK_MAX_PARALLEL_* caps (WORKER count,
+   *  not chunk count). */
+  workerCount: number;
   /** Why single was chosen (diagnostics/logs only); "eligible" when chunked. */
   reason: string;
 }
@@ -128,7 +132,7 @@ export function chunkingEnabled(env: Record<string, string | undefined>): boolea
 }
 
 function single(reason: string): ChunkPlan {
-  return { renderMode: "single", chunkCount: 1, chunkSeconds: 0, chunkParallelism: 1, reason };
+  return { renderMode: "single", chunkCount: 1, chunkSeconds: 0, workerCount: 1, reason };
 }
 
 /**
@@ -151,8 +155,8 @@ export function planChunking(input: ChunkPlanInput): ChunkPlan {
   const minVideo = intEnv(env, "EXPORT_CHUNK_MIN_VIDEO_SECONDS", 360);
   if (dur < minVideo) return single("too_short");
 
-  const maxTotal = Math.max(2, intEnv(env, "EXPORT_CHUNK_MAX_TOTAL_CHUNKS", 30));
-  const targetSeconds = Math.max(1, intEnv(env, "EXPORT_CHUNK_SECONDS", 120));
+  const maxTotal = Math.max(2, intEnv(env, "EXPORT_CHUNK_MAX_TOTAL_CHUNKS", 80));
+  const targetSeconds = Math.max(1, intEnv(env, "EXPORT_CHUNK_SECONDS", 15));
 
   // Pick chunkSeconds so the chunk COUNT never exceeds maxTotal, then derive the
   // ACTUAL count from the (possibly grown) chunkSeconds so the worker's window
@@ -165,13 +169,17 @@ export function planChunking(input: ChunkPlanInput): ChunkPlan {
   }
   if (chunkCount < 2) return single("not_enough_chunks");
 
-  const maxParallel =
+  // workerCount = number of SHARD WORKERS (Batch tasks). Each worker renders a
+  // contiguous range of small chunks, so we cap the TASK count (not the chunk
+  // count) to avoid one-container-per-chunk overhead. EXPORT_CHUNK_MAX_PARALLEL_*
+  // is the per-plan WORKER cap (pro 4, creator 6).
+  const maxWorkers =
     input.plan === "creator"
-      ? Math.max(1, intEnv(env, "EXPORT_CHUNK_MAX_PARALLEL_CREATOR", 4))
-      : Math.max(1, intEnv(env, "EXPORT_CHUNK_MAX_PARALLEL_PRO", 2));
-  const chunkParallelism = Math.max(1, Math.min(maxParallel, chunkCount));
+      ? Math.max(1, intEnv(env, "EXPORT_CHUNK_MAX_PARALLEL_CREATOR", 6))
+      : Math.max(1, intEnv(env, "EXPORT_CHUNK_MAX_PARALLEL_PRO", 4));
+  const workerCount = Math.max(1, Math.min(maxWorkers, chunkCount));
 
-  return { renderMode: "chunked", chunkCount, chunkSeconds, chunkParallelism, reason: "eligible" };
+  return { renderMode: "chunked", chunkCount, chunkSeconds, workerCount, reason: "eligible" };
 }
 
 /**
@@ -195,6 +203,7 @@ export function chunkEligibilityLog(
     hasAnimations: input.timeline.hasAnimations,
     unsupportedEffects: input.timeline.unsupportedEffects,
     chunkCount: plan.chunkCount,
-    parallelism: plan.chunkParallelism,
+    workerCount: plan.workerCount,
+    chunkSeconds: plan.chunkSeconds,
   };
 }

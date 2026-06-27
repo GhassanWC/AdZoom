@@ -175,12 +175,17 @@ them — same architecture (one job per export), faster wall-clock, low cost.
 
 ```
 createCloudExportJob: planChunking() decides single vs chunked (renderMode on the doc)
-  → submitBatchJob: ONE Batch job, taskGroup { taskCount=N, parallelism=plan-cap }
-      → N chunk tasks (BATCH_TASK_INDEX): render window → upload chunk to GCS →
-        RecordChunkDoneAsync (per-chunk marker gates an exactly-once counter)
-      → the task that records the LAST chunk wins TryClaimMergeAsync → downloads all
-        chunks, ffmpeg -f concat -c copy, uploads final, SettleSuccessAsync
-  → every other task exits 0; cancel/fail → cancelBatchJob deletes the one job
+  → submitBatchJob: ONE Batch job, taskGroup { taskCount = parallelism = workerCount }
+      (workerCount = plan cap, NOT chunkCount — e.g. 24 chunks → 4–6 SHARD workers)
+      → each shard worker (BATCH_TASK_INDEX = workerIndex) renders a CONTIGUOUS
+        range of chunks: chunksPerWorker = ceil(EXPORT_CHUNK_COUNT / EXPORT_WORKER_COUNT);
+        start = workerIndex*chunksPerWorker; end = min(chunkCount, start+chunksPerWorker).
+        Source downloaded + normalized ONCE per worker. Per chunk: render window →
+        upload → RecordChunkDoneAsync (per-chunk marker gates an exactly-once counter
+        + writes the progress summary) → attempt merge (NotReady until all done).
+      → the worker that records the LAST chunk wins TryClaimMergeAsync → concat the
+        silent chunks → global audiomux → upload final → SettleSuccessAsync
+  → every other worker exits 0; cancel/fail → cancelBatchJob deletes the one job
 ```
 
 **Eligibility (app-side, `chunk-plan.ts`):** kill switch ON, MP4, output ≥
@@ -191,25 +196,30 @@ each output frame to source time via the recipe timeline map; only an effect typ
 chunk renderer can't reproduce (→ `chunk_unsupported_effects`) forces the single path.
 Each chunk renders SILENT; final audio is composed once over the whole timeline and muxed
 in by the merge leader (`audiomux`: video `-c copy`, audio direct/filter, `-shortest`).
-`chunkCount = clamp(ceil(dur/EXPORT_CHUNK_SECONDS), 2, EXPORT_CHUNK_MAX_TOTAL_CHUNKS)`;
-parallelism = Pro 2 / Creator 4 (capped at count).
+`chunkCount = clamp(ceil(dur/EXPORT_CHUNK_SECONDS), 2, EXPORT_CHUNK_MAX_TOTAL_CHUNKS)` is
+the TOTAL chunk count; `workerCount = min(EXPORT_CHUNK_MAX_PARALLEL_<plan>, chunkCount)`
+is the Batch task count (= parallelism). **EXPORT_CHUNK_MAX_PARALLEL_\* caps the WORKER
+count, not the chunk count.**
 
 **Kill switch / rollout:** ship with `EXPORT_CHUNKED_RENDER` unset/`0` (single only).
 Set `EXPORT_CHUNKED_RENDER=1` on the **Next.js** runtime to enable; the submitter
-injects `EXPORT_RENDER_MODE=chunked` + `EXPORT_CHUNK_COUNT`/`EXPORT_CHUNK_SECONDS`
-into the chunk tasks (you do not set those by hand). Per-task Batch timeout is
-**dynamic** (from chunk length + plan), not the flat 7200s.
+injects `EXPORT_RENDER_MODE=chunked` + `EXPORT_CHUNK_COUNT` (total) +
+`EXPORT_WORKER_COUNT` (shard tasks) + `EXPORT_CHUNK_SECONDS` into the shard tasks (you
+do not set those by hand). Per-task Batch timeout is fixed
+(`EXPORT_CHUNK_TASK_TIMEOUT_SECONDS`, default 5400) since each worker renders many chunks.
 
 Next.js runtime env:
 
 ```ini
 EXPORT_CHUNKED_RENDER=1                 # master switch (0/unset = single only)
 EXPORT_CHUNK_MIN_VIDEO_SECONDS=360
-EXPORT_CHUNK_SECONDS=120
-EXPORT_CHUNK_MAX_TOTAL_CHUNKS=30
-EXPORT_CHUNK_MAX_PARALLEL_PRO=2
-EXPORT_CHUNK_MAX_PARALLEL_CREATOR=4
-EXPORT_CHUNK_MAX_RETRY_COUNT=1          # per-chunk Batch task retries
+EXPORT_CHUNK_SECONDS=15                 # small chunks; many sharded onto few workers
+EXPORT_CHUNK_MAX_TOTAL_CHUNKS=80
+EXPORT_CHUNK_MAX_PARALLEL_PRO=4         # = WORKER (Batch task) count for Pro
+EXPORT_CHUNK_MAX_PARALLEL_CREATOR=6     # = WORKER (Batch task) count for Creator
+EXPORT_CHUNK_TASK_TIMEOUT_SECONDS=5400  # per shard-task Batch timeout
+EXPORT_MAX_ACTIVE_BATCH_JOBS=2          # concurrent shard JOBS (each uses 4–6 VMs)
+EXPORT_CHUNK_MAX_RETRY_COUNT=1          # per shard-task Batch retries
 EXPORT_MERGE_LEASE_SECONDS=300          # worst-case merge < this < 600s reconcile window
 EXPORT_MAX_ACTIVE_BATCH_EXPORTS=...     # global concurrency cap (optional)
 # Dynamic per-task timeout tunables (optional): EXPORT_TASK_COLD_START_SECONDS,

@@ -68,10 +68,13 @@ export interface SubmitBatchParams {
   /** "chunked" → ONE Batch job with N parallel chunk tasks (leader-merge). Anything
    *  else (default) → the proven single-task job, untouched. */
   renderMode?: "single" | "chunked";
+  /** TOTAL chunk count (NOT the task count). */
   chunkCount?: number;
   chunkSeconds?: number;
-  chunkParallelism?: number;
-  /** OUTPUT duration (seconds) — drives the dynamic per-task Batch timeout. */
+  /** SHARD WORKER count = Batch taskCount = parallelism. Each worker renders a
+   *  contiguous range of chunks, so the task count is small (pro 4 / creator 6). */
+  workerCount?: number;
+  /** OUTPUT duration (seconds) — informational; the per-task timeout is fixed. */
   durationSeconds?: number;
 }
 
@@ -96,27 +99,14 @@ function numEnv(key: string, fallback: number): number {
 }
 
 /**
- * Dynamic per-task Batch timeout for chunked render (NOT the flat single-job
- * 7200s). Every chunk task gets the same budget because ANY task may become the
- * merge leader and so needs render + merge headroom; Batch bills actual runtime,
- * so non-leaders that finish early cost nothing extra. Bounded so a wedged task
- * can't bill forever.
+ * Per-task Batch timeout for a SHARD WORKER. Each worker renders a contiguous
+ * range (≈ chunkCount/workerCount chunks) + the merge leader does the concat +
+ * global audio pass, so a fixed, generous budget is simpler than the old per-chunk
+ * estimate. Every task gets the same budget because ANY task may become the merge
+ * leader. Batch bills actual runtime, so a worker that finishes early costs nothing.
  */
-function chunkedTaskMaxRunSeconds(chunkSeconds: number, durationSeconds: number): number {
-  const coldStart = intEnv("EXPORT_TASK_COLD_START_SECONDS", 180);
-  const download = intEnv("EXPORT_TASK_DOWNLOAD_SECONDS", 300);
-  const renderFactor = numEnv("EXPORT_CHUNK_RUNTIME_FACTOR", 8); // realtime multiple (incl. retry headroom)
-  // Merge = concat (-c copy, cheap) + download the persisted normalized source +
-  // the GLOBAL audio pass (audiomux: video -c copy, audio AAC re-encode). The base
-  // covers the extra download + audiomux setup; the per-second factor covers the
-  // audio re-encode over the output (AAC is well under realtime).
-  const mergeBase = intEnv("EXPORT_MERGE_BASE_SECONDS", 180);
-  const mergeFactor = numEnv("EXPORT_MERGE_FACTOR", 0.5); // per output second
-  const min = intEnv("EXPORT_CHUNK_TASK_MIN_SECONDS", 600);
-  const max = intEnv("BATCH_MAX_RUN_SECONDS", 7200); // hard ceiling, shared with single
-  const perChunkRender = Math.ceil(Math.max(1, chunkSeconds) * renderFactor);
-  const mergeBudget = mergeBase + Math.ceil(Math.max(0, durationSeconds) * mergeFactor);
-  return Math.min(max, Math.max(min, coldStart + download + perChunkRender + mergeBudget));
+function chunkedTaskMaxRunSeconds(): number {
+  return intEnv("EXPORT_CHUNK_TASK_TIMEOUT_SECONDS", 5400);
 }
 
 /**
@@ -201,21 +191,20 @@ function buildBatchJob(
 }
 
 /**
- * Build the CHUNKED Batch job: ONE job, ONE task group with `taskCount = chunkCount`
- * parallel tasks capped at `parallelism`. Each task reads the runtime-injected
- * BATCH_TASK_INDEX to render its window; the task that finishes the LAST chunk
- * (leader election in Firestore) merges. Identical machine/SA/logging/labels to the
- * single job — only the task fan-out + a dynamic, tighter per-task timeout differ.
+ * Build the SHARDED chunked Batch job: ONE job, ONE task group with
+ * `taskCount = parallelism = workerCount` SHARD WORKERS. Each worker reads the
+ * runtime-injected BATCH_TASK_INDEX (as its workerIndex) and renders a CONTIGUOUS
+ * range of chunks (chunksPerWorker = ceil(EXPORT_CHUNK_COUNT / EXPORT_WORKER_COUNT);
+ * [workerIndex*chunksPerWorker, +chunksPerWorker)) — so 24 chunks run on 4–6 tasks,
+ * not 24. The worker that records the LAST chunk (leader election in Firestore) merges.
+ * Identical machine/SA/logging/labels to the single job — only the fan-out differs.
  */
 function buildChunkedBatchJob(
   image: string,
   serviceAccount: string | undefined,
   env: Record<string, string>,
   priority: "normal" | "priority",
-  chunkCount: number,
-  chunkParallelism: number,
-  chunkSeconds: number,
-  durationSeconds: number,
+  workerCount: number,
   allowedLocations: string[]
 ): protos.google.cloud.batch.v1.IJob {
   const machineType = process.env.BATCH_MACHINE_TYPE || "e2-standard-4";
@@ -224,18 +213,20 @@ function buildChunkedBatchJob(
   const bootDiskGb = intEnv("BATCH_BOOT_DISK_GB", 100);
   const maxRetryCount = intEnv("EXPORT_CHUNK_MAX_RETRY_COUNT", 1);
   const provisioningModel = (process.env.BATCH_PROVISIONING_MODEL || "STANDARD").toUpperCase();
-  const maxRunSeconds = chunkedTaskMaxRunSeconds(chunkSeconds, durationSeconds);
+  const maxRunSeconds = chunkedTaskMaxRunSeconds();
+  const tasks = Math.max(1, workerCount);
 
   return {
     priority: priority === "priority" ? 1 : 0,
     taskGroups: [
       {
-        taskCount: chunkCount,
-        parallelism: Math.max(1, Math.min(chunkParallelism, chunkCount)),
+        // taskCount == parallelism == workerCount: every shard worker runs at once.
+        taskCount: tasks,
+        parallelism: tasks,
         taskSpec: {
           // SHARED env for every task. The runtime injects BATCH_TASK_INDEX /
-          // BATCH_TASK_COUNT per task, so each derives its own chunk window — no
-          // per-task taskEnvironments needed.
+          // BATCH_TASK_COUNT per task; each worker derives its assigned chunk set
+          // from BATCH_TASK_INDEX + EXPORT_WORKER_COUNT + EXPORT_CHUNK_COUNT.
           environment: { variables: env },
           computeResource: { cpuMilli, memoryMib },
           maxRunDuration: { seconds: maxRunSeconds },
@@ -281,7 +272,7 @@ export async function submitBatchJob({
   renderMode,
   chunkCount,
   chunkSeconds,
-  chunkParallelism,
+  workerCount,
   durationSeconds,
 }: SubmitBatchParams): Promise<void> {
   const project = projectId();
@@ -321,10 +312,16 @@ export async function submitBatchJob({
     ...(chunked
       ? {
           EXPORT_RENDER_MODE: "chunked",
+          // EXPORT_CHUNK_COUNT = TOTAL chunks (NOT the task count). Each worker
+          // renders chunks [workerIndex, +workerCount, …].
           EXPORT_CHUNK_COUNT: String(chunkCount),
-          EXPORT_CHUNK_SECONDS: String(chunkSeconds ?? 120),
+          EXPORT_WORKER_COUNT: String(workerCount ?? 1),
+          EXPORT_CHUNK_SECONDS: String(chunkSeconds ?? 15),
           EXPORT_CHUNK_BOUNDARY_PADDING_SECONDS:
             process.env.EXPORT_CHUNK_BOUNDARY_PADDING_SECONDS ?? "0",
+          ...(process.env.EXPORT_CHUNK_TASK_TIMEOUT_SECONDS
+            ? { EXPORT_CHUNK_TASK_TIMEOUT_SECONDS: process.env.EXPORT_CHUNK_TASK_TIMEOUT_SECONDS }
+            : {}),
           ...(process.env.EXPORT_MERGE_LEASE_SECONDS
             ? { EXPORT_MERGE_LEASE_SECONDS: process.env.EXPORT_MERGE_LEASE_SECONDS }
             : {}),
@@ -342,30 +339,21 @@ export async function submitBatchJob({
   const client = new BatchServiceClient();
   const allowedLocations = batchAllowedLocations(region);
 
+  const workers = Math.max(1, Math.min(workerCount ?? 1, chunkCount ?? 1));
   const job = chunked
-    ? buildChunkedBatchJob(
-        image,
-        serviceAccount,
-        env,
-        priority,
-        chunkCount!,
-        chunkParallelism ?? 1,
-        chunkSeconds ?? 120,
-        durationSeconds ?? 0,
-        allowedLocations
-      )
+    ? buildChunkedBatchJob(image, serviceAccount, env, priority, workers, allowedLocations)
     : buildBatchJob(image, serviceAccount, env, priority, allowedLocations);
 
   // Effective fan-out (mirrors the builders) — logged so a capacity failure can
-  // be correlated to the allocation/region/fan-out without reading the spec.
+  // be correlated to the allocation/region/fan-out without reading the spec. With
+  // sharding, taskCount == parallelism == workerCount (NOT chunkCount).
   const machineType = process.env.BATCH_MACHINE_TYPE || "e2-standard-4";
-  const taskCount = chunked ? chunkCount! : 1;
-  const parallelism = chunked
-    ? Math.max(1, Math.min(chunkParallelism ?? 1, chunkCount!))
-    : 1;
+  const taskCount = chunked ? workers : 1;
+  const parallelism = chunked ? workers : 1;
   console.log(
     `[export-enqueue] backend=batch config job=${jobId} ` +
       `allowedLocations=${allowedLocations.join("|")} machineType=${machineType} ` +
+      `chunkCount=${chunked ? chunkCount : 1} workerCount=${taskCount} ` +
       `taskCount=${taskCount} parallelism=${parallelism}`
   );
 
@@ -374,7 +362,7 @@ export async function submitBatchJob({
     const [created] = await client.createJob({ parent, jobId: id, job });
     jobName = created.name ?? `${parent}/jobs/${id}`;
     console.log(
-      `[export-enqueue] backend=batch submitted job=${jobId} batchJob=${jobName} (${priority}) mode=${chunked ? `chunked×${chunkCount}@${chunkParallelism}` : "single"}`
+      `[export-enqueue] backend=batch submitted job=${jobId} batchJob=${jobName} (${priority}) mode=${chunked ? `chunked chunks=${chunkCount} workers=${workers}` : "single"}`
     );
   } catch (err) {
     const code = (err as { code?: unknown })?.code;

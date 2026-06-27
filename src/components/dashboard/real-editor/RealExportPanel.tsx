@@ -773,9 +773,9 @@ function ExportDiagnostics({ job }: { job: ExportJobView }) {
   const rows: Array<[string, string | number | undefined]> = [
     ["renderMode", job.renderMode],
     ["chunkCount", job.chunkCount],
+    ["workerCount", job.workerCount ?? job.chunkParallelism],
     ["chunksCompleted", job.chunkCount != null ? `${job.chunksCompleted ?? 0} / ${job.chunkCount}` : undefined],
     ["chunksFailed", job.chunksFailed],
-    ["chunkParallelism", job.chunkParallelism],
     ["coldStartSeconds", job.coldStartSeconds],
     ["chunkRenderSeconds", job.chunkRenderSeconds],
     ["mergeSeconds", job.mergeSeconds],

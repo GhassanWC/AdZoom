@@ -4,13 +4,16 @@ using Google.Cloud.Firestore;
 namespace ExportApi.Services;
 
 /// <summary>
-/// One PARALLEL chunk task of a chunked cloud export. Each Batch task in the group
-/// runs this with a distinct BATCH_TASK_INDEX: it renders ONLY its output-time
-/// window, uploads the chunk MP4 to GCS, and atomically records completion. The
-/// task whose completion makes chunksCompleted == chunkCount becomes the merge
-/// leader (delegates to <see cref="MergeStep"/>); every other task exits 0.
+/// One SHARD WORKER of a sharded chunked cloud export. Each Batch task runs this
+/// with a distinct BATCH_TASK_INDEX (its workerIndex) and renders MANY chunks
+/// round-robin — chunkIndex = workerIndex; chunkIndex &lt; EXPORT_CHUNK_COUNT;
+/// chunkIndex += EXPORT_WORKER_COUNT — so 24 chunks run on 4–6 workers, not 24
+/// containers. The source is downloaded + normalized ONCE per worker (later chunks
+/// reuse the normalized file). After EACH chunk it uploads + records + updates the
+/// progress summary + attempts the merge; the worker that records the LAST chunk
+/// (leader election in Firestore) merges. Every other worker exits 0.
 ///
-/// No exclusive job lease is taken (N tasks share one job). Coordination is the
+/// No exclusive job lease is taken (workers share one job). Coordination is the
 /// per-chunk markers + the terminal status flip in <see cref="FirestoreService"/>.
 /// Always returns a process exit code so the container exits.
 /// </summary>
@@ -24,18 +27,19 @@ public sealed class ChunkTaskRunner(
 {
     public async Task<int> RunAsync(string uid, string jobId, CancellationToken stopping)
     {
-        var index = opts.TaskIndex;
-        BatchLog.Line($"chunk task start job={jobId} index={index}/{opts.TaskCount}");
+        var workerIndex = opts.TaskIndex;
+        var workerCount = opts.WorkerCount > 0 ? opts.WorkerCount : Math.Max(1, opts.TaskCount);
+        BatchLog.Line($"worker shard start job={jobId} workerIndex={workerIndex} workerCount={workerCount}");
 
         var snap = await fs.GetJobAsync(uid, jobId);
         if (snap is null)
         {
-            BatchLog.Error($"chunk task: job doc not found job={jobId} index={index}");
+            BatchLog.Error($"worker: job doc not found job={jobId} worker={workerIndex}");
             return 1;
         }
         if (JobFields.IsTerminal(Str(snap, JobFields.Status)))
         {
-            BatchLog.Line($"chunk task: job already terminal — exiting job={jobId} index={index}");
+            BatchLog.Line($"worker: job already terminal — exiting job={jobId} worker={workerIndex}");
             return 0;
         }
 
@@ -49,27 +53,28 @@ public sealed class ChunkTaskRunner(
         var chunkCount = (int)Long(snap, JobFields.ChunkCount);
         if (chunkCount <= 0) chunkCount = Math.Max(1, opts.ChunkCount);
 
-        if (index < 0 || index >= chunkCount)
-        {
-            BatchLog.Error($"chunk task: index {index} out of range (count={chunkCount}) — failing job={jobId}");
-            await fs.FailJobFromChunkAsync(uid, jobId, JobFields.ErrChunkFailed,
-                "Export setup error (bad chunk index). Please try again.");
-            return 1;
-        }
+        // The chunks THIS worker owns (CONTIGUOUS shard range):
+        //   chunksPerWorker = ceil(chunkCount / workerCount)
+        //   start = workerIndex * chunksPerWorker; end = min(chunkCount, start + chunksPerWorker)
+        var shard = ChunkWindows.ShardChunks(workerIndex, workerCount, chunkCount);
+        var assigned = new List<int>();
+        for (var ci = shard.StartChunk; ci < shard.EndChunkExclusive; ci++)
+            assigned.Add(ci);
+        BatchLog.Line($"assigned chunks job={jobId} worker={workerIndex} count={assigned.Count} range=[{shard.StartChunk},{shard.EndChunkExclusive}) indexes=[{string.Join(",", assigned)}]");
 
-        // Timeline-aware OUTPUT window (integer-frame tiling so seams concat cleanly).
-        // The worker maps each output frame to source time via the recipe timeline
-        // map, so cuts/speed are handled. RENDER window = trim (emit) window grown by
-        // boundary padding (decode warm-up only); EMIT window is the exact span this
-        // chunk contributes and begins on an IDR keyframe.
-        var win = ChunkWindows.Derive(
-            index, chunkCount, chunkSeconds, fps, durationSeconds, opts.ChunkBoundaryPaddingSeconds);
-        if (!(win.TrimEndFrame > win.TrimStartFrame))
+        // First worker to arrive flips the job to rendering (idempotent for the rest).
+        await fs.EnsureChunkedRenderingAsync(uid, jobId);
+
+        using var cancelCts = CancellationTokenSource.CreateLinkedTokenSource(stopping);
+        using var heartbeat = StartHeartbeat(uid, jobId, cancelCts.Token);
+        using var cancelPoll = StartCancelPoll(uid, jobId, cancelCts);
+
+        if (assigned.Count == 0)
         {
-            BatchLog.Error($"chunk task: empty window trim=[{win.TrimStartFrame},{win.TrimEndFrame}] index={index} — failing job={jobId}");
-            await fs.FailJobFromChunkAsync(uid, jobId, JobFields.ErrChunkFailed,
-                "Export setup error (empty chunk window). Please try again.");
-            return 1;
+            // Spurious worker (more workers than chunks, or a bad index). Nothing to
+            // render; still attempt the merge (NotReady/Lost = 0) then exit cleanly.
+            BatchLog.Line($"worker has no assigned chunks job={jobId} worker={workerIndex} — merge-only");
+            return await merge.RunAsync(uid, jobId, 0, cancelCts.Token);
         }
 
         Dictionary<string, object> recipe;
@@ -81,20 +86,13 @@ public sealed class ChunkTaskRunner(
         }
         catch { recipe = new Dictionary<string, object>(); }
 
-        // First task to arrive flips the job to rendering (idempotent for the rest).
-        await fs.EnsureChunkedRenderingAsync(uid, jobId);
-
-        var workDir = Path.Combine(opts.WorkDir, jobId, $"task-{index}");
+        var workDir = Path.Combine(opts.WorkDir, jobId, $"worker-{workerIndex}");
         Directory.CreateDirectory(workDir);
         var srcExt = Path.GetExtension(sourcePath);
         if (string.IsNullOrEmpty(srcExt)) srcExt = ".mp4";
         var srcFile = Path.Combine(workDir, "source" + srcExt);
-        var chunkFile = Path.Combine(workDir, $"chunk-{index}.mp4");
-        var chunkObjectPath = $"users/{uid}/projects/{projectId}/exports/{jobId}/chunks/chunk-{index}.mp4";
-
-        using var cancelCts = CancellationTokenSource.CreateLinkedTokenSource(stopping);
-        using var heartbeat = StartHeartbeat(uid, jobId, cancelCts.Token);
-        using var cancelPoll = StartCancelPoll(uid, jobId, cancelCts);
+        // Written by this worker's FIRST chunk render (normalize once); reused by the rest.
+        var normalizedPath = Path.Combine(workDir, "normalized-source.mp4");
 
         var sourceHasAudio = false;
         void OnEvent(RenderEvent ev)
@@ -106,91 +104,116 @@ public sealed class ChunkTaskRunner(
 
         try
         {
-            var renderStart = DateTime.UtcNow;
-            log.LogInformation("[export:download] job={JobId} chunk={Idx} src={Src}", jobId, index, sourcePath);
-            BatchLog.Line($"downloading source job={jobId} index={index}");
+            // Download/prepare the source ONCE per worker (not once per chunk).
+            log.LogInformation("[export:download] job={JobId} worker={Idx} src={Src}", jobId, workerIndex, sourcePath);
+            BatchLog.Line($"downloading source job={jobId} worker={workerIndex}");
             await storage.DownloadAsync(sourcePath, srcFile, cancelCts.Token);
 
-            var spec = new Dictionary<string, object?>
+            var totalRenderSec = 0;
+            var rendered = 0;
+            foreach (var ci in assigned)
             {
-                ["jobId"] = jobId,
-                ["sourcePath"] = srcFile,
-                ["outputPath"] = chunkFile,
-                ["serializedRecipe"] = recipe,
-                ["crf"] = opts.X264Crf,
-                ["preset"] = opts.X264Preset,
-                ["normalizeCrf"] = opts.NormalizeCrf,
-                ["normalizePreset"] = opts.NormalizePreset,
-                ["normalizeEnabled"] = opts.NormalizeEnabled,
-                ["chunk"] = new Dictionary<string, object?>
+                if (cancelCts.IsCancellationRequested)
                 {
-                    ["index"] = index,
-                    ["renderStartSec"] = win.RenderStartSec,
-                    ["renderEndSec"] = win.RenderEndSec,
-                    ["trimStartSec"] = win.TrimStartSec,
-                    ["trimEndSec"] = win.TrimEndSec,
-                },
-            };
-
-            BatchLog.Line($"rendering chunk job={jobId} index={index} trim=[{win.TrimStartSec:F1},{win.TrimEndSec:F1}] render=[{win.RenderStartSec:F1},{win.RenderEndSec:F1}]");
-            RenderOutcome? outcome = null;
-            var ok = false;
-            for (var attempt = 0; attempt <= Math.Max(0, opts.ChunkMaxRetries); attempt++)
-            {
-                if (attempt > 0)
-                    log.LogWarning("[{Tag}:chunk-retry] job={JobId} chunk={Idx} attempt={Att}", opts.WorkerTag, jobId, index, attempt + 1);
-                outcome = await render.RunAsync(jobId, spec, workDir, OnEvent, cancelCts.Token, specName: $"spec-chunk-{index}.json");
-                if (cancelCts.IsCancellationRequested || outcome.Canceled || outcome.ExitCode == 2)
-                {
-                    BatchLog.Line($"chunk task canceled job={jobId} index={index}");
-                    return 0; // job canceled/failed elsewhere — not this task's failure
+                    BatchLog.Line($"worker canceled job={jobId} worker={workerIndex}");
+                    return 0;
                 }
-                if (outcome.ExitCode == 0 && outcome.Done is not null) { ok = true; break; }
-                log.LogWarning("[{Tag}:chunk-fail] job={JobId} chunk={Idx} code={Code}", opts.WorkerTag, jobId, index, outcome.Error?.Code ?? "render_failed");
-            }
 
-            if (!ok)
-            {
-                var code = outcome?.Error?.Code ?? JobFields.ErrChunkFailed;
-                var msg = outcome?.Error?.Message ?? "Something went wrong while exporting your video. Please try again.";
-                // The app's eligibility gate mirrors the CLI allowlist, so this should
-                // never happen — but if a timeline with a chunk-incompatible effect
-                // type ever reaches a chunk task, fail with a clear reason.
-                if (code == "chunk_unsupported_effects")
-                    msg = "This export can't be split into chunks (it uses an effect that isn't chunk-compatible). Please try again.";
-                await fs.FailJobFromChunkAsync(uid, jobId, code, msg);
-                BatchLog.Error($"chunk render FAILED job={jobId} index={index} code={code} — job failed");
-                return 1;
-            }
+                // Timeline-aware OUTPUT window (integer-frame tiling so seams concat
+                // cleanly). Output→source mapping handles cuts/speed.
+                var win = ChunkWindows.Derive(
+                    ci, chunkCount, chunkSeconds, fps, durationSeconds, opts.ChunkBoundaryPaddingSeconds);
+                if (!(win.TrimEndFrame > win.TrimStartFrame))
+                {
+                    BatchLog.Error($"worker: empty window chunk={ci} — failing job={jobId}");
+                    await fs.FailJobFromChunkAsync(uid, jobId, JobFields.ErrChunkFailed,
+                        "Export setup error (empty chunk window). Please try again.");
+                    return 1;
+                }
 
-            // Backstop: never ship a chunk that skipped normalization while it was enabled.
-            if (opts.NormalizeEnabled && outcome!.Done!.Normalized == false)
-            {
-                await fs.FailJobFromChunkAsync(uid, jobId, "normalize_not_executed",
-                    "The export could not be prepared (normalization did not run). Please try again.");
-                return 1;
-            }
+                var chunkFile = Path.Combine(workDir, $"chunk-{ci}.mp4");
+                var chunkObjectPath = $"users/{uid}/projects/{projectId}/exports/{jobId}/chunks/chunk-{ci}.mp4";
 
-            var chunkSizeBytes = File.Exists(chunkFile) ? new FileInfo(chunkFile).Length : 0;
-            BatchLog.Line($"upload start job={jobId} index={index} size={chunkSizeBytes}B → {chunkObjectPath}");
-            var uploadStart = DateTime.UtcNow;
-            await storage.UploadMp4Async(chunkFile, chunkObjectPath, cancelCts.Token);
-            BatchLog.Line($"upload complete job={jobId} index={index} size={chunkSizeBytes}B ({(int)(DateTime.UtcNow - uploadStart).TotalSeconds}s)");
+                // Normalize ONCE per worker (its first rendered chunk). Later chunks
+                // read the normalized file → no re-transcode per chunk.
+                var firstRender = rendered == 0;
+                var normalizeNow = firstRender && opts.NormalizeEnabled;
+                var renderSourcePath =
+                    firstRender || !opts.NormalizeEnabled || !File.Exists(normalizedPath)
+                        ? srcFile
+                        : normalizedPath;
 
-            // Persist the normalized source ONCE (deterministic single uploader =
-            // index 0) so the merge's GLOBAL audio pass reuses it instead of
-            // re-transcoding, and the muxed audio is built from bit-identical source.
-            // Best-effort: the merge re-normalizes the original as a fallback if this
-            // object is missing. The render CLI wrote it next to the chunk output.
-            if (index == 0 && opts.NormalizeEnabled)
-            {
-                var normFile = Path.Combine(workDir, "normalized-source.mp4");
-                if (File.Exists(normFile))
+                var spec = new Dictionary<string, object?>
+                {
+                    ["jobId"] = jobId,
+                    ["sourcePath"] = renderSourcePath,
+                    ["outputPath"] = chunkFile,
+                    ["serializedRecipe"] = recipe,
+                    ["crf"] = opts.X264Crf,
+                    ["preset"] = opts.X264Preset,
+                    ["normalizeCrf"] = opts.NormalizeCrf,
+                    ["normalizePreset"] = opts.NormalizePreset,
+                    ["normalizeEnabled"] = normalizeNow,
+                    ["chunk"] = new Dictionary<string, object?>
+                    {
+                        ["index"] = ci,
+                        ["renderStartSec"] = win.RenderStartSec,
+                        ["renderEndSec"] = win.RenderEndSec,
+                        ["trimStartSec"] = win.TrimStartSec,
+                        ["trimEndSec"] = win.TrimEndSec,
+                    },
+                };
+
+                BatchLog.Line($"chunk render start job={jobId} worker={workerIndex} chunk={ci} ({rendered + 1}/{assigned.Count}) trim=[{win.TrimStartSec:F1},{win.TrimEndSec:F1}]");
+                var renderStart = DateTime.UtcNow;
+                RenderOutcome? outcome = null;
+                var ok = false;
+                for (var attempt = 0; attempt <= Math.Max(0, opts.ChunkMaxRetries); attempt++)
+                {
+                    if (attempt > 0)
+                        log.LogWarning("[{Tag}:chunk-retry] job={JobId} chunk={Idx} attempt={Att}", opts.WorkerTag, jobId, ci, attempt + 1);
+                    outcome = await render.RunAsync(jobId, spec, workDir, OnEvent, cancelCts.Token, specName: $"spec-chunk-{ci}.json");
+                    if (cancelCts.IsCancellationRequested || outcome.Canceled || outcome.ExitCode == 2)
+                    {
+                        BatchLog.Line($"chunk canceled job={jobId} worker={workerIndex} chunk={ci}");
+                        return 0; // job canceled/failed elsewhere — not this worker's failure
+                    }
+                    if (outcome.ExitCode == 0 && outcome.Done is not null) { ok = true; break; }
+                    log.LogWarning("[{Tag}:chunk-fail] job={JobId} chunk={Idx} code={Code}", opts.WorkerTag, jobId, ci, outcome.Error?.Code ?? "render_failed");
+                }
+
+                if (!ok)
+                {
+                    var code = outcome?.Error?.Code ?? JobFields.ErrChunkFailed;
+                    var msg = outcome?.Error?.Message ?? "Something went wrong while exporting your video. Please try again.";
+                    if (code == "chunk_unsupported_effects")
+                        msg = "This export can't be split into chunks (it uses an effect that isn't chunk-compatible). Please try again.";
+                    await fs.FailJobFromChunkAsync(uid, jobId, code, msg);
+                    BatchLog.Error($"chunk render FAILED job={jobId} worker={workerIndex} chunk={ci} code={code} — job failed");
+                    return 1;
+                }
+
+                // Backstop: never ship a chunk that skipped normalization while it was
+                // expected (only meaningful on the worker's first/normalizing render).
+                if (normalizeNow && outcome!.Done!.Normalized == false)
+                {
+                    await fs.FailJobFromChunkAsync(uid, jobId, "normalize_not_executed",
+                        "The export could not be prepared (normalization did not run). Please try again.");
+                    return 1;
+                }
+
+                var chunkSizeBytes = File.Exists(chunkFile) ? new FileInfo(chunkFile).Length : 0;
+                await storage.UploadMp4Async(chunkFile, chunkObjectPath, cancelCts.Token);
+                BatchLog.Line($"chunk uploaded job={jobId} worker={workerIndex} chunk={ci} size={chunkSizeBytes}B → {chunkObjectPath}");
+
+                // Persist the normalized source ONCE (global chunk 0 = worker 0's first
+                // render) so the merge's GLOBAL audio pass reuses it (no re-transcode).
+                if (ci == 0 && opts.NormalizeEnabled && File.Exists(normalizedPath))
                 {
                     var normObjectPath = $"users/{uid}/projects/{projectId}/exports/{jobId}/normalized-source.mp4";
                     try
                     {
-                        await storage.UploadMp4Async(normFile, normObjectPath, cancelCts.Token);
+                        await storage.UploadMp4Async(normalizedPath, normObjectPath, cancelCts.Token);
                         BatchLog.Line($"persisted normalized source job={jobId} → {normObjectPath}");
                     }
                     catch (Exception ex)
@@ -198,32 +221,36 @@ public sealed class ChunkTaskRunner(
                         log.LogWarning(ex, "[export] persist normalized source failed job={JobId}", jobId);
                     }
                 }
+
+                totalRenderSec += (int)(DateTime.UtcNow - renderStart).TotalSeconds;
+                rendered++;
+
+                var result = await fs.RecordChunkDoneAsync(uid, jobId, ci, chunkObjectPath, sourceHasAudio, workerIndex);
+                BatchLog.Line($"chunk recorded job={jobId} worker={workerIndex} chunk={ci} result={result}");
+                if (result == FirestoreService.ChunkRecordResult.AlreadyTerminal)
+                    return 0; // job canceled/failed elsewhere — stop this worker
+                BatchLog.Line($"progress summary updated job={jobId} worker={workerIndex} chunk={ci}");
+
+                // Try merge after EVERY chunk: NotReady (cheap, read-only) until ALL
+                // chunks are recorded, then exactly one worker wins + merges. A
+                // non-zero exit means the merge itself FAILED → fail the whole job.
+                var mergeExit = await merge.RunAsync(uid, jobId, totalRenderSec, cancelCts.Token);
+                if (mergeExit != 0) return mergeExit;
             }
 
-            var chunkRenderSec = (int)(DateTime.UtcNow - renderStart).TotalSeconds;
-            var result = await fs.RecordChunkDoneAsync(uid, jobId, index, chunkObjectPath, sourceHasAudio, index);
-            BatchLog.Line($"chunk recorded job={jobId} index={index} result={result} ({chunkRenderSec}s)");
-
-            if (result == FirestoreService.ChunkRecordResult.AlreadyTerminal)
-                return 0; // job canceled/failed elsewhere — nothing to do
-
-            // Attempt the merge on EVERY successful record (Counted / AlreadyCounted /
-            // AllComplete), not just the first AllComplete. merge.RunAsync is fully
-            // idempotent via TryClaimMergeAsync: NotReady when chunks aren't all done
-            // (→ exits 0 cheaply, read-only), Lost when a live leader holds the lease,
-            // Won when this task should merge. This is what lets a Batch-RETRIED task
-            // re-drive a merge stalled by a dead leader once its lease expires (the
-            // original AllComplete-only path made that recovery unreachable).
-            return await merge.RunAsync(uid, jobId, chunkRenderSec, cancelCts.Token);
+            // All my chunks are done. One final merge attempt covers the case where
+            // this worker recorded the GLOBAL-last chunk (idempotent: a re-claimed
+            // stale lease re-drives a merge a dead leader left unfinished).
+            return await merge.RunAsync(uid, jobId, totalRenderSec, cancelCts.Token);
         }
         catch (OperationCanceledException)
         {
-            BatchLog.Line($"chunk task canceled (operation) job={jobId} index={index}");
+            BatchLog.Line($"worker canceled (operation) job={jobId} worker={workerIndex}");
             return 0;
         }
         catch (Exception ex)
         {
-            log.LogError(ex, "[{Tag}:chunk] unexpected job={JobId} index={Idx}", opts.WorkerTag, jobId, index);
+            log.LogError(ex, "[{Tag}:chunk] unexpected job={JobId} worker={Idx}", opts.WorkerTag, jobId, workerIndex);
             await fs.FailJobFromChunkAsync(uid, jobId, JobFields.ErrChunkFailed,
                 "Something went wrong while exporting your video. Please try again.");
             return 1;

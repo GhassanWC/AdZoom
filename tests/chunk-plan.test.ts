@@ -50,17 +50,33 @@ test("kill switch: chunking OFF unless EXPORT_CHUNKED_RENDER is 1/true", () => {
   assert.equal(planChunking(base({ env: { EXPORT_CHUNKED_RENDER: "0" } })).reason, "kill_switch_off");
 });
 
-test("7-min linear MP4 (pro) → chunked, 2-way parallel", () => {
+test("7-min linear MP4 (pro) → chunked, sharded across 4 workers", () => {
   const p = planChunking(base());
   assert.equal(p.renderMode, "chunked");
-  assert.equal(p.chunkSeconds, 120);
-  assert.equal(p.chunkCount, 4); // ceil(420/120)
-  assert.equal(p.chunkParallelism, 2); // pro cap
+  assert.equal(p.chunkSeconds, 15);
+  assert.equal(p.chunkCount, 28); // ceil(420/15) — TOTAL chunks
+  assert.equal(p.workerCount, 4); // pro WORKER cap (Batch tasks), NOT chunkCount
 });
 
-test("creator gets 4-way parallel; capped by chunkCount", () => {
-  assert.equal(planChunking(base({ plan: "creator", outputDurationSeconds: 1200 })).chunkParallelism, 4);
-  assert.equal(planChunking(base({ plan: "creator", outputDurationSeconds: 360 })).chunkParallelism, 3);
+test("SHARDING: 24-chunk export uses few workers, not one task per chunk", () => {
+  // 360s / 15s = 24 chunks. Acceptance criterion #1.
+  const pro = planChunking(base({ outputDurationSeconds: 360, plan: "pro" }));
+  assert.equal(pro.chunkCount, 24);
+  assert.equal(pro.workerCount, 4); // 4 Batch tasks, NOT 24
+  const creator = planChunking(base({ outputDurationSeconds: 360, plan: "creator" }));
+  assert.equal(creator.chunkCount, 24);
+  assert.equal(creator.workerCount, 6); // 6 Batch tasks, NOT 24
+});
+
+test("worker count is capped by chunkCount (tiny videos)", () => {
+  // 60s / 15s = 4 chunks → min(6, 4) = 4 workers (min-duration overridden for the test)
+  const env = { EXPORT_CHUNKED_RENDER: "1", EXPORT_CHUNK_MIN_VIDEO_SECONDS: "30" } as Record<
+    string,
+    string | undefined
+  >;
+  const p = planChunking(base({ plan: "creator", outputDurationSeconds: 60, env }));
+  assert.equal(p.chunkCount, 4);
+  assert.equal(p.workerCount, 4);
 });
 
 test("short videos fall back to single", () => {
@@ -103,11 +119,13 @@ test("non-mp4 and free plan fall back to single", () => {
 });
 
 test("max total chunks cap: count never exceeds cap, no empty trailing chunk", () => {
+  // 3960s / 15s = 264 chunks > 80 cap → grow chunkSeconds to keep count <= 80.
   const p = planChunking(base({ outputDurationSeconds: 3960, plan: "creator" }));
   assert.equal(p.renderMode, "chunked");
-  assert.ok(p.chunkCount <= 30, `chunkCount ${p.chunkCount} should be <= 30`);
+  assert.ok(p.chunkCount <= 80, `chunkCount ${p.chunkCount} should be <= 80`);
   assert.equal(p.chunkCount, Math.ceil(3960 / p.chunkSeconds));
   assert.ok((p.chunkCount - 1) * p.chunkSeconds < 3960);
+  assert.ok(p.workerCount <= 6, "worker count never exceeds the creator cap");
 });
 
 test("custom env overrides are honored", () => {
@@ -121,7 +139,7 @@ test("custom env overrides are honored", () => {
   assert.equal(p.renderMode, "chunked");
   assert.equal(p.chunkSeconds, 60);
   assert.equal(p.chunkCount, 5); // ceil(300/60)
-  assert.equal(p.chunkParallelism, 3);
+  assert.equal(p.workerCount, 3); // EXPORT_CHUNK_MAX_PARALLEL_PRO = worker cap
 });
 
 test("invalid duration → single", () => {

@@ -50,13 +50,25 @@ public static class JobFields
     public const string ExportPath = "exportPath";
     public const string SettingsHash = "settingsHash";
 
-    // ── Parallel chunked render (one Batch job, N parallel chunk tasks) ───────
+    // ── Sharded chunked render (one Batch job, workerCount shard tasks) ───────
     public const string RenderMode = "renderMode";
+    /// <summary>TOTAL output chunks (NOT the task count).</summary>
     public const string ChunkCount = "chunkCount";
     public const string ChunkSeconds = "chunkSeconds";
-    public const string ChunkParallelism = "chunkParallelism";
+    /// <summary>Shard worker count = Batch taskCount = parallelism.</summary>
+    public const string WorkerCount = "workerCount";
+    public const string ChunkParallelism = "chunkParallelism"; // deprecated alias of WorkerCount
     public const string ChunksCompleted = "chunksCompleted";
     public const string ChunksFailed = "chunksFailed";
+    // ── Progress summary (worker writes after every completed chunk) ──────────
+    public const string TotalChunks = "totalChunks";
+    public const string CompletedChunks = "completedChunks";
+    public const string FailedChunks = "failedChunks";
+    public const string ActiveChunks = "activeChunks";
+    public const string FramesRendered = "framesRendered";
+    public const string FramesExpected = "framesExpected";
+    public const string ProgressPercent = "progressPercent";
+    public const string Phase = "phase";
     public const string ChunkedStartedAt = "chunkedStartedAt";
     public const string ChunkedCompletedAt = "chunkedCompletedAt";
     public const string MergeWorkerId = "mergeWorkerId";

@@ -253,6 +253,21 @@ public sealed class FirestoreService(FirestoreDb db, ExportOptions opts, ILogger
 
             var chunkCount = EffectiveChunkCount(jobSnap);
             var completed = (int)GetLong(jobSnap, JobFields.ChunksCompleted) + 1;
+            var failed = (int)GetLong(jobSnap, JobFields.ChunksFailed);
+            var workerCount = (int)GetLong(jobSnap, JobFields.WorkerCount);
+            if (workerCount <= 0) workerCount = Math.Max(1, opts.WorkerCount > 0 ? opts.WorkerCount : opts.TaskCount);
+
+            // Progress summary (UI reads chunksCompleted/chunkCount; these extra
+            // fields give a richer view + a render-phase percent that reserves the
+            // last few % for the merge/audiomux pass).
+            var durationSeconds = GetDouble(jobSnap, "durationSeconds");
+            var fps = GetDouble(jobSnap, "fps");
+            if (fps <= 0) fps = 30;
+            var framesExpected = (long)Math.Round(Math.Max(0, durationSeconds) * fps);
+            var ratio = chunkCount > 0 ? (double)completed / chunkCount : 0;
+            var framesRendered = (long)Math.Round(ratio * framesExpected);
+            var progressPercent = (int)Math.Floor(ratio * 95); // last 5% reserved for merge
+            var activeChunks = Math.Max(0, Math.Min(workerCount, chunkCount - completed));
 
             tx.Set(chunkRef, new Dictionary<string, object?>
             {
@@ -267,6 +282,16 @@ public sealed class FirestoreService(FirestoreDb db, ExportOptions opts, ILogger
             tx.Update(jobRef, new Dictionary<string, object>
             {
                 [JobFields.ChunksCompleted] = completed,
+                // Progress summary fields.
+                [JobFields.TotalChunks] = chunkCount,
+                [JobFields.CompletedChunks] = completed,
+                [JobFields.FailedChunks] = failed,
+                [JobFields.ActiveChunks] = activeChunks,
+                [JobFields.FramesExpected] = framesExpected,
+                [JobFields.FramesRendered] = framesRendered,
+                [JobFields.ProgressPercent] = progressPercent,
+                [JobFields.Progress] = ratio, // 0..1 (kept for existing UI)
+                [JobFields.Phase] = "rendering",
                 [JobFields.UpdatedAt] = FieldValue.ServerTimestamp,
                 [JobFields.LastHeartbeatAt] = FieldValue.ServerTimestamp,
                 [JobFields.HeartbeatAt] = FieldValue.ServerTimestamp,
@@ -302,6 +327,8 @@ public sealed class FirestoreService(FirestoreDb db, ExportOptions opts, ILogger
                 [JobFields.MergeStartedAt] = FieldValue.ServerTimestamp,
                 [JobFields.Stage] = "merging",
                 [JobFields.ProgressStage] = "merging",
+                [JobFields.Phase] = "merging",
+                [JobFields.ProgressPercent] = 97,
                 [JobFields.UpdatedAt] = FieldValue.ServerTimestamp,
                 [JobFields.LastHeartbeatAt] = FieldValue.ServerTimestamp,
                 [JobFields.HeartbeatAt] = FieldValue.ServerTimestamp,

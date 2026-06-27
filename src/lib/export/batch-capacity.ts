@@ -20,8 +20,9 @@ export const BATCH_SLOT_STATUSES: readonly ExportJobStatus[] = [
   "uploading",
 ];
 
-/** Default global cap when no env var is set (requirement: default 3). */
-export const DEFAULT_MAX_ACTIVE_BATCH_JOBS = 3;
+/** Default global cap when no env var is set. Each chunked export now uses a
+ *  multi-task shard job (4–6 worker VMs), so the concurrent-JOB cap is lower. */
+export const DEFAULT_MAX_ACTIVE_BATCH_JOBS = 2;
 
 /** Doc marker (status `queued`) for a job deferred because the cap was hit. */
 export const QUEUE_REASON_WAITING_FOR_SLOT = "waiting_for_slot";

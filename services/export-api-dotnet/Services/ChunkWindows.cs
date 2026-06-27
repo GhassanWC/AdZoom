@@ -24,8 +24,35 @@ public readonly record struct ChunkWindow(
 /// the non-negative values used here, so we use MidpointRounding.AwayFromZero to
 /// match it exactly.
 /// </summary>
+/// <summary>A worker's CONTIGUOUS chunk range [StartChunk, EndChunkExclusive).</summary>
+public readonly record struct ShardRange(int StartChunk, int EndChunkExclusive)
+{
+    public int Count => Math.Max(0, EndChunkExclusive - StartChunk);
+}
+
 public static class ChunkWindows
 {
+    /// <summary>
+    /// CONTIGUOUS shard range a worker owns:
+    ///   chunksPerWorker = ceil(chunkCount / workerCount)
+    ///   start           = workerIndex * chunksPerWorker
+    ///   endExclusive    = min(chunkCount, start + chunksPerWorker)
+    /// Each worker renders chunks [Start, EndExclusive). With ceil sizing, a trailing
+    /// worker can get an EMPTY range (Count == 0) when chunkCount isn't a multiple of
+    /// workerCount — that worker just attempts the merge and exits. The ranges
+    /// partition [0, chunkCount) with no gaps or overlaps.
+    /// </summary>
+    public static ShardRange ShardChunks(int workerIndex, int workerCount, int chunkCount)
+    {
+        var workers = Math.Max(1, workerCount);
+        var total = Math.Max(0, chunkCount);
+        var chunksPerWorker = (int)Math.Ceiling((double)total / workers);
+        var start = Math.Max(0, workerIndex) * chunksPerWorker;
+        if (start >= total) return new ShardRange(total, total); // empty trailing shard
+        var end = Math.Min(total, start + chunksPerWorker);
+        return new ShardRange(start, end);
+    }
+
     public static int TotalOutputFrames(double outputDurationSeconds, double fps) =>
         Math.Max(1, (int)Math.Round(outputDurationSeconds * fps, MidpointRounding.AwayFromZero));
 

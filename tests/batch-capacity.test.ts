@@ -16,9 +16,9 @@ import {
   WAITING_FOR_SLOT_MESSAGE,
 } from "../src/lib/export/batch-capacity.ts";
 
-test("maxActiveBatchJobs: default is 3 when no env var is set", () => {
-  assert.equal(maxActiveBatchJobs({}), 3);
-  assert.equal(DEFAULT_MAX_ACTIVE_BATCH_JOBS, 3);
+test("maxActiveBatchJobs: default is 2 when no env var is set", () => {
+  assert.equal(maxActiveBatchJobs({}), 2);
+  assert.equal(DEFAULT_MAX_ACTIVE_BATCH_JOBS, 2);
 });
 
 test("maxActiveBatchJobs: reads EXPORT_MAX_ACTIVE_BATCH_JOBS", () => {
@@ -41,10 +41,10 @@ test("maxActiveBatchJobs: falls back to the legacy EXPORT_MAX_ACTIVE_BATCH_EXPOR
 });
 
 test("maxActiveBatchJobs: invalid / non-positive values fall back to the default", () => {
-  assert.equal(maxActiveBatchJobs({ EXPORT_MAX_ACTIVE_BATCH_JOBS: "" }), 3);
-  assert.equal(maxActiveBatchJobs({ EXPORT_MAX_ACTIVE_BATCH_JOBS: "abc" }), 3);
-  assert.equal(maxActiveBatchJobs({ EXPORT_MAX_ACTIVE_BATCH_JOBS: "0" }), 3);
-  assert.equal(maxActiveBatchJobs({ EXPORT_MAX_ACTIVE_BATCH_JOBS: "-2" }), 3);
+  assert.equal(maxActiveBatchJobs({ EXPORT_MAX_ACTIVE_BATCH_JOBS: "" }), 2);
+  assert.equal(maxActiveBatchJobs({ EXPORT_MAX_ACTIVE_BATCH_JOBS: "abc" }), 2);
+  assert.equal(maxActiveBatchJobs({ EXPORT_MAX_ACTIVE_BATCH_JOBS: "0" }), 2);
+  assert.equal(maxActiveBatchJobs({ EXPORT_MAX_ACTIVE_BATCH_JOBS: "-2" }), 2);
 });
 
 test("BATCH_SLOT_STATUSES = submitted/running only (queued is NOT a slot)", () => {

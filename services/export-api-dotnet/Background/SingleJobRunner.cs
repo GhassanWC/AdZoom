@@ -85,14 +85,15 @@ public sealed class SingleJobRunner(
             uid, jobId, opts.BuildVersion, opts.ChunkedRenderEnabled);
 
         // ── Parallel chunked task ────────────────────────────────────────────
-        // N tasks share ONE job: do NOT take the exclusive single-job lease. Each
-        // renders its chunk; the last to finish merges. The startup watchdog is left
-        // running — it stands down once any task flips the job to "rendering"
-        // (EnsureChunkedRenderingAsync), and still fires if NOTHING starts in time.
+        // SHARD WORKERS share ONE job: do NOT take the exclusive single-job lease.
+        // Each worker renders MANY chunks round-robin; the worker that records the
+        // last chunk merges. The startup watchdog is left running — it stands down
+        // once any worker flips the job to "rendering" (EnsureChunkedRenderingAsync),
+        // and still fires if NOTHING starts in time.
         if (opts.IsChunkedTask)
         {
-            log.LogInformation("[batch:single-job] chunked task uid={Uid} jobId={JobId} index={Idx}/{Cnt}",
-                uid, jobId, opts.TaskIndex, opts.TaskCount);
+            log.LogInformation("[batch:single-job] shard worker uid={Uid} jobId={JobId} worker={Idx}/{Workers} chunks={Chunks}",
+                uid, jobId, opts.TaskIndex, opts.WorkerCount > 0 ? opts.WorkerCount : opts.TaskCount, opts.ChunkCount);
             return await chunkRunner.RunAsync(uid, jobId, stopping);
         }
 

@@ -239,7 +239,9 @@ async function promoteQueuedJobs(
           ? {
               chunkCount: job.chunkCount,
               chunkSeconds: job.chunkSeconds,
-              chunkParallelism: job.chunkParallelism,
+              // workerCount is the shard/task count; fall back to chunkParallelism
+              // for docs created before the sharding change.
+              workerCount: job.workerCount ?? job.chunkParallelism,
               durationSeconds: job.durationSeconds,
             }
           : {}),

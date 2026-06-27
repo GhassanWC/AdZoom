@@ -32,11 +32,12 @@ export interface EnqueueParams {
   /** Render strategy decided at creation. Only "chunked" changes Batch dispatch
    *  (one job, N parallel tasks); "single"/undefined keeps the proven one-task job. */
   renderMode?: "single" | "chunked";
-  /** Chunked-only: parallel task count, output seconds per chunk, parallelism cap,
-   *  and the OUTPUT duration (for the dynamic Batch timeout). */
+  /** Chunked-only: TOTAL chunk count, output seconds per chunk, the SHARD WORKER
+   *  count (Batch taskCount = parallelism; each worker renders many chunks), and the
+   *  OUTPUT duration (for the Batch timeout). */
   chunkCount?: number;
   chunkSeconds?: number;
-  chunkParallelism?: number;
+  workerCount?: number;
   durationSeconds?: number;
 }
 

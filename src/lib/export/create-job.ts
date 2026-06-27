@@ -535,11 +535,18 @@ export async function createCloudExportJob(
         renderMode: chunk.renderMode,
         ...(chunk.renderMode === "chunked"
           ? {
-              chunkCount: chunk.chunkCount,
+              chunkCount: chunk.chunkCount, // TOTAL chunks (UI shows chunksCompleted/chunkCount)
               chunkSeconds: chunk.chunkSeconds,
-              chunkParallelism: chunk.chunkParallelism,
+              workerCount: chunk.workerCount, // Batch tasks (shard workers)
+              // chunkParallelism kept = workerCount for existing diagnostics UI.
+              chunkParallelism: chunk.workerCount,
               chunksCompleted: 0,
               chunksFailed: 0,
+              // Progress summary (worker updates these per completed chunk).
+              totalChunks: chunk.chunkCount,
+              completedChunks: 0,
+              failedChunks: 0,
+              progressPercent: 0,
             }
           : {}),
         monthlyBucket: monthKey,
@@ -612,7 +619,7 @@ export async function createCloudExportJob(
         ? {
             chunkCount: chunk.chunkCount,
             chunkSeconds: chunk.chunkSeconds,
-            chunkParallelism: chunk.chunkParallelism,
+            workerCount: chunk.workerCount,
             durationSeconds: outputDurationSeconds,
           }
         : {}),
