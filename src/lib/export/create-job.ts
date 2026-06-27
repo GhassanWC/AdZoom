@@ -20,7 +20,9 @@ import {
   BatchCapacityError,
   BATCH_CAPACITY_ERROR_CODE,
   BATCH_CAPACITY_ERROR_MESSAGE,
+  inspectBatchJob,
 } from "@/lib/export/batch-backend";
+import { isActiveBatchState } from "@/lib/export/batch-status";
 import { exportBackend } from "@/lib/export/dotnet-backend";
 import {
   BATCH_SLOT_STATUSES,
@@ -193,9 +195,11 @@ export async function createCloudExportJob(
       .get();
 
     const now = Date.now();
-    const staleIds: string[] = [];
+    const staleIds: string[] = []; // heartbeat-stale (dead worker)
+    const staleBatchIds: string[] = []; // doc says active but the Batch job is gone
     let freshDuplicateId: string | null = null;
     let freshOtherActive = false;
+    const batchBackend = exportBackend() === "batch";
 
     for (const d of activeSnap.docs) {
       const data = d.data();
@@ -211,10 +215,54 @@ export async function createCloudExportJob(
       if (data.cancelRequested === true) {
         continue;
       }
-      if (data.projectId === projectId && data.settingsHash === settingsHash) {
-        freshDuplicateId = d.id; // identical export already running
+
+      const isDuplicate = data.projectId === projectId && data.settingsHash === settingsHash;
+      if (isDuplicate) {
+        console.log("[export-create] existing export candidate", {
+          uid,
+          jobId: d.id,
+          status: data.status,
+          batchJobName: data.batchJobName ?? null,
+        });
+      }
+
+      // Batch-reality check (THE fix): a doc that's been SUBMITTED (status != queued)
+      // must still have a LIVE Batch job (QUEUED/SCHEDULED/RUNNING). If the Batch job
+      // is CANCELLED/FAILED/SUCCEEDED/missing, the doc is STALE — the UI shows
+      // "rendering" but nothing renders. Treat it as stale (fail + release minutes);
+      // never reuse it and never let it block a fresh export. A `queued` doc hasn't
+      // been submitted yet (no Batch job to check) → it's legitimately queued.
+      if (batchBackend && data.status !== "queued") {
+        const inspection = await inspectBatchJob({
+          jobName: data.batchJobName,
+          batchJobId: data.batchJobId,
+        }).catch(() => null);
+        const alive = !!inspection && inspection.active;
+        console.log("[export-create] existing export batch state checked", {
+          uid,
+          jobId: d.id,
+          status: data.status,
+          batchState: inspection?.state ?? "missing",
+          terminalBad: inspection?.terminalBad ?? null,
+          alive,
+        });
+        if (!alive) {
+          console.log("[export-create] stale export rejected", {
+            uid,
+            jobId: d.id,
+            status: data.status,
+            reason: inspection ? "batch_not_running" : "batch_missing",
+            batchState: inspection?.state ?? "missing",
+          });
+          staleBatchIds.push(d.id);
+          continue;
+        }
+      }
+
+      if (isDuplicate) {
+        freshDuplicateId = d.id; // identical export with a LIVE Batch job
       } else {
-        freshOtherActive = true; // a different export is in flight
+        freshOtherActive = true; // a different export is genuinely in flight
       }
     }
 
@@ -260,6 +308,17 @@ export async function createCloudExportJob(
     for (const id of staleIds) {
       await failStaleJob(db, uid, id).catch((e) =>
         console.warn("[export-create] failStaleJob error (continuing)", { id, e })
+      );
+    }
+    // Stale-Batch jobs (doc active but the Batch job is gone) → fail them too, with a
+    // clear reason, so a fresh export can take over.
+    for (const id of staleBatchIds) {
+      await failStaleJob(db, uid, id, {
+        errorCode: "batch_missing",
+        errorMessage:
+          "The previous render stopped unexpectedly. Starting a fresh export.",
+      }).catch((e) =>
+        console.warn("[export-create] failStaleJob (batch) error (continuing)", { id, e })
       );
     }
 
@@ -511,6 +570,15 @@ export async function createCloudExportJob(
     throw err;
   }
 
+  console.log("[export-create] fresh export created", {
+    uid,
+    jobId,
+    projectId,
+    settingsHash,
+    renderMode: chunk.renderMode,
+    deferred,
+  });
+
   // ── Dispatch (or defer when the global Batch cap is hit) ──────────────────
   // When deferred, the job stays `queued` (waiting_for_slot) and is NOT submitted
   // to Batch now; the reconcile/queue cron promotes it once a slot frees up.
@@ -604,7 +672,12 @@ export async function createCloudExportJob(
 async function failStaleJob(
   db: FirebaseFirestore.Firestore,
   uid: string,
-  jobId: string
+  jobId: string,
+  reason: { errorCode: string; errorMessage: string } = {
+    errorCode: "stale",
+    errorMessage:
+      "This export timed out (the render service stopped responding). Please try again.",
+  }
 ): Promise<void> {
   const jobRef = db.doc(`users/${uid}/exportJobs/${jobId}`);
   await db.runTransaction(async (tx) => {
@@ -612,7 +685,7 @@ async function failStaleJob(
     if (!snap.exists) return;
     const job = snap.data() as { status?: string; monthlyBucket?: string; estimatedExportMinutes?: number };
     if (job.status === "ready" || job.status === "failed" || job.status === "canceled") {
-      return; // already terminal
+      return; // already terminal — don't clobber a job the worker just settled
     }
     if (job.monthlyBucket && (job.estimatedExportMinutes ?? 0) > 0) {
       const usageRef = db.doc(`users/${uid}/usage/${job.monthlyBucket}`);
@@ -632,16 +705,15 @@ async function failStaleJob(
       jobRef,
       {
         status: "failed",
-        errorCode: "stale",
-        errorMessage:
-          "This export timed out (the render service stopped responding). Please try again.",
+        errorCode: reason.errorCode,
+        errorMessage: reason.errorMessage,
         failedAt: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
       },
       { merge: true }
     );
   });
-  console.log("[export-create] failed stale job", { uid, jobId });
+  console.log("[export-create] failed stale job", { uid, jobId, errorCode: reason.errorCode });
 }
 
 async function releaseAndFail(

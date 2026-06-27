@@ -70,6 +70,27 @@ export const TERMINAL_BAD_STATES = new Set<string | number>([
   "CANCELLED",
 ]);
 
+/**
+ * States in which a Batch job is genuinely going to render: QUEUED=1, SCHEDULED=2,
+ * RUNNING=3 (gax may return the enum number or its string name). SUCCEEDED is NOT
+ * here — a job whose Batch is already SUCCEEDED but whose export doc is still
+ * "rendering" means the worker never settled (crashed merge), i.e. stale — so the
+ * create path must NOT reuse it.
+ */
+export const ACTIVE_BATCH_STATES = new Set<string | number>([
+  1,
+  2,
+  3,
+  "QUEUED",
+  "SCHEDULED",
+  "RUNNING",
+]);
+
+/** True iff the Batch job is actively queued/scheduled/running (will produce output). */
+export function isActiveBatchState(state: string | number | null | undefined): boolean {
+  return state != null && ACTIVE_BATCH_STATES.has(state);
+}
+
 export interface BatchJobInspection {
   /** Raw state as returned (string name or number). */
   state: string | number | null | undefined;
@@ -77,6 +98,8 @@ export interface BatchJobInspection {
   terminalBad: boolean;
   /** A status event blames zone/region capacity exhaustion. */
   capacityExhausted: boolean;
+  /** The job is QUEUED / SCHEDULED / RUNNING (genuinely going to render). */
+  active: boolean;
 }
 
 /** Classify a Batch job's status into the terminal-bad / capacity-exhausted flags
@@ -89,5 +112,5 @@ export function classifyBatchJobStatus(
   const capacityExhausted = (statusEvents ?? []).some((e) =>
     RESOURCE_POOL_EXHAUSTED_RE.test(e?.description ?? "")
   );
-  return { state, terminalBad, capacityExhausted };
+  return { state, terminalBad, capacityExhausted, active: isActiveBatchState(state) };
 }

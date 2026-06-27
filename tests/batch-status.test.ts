@@ -12,6 +12,7 @@ import assert from "node:assert/strict";
 import {
   batchAllowedLocations,
   classifyBatchJobStatus,
+  isActiveBatchState,
   BatchCapacityError,
   BATCH_CAPACITY_ERROR_CODE,
   BATCH_CAPACITY_ERROR_MESSAGE,
@@ -95,6 +96,27 @@ test("classify: null/undefined state is never terminalBad", () => {
 test("classify: missing/empty statusEvents → capacityExhausted false", () => {
   assert.equal(classifyBatchJobStatus("FAILED", null).capacityExhausted, false);
   assert.equal(classifyBatchJobStatus("FAILED", undefined).capacityExhausted, false);
+});
+
+// ── isActiveBatchState / inspection.active ───────────────────────────────────
+
+test("active: QUEUED/SCHEDULED/RUNNING (name + number) are active", () => {
+  for (const s of ["QUEUED", "SCHEDULED", "RUNNING", 1, 2, 3]) {
+    assert.equal(isActiveBatchState(s), true, `state ${s} should be active`);
+  }
+});
+
+test("active: terminal + SUCCEEDED + missing are NOT active (create path won't reuse)", () => {
+  for (const s of ["SUCCEEDED", 4, "FAILED", 5, "CANCELLED", 8, null, undefined]) {
+    assert.equal(isActiveBatchState(s), false, `state ${s} should NOT be active`);
+  }
+});
+
+test("classify exposes active flag consistent with isActiveBatchState", () => {
+  assert.equal(classifyBatchJobStatus("RUNNING", []).active, true);
+  assert.equal(classifyBatchJobStatus("CANCELLED", []).active, false);
+  assert.equal(classifyBatchJobStatus("SUCCEEDED", []).active, false);
+  assert.equal(classifyBatchJobStatus(null, []).active, false);
 });
 
 // ── BatchCapacityError ───────────────────────────────────────────────────────

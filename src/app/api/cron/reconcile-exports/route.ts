@@ -315,11 +315,21 @@ export async function POST(req: NextRequest) {
     if (!uid) continue;
     const job = d.data() as ExportJobDoc;
     try {
-      // 1) Pre-render Batch cancel/fail: a batch_submitted job whose container
-      //    never started writes no progress, so ask Batch directly. Healthy
-      //    provisioning jobs report QUEUED/SCHEDULED/RUNNING → not terminalBad →
-      //    fall through to the time-based stale check.
-      if (job.status === "batch_submitted" && (job.batchJobName || job.batchJobId)) {
+      // 1) Batch cancel/fail at ANY submitted stage. A batch_submitted job whose
+      //    container never started writes no progress; a rendering/uploading job
+      //    whose Batch job was cancelled/deleted (or whose merge leader died) leaves
+      //    the doc stuck "rendering" — the UI shows "Rendering chunks: 0/N" forever.
+      //    Ask Batch directly for ALL submitted-stage statuses (not just
+      //    batch_submitted): a terminal Batch state (CANCELLED/FAILED/_IN_PROGRESS)
+      //    fails it fast. Healthy jobs report QUEUED/SCHEDULED/RUNNING → not
+      //    terminalBad → fall through to the time-based stale check. (A null/missing
+      //    inspection is AMBIGUOUS — control-plane blip vs deleted — so it's left to
+      //    the 10-min stale sweep rather than risk failing a healthy job on a blip.)
+      const submittedStage =
+        job.status === "batch_submitted" ||
+        job.status === "rendering" ||
+        job.status === "uploading";
+      if (submittedStage && (job.batchJobName || job.batchJobId)) {
         const inspection = await inspectBatchJob({
           jobName: job.batchJobName,
           batchJobId: job.batchJobId,
@@ -336,6 +346,12 @@ export async function POST(req: NextRequest) {
           if (didFail) {
             failed++;
             if (inspection.capacityExhausted) capacityFailed++;
+            console.info("[reconcile-exports] failed job with terminal Batch state", {
+              jobId: d.id,
+              status: job.status,
+              batchState: inspection.state,
+              capacityExhausted: inspection.capacityExhausted,
+            });
           }
           continue; // handled — don't also stale-sweep this doc
         }
