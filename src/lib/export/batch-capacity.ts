@@ -21,8 +21,32 @@ export const BATCH_SLOT_STATUSES: readonly ExportJobStatus[] = [
 ];
 
 /** Default global cap when no env var is set. Each chunked export now uses a
- *  multi-task shard job (4–6 worker VMs), so the concurrent-JOB cap is lower. */
-export const DEFAULT_MAX_ACTIVE_BATCH_JOBS = 2;
+ *  multi-task shard job (up to 6–8 worker VMs × bootDiskGb), so one job at a time
+ *  keeps total SSD usage under the GCE SSD_TOTAL_GB quota. */
+export const DEFAULT_MAX_ACTIVE_BATCH_JOBS = 1;
+
+/** Per-worker Batch boot disk (GB) + per-job total-disk cap. Batch boot disks are
+ *  pd-balanced, which count toward the GCE SSD_TOTAL_GB quota, so a multi-worker
+ *  shard job must keep workers × bootDiskGb under the cap or excess tasks sit
+ *  PENDING with CODE_GCE_QUOTA_EXCEEDED. */
+export const DEFAULT_BATCH_BOOT_DISK_GB = 50;
+export const DEFAULT_BATCH_MAX_TOTAL_DISK_GB = 450;
+
+/**
+ * Largest shard-worker count whose total boot disk (workers × bootDiskGb) fits the
+ * per-job disk budget. Returns the input when it already fits, else the largest
+ * count that does (>= 1). Pure — unit-tested.
+ */
+export function clampWorkersForDiskQuota(
+  workers: number,
+  bootDiskGb: number,
+  maxTotalDiskGb: number
+): number {
+  const w = Math.max(1, Math.floor(workers));
+  const disk = Math.max(1, Math.floor(bootDiskGb));
+  if (w * disk <= maxTotalDiskGb) return w;
+  return Math.max(1, Math.min(w, Math.floor(maxTotalDiskGb / disk)));
+}
 
 /** Doc marker (status `queued`) for a job deferred because the cap was hit. */
 export const QUEUE_REASON_WAITING_FOR_SLOT = "waiting_for_slot";

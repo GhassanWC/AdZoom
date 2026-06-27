@@ -15,6 +15,7 @@ import {
   classifyBatchJobStatus,
   type BatchJobInspection,
 } from "@/lib/export/batch-status";
+import { clampWorkersForDiskQuota } from "@/lib/export/batch-capacity";
 
 // Re-export the pure capacity symbols so existing server-only importers can keep
 // importing them from this module.
@@ -48,7 +49,8 @@ export type { BatchJobInspection } from "@/lib/export/batch-status";
  *   BATCH_MACHINE_TYPE        default "e2-standard-4" (4 vCPU / 16 GB)
  *   BATCH_CPU_MILLI           default 4000
  *   BATCH_MEMORY_MIB          default 16384
- *   BATCH_BOOT_DISK_GB        default 100
+ *   BATCH_BOOT_DISK_GB        default 50 (pd-balanced; counts toward SSD_TOTAL_GB)
+ *   BATCH_MAX_TOTAL_DISK_GB   default 450 (cap on workers × bootDiskGb per job)
  *   BATCH_MAX_RUN_SECONDS     default 7200 (2h ceiling per export)
  *   BATCH_MAX_RETRY_COUNT     default 1
  *   BATCH_PROVISIONING_MODEL  "STANDARD" (default) | "SPOT"
@@ -133,7 +135,7 @@ function buildBatchJob(
   const machineType = process.env.BATCH_MACHINE_TYPE || "e2-standard-4";
   const cpuMilli = intEnv("BATCH_CPU_MILLI", 4000);
   const memoryMib = intEnv("BATCH_MEMORY_MIB", 16384);
-  const bootDiskGb = intEnv("BATCH_BOOT_DISK_GB", 100);
+  const bootDiskGb = intEnv("BATCH_BOOT_DISK_GB", 50);
   const maxRunSeconds = intEnv("BATCH_MAX_RUN_SECONDS", 7200);
   const maxRetryCount = intEnv("BATCH_MAX_RETRY_COUNT", 1);
   const provisioningModel = (process.env.BATCH_PROVISIONING_MODEL || "STANDARD").toUpperCase();
@@ -178,7 +180,9 @@ function buildBatchJob(
               provisioningModel === "SPOT"
                 ? protos.google.cloud.batch.v1.AllocationPolicy.ProvisioningModel.SPOT
                 : protos.google.cloud.batch.v1.AllocationPolicy.ProvisioningModel.STANDARD,
-            bootDisk: { sizeGb: bootDiskGb },
+            // pd-balanced (counts against the SSD_TOTAL_GB quota — see the worker-
+            // count guard in submitBatchJob that keeps workers × sizeGb under it).
+            bootDisk: { sizeGb: bootDiskGb, type: "pd-balanced" },
           },
         },
       ],
@@ -205,12 +209,12 @@ function buildChunkedBatchJob(
   env: Record<string, string>,
   priority: "normal" | "priority",
   workerCount: number,
+  bootDiskGb: number,
   allowedLocations: string[]
 ): protos.google.cloud.batch.v1.IJob {
   const machineType = process.env.BATCH_MACHINE_TYPE || "e2-standard-4";
   const cpuMilli = intEnv("BATCH_CPU_MILLI", 4000);
   const memoryMib = intEnv("BATCH_MEMORY_MIB", 16384);
-  const bootDiskGb = intEnv("BATCH_BOOT_DISK_GB", 100);
   const maxRetryCount = intEnv("EXPORT_CHUNK_MAX_RETRY_COUNT", 1);
   const provisioningModel = (process.env.BATCH_PROVISIONING_MODEL || "STANDARD").toUpperCase();
   const maxRunSeconds = chunkedTaskMaxRunSeconds();
@@ -249,7 +253,9 @@ function buildChunkedBatchJob(
               provisioningModel === "SPOT"
                 ? protos.google.cloud.batch.v1.AllocationPolicy.ProvisioningModel.SPOT
                 : protos.google.cloud.batch.v1.AllocationPolicy.ProvisioningModel.STANDARD,
-            bootDisk: { sizeGb: bootDiskGb },
+            // pd-balanced (counts against the SSD_TOTAL_GB quota — see the worker-
+            // count guard in submitBatchJob that keeps workers × sizeGb under it).
+            bootDisk: { sizeGb: bootDiskGb, type: "pd-balanced" },
           },
         },
       ],
@@ -292,6 +298,28 @@ export async function submitBatchJob({
     throw new Error(msg);
   }
 
+  // ── Shard worker count + boot-disk budget (SSD_TOTAL_GB quota guard) ──────
+  // Batch boot disks are pd-balanced, which count against the GCE SSD_TOTAL_GB
+  // quota. If workers × bootDiskGb exceeds it, the excess tasks sit PENDING with
+  // CODE_GCE_QUOTA_EXCEEDED (e.g. 8 × 100GB = 800GB > a 500GB quota → only 4 run).
+  // Cap the worker count so the whole job's disk fits. This MUST run before the env
+  // block below: the worker shards by EXPORT_WORKER_COUNT, so it has to equal the
+  // FINAL task count.
+  const bootDiskGb = intEnv("BATCH_BOOT_DISK_GB", 50);
+  const maxTotalDiskGb = intEnv("BATCH_MAX_TOTAL_DISK_GB", 450);
+  const requestedWorkers = chunked ? Math.max(1, Math.min(workerCount ?? 1, chunkCount ?? 1)) : 1;
+  const workers = chunked
+    ? clampWorkersForDiskQuota(requestedWorkers, bootDiskGb, maxTotalDiskGb)
+    : 1;
+  const estimatedTotalDiskGb = workers * bootDiskGb;
+  if (chunked && workers < requestedWorkers) {
+    console.warn(
+      `[export-enqueue] backend=batch SSD-quota guard job=${jobId} ` +
+        `requestedWorkers=${requestedWorkers} bootDiskGb=${bootDiskGb} ` +
+        `estimatedTotalDiskGb(req)=${requestedWorkers * bootDiskGb} maxTotalDiskGb=${maxTotalDiskGb} → reducedWorkers=${workers}`
+    );
+  }
+
   const bucket = process.env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET ?? "";
   const env: Record<string, string> = {
     EXPORT_JOB_ID: jobId,
@@ -315,7 +343,9 @@ export async function submitBatchJob({
           // EXPORT_CHUNK_COUNT = TOTAL chunks (NOT the task count). Each worker
           // renders chunks [workerIndex, +workerCount, …].
           EXPORT_CHUNK_COUNT: String(chunkCount),
-          EXPORT_WORKER_COUNT: String(workerCount ?? 1),
+          // Final worker count AFTER the SSD-quota reduction (the worker shards by
+          // this, so it must match the actual Batch taskCount).
+          EXPORT_WORKER_COUNT: String(workers),
           EXPORT_CHUNK_SECONDS: String(chunkSeconds ?? 15),
           EXPORT_CHUNK_BOUNDARY_PADDING_SECONDS:
             process.env.EXPORT_CHUNK_BOUNDARY_PADDING_SECONDS ?? "0",
@@ -339,14 +369,13 @@ export async function submitBatchJob({
   const client = new BatchServiceClient();
   const allowedLocations = batchAllowedLocations(region);
 
-  const workers = Math.max(1, Math.min(workerCount ?? 1, chunkCount ?? 1));
   const job = chunked
-    ? buildChunkedBatchJob(image, serviceAccount, env, priority, workers, allowedLocations)
+    ? buildChunkedBatchJob(image, serviceAccount, env, priority, workers, bootDiskGb, allowedLocations)
     : buildBatchJob(image, serviceAccount, env, priority, allowedLocations);
 
-  // Effective fan-out (mirrors the builders) — logged so a capacity failure can
-  // be correlated to the allocation/region/fan-out without reading the spec. With
-  // sharding, taskCount == parallelism == workerCount (NOT chunkCount).
+  // Effective fan-out (mirrors the builders) — logged so a capacity/quota failure
+  // can be correlated to the allocation/region/fan-out/disk without reading the
+  // spec. With sharding, taskCount == parallelism == workerCount (NOT chunkCount).
   const machineType = process.env.BATCH_MACHINE_TYPE || "e2-standard-4";
   const taskCount = chunked ? workers : 1;
   const parallelism = chunked ? workers : 1;
@@ -354,7 +383,8 @@ export async function submitBatchJob({
     `[export-enqueue] backend=batch config job=${jobId} ` +
       `allowedLocations=${allowedLocations.join("|")} machineType=${machineType} ` +
       `chunkCount=${chunked ? chunkCount : 1} workerCount=${taskCount} ` +
-      `taskCount=${taskCount} parallelism=${parallelism}`
+      `taskCount=${taskCount} parallelism=${parallelism} ` +
+      `bootDiskGb=${bootDiskGb} estimatedTotalDiskGb=${chunked ? estimatedTotalDiskGb : bootDiskGb}`
   );
 
   let jobName: string;

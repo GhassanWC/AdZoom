@@ -172,11 +172,12 @@ export function planChunking(input: ChunkPlanInput): ChunkPlan {
   // workerCount = number of SHARD WORKERS (Batch tasks). Each worker renders a
   // contiguous range of small chunks, so we cap the TASK count (not the chunk
   // count) to avoid one-container-per-chunk overhead. EXPORT_CHUNK_MAX_PARALLEL_*
-  // is the per-plan WORKER cap (pro 4, creator 6).
+  // is the per-plan WORKER cap (pro 6, creator 8). The Batch submitter further
+  // reduces this if workers × bootDiskGb would bust the SSD_TOTAL_GB quota.
   const maxWorkers =
     input.plan === "creator"
-      ? Math.max(1, intEnv(env, "EXPORT_CHUNK_MAX_PARALLEL_CREATOR", 6))
-      : Math.max(1, intEnv(env, "EXPORT_CHUNK_MAX_PARALLEL_PRO", 4));
+      ? Math.max(1, intEnv(env, "EXPORT_CHUNK_MAX_PARALLEL_CREATOR", 8))
+      : Math.max(1, intEnv(env, "EXPORT_CHUNK_MAX_PARALLEL_PRO", 6));
   const workerCount = Math.max(1, Math.min(maxWorkers, chunkCount));
 
   return { renderMode: "chunked", chunkCount, chunkSeconds, workerCount, reason: "eligible" };

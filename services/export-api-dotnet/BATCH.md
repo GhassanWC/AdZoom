@@ -130,7 +130,8 @@ BATCH_PROJECT_ID=adzoom-prod          # else GCLOUD_PROJECT / NEXT_PUBLIC_FIREBA
 BATCH_MACHINE_TYPE=e2-standard-4
 BATCH_CPU_MILLI=4000
 BATCH_MEMORY_MIB=16384
-BATCH_BOOT_DISK_GB=100                # temp space for source + chunks + output
+BATCH_BOOT_DISK_GB=50                 # per-worker temp disk; pd-balanced → counts toward SSD_TOTAL_GB
+BATCH_MAX_TOTAL_DISK_GB=450           # cap on workers × BATCH_BOOT_DISK_GB (SSD quota guard)
 BATCH_MAX_RUN_SECONDS=7200            # hard per-export ceiling (2h)
 BATCH_MAX_RETRY_COUNT=1
 BATCH_PROVISIONING_MODEL=STANDARD     # or SPOT for cheaper, preemptible VMs
@@ -201,6 +202,14 @@ the TOTAL chunk count; `workerCount = min(EXPORT_CHUNK_MAX_PARALLEL_<plan>, chun
 is the Batch task count (= parallelism). **EXPORT_CHUNK_MAX_PARALLEL_\* caps the WORKER
 count, not the chunk count.**
 
+**SSD quota guard:** Batch boot disks are `pd-balanced`, which count toward the GCE
+`SSD_TOTAL_GB` quota. `submitBatchJob` reduces `workerCount` so
+`workerCount × BATCH_BOOT_DISK_GB ≤ BATCH_MAX_TOTAL_DISK_GB` (default 50GB × ≤9 = 450GB),
+preventing `CODE_GCE_QUOTA_EXCEEDED` (where excess tasks sit PENDING). It logs
+`bootDiskGb` + `estimatedTotalDiskGb`; `EXPORT_WORKER_COUNT` is set to the REDUCED count
+(the worker shards by it). With the defaults (50GB disk, ≤8 workers) an 8-worker job =
+400GB and runs fully.
+
 **Kill switch / rollout:** ship with `EXPORT_CHUNKED_RENDER` unset/`0` (single only).
 Set `EXPORT_CHUNKED_RENDER=1` on the **Next.js** runtime to enable; the submitter
 injects `EXPORT_RENDER_MODE=chunked` + `EXPORT_CHUNK_COUNT` (total) +
@@ -215,10 +224,10 @@ EXPORT_CHUNKED_RENDER=1                 # master switch (0/unset = single only)
 EXPORT_CHUNK_MIN_VIDEO_SECONDS=360
 EXPORT_CHUNK_SECONDS=15                 # small chunks; many sharded onto few workers
 EXPORT_CHUNK_MAX_TOTAL_CHUNKS=80
-EXPORT_CHUNK_MAX_PARALLEL_PRO=4         # = WORKER (Batch task) count for Pro
-EXPORT_CHUNK_MAX_PARALLEL_CREATOR=6     # = WORKER (Batch task) count for Creator
+EXPORT_CHUNK_MAX_PARALLEL_PRO=6         # = WORKER (Batch task) count for Pro
+EXPORT_CHUNK_MAX_PARALLEL_CREATOR=8     # = WORKER (Batch task) count for Creator
 EXPORT_CHUNK_TASK_TIMEOUT_SECONDS=5400  # per shard-task Batch timeout
-EXPORT_MAX_ACTIVE_BATCH_JOBS=2          # concurrent shard JOBS (each uses 4–6 VMs)
+EXPORT_MAX_ACTIVE_BATCH_JOBS=1          # concurrent shard JOBS (each uses up to 8 VMs × 50GB)
 EXPORT_CHUNK_MAX_RETRY_COUNT=1          # per shard-task Batch retries
 EXPORT_MERGE_LEASE_SECONDS=300          # worst-case merge < this < 600s reconcile window
 EXPORT_MAX_ACTIVE_BATCH_EXPORTS=...     # global concurrency cap (optional)
