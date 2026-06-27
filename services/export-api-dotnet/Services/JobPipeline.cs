@@ -357,6 +357,7 @@ public sealed class JobPipeline(
                 // Timeline-aware OUTPUT window (silent — global audio added at audiomux).
                 ["chunk"] = new Dictionary<string, object?>
                 {
+                    ["index"] = i,
                     ["renderStartSec"] = win.RenderStartSec,
                     ["renderEndSec"] = win.RenderEndSec,
                     ["trimStartSec"] = win.TrimStartSec,

@@ -123,6 +123,7 @@ public sealed class ChunkTaskRunner(
                 ["normalizeEnabled"] = opts.NormalizeEnabled,
                 ["chunk"] = new Dictionary<string, object?>
                 {
+                    ["index"] = index,
                     ["renderStartSec"] = win.RenderStartSec,
                     ["renderEndSec"] = win.RenderEndSec,
                     ["trimStartSec"] = win.TrimStartSec,
@@ -169,8 +170,11 @@ public sealed class ChunkTaskRunner(
                 return 1;
             }
 
-            BatchLog.Line($"uploading chunk job={jobId} index={index} → {chunkObjectPath}");
+            var chunkSizeBytes = File.Exists(chunkFile) ? new FileInfo(chunkFile).Length : 0;
+            BatchLog.Line($"upload start job={jobId} index={index} size={chunkSizeBytes}B → {chunkObjectPath}");
+            var uploadStart = DateTime.UtcNow;
             await storage.UploadMp4Async(chunkFile, chunkObjectPath, cancelCts.Token);
+            BatchLog.Line($"upload complete job={jobId} index={index} size={chunkSizeBytes}B ({(int)(DateTime.UtcNow - uploadStart).TotalSeconds}s)");
 
             // Persist the normalized source ONCE (deterministic single uploader =
             // index 0) so the merge's GLOBAL audio pass reuses it instead of

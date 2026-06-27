@@ -77,6 +77,7 @@ interface JobSpec {
    *  source time via the timeline map, so cuts/speed work. Chunks are silent —
    *  audio is added globally in `audiomux`. Omitted ⇒ whole-video render. */
   chunk?: {
+    index?: number;
     renderStartSec: number;
     renderEndSec: number;
     trimStartSec: number;
@@ -179,6 +180,9 @@ async function runAudioMux(spec: JobSpec, signal: AbortSignal): Promise<void> {
     process.exit(1);
   }
   emit({ type: "stage", name: "muxing-audio" });
+  toStderr(
+    `[worker:audiomux] start video=${videoPath} source=${spec.sourcePath} out=${spec.outputPath}`
+  );
 
   const recipe = buildRenderRecipe({ ...spec.serializedRecipe, debugBorders: false });
   const { fps, outputDuration, timelineMap } = recipe;
@@ -539,6 +543,35 @@ async function main(): Promise<void> {
       throw new Error(
         "audio_missing_after_render: render source has audio but final output has none"
       );
+    }
+
+    // Chunk completion visibility + output-duration sanity. The renderer EMITs only
+    // the trim window, so the chunk output should ≈ that span; a big overshoot would
+    // mean it rendered outside the requested window.
+    if (chunkSilent && spec.chunk) {
+      const expectedDur = Math.max(0, spec.chunk.trimEndSec - spec.chunk.trimStartSec);
+      const fileSize = existsSync(spec.outputPath) ? statSync(spec.outputPath).size : 0;
+      emit({
+        type: "chunk-complete",
+        chunkIndex: spec.chunk.index ?? -1,
+        outputStartSec: spec.chunk.trimStartSec,
+        outputEndSec: spec.chunk.trimEndSec,
+        expectedDurationSec: Number(expectedDur.toFixed(2)),
+        outputDurationSec: Number(outDur.toFixed(2)),
+        fileSizeBytes: fileSize,
+      });
+      toStderr(
+        `[worker:cli] chunk-complete index=${spec.chunk.index ?? -1} ` +
+          `outWindow=[${spec.chunk.trimStartSec.toFixed(2)},${spec.chunk.trimEndSec.toFixed(2)}] ` +
+          `outDur=${outDur.toFixed(2)}s expected=${expectedDur.toFixed(2)}s size=${fileSize}B`
+      );
+      if (expectedDur > 0 && outDur > expectedDur * 1.5) {
+        toStderr(
+          `[worker:cli] WARN chunk_output_duration_unexpected index=${spec.chunk.index ?? -1} ` +
+            `outDur=${outDur.toFixed(2)}s >> expected=${expectedDur.toFixed(2)}s — rendered outside the window?`
+        );
+        emit({ type: "warning", message: "chunk_output_duration_unexpected" });
+      }
     }
 
     emit({

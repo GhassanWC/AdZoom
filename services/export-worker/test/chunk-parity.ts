@@ -177,6 +177,7 @@ async function runScenario(
         serialized, sourcePath: source, outputPath: cf,
         crf: CRF, preset: PRESET, signal: neverAbort, onProgress: () => {},
         chunk: {
+          index: i,
           renderStartSec: w.renderStartSec, renderEndSec: w.renderEndSec,
           trimStartSec: w.trimStartSec, trimEndSec: w.trimEndSec,
         },

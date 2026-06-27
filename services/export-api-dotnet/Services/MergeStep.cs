@@ -84,7 +84,7 @@ public sealed class MergeStep(
             }
 
             // ── 1. Concat the SILENT video chunks (lossless stream-copy). ────────
-            BatchLog.Line($"merging {inputs.Count} chunks job={jobId}");
+            BatchLog.Line($"merge start job={jobId} chunks={inputs.Count}");
             var concatSpec = new Dictionary<string, object?>
             {
                 ["mode"] = "concat",
@@ -122,7 +122,8 @@ public sealed class MergeStep(
                 audioSourceFile = Path.Combine(workDir, "source" + srcExt);
                 await storage.DownloadAsync(sourceStoragePath, audioSourceFile, ct);
             }
-            BatchLog.Line($"audiomux job={jobId} reuseNormalized={reuseNormalized}");
+            BatchLog.Line($"audiomux start job={jobId} reuseNormalized={reuseNormalized}");
+            var muxStart = DateTime.UtcNow;
 
             // ── 3. Compose final audio over the WHOLE timeline + mux into the video
             //       (video stream-copied). The CLI validates duration ≈ expected and
@@ -156,12 +157,16 @@ public sealed class MergeStep(
             // ── 4. Validate the final file (CLI already checked duration/audio). ──
             if (!File.Exists(outFile) || new FileInfo(outFile).Length <= 0)
                 return await FailMerge(uid, jobId, "final file missing/empty");
+            var finalSizeBytes = new FileInfo(outFile).Length;
+            BatchLog.Line($"audiomux complete job={jobId} size={finalSizeBytes}B ({(int)(DateTime.UtcNow - muxStart).TotalSeconds}s)");
             // sourceHasAudio prefers the audiomux audio-verify; chunk markers are a
             // fallback (e.g. if the event was missed).
             var sourceHasAudio2 = sourceHasAudioFinal || sourceHasAudio;
 
-            BatchLog.Line($"uploading final MP4 job={jobId} → {outputPath}");
+            BatchLog.Line($"final upload start job={jobId} size={finalSizeBytes}B → {outputPath}");
+            var finalUploadStart = DateTime.UtcNow;
             var downloadUrl = await storage.UploadMp4Async(outFile, outputPath, ct);
+            BatchLog.Line($"final upload complete job={jobId} size={finalSizeBytes}B ({(int)(DateTime.UtcNow - finalUploadStart).TotalSeconds}s)");
 
             var preflight = new Dictionary<string, object?>
             {

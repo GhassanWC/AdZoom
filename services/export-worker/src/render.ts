@@ -63,6 +63,8 @@ export interface RenderOptions {
    * (see the CLI `audiomux` mode). Undefined ⇒ render the whole video (default).
    */
   chunk?: {
+    /** 0-based chunk index (diagnostics/logs only). */
+    index?: number;
     renderStartSec: number;
     renderEndSec: number;
     trimStartSec: number;
@@ -76,6 +78,14 @@ const STALL_MS = 90_000;
 
 /** Cadence (in output frames) for the heartbeat progress + memory log + leak guard. */
 const PROGRESS_LOG_EVERY = 250;
+
+/** Wall-clock cadence (ms) for the rich render-progress log — so progress stays
+ *  VISIBLE in the orchestrator logs even when a single frame is slow (a high-res
+ *  upscale can render < PROGRESS_LOG_EVERY frames between heartbeats). */
+const CHUNK_PROGRESS_LOG_MS = 10_000;
+
+/** Warn once if render throughput stays below this (fps) past warmup. */
+const LOW_FPS_WARN = 1;
 
 /**
  * Force a GC this often (output frames). The composited frame each `getImageData`
@@ -342,7 +352,13 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
 
   let lastPct = -1;
   let wroteFirstFrame = false;
+  let writtenFrames = 0;
   const renderStartMs = Date.now();
+  // Rich render-progress (wall-clock) + diagnostics state.
+  const chunkIndex = opts.chunk?.index ?? -1;
+  const decodedStartIndex = Math.round(seekSourceTime * fps); // source frame the seek lands on
+  let lastChunkLogMs = renderStartMs;
+  let lowFpsWarned = false;
   // Recent RSS samples (one per heartbeat) for the linear-growth tripwire.
   const rssSamples: number[] = [];
   try {
@@ -376,6 +392,40 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
       if (pct !== lastPct) {
         lastPct = pct;
         opts.onProgress({ stage: "rendering", progress: pct / 100 });
+      }
+
+      // Rich render-progress on a WALL-CLOCK cadence (every CHUNK_PROGRESS_LOG_MS)
+      // so a slow high-res chunk still reports progress + render throughput, and
+      // so it's clear the chunk is rendering its OUTPUT window (not the whole video).
+      const nowMs = Date.now();
+      if (nowMs - lastChunkLogMs >= CHUNK_PROGRESS_LOG_MS) {
+        lastChunkLogMs = nowMs;
+        const framesRendered = i - renderStartFrame;
+        const elapsedSeconds = (nowMs - renderStartMs) / 1000;
+        const renderFps = elapsedSeconds > 0 ? framesRendered / elapsedSeconds : 0;
+        const remaining = renderFps > 0 ? (renderWindowFrames - framesRendered) / renderFps : -1;
+        console.info("[worker:chunk-progress]", {
+          chunkIndex,
+          outputStart: Number((opts.chunk?.trimStartSec ?? 0).toFixed(2)),
+          outputEnd: Number((opts.chunk?.trimEndSec ?? outputDuration).toFixed(2)),
+          sourceSeekTime: Number(seekSourceTime.toFixed(2)),
+          framesExpected: renderWindowFrames,
+          framesRendered,
+          renderFps: Number(renderFps.toFixed(2)),
+          elapsedSeconds: Number(elapsedSeconds.toFixed(1)),
+          estimatedRemainingSeconds: remaining < 0 ? null : Number(remaining.toFixed(1)),
+        });
+        // Diagnostic: extremely low throughput (a chunk this slow won't finish in
+        // its task budget — surfaces a perf problem instead of a silent hang).
+        if (!lowFpsWarned && elapsedSeconds > 30 && renderFps > 0 && renderFps < LOW_FPS_WARN) {
+          lowFpsWarned = true;
+          console.warn("[worker:chunk-diag] render_fps_extremely_low", {
+            chunkIndex,
+            renderFps: Number(renderFps.toFixed(2)),
+            framesRendered,
+            framesExpected: renderWindowFrames,
+          });
+        }
       }
 
       // Reclaim the external composited-frame buffers before they pile up. They
@@ -467,6 +517,7 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
         // with no such leak (verified) and is GC-tracked, so it streams cleanly.
         const composited = outCanvas.data();
         await encoder.writeFrame(composited);
+        writtenFrames++;
         if (!wroteFirstFrame) {
           // First frame accepted by the encoder — the pipeline is flowing.
           wroteFirstFrame = true;
@@ -479,13 +530,43 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
     opts.onProgress({ stage: "encoding", progress: 0.97 });
     await encoder.finish();
     decoder.kill();
+    const elapsedMs = Date.now() - renderStartMs;
+    const renderFps = elapsedMs > 0 ? writtenFrames / (elapsedMs / 1000) : 0;
+    if (opts.chunk) {
+      // Integrity: a chunk must EMIT exactly its trim window (and decode FROM the
+      // seek point, not source 0). Surface both so "rendering outside the window"
+      // is impossible to miss.
+      console.info("[worker:chunk-complete]", {
+        chunkIndex,
+        outputStart: Number(opts.chunk.trimStartSec.toFixed(2)),
+        outputEnd: Number(opts.chunk.trimEndSec.toFixed(2)),
+        sourceSeekTime: Number(seekSourceTime.toFixed(2)),
+        framesExpected: emittedFrames,
+        framesEmitted: writtenFrames,
+        framesRendered: renderWindowFrames,
+        decodedFromIndex: decodedStartIndex,
+        decodedToIndex: decodedIndex,
+        chunkDurationSec: Number((writtenFrames / fps).toFixed(2)),
+        renderFps: Number(renderFps.toFixed(2)),
+        elapsedSeconds: Number((elapsedMs / 1000).toFixed(1)),
+      });
+      // Diagnostic: emitted more than the trim window (off-by-one / overrun).
+      if (writtenFrames > emittedFrames * 1.05) {
+        console.warn("[worker:chunk-diag] frames_emitted_exceeds_expected", {
+          chunkIndex,
+          framesEmitted: writtenFrames,
+          framesExpected: emittedFrames,
+        });
+      }
+    }
     console.info("[worker:complete]", {
       outputWidth: canvasW,
       outputHeight: canvasH,
       fps,
       frames: totalFrames,
       ...(opts.chunk ? { emittedFrames, renderedFrames: renderWindowFrames } : {}),
-      elapsedMs: Date.now() - renderStartMs,
+      renderFps: Number(renderFps.toFixed(2)),
+      elapsedMs,
       warnings: warnings.length,
     });
     return { warnings, outputWidth: canvasW, outputHeight: canvasH, fps };

@@ -1655,6 +1655,8 @@ var CanceledError = class extends Error {
 };
 var STALL_MS = 9e4;
 var PROGRESS_LOG_EVERY = 250;
+var CHUNK_PROGRESS_LOG_MS = 1e4;
+var LOW_FPS_WARN = 1;
 var GC_EVERY = 50;
 var MAX_RSS_MB = Number(process.env.RENDER_MAX_RSS_MB) || 4096;
 var LEAK_SLOPE_MB = 400;
@@ -1811,7 +1813,12 @@ async function renderToMp4(opts) {
   opts.signal.addEventListener("abort", onAbort);
   let lastPct = -1;
   let wroteFirstFrame = false;
+  let writtenFrames = 0;
   const renderStartMs = Date.now();
+  const chunkIndex = opts.chunk?.index ?? -1;
+  const decodedStartIndex = Math.round(seekSourceTime * fps);
+  let lastChunkLogMs = renderStartMs;
+  let lowFpsWarned = false;
   const rssSamples = [];
   try {
     if (opts.signal.aborted) throw new CanceledError();
@@ -1836,6 +1843,34 @@ async function renderToMp4(opts) {
       if (pct !== lastPct) {
         lastPct = pct;
         opts.onProgress({ stage: "rendering", progress: pct / 100 });
+      }
+      const nowMs = Date.now();
+      if (nowMs - lastChunkLogMs >= CHUNK_PROGRESS_LOG_MS) {
+        lastChunkLogMs = nowMs;
+        const framesRendered = i - renderStartFrame;
+        const elapsedSeconds = (nowMs - renderStartMs) / 1e3;
+        const renderFps2 = elapsedSeconds > 0 ? framesRendered / elapsedSeconds : 0;
+        const remaining = renderFps2 > 0 ? (renderWindowFrames - framesRendered) / renderFps2 : -1;
+        console.info("[worker:chunk-progress]", {
+          chunkIndex,
+          outputStart: Number((opts.chunk?.trimStartSec ?? 0).toFixed(2)),
+          outputEnd: Number((opts.chunk?.trimEndSec ?? outputDuration).toFixed(2)),
+          sourceSeekTime: Number(seekSourceTime.toFixed(2)),
+          framesExpected: renderWindowFrames,
+          framesRendered,
+          renderFps: Number(renderFps2.toFixed(2)),
+          elapsedSeconds: Number(elapsedSeconds.toFixed(1)),
+          estimatedRemainingSeconds: remaining < 0 ? null : Number(remaining.toFixed(1))
+        });
+        if (!lowFpsWarned && elapsedSeconds > 30 && renderFps2 > 0 && renderFps2 < LOW_FPS_WARN) {
+          lowFpsWarned = true;
+          console.warn("[worker:chunk-diag] render_fps_extremely_low", {
+            chunkIndex,
+            renderFps: Number(renderFps2.toFixed(2)),
+            framesRendered,
+            framesExpected: renderWindowFrames
+          });
+        }
       }
       if (forceGc && i > 0 && i % GC_EVERY === 0) forceGc();
       if (i > 0 && i % PROGRESS_LOG_EVERY === 0) {
@@ -1898,6 +1933,7 @@ async function renderToMp4(opts) {
       if (i >= trimStartFrame && i < trimEndFrame) {
         const composited = outCanvas.data();
         await encoder.writeFrame(composited);
+        writtenFrames++;
         if (!wroteFirstFrame) {
           wroteFirstFrame = true;
           console.info("[worker:first-frame]", { afterMs: Date.now() - renderStartMs });
@@ -1908,13 +1944,39 @@ async function renderToMp4(opts) {
     opts.onProgress({ stage: "encoding", progress: 0.97 });
     await encoder.finish();
     decoder.kill();
+    const elapsedMs = Date.now() - renderStartMs;
+    const renderFps = elapsedMs > 0 ? writtenFrames / (elapsedMs / 1e3) : 0;
+    if (opts.chunk) {
+      console.info("[worker:chunk-complete]", {
+        chunkIndex,
+        outputStart: Number(opts.chunk.trimStartSec.toFixed(2)),
+        outputEnd: Number(opts.chunk.trimEndSec.toFixed(2)),
+        sourceSeekTime: Number(seekSourceTime.toFixed(2)),
+        framesExpected: emittedFrames,
+        framesEmitted: writtenFrames,
+        framesRendered: renderWindowFrames,
+        decodedFromIndex: decodedStartIndex,
+        decodedToIndex: decodedIndex,
+        chunkDurationSec: Number((writtenFrames / fps).toFixed(2)),
+        renderFps: Number(renderFps.toFixed(2)),
+        elapsedSeconds: Number((elapsedMs / 1e3).toFixed(1))
+      });
+      if (writtenFrames > emittedFrames * 1.05) {
+        console.warn("[worker:chunk-diag] frames_emitted_exceeds_expected", {
+          chunkIndex,
+          framesEmitted: writtenFrames,
+          framesExpected: emittedFrames
+        });
+      }
+    }
     console.info("[worker:complete]", {
       outputWidth: canvasW,
       outputHeight: canvasH,
       fps,
       frames: totalFrames,
       ...opts.chunk ? { emittedFrames, renderedFrames: renderWindowFrames } : {},
-      elapsedMs: Date.now() - renderStartMs,
+      renderFps: Number(renderFps.toFixed(2)),
+      elapsedMs,
       warnings: warnings.length
     });
     return { warnings, outputWidth: canvasW, outputHeight: canvasH, fps };
