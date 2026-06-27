@@ -9,6 +9,19 @@
     <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
 
+  <!-- Tests live in ExportApi.Tests/ — a SUBDIR of this project root. SDK-style
+       projects glob **/*.cs by default, which would pull the xUnit test sources
+       into this production app (which has NO xUnit reference) and break
+       `dotnet publish`. Exclude that folder from every default item glob. The test
+       project builds separately: `cd ExportApi.Tests && dotnet test`. Do NOT add
+       xUnit here. -->
+  <ItemGroup>
+    <Compile Remove="ExportApi.Tests/**/*.cs" />
+    <Content Remove="ExportApi.Tests/**/*" />
+    <EmbeddedResource Remove="ExportApi.Tests/**/*" />
+    <None Remove="ExportApi.Tests/**/*" />
+  </ItemGroup>
+
   <ItemGroup>
     <PackageReference Include="Google.Cloud.Firestore" Version="3.8.0" />
     <PackageReference Include="Google.Cloud.Storage.V1" Version="4.10.0" />

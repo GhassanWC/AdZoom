@@ -12,5 +12,9 @@ services/export-worker/dist
 # .NET build artifacts (services/export-api-dotnet) — rebuilt inside the image.
 **/bin
 **/obj
+# .NET test project — not needed in the production worker image (its xUnit sources
+# must never reach the production ExportApi.csproj compile). Belt-and-suspenders
+# with the <Compile Remove> in ExportApi.csproj.
+services/export-api-dotnet/ExportApi.Tests
 .claude
 .vscode
