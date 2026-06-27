@@ -161,7 +161,7 @@ async function runScenario(
     // 1. Single (whole-video) render — the reference.
     const single = join(dir, `${name}-single.mp4`);
     await renderToMp4({
-      serialized, sourcePath: source, outputPath: single,
+      serialized, jobId: `parity-${name}-single`, sourcePath: source, outputPath: single,
       crf: CRF, preset: PRESET, signal: neverAbort, onProgress: () => {},
     });
 
@@ -174,7 +174,7 @@ async function runScenario(
       const w = deriveChunkWindow(i, tiling);
       const cf = join(dir, `${name}-chunk-${i}.mp4`);
       await renderToMp4({
-        serialized, sourcePath: source, outputPath: cf,
+        serialized, jobId: `parity-${name}`, sourcePath: source, outputPath: cf,
         crf: CRF, preset: PRESET, signal: neverAbort, onProgress: () => {},
         chunk: {
           index: i,

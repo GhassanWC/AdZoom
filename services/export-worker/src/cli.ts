@@ -63,6 +63,8 @@ import { toUserFacingError } from "./errors.js";
 import type { SerializedRenderRecipe } from "@/lib/firebase/schema";
 
 interface JobSpec {
+  /** Job id for log correlation (diagnostics only). */
+  jobId?: string;
   sourcePath: string;
   outputPath: string;
   serializedRecipe: SerializedRenderRecipe;
@@ -485,6 +487,7 @@ async function main(): Promise<void> {
     let firstFrameEmitted = false;
     const result = await renderToMp4({
       serialized: spec.serializedRecipe,
+      jobId: spec.jobId,
       sourcePath: renderSource,
       outputPath: spec.outputPath,
       crf,

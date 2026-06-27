@@ -36,6 +36,8 @@ export class CanceledError extends Error {
 
 export interface RenderOptions {
   serialized: SerializedRenderRecipe;
+  /** Job id for log correlation (diagnostics only). */
+  jobId?: string;
   /** Local path of the downloaded source video. */
   sourcePath: string;
   /** Local path to write the MP4 to. */
@@ -354,10 +356,15 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
   let wroteFirstFrame = false;
   let writtenFrames = 0;
   const renderStartMs = Date.now();
-  // Rich render-progress (wall-clock) + diagnostics state.
+  // Rich render-progress + diagnostics state.
+  const jobId = opts.jobId ?? "(unknown)";
   const chunkIndex = opts.chunk?.index ?? -1;
   const decodedStartIndex = Math.round(seekSourceTime * fps); // source frame the seek lands on
-  let lastChunkLogMs = renderStartMs;
+  // The frame index the progress TIMER reads. Updated each loop iteration; the
+  // timer runs on the event loop so it logs even while a single frame's decode is
+  // blocked (a slow first-frame seek/decode would otherwise show NO progress).
+  let currentFrameIndex = renderStartFrame;
+  let progressTimer: ReturnType<typeof setInterval> | undefined;
   let lowFpsWarned = false;
   // Recent RSS samples (one per heartbeat) for the linear-growth tripwire.
   const rssSamples: number[] = [];
@@ -382,9 +389,62 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
     // a big GOP) — without this the bar looks frozen between "downloading" and
     // the first rendered frame.
     opts.onProgress({ stage: "decoding", progress: 0.01 });
+
+    // Prove the frame loop was REACHED (so "no progress" vs "never started" is
+    // unambiguous) — emitted immediately, before any frame decode can block.
+    console.info("[worker:chunk-loop-start]", {
+      jobId,
+      chunkIndex,
+      renderStartFrame,
+      renderEndFrame,
+      framesExpected: renderWindowFrames,
+      seekSourceTime: Number(seekSourceTime.toFixed(3)),
+      outputStart: Number((opts.chunk?.trimStartSec ?? 0).toFixed(2)),
+      outputEnd: Number((opts.chunk?.trimEndSec ?? outputDuration).toFixed(2)),
+    });
+
+    // Rich render-progress on a real TIMER (not an in-loop wall-clock check). The
+    // timer fires on the event loop during ANY `await` (decode / encoder write),
+    // so progress + throughput appear every CHUNK_PROGRESS_LOG_MS even if a single
+    // frame's decode is slow or the first-frame seek is still discarding — the case
+    // where the old in-loop check stayed silent because the loop body was blocked.
+    progressTimer = setInterval(() => {
+      const framesRendered = Math.max(0, currentFrameIndex - renderStartFrame);
+      const elapsedSeconds = (Date.now() - renderStartMs) / 1000;
+      const renderFps = elapsedSeconds > 0 ? framesRendered / elapsedSeconds : 0;
+      const remaining = renderFps > 0 ? (renderWindowFrames - framesRendered) / renderFps : -1;
+      console.info("[worker:chunk-progress]", {
+        jobId,
+        chunkIndex,
+        outputStart: Number((opts.chunk?.trimStartSec ?? 0).toFixed(2)),
+        outputEnd: Number((opts.chunk?.trimEndSec ?? outputDuration).toFixed(2)),
+        sourceSeekTime: Number(seekSourceTime.toFixed(2)),
+        framesExpected: renderWindowFrames,
+        framesRendered,
+        renderFps: Number(renderFps.toFixed(2)),
+        elapsedSeconds: Number(elapsedSeconds.toFixed(1)),
+        estimatedRemainingSeconds: remaining < 0 ? null : Number(remaining.toFixed(1)),
+      });
+      // Diagnostic: extremely low throughput (a chunk this slow won't finish in its
+      // task budget — surfaces a perf problem instead of a silent hang).
+      if (!lowFpsWarned && elapsedSeconds > 30 && renderFps > 0 && renderFps < LOW_FPS_WARN) {
+        lowFpsWarned = true;
+        console.warn("[worker:chunk-diag] render_fps_extremely_low", {
+          jobId,
+          chunkIndex,
+          renderFps: Number(renderFps.toFixed(2)),
+          framesRendered,
+          framesExpected: renderWindowFrames,
+        });
+      }
+    }, CHUNK_PROGRESS_LOG_MS);
+    // Don't let the timer keep the process alive on its own.
+    if (typeof progressTimer.unref === "function") progressTimer.unref();
+
     armWatchdog();
     for (let i = renderStartFrame; i < renderEndFrame; i++) {
       if (opts.signal.aborted) throw new CanceledError();
+      currentFrameIndex = i; // read by the progress timer above
 
       // Progress is reported RELATIVE to this render's window (0..95), so a chunk
       // reads 0→95% over its own frames (the orchestrator scales it across chunks).
@@ -392,40 +452,6 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
       if (pct !== lastPct) {
         lastPct = pct;
         opts.onProgress({ stage: "rendering", progress: pct / 100 });
-      }
-
-      // Rich render-progress on a WALL-CLOCK cadence (every CHUNK_PROGRESS_LOG_MS)
-      // so a slow high-res chunk still reports progress + render throughput, and
-      // so it's clear the chunk is rendering its OUTPUT window (not the whole video).
-      const nowMs = Date.now();
-      if (nowMs - lastChunkLogMs >= CHUNK_PROGRESS_LOG_MS) {
-        lastChunkLogMs = nowMs;
-        const framesRendered = i - renderStartFrame;
-        const elapsedSeconds = (nowMs - renderStartMs) / 1000;
-        const renderFps = elapsedSeconds > 0 ? framesRendered / elapsedSeconds : 0;
-        const remaining = renderFps > 0 ? (renderWindowFrames - framesRendered) / renderFps : -1;
-        console.info("[worker:chunk-progress]", {
-          chunkIndex,
-          outputStart: Number((opts.chunk?.trimStartSec ?? 0).toFixed(2)),
-          outputEnd: Number((opts.chunk?.trimEndSec ?? outputDuration).toFixed(2)),
-          sourceSeekTime: Number(seekSourceTime.toFixed(2)),
-          framesExpected: renderWindowFrames,
-          framesRendered,
-          renderFps: Number(renderFps.toFixed(2)),
-          elapsedSeconds: Number(elapsedSeconds.toFixed(1)),
-          estimatedRemainingSeconds: remaining < 0 ? null : Number(remaining.toFixed(1)),
-        });
-        // Diagnostic: extremely low throughput (a chunk this slow won't finish in
-        // its task budget — surfaces a perf problem instead of a silent hang).
-        if (!lowFpsWarned && elapsedSeconds > 30 && renderFps > 0 && renderFps < LOW_FPS_WARN) {
-          lowFpsWarned = true;
-          console.warn("[worker:chunk-diag] render_fps_extremely_low", {
-            chunkIndex,
-            renderFps: Number(renderFps.toFixed(2)),
-            framesRendered,
-            framesExpected: renderWindowFrames,
-          });
-        }
       }
 
       // Reclaim the external composited-frame buffers before they pile up. They
@@ -530,6 +556,7 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
     opts.onProgress({ stage: "encoding", progress: 0.97 });
     await encoder.finish();
     decoder.kill();
+    if (progressTimer) clearInterval(progressTimer);
     const elapsedMs = Date.now() - renderStartMs;
     const renderFps = elapsedMs > 0 ? writtenFrames / (elapsedMs / 1000) : 0;
     if (opts.chunk) {
@@ -537,6 +564,7 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
       // seek point, not source 0). Surface both so "rendering outside the window"
       // is impossible to miss.
       console.info("[worker:chunk-complete]", {
+        jobId,
         chunkIndex,
         outputStart: Number(opts.chunk.trimStartSec.toFixed(2)),
         outputEnd: Number(opts.chunk.trimEndSec.toFixed(2)),
@@ -581,6 +609,7 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
     throw err;
   } finally {
     if (watchdog) clearTimeout(watchdog);
+    if (progressTimer) clearInterval(progressTimer);
     opts.signal.removeEventListener("abort", onAbort);
   }
 }

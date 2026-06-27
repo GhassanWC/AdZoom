@@ -185,6 +185,7 @@ public sealed class JobPipeline(
             // ── Render (Node CLI subprocess) ─────────────────────────────────
             var spec = new Dictionary<string, object?>
             {
+                ["jobId"] = jobId,
                 ["sourcePath"] = srcFile,
                 ["outputPath"] = outFile,
                 ["serializedRecipe"] = recipe,
@@ -341,6 +342,7 @@ public sealed class JobPipeline(
 
             var spec = new Dictionary<string, object?>
             {
+                ["jobId"] = jobId,
                 // Chunk 0 reads the original (and normalizes once → normalized-source.mp4);
                 // later chunks read that normalized file. If normalization is globally
                 // off, there is no normalized file, so every chunk reads the original.

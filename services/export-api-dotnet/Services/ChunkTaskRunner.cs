@@ -113,6 +113,7 @@ public sealed class ChunkTaskRunner(
 
             var spec = new Dictionary<string, object?>
             {
+                ["jobId"] = jobId,
                 ["sourcePath"] = srcFile,
                 ["outputPath"] = chunkFile,
                 ["serializedRecipe"] = recipe,
