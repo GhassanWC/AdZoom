@@ -42,6 +42,8 @@ public sealed class ChunkTaskRunner(
         var projectId = Str(snap, "projectId") ?? "";
         var sourcePath = Str(snap, JobFields.SourceStoragePath) ?? "";
         var durationSeconds = Dbl(snap, "durationSeconds");
+        var fps = Dbl(snap, "fps");
+        if (fps <= 0) fps = 30;
         var chunkSeconds = (int)Long(snap, JobFields.ChunkSeconds);
         if (chunkSeconds <= 0) chunkSeconds = Math.Max(1, opts.ChunkSeconds);
         var chunkCount = (int)Long(snap, JobFields.ChunkCount);
@@ -55,14 +57,16 @@ public sealed class ChunkTaskRunner(
             return 1;
         }
 
-        // Output-time window for this chunk. Boundaries are exact: effects are
-        // computed per absolute frame (deterministic) and each chunk begins with a
-        // keyframe, so windows concat cleanly with stream-copy.
-        var startSec = (double)index * chunkSeconds;
-        var endSec = Math.Min((double)(index + 1) * chunkSeconds, durationSeconds);
-        if (!(endSec > startSec))
+        // Timeline-aware OUTPUT window (integer-frame tiling so seams concat cleanly).
+        // The worker maps each output frame to source time via the recipe timeline
+        // map, so cuts/speed are handled. RENDER window = trim (emit) window grown by
+        // boundary padding (decode warm-up only); EMIT window is the exact span this
+        // chunk contributes and begins on an IDR keyframe.
+        var win = ChunkWindows.Derive(
+            index, chunkCount, chunkSeconds, fps, durationSeconds, opts.ChunkBoundaryPaddingSeconds);
+        if (!(win.TrimEndFrame > win.TrimStartFrame))
         {
-            BatchLog.Error($"chunk task: empty window [{startSec},{endSec}] index={index} — failing job={jobId}");
+            BatchLog.Error($"chunk task: empty window trim=[{win.TrimStartFrame},{win.TrimEndFrame}] index={index} — failing job={jobId}");
             await fs.FailJobFromChunkAsync(uid, jobId, JobFields.ErrChunkFailed,
                 "Export setup error (empty chunk window). Please try again.");
             return 1;
@@ -117,10 +121,16 @@ public sealed class ChunkTaskRunner(
                 ["normalizeCrf"] = opts.NormalizeCrf,
                 ["normalizePreset"] = opts.NormalizePreset,
                 ["normalizeEnabled"] = opts.NormalizeEnabled,
-                ["chunk"] = new Dictionary<string, object?> { ["startSec"] = startSec, ["endSec"] = endSec },
+                ["chunk"] = new Dictionary<string, object?>
+                {
+                    ["renderStartSec"] = win.RenderStartSec,
+                    ["renderEndSec"] = win.RenderEndSec,
+                    ["trimStartSec"] = win.TrimStartSec,
+                    ["trimEndSec"] = win.TrimEndSec,
+                },
             };
 
-            BatchLog.Line($"rendering chunk job={jobId} index={index} window=[{startSec:F1},{endSec:F1}]");
+            BatchLog.Line($"rendering chunk job={jobId} index={index} trim=[{win.TrimStartSec:F1},{win.TrimEndSec:F1}] render=[{win.RenderStartSec:F1},{win.RenderEndSec:F1}]");
             RenderOutcome? outcome = null;
             var ok = false;
             for (var attempt = 0; attempt <= Math.Max(0, opts.ChunkMaxRetries); attempt++)
@@ -141,11 +151,11 @@ public sealed class ChunkTaskRunner(
             {
                 var code = outcome?.Error?.Code ?? JobFields.ErrChunkFailed;
                 var msg = outcome?.Error?.Message ?? "Something went wrong while exporting your video. Please try again.";
-                // The app's eligibility gate mirrors the CLI, so this should never
-                // happen — but if a cuts/speed timeline ever reaches a chunk task, fail
-                // with a clear reason instead of a generic chunk error.
-                if (code == "chunk_unsupported_timeline")
-                    msg = "This export can't be split into chunks (its timeline has cuts or speed changes). Please try again.";
+                // The app's eligibility gate mirrors the CLI allowlist, so this should
+                // never happen — but if a timeline with a chunk-incompatible effect
+                // type ever reaches a chunk task, fail with a clear reason.
+                if (code == "chunk_unsupported_effects")
+                    msg = "This export can't be split into chunks (it uses an effect that isn't chunk-compatible). Please try again.";
                 await fs.FailJobFromChunkAsync(uid, jobId, code, msg);
                 BatchLog.Error($"chunk render FAILED job={jobId} index={index} code={code} — job failed");
                 return 1;
@@ -161,6 +171,29 @@ public sealed class ChunkTaskRunner(
 
             BatchLog.Line($"uploading chunk job={jobId} index={index} → {chunkObjectPath}");
             await storage.UploadMp4Async(chunkFile, chunkObjectPath, cancelCts.Token);
+
+            // Persist the normalized source ONCE (deterministic single uploader =
+            // index 0) so the merge's GLOBAL audio pass reuses it instead of
+            // re-transcoding, and the muxed audio is built from bit-identical source.
+            // Best-effort: the merge re-normalizes the original as a fallback if this
+            // object is missing. The render CLI wrote it next to the chunk output.
+            if (index == 0 && opts.NormalizeEnabled)
+            {
+                var normFile = Path.Combine(workDir, "normalized-source.mp4");
+                if (File.Exists(normFile))
+                {
+                    var normObjectPath = $"users/{uid}/projects/{projectId}/exports/{jobId}/normalized-source.mp4";
+                    try
+                    {
+                        await storage.UploadMp4Async(normFile, normObjectPath, cancelCts.Token);
+                        BatchLog.Line($"persisted normalized source job={jobId} → {normObjectPath}");
+                    }
+                    catch (Exception ex)
+                    {
+                        log.LogWarning(ex, "[export] persist normalized source failed job={JobId}", jobId);
+                    }
+                }
+            }
 
             var chunkRenderSec = (int)(DateTime.UtcNow - renderStart).TotalSeconds;
             var result = await fs.RecordChunkDoneAsync(uid, jobId, index, chunkObjectPath, sourceHasAudio, index);

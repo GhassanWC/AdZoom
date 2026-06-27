@@ -27,7 +27,12 @@ import {
   QUEUE_REASON_WAITING_FOR_SLOT,
   maxActiveBatchJobs,
 } from "@/lib/export/batch-capacity";
-import { planChunking } from "@/lib/export/chunk-plan";
+import {
+  planChunking,
+  summarizeTimelineForChunking,
+  chunkEligibilityLog,
+  type ChunkPlanInput,
+} from "@/lib/export/chunk-plan";
 import { computeSettingsHash } from "@/lib/export/settings-hash";
 import type {
   DetectedMoment,
@@ -348,32 +353,27 @@ export async function createCloudExportJob(
   const buildVersion = process.env.BUILD_VERSION ?? "unknown";
 
   // ── Single vs chunked render decision ────────────────────────────────────
-  // Chunked = N parallel Batch tasks merged into one MP4 (faster for long videos);
-  // requires a LINEAR timeline (no cuts/speed — the render CLI refuses to chunk
-  // those). Anything ineligible falls back to the proven single-worker path.
-  // Mirror the render CLI's chunk_unsupported_timeline predicate EXACTLY
-  // (services/export-worker/src/render.ts): hasSpeed is moment-type based and
-  // multiplier-agnostic (buildTimelineMap clamps multiplier to >=1, so a speed-up
-  // moment with multiplier<=1 still yields speedMultiplier===1 — checking segments
-  // would wrongly pass it as linear, then the CLI would hard-refuse the chunk).
-  const hasSpeed = input.moments.some((m) => m.effectType === "speed-up");
-  const hasCuts = recipe.timelineMap.totalRemoved > 0;
-  const timelineLinear = !hasSpeed && !hasCuts;
-  const chunk = planChunking({
+  // Chunked = N parallel Batch tasks merged into one MP4 (faster for long videos).
+  // Timeline-aware: chunks are sliced by OUTPUT time and the render core maps each
+  // output frame back to source time via the recipe timeline map, so cuts + speed
+  // ARE chunkable. Only effect TYPES the chunk renderer can't reproduce force a
+  // single render (fail-closed — see summarizeTimelineForChunking). The single
+  // path stays as the emergency fallback. `summarizeTimelineForChunking` keeps
+  // hasSpeed moment-type based (multiplier-agnostic) so a speed-up's audioMode is
+  // always honored by the global audio pass.
+  const chunkTimeline = summarizeTimelineForChunking(input.moments);
+  const chunkInput: ChunkPlanInput = {
     outputDurationSeconds,
     format: "mp4",
-    linear: timelineLinear,
     plan: paidPlan,
+    timeline: chunkTimeline,
     env: process.env,
-  });
+  };
+  const chunk = planChunking(chunkInput);
   console.log("[export-create] render mode decided", {
     uid,
     jobId,
-    renderMode: chunk.renderMode,
-    reason: chunk.reason,
-    ...(chunk.renderMode === "chunked"
-      ? { chunkCount: chunk.chunkCount, chunkSeconds: chunk.chunkSeconds, chunkParallelism: chunk.chunkParallelism }
-      : {}),
+    ...chunkEligibilityLog(chunkInput, chunk, { sourceDurationSeconds: sourceDuration }),
   });
 
   // ── Global active-Batch-export cap (cost guard) ──────────────────────────

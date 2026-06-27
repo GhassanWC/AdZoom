@@ -23,7 +23,7 @@
  *
  * Exit codes: 0 = done, 1 = error, 2 = canceled.
  */
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, statSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
@@ -57,6 +57,8 @@ console.error = toStderr as typeof console.error;
 import { renderToMp4 } from "./render.js";
 import { computePreflight, AUDIO_UNSUPPORTED_WARNING } from "./preflight.js";
 import { normalizeSource, probeSource, ffmpegBin } from "./ffmpeg.js";
+import { buildAudioFilterComplex } from "./audio.js";
+import { buildRenderRecipe } from "@/lib/render/recipe";
 import { toUserFacingError } from "./errors.js";
 import type { SerializedRenderRecipe } from "@/lib/firebase/schema";
 
@@ -70,18 +72,52 @@ interface JobSpec {
   normalizePreset?: string;
   normalizeEnabled?: boolean;
   audioAlreadyDropped?: boolean;
-  /** Chunked render: render ONLY this OUTPUT window [startSec, endSec) (see
-   *  RenderOptions.chunk). Omitted ⇒ whole-video render (default). */
-  chunk?: { startSec: number; endSec: number };
-  /** "concat" ⇒ losslessly join `inputs` (rendered chunks) into `outputPath`. */
-  mode?: "render" | "concat";
+  /** Chunked render: RENDER [renderStartSec, renderEndSec) but EMIT only
+   *  [trimStartSec, trimEndSec) (see RenderOptions.chunk). Output time is mapped to
+   *  source time via the timeline map, so cuts/speed work. Chunks are silent —
+   *  audio is added globally in `audiomux`. Omitted ⇒ whole-video render. */
+  chunk?: {
+    renderStartSec: number;
+    renderEndSec: number;
+    trimStartSec: number;
+    trimEndSec: number;
+  };
+  /**
+   * Pipeline stage:
+   *   "render"   (default) → decode/composite/encode (whole video or one chunk).
+   *   "concat"   → losslessly join `inputs` (rendered SILENT chunks) into `outputPath`.
+   *   "audiomux" → compose final audio over the WHOLE timeline and mux it into the
+   *                concatenated silent video (`videoPath`) → `outputPath`.
+   */
+  mode?: "render" | "concat" | "audiomux";
   /** concat mode: ordered chunk file paths to join. */
   inputs?: string[];
+  /** audiomux mode: the concatenated SILENT video to add audio to. */
+  videoPath?: string;
+}
+
+/** Spawn ffmpeg, stream stderr to logs, resolve on exit 0, reject otherwise. */
+function runFfmpeg(args: string[], tag: string, failCode: string): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const child = spawn(ffmpegBin(), args, { stdio: ["ignore", "ignore", "pipe"] });
+    let tail = "";
+    child.stderr.on("data", (d: Buffer) => {
+      tail = (tail + d.toString()).slice(-4000);
+      const t = d.toString().trim();
+      if (t) toStderr(`[worker:${tag}]`, t);
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`${failCode}: ffmpeg exited ${code}: ${tail.trim().slice(-800)}`));
+    });
+  });
 }
 
 /**
- * Concat mode — losslessly join pre-rendered chunk MP4s (identical codecs/params)
- * into the final MP4 via ffmpeg's concat demuxer (`-c copy`, no re-encode).
+ * Concat mode — losslessly join pre-rendered SILENT chunk MP4s (identical codecs/
+ * params, each starting on an IDR) into one MP4 via ffmpeg's concat demuxer
+ * (`-c copy`, no re-encode). Audio is added afterwards by `audiomux`.
  */
 async function runConcat(spec: JobSpec): Promise<void> {
   const inputs = spec.inputs ?? [];
@@ -118,21 +154,159 @@ async function runConcat(spec: JobSpec): Promise<void> {
     "-y",
     spec.outputPath,
   ];
-  await new Promise<void>((resolve, reject) => {
-    const child = spawn(ffmpegBin(), args, { stdio: ["ignore", "ignore", "pipe"] });
-    let tail = "";
-    child.stderr.on("data", (d: Buffer) => {
-      tail = (tail + d.toString()).slice(-4000);
-      const t = d.toString().trim();
-      if (t) toStderr("[worker:concat]", t);
-    });
-    child.on("error", reject);
-    child.on("close", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`concat_failed: ffmpeg exited ${code}: ${tail.trim().slice(-800)}`));
-    });
-  });
+  await runFfmpeg(args, "concat", "concat_failed");
   emit({ type: "done", warnings: [], merged: inputs.length });
+  process.exit(0);
+}
+
+/**
+ * Audiomux mode (chunked finalize) — compose the FINAL audio over the WHOLE output
+ * timeline and mux it into the concatenated silent video. Video is stream-copied
+ * (`-c:v copy`, no re-encode); audio is mapped direct (linear timeline) or rebuilt
+ * from the timeline segments (cuts/speed), padded to the video length so `-shortest`
+ * trims it exactly. Validates the result (duration ≈ expected; audio present if
+ * expected) BEFORE the orchestrator uploads it. Idempotent: writes `outputPath`
+ * fresh each run, so a re-claimed merge leader can re-run safely.
+ */
+async function runAudioMux(spec: JobSpec, signal: AbortSignal): Promise<void> {
+  const videoPath = spec.videoPath ?? "";
+  if (!videoPath || !existsSync(videoPath)) {
+    emit({ type: "error", code: "audiomux_no_video", message: `Merged video missing: ${videoPath}` });
+    process.exit(1);
+  }
+  if (!spec.sourcePath || !existsSync(spec.sourcePath)) {
+    emit({ type: "error", code: "audiomux_no_source", message: `Audio source missing: ${spec.sourcePath}` });
+    process.exit(1);
+  }
+  emit({ type: "stage", name: "muxing-audio" });
+
+  const recipe = buildRenderRecipe({ ...spec.serializedRecipe, debugBorders: false });
+  const { fps, outputDuration, timelineMap } = recipe;
+  const hasSpeed = recipe.moments.some((m) => m.effectType === "speed-up");
+  const hasCuts = timelineMap.totalRemoved > 0;
+
+  // Obtain a clean AAC audio source. The merge normally passes the PERSISTED
+  // normalized-source.mp4 with normalizeEnabled=false (use as-is, no re-transcode).
+  // Fallback (persisted missing) passes the ORIGINAL with normalizeEnabled !== false.
+  let audioSource = spec.sourcePath;
+  let audioStatus: "preserved" | "removed" | "none";
+  if (spec.normalizeEnabled !== false) {
+    const normPath = join(dirname(spec.outputPath), "normalized-source.mp4");
+    const norm = await normalizeSource({
+      sourcePath: spec.sourcePath,
+      outputPath: normPath,
+      crf: spec.normalizeCrf ?? 18,
+      preset: spec.normalizePreset ?? "veryfast",
+      signal,
+    });
+    audioSource = normPath;
+    audioStatus = norm.audioStatus;
+  } else {
+    const probe = await probeSource(audioSource).catch(() => null);
+    audioStatus = probe?.hasAudio ? "preserved" : "none";
+  }
+
+  const srcProbe = await probeSource(audioSource).catch(() => null);
+  const sourceHasAudio = audioStatus === "preserved" && !!srcProbe?.hasAudio;
+
+  // Surface the unsupported-audio notice ONCE for the final output (the per-chunk
+  // renders suppress it). Only knowable here when audiomux re-normalized the source.
+  const muxWarnings: string[] = [];
+  if (audioStatus === "removed") {
+    muxWarnings.push(AUDIO_UNSUPPORTED_WARNING);
+    emit({ type: "warning", message: AUDIO_UNSUPPORTED_WARNING });
+  }
+
+  const args: string[] = ["-hide_banner", "-loglevel", "warning", "-i", videoPath];
+  if (!sourceHasAudio) {
+    // No usable audio → final stays silent (copy the video only).
+    args.push("-map", "0:v", "-c:v", "copy", "-movflags", "+faststart", "-y", spec.outputPath);
+  } else {
+    args.push("-i", audioSource);
+    const sampleRate = srcProbe?.audioSampleRate ?? 48000;
+    const fc =
+      !hasSpeed && !hasCuts
+        ? null
+        : buildAudioFilterComplex(timelineMap.segments, recipe.moments, sampleRate, {
+            padToFill: true,
+          });
+    if (fc) {
+      // Cuts/speed: rebuild audio from the timeline segments (already apad-padded).
+      const scriptPath = join(dirname(spec.outputPath), "audiomux-afc.txt");
+      writeFileSync(scriptPath, fc, "utf8");
+      args.push("-filter_complex_script", scriptPath, "-map", "0:v", "-map", "[aout]");
+    } else {
+      // Linear: map the source audio straight through, padded to the video length.
+      args.push("-map", "0:v", "-map", "1:a:0?", "-af", "apad");
+    }
+    args.push(
+      "-c:v",
+      "copy",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "192k",
+      "-shortest",
+      "-movflags",
+      "+faststart",
+      "-y",
+      spec.outputPath
+    );
+  }
+
+  await runFfmpeg(args, "audiomux", "audiomux_failed");
+
+  // ── Validate BEFORE the orchestrator uploads/settles. ───────────────────────
+  const outProbe = await probeSource(spec.outputPath).catch(() => null);
+  const size = existsSync(spec.outputPath) ? statSync(spec.outputPath).size : 0;
+  if (!outProbe || size <= 0) {
+    emit({ type: "error", code: "audiomux_failed", message: "audiomux produced no/empty output" });
+    process.exit(1);
+  }
+  const outDur = outProbe.durationSec ?? 0;
+  const tol = Math.max(0.5, 2 / fps);
+  emit({
+    type: "audio-verify",
+    audioStatus: sourceHasAudio ? "preserved" : "none",
+    sourceHasAudio,
+    outputHasAudio: outProbe.hasAudio,
+    outputAudioCodec: outProbe.audioCodec || "(none)",
+    outputDurationSec: outDur,
+    expectedDurationSec: outputDuration,
+    durationDiffSec: Math.abs(outDur - outputDuration),
+    fileSizeBytes: size,
+  });
+  toStderr(
+    `[worker:audiomux] audio-verify sourceAudio=${sourceHasAudio} outputAudio=${outProbe.hasAudio} ` +
+      `outDur=${outDur.toFixed(2)} expected=${outputDuration.toFixed(2)} tol=${tol.toFixed(2)} size=${size}`
+  );
+  // Audio expected (source had usable audio, not muted-by-design) but final silent
+  // → real bug; fail so the orchestrator never uploads a wrongly-silent export.
+  if (sourceHasAudio && !outProbe.hasAudio) {
+    emit({
+      type: "error",
+      code: "audio_missing_after_render",
+      message: "audio expected but the final muxed output is silent",
+    });
+    process.exit(1);
+  }
+  if (Math.abs(outDur - outputDuration) > tol) {
+    emit({
+      type: "error",
+      code: "duration_mismatch",
+      message: `final duration ${outDur.toFixed(2)}s differs from expected ${outputDuration.toFixed(2)}s by more than ${tol.toFixed(2)}s`,
+    });
+    process.exit(1);
+  }
+
+  emit({
+    type: "done",
+    warnings: muxWarnings,
+    merged: 1,
+    normalized: spec.normalizeEnabled !== false,
+    audioStatus: sourceHasAudio ? "preserved" : "none",
+    outputDurationSec: outDur,
+  });
   process.exit(0);
 }
 
@@ -184,8 +358,33 @@ async function main(): Promise<void> {
   });
   rl.on("error", () => {});
 
+  // Audiomux mode (chunked finalize) — global audio over the whole timeline, muxed
+  // into the concatenated silent video. Uses controller.signal so a cancel mid-
+  // normalize aborts cleanly.
+  if (spec.mode === "audiomux") {
+    try {
+      await runAudioMux(spec, controller.signal);
+    } catch (err) {
+      if (controller.signal.aborted) {
+        emit({ type: "canceled" });
+        rl.close();
+        process.exit(2);
+      }
+      const friendly = toUserFacingError(err);
+      toStderr("[worker:cli] audiomux failed:", (err as Error)?.message ?? String(err));
+      emit({ type: "error", code: friendly.code, message: friendly.message });
+      rl.close();
+      process.exit(1);
+    }
+    return;
+  }
+
   const crf = spec.crf ?? 19;
   const preset = spec.preset ?? "veryfast";
+  // A chunk render is INTENTIONALLY silent — final audio is composed once over the
+  // whole timeline in `audiomux`. So we must NOT push an audio-drop warning per
+  // chunk, and must NOT treat the silent chunk output as a bug.
+  const chunkSilent = !!spec.chunk;
   const warnings: string[] = [];
   const pushWarning = (w: string): void => {
     if (!warnings.includes(w)) {
@@ -250,7 +449,9 @@ async function main(): Promise<void> {
     // when removed/absent, so the render stays silent WITHOUT its own notice.
     if (spec.audioAlreadyDropped && audioStatus === "preserved") audioStatus = "removed";
     const audioDropped = audioStatus !== "preserved";
-    if (audioStatus === "removed") pushWarning(AUDIO_UNSUPPORTED_WARNING);
+    // Per-chunk: suppress the unsupported-audio notice (it would duplicate across N
+    // chunks); the global audiomux stage surfaces it once for the final output.
+    if (audioStatus === "removed" && !chunkSilent) pushWarning(AUDIO_UNSUPPORTED_WARNING);
 
     // 2b. REQUIRED pre-render contract — prove exactly what the renderer will read.
     emit({
@@ -331,8 +532,10 @@ async function main(): Promise<void> {
         `outputCodec=${outProbe?.audioCodec || "(none)"} outDur=${outDur.toFixed(2)} ` +
         `vidDur=${srcDur.toFixed(2)} diff=${Math.abs(outDur - srcDur).toFixed(2)}`
     );
-    // Only "preserved" means audio should be present (removed/none = silent by design).
-    if (audioStatus === "preserved" && outProbe && !outProbe.hasAudio) {
+    // Only "preserved" means audio should be present (removed/none = silent by
+    // design). A CHUNK is silent on purpose — its audio is composed later in
+    // audiomux — so don't flag a missing-audio "bug" here for chunk renders.
+    if (audioStatus === "preserved" && !chunkSilent && outProbe && !outProbe.hasAudio) {
       throw new Error(
         "audio_missing_after_render: render source has audio but final output has none"
       );

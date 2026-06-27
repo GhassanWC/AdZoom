@@ -13,6 +13,16 @@
  * `ffmpeg-static`) installed under `services/export-worker` AND the stored
  * golden PNGs. See `services/export-worker/README.md`. Implement by importing
  * the worker's `renderToMp4` against fixture clips and decoding sample frames.
+ *
+ * NOTE: the single-vs-chunked TIMELINE-AWARE parity gate IS implemented and
+ * runnable (it needs the worker's native deps, so it lives worker-side, not under
+ * node --test which can't resolve the worker's runtime `@/` imports):
+ *
+ *   cd services/export-worker && npm run test:chunk-parity
+ *
+ * It renders linear / cuts / speed / cuts+speed (and a padded chunk) whole vs
+ * chunked, then asserts identical frame count + high PSNR (seam/seek correctness)
+ * + final duration/audio parity (the global audio pass).
  */
 import { test } from "node:test";
 

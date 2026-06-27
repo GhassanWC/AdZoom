@@ -13,12 +13,29 @@
  *
  * Operates on input #1 (`[1:a]`, the source file) and yields `[aout]`. Returns
  * null when there's nothing to build (no segments) — the caller then muxes `-an`.
+ *
+ * ── Extension seam (future music / fades / SFX) ──────────────────────────────
+ * This builder is the single place final audio is composed, so it is the seam to
+ * grow when background-music / SFX tracks land: build each extra track as its own
+ * input chain (trim/volume/afade) and `amix` it with `[aout]` here, keeping the
+ * source-audio timeline (cuts/speed) intact. The whole-timeline `audiomux` CLI
+ * stage already runs AFTER the video chunks are concatenated, so a global mix
+ * stays in sync regardless of how the video was chunked. `opts.padToFill` appends
+ * `apad` so the composed track can be `-shortest`-trimmed to the exact video
+ * length (used by audiomux; off for the in-render whole-video path to preserve its
+ * existing behavior).
  */
 import { activeSpeedAt } from "@/lib/timeline/crop-speed";
 import type { DetectedMoment } from "@/lib/firebase/schema";
 import type { TimelineSegment } from "@/lib/timeline/crop-speed";
 
 const EPS = 1e-3;
+
+export interface AudioFilterOptions {
+  /** Append `apad` to the composed track so `-shortest` trims it to the video
+   *  length exactly (prevents a too-short audio track from truncating the video). */
+  padToFill?: boolean;
+}
 
 /** Decompose a tempo ratio into a chain of atempo filters (each in [0.5, 2]). */
 function atempoChain(mult: number): string[] {
@@ -39,7 +56,8 @@ function atempoChain(mult: number): string[] {
 export function buildAudioFilterComplex(
   segments: TimelineSegment[],
   moments: DetectedMoment[],
-  sampleRate: number
+  sampleRate: number,
+  opts: AudioFilterOptions = {}
 ): string | null {
   if (!segments.length) return null;
 
@@ -76,6 +94,7 @@ export function buildAudioFilterComplex(
     labels.push(`[${out}]`);
   });
 
-  const concat = `${labels.join("")}concat=n=${labels.length}:v=0:a=1[aout]`;
+  const tail = opts.padToFill ? ",apad" : "";
+  const concat = `${labels.join("")}concat=n=${labels.length}:v=0:a=1${tail}[aout]`;
   return [...chains, concat].join(";");
 }

@@ -11,6 +11,7 @@ import vm from "node:vm";
 import { createCanvas, ImageData } from "@napi-rs/canvas";
 import { buildRenderRecipe } from "@/lib/render/recipe";
 import { composeFrame } from "@/lib/render/compose-frame";
+import { SUPPORTED_CHUNK_EFFECT_TYPES } from "@/lib/export/chunk-plan";
 import type { SerializedRenderRecipe } from "@/lib/firebase/schema";
 import type { TimelineMap } from "@/lib/timeline/crop-speed";
 import {
@@ -51,14 +52,22 @@ export interface RenderOptions {
    */
   audioAlreadyDropped?: boolean;
   /**
-   * Chunked render of a long video: render ONLY the OUTPUT window
-   * [startSec, endSec) to `outputPath`. Requires a LINEAR timeline (no cuts /
-   * speed) so output time == source time and a single input-seek lands on the
-   * chunk's first frame + audio. Throws `chunk_unsupported_timeline` when the
-   * recipe HAS cuts/speed AND audio (the orchestrator then falls back to a
-   * single whole-video render). Undefined ⇒ render the whole video (default).
+   * Chunked render of a long video. RENDER the OUTPUT window [renderStartSec,
+   * renderEndSec) but EMIT only [trimStartSec, trimEndSec) to `outputPath`. The
+   * pad frames outside the trim window (renderStart..trimStart, trimEnd..renderEnd)
+   * are decoded/composited for temporal warm-up ONLY and are NEVER written to the
+   * encoder — so the emitted clip starts on an IDR keyframe and concats losslessly.
+   * Output time is mapped to SOURCE time via the recipe's timeline map, so cuts +
+   * speed are fully supported (NOT just linear). Chunks are ALWAYS silent: final
+   * audio is composed once, globally, after the video chunks are concatenated
+   * (see the CLI `audiomux` mode). Undefined ⇒ render the whole video (default).
    */
-  chunk?: { startSec: number; endSec: number };
+  chunk?: {
+    renderStartSec: number;
+    renderEndSec: number;
+    trimStartSec: number;
+    trimEndSec: number;
+  };
   onProgress: (p: { stage: RenderStage; progress: number }) => void;
 }
 
@@ -189,14 +198,17 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
   // leaves smoothing at its enabled default; mirror that here.
   outCtx.imageSmoothingEnabled = true;
 
-  // Chunk window (output seconds). Whole-video render leaves these at the full span.
-  const chunkStartSec = opts.chunk ? Math.max(0, opts.chunk.startSec) : 0;
+  // Chunk render window (OUTPUT seconds). The decoder seeks to the SOURCE time the
+  // chunk's first RENDERED output frame samples (mapped via the timeline map) so
+  // cuts + speed work — NOT just linear. Whole-video render seeks to 0.
+  const renderStartSec = opts.chunk ? Math.max(0, opts.chunk.renderStartSec) : 0;
+  const seekSourceTime = opts.chunk ? sourceTimeForOutput(timelineMap, renderStartSec) : 0;
   const decoder = spawnDecoder(
     opts.sourcePath,
     fps,
     sourceWidth,
     sourceHeight,
-    opts.chunk ? chunkStartSec : undefined
+    opts.chunk ? seekSourceTime : undefined
   );
 
   // Choose how to source audio. Cuts/speed remap the timeline, so the audio has
@@ -207,20 +219,31 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
   const hasSpeed = recipe.moments.some((m) => m.effectType === "speed-up");
   const hasCuts = timelineMap.totalRemoved > 0;
 
-  // ── Chunked render guard ───────────────────────────────────────────────────
-  // A chunk renders a sub-window of OUTPUT time. That only stays correct on a
-  // LINEAR timeline (output time == source time) — a single input-seek then lands
-  // on the chunk's first frame AND its audio window. With cuts/speed the mapping
-  // is non-linear, so windowing audio per chunk would desync. Refuse loudly so the
-  // C# orchestrator falls back to a single whole-video render for this job.
-  if (opts.chunk && (hasSpeed || hasCuts)) {
-    throw new Error(
-      "chunk_unsupported_timeline: cannot chunk a render with cuts or speed changes"
-    );
+  // ── Chunk backstop (fail-closed) ────────────────────────────────────────────
+  // Cuts + speed ARE chunkable: each output frame is mapped to source time via the
+  // timeline map, so a chunk renders the correct edited window. The ONLY thing a
+  // chunk can't reproduce is an effect TYPE outside the allowlist (e.g. a future
+  // transition that reads neighbor frames). The app's eligibility gate
+  // (chunk-plan.ts) already refuses those; this mirrors that allowlist so a stale/
+  // buggy caller can never slip an unsupported effect into a chunk task.
+  if (opts.chunk) {
+    const supported = new Set<string>(SUPPORTED_CHUNK_EFFECT_TYPES);
+    const unsupported = [
+      ...new Set(recipe.moments.map((m) => m.effectType as string)),
+    ].filter((t) => !supported.has(t));
+    if (unsupported.length > 0) {
+      throw new Error(
+        `chunk_unsupported_effects: timeline has effect types the chunk renderer can't reproduce: ${unsupported.join(", ")}`
+      );
+    }
   }
 
+  // Audio source. Chunks are ALWAYS silent — final audio is composed once over the
+  // WHOLE timeline after the video chunks are concatenated (CLI `audiomux`). For a
+  // whole-video render: no cuts/speed → map the source audio straight through
+  // ("direct"); otherwise rebuild it from the timeline segments ("filter").
   let audio: EncoderAudio;
-  if (!hasAudio) {
+  if (opts.chunk || !hasAudio) {
     audio = { kind: "none" };
   } else if (!hasSpeed && !hasCuts) {
     audio = { kind: "direct" };
@@ -235,6 +258,7 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
   console.info("[worker:audio]", {
     hasAudio,
     mode: audio.kind,
+    chunked: !!opts.chunk,
     hasSpeed,
     hasCuts,
     segments: timelineMap.segments.length,
@@ -242,12 +266,24 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
   });
 
   const totalFrames = Math.max(1, Math.round(outputDuration * fps));
-  // Frame window for this render: whole video, or just the chunk's output span.
-  const startFrame = opts.chunk ? Math.min(totalFrames, Math.round(chunkStartSec * fps)) : 0;
-  const endFrame = opts.chunk
-    ? Math.min(totalFrames, Math.round(opts.chunk.endSec * fps))
+  // Two windows (integer OUTPUT frames so chunks tile exactly at the seams):
+  //   RENDER window — frames we decode/composite, incl. boundary-padding warm-up.
+  //   TRIM (emit) window — frames we actually WRITE to the encoder.
+  // Without a chunk both are the full span [0, totalFrames).
+  const renderStartFrame = opts.chunk
+    ? Math.min(totalFrames, Math.max(0, Math.round(renderStartSec * fps)))
+    : 0;
+  const renderEndFrame = opts.chunk
+    ? Math.min(totalFrames, Math.round(opts.chunk.renderEndSec * fps))
     : totalFrames;
-  const windowFrames = Math.max(1, endFrame - startFrame);
+  const trimStartFrame = opts.chunk
+    ? Math.min(totalFrames, Math.max(0, Math.round(opts.chunk.trimStartSec * fps)))
+    : 0;
+  const trimEndFrame = opts.chunk
+    ? Math.min(totalFrames, Math.round(opts.chunk.trimEndSec * fps))
+    : totalFrames;
+  const renderWindowFrames = Math.max(1, renderEndFrame - renderStartFrame);
+  const emittedFrames = Math.max(1, trimEndFrame - trimStartFrame);
 
   const encoder = await spawnEncoder({
     width: canvasW,
@@ -255,21 +291,19 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
     fps,
     outputPath: opts.outputPath,
     sourcePath: opts.sourcePath,
+    // Chunks are silent (audio is muxed globally after concat) ⇒ no audioWindow.
     audio,
     crf: opts.crf,
     preset: opts.preset,
-    // Direct audio + a chunk window ⇒ seek the source audio to the chunk so it
-    // aligns with the stdin video (which starts at PTS 0).
-    ...(opts.chunk && audio.kind === "direct"
-      ? { audioWindow: { startSec: chunkStartSec, durSec: opts.chunk.endSec - chunkStartSec } }
-      : {}),
   });
 
   const frameBytes = sourceWidth * sourceHeight * 4;
 
-  // The decoder was input-seeked to the chunk start, so its FIRST emitted frame
-  // is the chunk's first output frame (== index startFrame on a linear timeline).
-  let decodedIndex = startFrame - 1;
+  // The decoder was accurately input-seeked to `seekSourceTime`, so its FIRST
+  // emitted frame is the SOURCE frame at that time. Seed the absolute source-frame
+  // counter to one before it; frameForSourceTime advances it forward (forward-only,
+  // valid because source time is monotonic in output time across the timeline).
+  let decodedIndex = Math.round(seekSourceTime * fps) - 1;
   let currentFrame: Buffer | null = null;
   let eof = false;
 
@@ -307,6 +341,7 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
   opts.signal.addEventListener("abort", onAbort);
 
   let lastPct = -1;
+  let wroteFirstFrame = false;
   const renderStartMs = Date.now();
   // Recent RSS samples (one per heartbeat) for the linear-growth tripwire.
   const rssSamples: number[] = [];
@@ -318,18 +353,26 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
       fps,
       totalFrames,
       audio: audio.kind,
+      chunked: !!opts.chunk,
+      ...(opts.chunk
+        ? {
+            renderWindow: [renderStartFrame, renderEndFrame],
+            trimWindow: [trimStartFrame, trimEndFrame],
+            seekSourceTime: Number(seekSourceTime.toFixed(3)),
+          }
+        : {}),
     });
     // Nudge the UI off 0% while the first frame decodes (it can take a moment on
     // a big GOP) — without this the bar looks frozen between "downloading" and
     // the first rendered frame.
     opts.onProgress({ stage: "decoding", progress: 0.01 });
     armWatchdog();
-    for (let i = startFrame; i < endFrame; i++) {
+    for (let i = renderStartFrame; i < renderEndFrame; i++) {
       if (opts.signal.aborted) throw new CanceledError();
 
       // Progress is reported RELATIVE to this render's window (0..95), so a chunk
       // reads 0→95% over its own frames (the orchestrator scales it across chunks).
-      const pct = Math.floor(((i - startFrame) / windowFrames) * 95);
+      const pct = Math.floor(((i - renderStartFrame) / renderWindowFrames) * 95);
       if (pct !== lastPct) {
         lastPct = pct;
         opts.onProgress({ stage: "rendering", progress: pct / 100 });
@@ -380,7 +423,7 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
       const outputTime = i / fps;
       const sourceTime = sourceTimeForOutput(timelineMap, outputTime);
       const frame = await frameForSourceTime(sourceTime);
-      if (i === 0) {
+      if (i === renderStartFrame) {
         console.info("[worker:first-decoded-frame]", {
           afterMs: Date.now() - renderStartMs,
           decodedToIndex: decodedIndex,
@@ -407,20 +450,28 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
         recipe,
         sourceTime
       );
-      if (i === 0) {
+      if (i === renderStartFrame) {
         console.info("[worker:first-composed-frame]", { afterMs: Date.now() - renderStartMs });
       }
 
-      // Read the composited frame via canvas.data() (a fresh, owned RGBA copy) —
-      // NOT getImageData. @napi-rs/canvas's getImageData leaks ~one frame of
-      // native (skia) memory PER CALL, invisible to V8/GC, which OOM-kills a long
-      // render (~8 MB/frame at 1080p). canvas.data() returns the SAME RGBA bytes
-      // with no such leak (verified) and is GC-tracked, so it streams cleanly.
-      const composited = outCanvas.data();
-      await encoder.writeFrame(composited);
-      if (i === 0) {
-        // First frame accepted by the encoder — the pipeline is flowing.
-        console.info("[worker:first-frame]", { afterMs: Date.now() - renderStartMs });
+      // EMIT only the trim window. Pad frames (outside [trimStartFrame, trimEndFrame))
+      // are composited for temporal warm-up but MUST NOT reach the encoder — the
+      // chunk's first WRITTEN frame must be `trimStartFrame` so libx264 makes it an
+      // IDR and the chunks concat losslessly. With padding 0 every rendered frame
+      // is emitted.
+      if (i >= trimStartFrame && i < trimEndFrame) {
+        // Read the composited frame via canvas.data() (a fresh, owned RGBA copy) —
+        // NOT getImageData. @napi-rs/canvas's getImageData leaks ~one frame of
+        // native (skia) memory PER CALL, invisible to V8/GC, which OOM-kills a long
+        // render (~8 MB/frame at 1080p). canvas.data() returns the SAME RGBA bytes
+        // with no such leak (verified) and is GC-tracked, so it streams cleanly.
+        const composited = outCanvas.data();
+        await encoder.writeFrame(composited);
+        if (!wroteFirstFrame) {
+          // First frame accepted by the encoder — the pipeline is flowing.
+          wroteFirstFrame = true;
+          console.info("[worker:first-frame]", { afterMs: Date.now() - renderStartMs });
+        }
       }
       armWatchdog(); // progress was made — reset the stall timer
     }
@@ -433,6 +484,7 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
       outputHeight: canvasH,
       fps,
       frames: totalFrames,
+      ...(opts.chunk ? { emittedFrames, renderedFrames: renderWindowFrames } : {}),
       elapsedMs: Date.now() - renderStartMs,
       warnings: warnings.length,
     });

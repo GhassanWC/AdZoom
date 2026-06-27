@@ -167,7 +167,8 @@ public sealed class JobPipeline(
             // (retried per-chunk) and concat. On success it uploads + settles and
             // RETURNS, so the monolithic block below stays the untouched default
             // path. It FALLS BACK to that block when chunking can't apply (too
-            // short, or the timeline has cuts/speed → chunk_unsupported_timeline).
+            // short, or the timeline uses a chunk-incompatible effect type →
+            // chunk_unsupported_effects). Cuts + speed ARE chunkable (timeline-aware).
             // NOTE: the NEW parallel chunked path runs via ChunkTaskRunner (one task
             // per chunk), NOT here. This legacy in-container SEQUENTIAL chunking only
             // engages for a non-chunked-task job that explicitly opts in via
@@ -292,11 +293,12 @@ public sealed class JobPipeline(
     private enum ChunkOutcome { Done, Failed, Canceled, FallBack }
 
     /// <summary>
-    /// Render a long video as independent OUTPUT-time chunks, retry each chunk on
-    /// failure, concat into the final MP4, then upload + settle. Returns FallBack
-    /// (doing nothing) when chunking can't apply — too few chunks, or the first
-    /// chunk reports `chunk_unsupported_timeline` (cuts/speed) — so the caller runs
-    /// the normal whole-video render instead. Done/Failed/Canceled are fully
+    /// Render a long video as independent OUTPUT-time chunks (timeline-aware: each
+    /// chunk maps output→source time, so cuts/speed are chunkable), retry each on
+    /// failure, concat the SILENT chunks, mux global audio (audiomux), then upload +
+    /// settle. Returns FallBack (doing nothing) when chunking can't apply — too few
+    /// chunks, or the first chunk reports `chunk_unsupported_effects` — so the caller
+    /// runs the normal whole-video render instead. Done/Failed/Canceled are fully
     /// finalized here (status + ledger written), mirroring the monolithic path.
     /// </summary>
     private async Task<ChunkOutcome> RunChunkedAsync(
@@ -308,6 +310,9 @@ public sealed class JobPipeline(
         var chunkLen = Math.Max(1, opts.ChunkSeconds);
         var chunkCount = (int)Math.Ceiling(durationSeconds / chunkLen);
         if (chunkCount <= 1) return ChunkOutcome.FallBack; // nothing to gain — render whole
+        double fps = 30;
+        if (recipe.TryGetValue("fps", out var fpsObj))
+            fps = fpsObj switch { double d => d, long l => l, int n => n, _ => 30 };
 
         var normalizedPath = Path.Combine(workDir, "normalized-source.mp4");
         var chunkFiles = new List<string>();
@@ -320,8 +325,8 @@ public sealed class JobPipeline(
 
         for (var i = 0; i < chunkCount; i++)
         {
-            var startSec = i * chunkLen;
-            var endSec = Math.Min((i + 1) * chunkLen, durationSeconds);
+            var win = ChunkWindows.Derive(
+                i, chunkCount, chunkLen, fps, durationSeconds, opts.ChunkBoundaryPaddingSeconds);
             var chunkOut = Path.Combine(workDir, $"chunk_{i:D3}.mp4");
             var first = i == 0;
 
@@ -349,7 +354,14 @@ public sealed class JobPipeline(
                 // Normalize ONCE (chunk 0) → normalized-source.mp4; later chunks
                 // render straight from it (skip the expensive re-transcode).
                 ["normalizeEnabled"] = first && opts.NormalizeEnabled,
-                ["chunk"] = new Dictionary<string, object?> { ["startSec"] = startSec, ["endSec"] = endSec },
+                // Timeline-aware OUTPUT window (silent — global audio added at audiomux).
+                ["chunk"] = new Dictionary<string, object?>
+                {
+                    ["renderStartSec"] = win.RenderStartSec,
+                    ["renderEndSec"] = win.RenderEndSec,
+                    ["trimStartSec"] = win.TrimStartSec,
+                    ["trimEndSec"] = win.TrimEndSec,
+                },
             };
 
             var lastOverallPct = -1;
@@ -400,9 +412,9 @@ public sealed class JobPipeline(
                     return ChunkOutcome.Canceled;
                 }
                 // First chunk says this timeline can't be chunked → abandon chunking.
-                if (first && outcome.Error?.Code == "chunk_unsupported_timeline")
+                if (first && outcome.Error?.Code == "chunk_unsupported_effects")
                 {
-                    log.LogInformation("[{Tag}:chunk-unsupported] job={JobId} — timeline has cuts/speed", opts.WorkerTag, jobId);
+                    log.LogInformation("[{Tag}:chunk-unsupported] job={JobId} — timeline uses a chunk-incompatible effect", opts.WorkerTag, jobId);
                     return ChunkOutcome.FallBack;
                 }
                 if (outcome.ExitCode == 0 && outcome.Done is not null) { ok = true; break; }
@@ -464,6 +476,38 @@ public sealed class JobPipeline(
             log.LogError("[{Tag}:failed] job={JobId} code={Code} (merge)", opts.WorkerTag, jobId, code);
             return ChunkOutcome.Failed;
         }
+
+        // ── Global audio pass ─────────────────────────────────────────────────
+        // The chunks are SILENT (audio is composed once, globally). Mux final audio
+        // over the WHOLE timeline into the concatenated video (reusing chunk 0's
+        // normalized source). The audiomux CLI validates duration + audio presence.
+        var silentVideo = outFile;
+        var finalFile = Path.Combine(workDir, jobId + "-final.mp4");
+        var reuseNorm = opts.NormalizeEnabled && File.Exists(normalizedPath);
+        var audioSpec = new Dictionary<string, object?>
+        {
+            ["mode"] = "audiomux",
+            ["videoPath"] = silentVideo,
+            ["sourcePath"] = reuseNorm ? normalizedPath : srcFile,
+            ["outputPath"] = finalFile,
+            ["serializedRecipe"] = recipe,
+            ["normalizeEnabled"] = reuseNorm ? false : opts.NormalizeEnabled,
+            ["normalizeCrf"] = opts.NormalizeCrf,
+            ["normalizePreset"] = opts.NormalizePreset,
+        };
+        var mux = await render.RunAsync(jobId, audioSpec, workDir, _ => { }, cancelCts.Token, specName: "spec-audiomux.json");
+        if (cancelCts.IsCancellationRequested || mux.Canceled || mux.ExitCode == 2)
+            return ChunkOutcome.Canceled;
+        if (mux.ExitCode != 0 || mux.Done is null)
+        {
+            await fs.FailAndReleaseAsync(uid, jobId, month, estimate, mux.Error?.Code ?? "audiomux_failed",
+                "Couldn't assemble the exported video. Please try again.");
+            log.LogError("[{Tag}:failed] job={JobId} code={Code} (audiomux)", opts.WorkerTag, jobId, mux.Error?.Code ?? "audiomux_failed");
+            return ChunkOutcome.Failed;
+        }
+        if (mux.Done.Warnings is { Length: > 0 } mw)
+            foreach (var w in mw) if (!warnings.Contains(w)) warnings.Add(w);
+        outFile = finalFile; // upload the muxed final, not the silent concat
 
         // ── Upload + settle ──────────────────────────────────────────────────
         await fs.PatchAsync(uid, jobId, new() { [JobFields.Stage] = "uploading", ["progressStage"] = "uploading", [JobFields.Progress] = 0.98 });

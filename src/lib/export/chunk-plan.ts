@@ -3,41 +3,80 @@
  * a cloud export renders as the proven single-worker job ("single") or as N
  * parallel chunk tasks inside one Batch job ("chunked"), and with what shape.
  *
- * Pure + dependency-free on purpose: no `@/` runtime imports, no `server-only`, so
+ * Pure + dependency-free on purpose: no `@/` RUNTIME imports, no `server-only`, so
  * it unit-tests cleanly under `node --test` (type-only imports are stripped). The
- * caller (create-job.ts) passes plain primitives; this module owns the gates +
- * arithmetic so the app NEVER asks the worker for something it will reject.
+ * caller (create-job.ts) passes a plain timeline summary + primitives; this module
+ * owns the gates + arithmetic so the app NEVER asks the worker for something it
+ * will reject.
  *
  * Chunking is gated OFF by default (ship dark): it engages only when
  * EXPORT_CHUNKED_RENDER is "1"/"true". EXPORT_CHUNKED_RENDER=0 (or unset) is the
- * emergency kill switch → every export uses the single path.
+ * emergency kill switch → every export uses the single path. (Distinct from
+ * EXPORT_RENDER_MODE, which selects the RUNTIME path per Batch task.)
+ *
+ * Timeline-aware: chunks are sliced by OUTPUT time (post cuts/speed) and the
+ * render core maps each output frame back to source time via the recipe's
+ * timeline map, so cuts + speed are chunkable. Only effect TYPES not in
+ * {@link SUPPORTED_CHUNK_EFFECT_TYPES} force a single render (fail-closed).
  */
+import type { DetectedMoment } from "@/lib/firebase/schema";
 
 export type RenderMode = "single" | "chunked";
+
+/**
+ * Moment effect types the chunked renderer can reproduce deterministically per
+ * OUTPUT frame (each is a pure function of source-time inside composeFrame, and
+ * cuts/speed are handled by the recipe timeline map). Any effect type NOT in this
+ * allowlist forces a single render — fail-closed, so a FUTURE stateful effect
+ * (e.g. a transition that reads neighbor frames, or look-ahead motion blur) must
+ * be explicitly vetted + added here before it can be chunked. Mirrored as a
+ * backstop in the worker (services/export-worker/src/render.ts) so the app gate
+ * and the CLI can never diverge.
+ */
+export const SUPPORTED_CHUNK_EFFECT_TYPES = [
+  "zoom",
+  "click-highlight",
+  "cursor-focus",
+  "speed-up",
+  "cut",
+  "crop",
+] as const;
+
+/** Timeline classification used for the chunk gate + diagnostics. */
+export interface ChunkTimelineSummary {
+  /** Any ACTIVE cut removes output time (restored cuts don't count). */
+  hasCuts: boolean;
+  /** Any speed-up moment (type based — multiplier-agnostic, so audioMode is kept). */
+  hasSpeed: boolean;
+  /** Background music present (no schema yet → always false; wired when it lands). */
+  hasMusic: boolean;
+  /** Any moment carries a camera keyframe path (animated zoom/pan). */
+  hasAnimations: boolean;
+  /** Distinct moment effect types NOT in the allowlist. Non-empty → single render. */
+  unsupportedEffects: string[];
+}
 
 export interface ChunkPlan {
   renderMode: RenderMode;
   /** Number of parallel chunk tasks (>=2 when chunked; 1 when single). */
   chunkCount: number;
-  /** Output seconds per chunk; the worker derives window [i*chunkSeconds, …]. */
+  /** Output seconds per chunk; the worker derives windows via chunk-window.ts. */
   chunkSeconds: number;
   /** Max chunks rendering at once (plan-capped); 1 when single. */
   chunkParallelism: number;
-  /** Why single was chosen (diagnostics/logs only). */
+  /** Why single was chosen (diagnostics/logs only); "eligible" when chunked. */
   reason: string;
 }
 
 export interface ChunkPlanInput {
-  /** OUTPUT duration in seconds (post cuts/speed). For linear timelines == source. */
+  /** OUTPUT duration in seconds (post cuts/speed). */
   outputDurationSeconds: number;
   /** Export container; only "mp4" is chunk-eligible. */
   format: string;
-  /** True iff the timeline is LINEAR: no active cuts AND no speed sections. The
-   *  render CLI hard-refuses cuts/speed (chunk_unsupported_timeline), so this
-   *  MUST mirror that condition (totalRemoved===0 && every segment speed===1). */
-  linear: boolean;
   /** Plan tier — only pro/creator reach cloud export; sets the parallelism cap. */
   plan: "free" | "pro" | "creator";
+  /** Timeline classification — gates on `unsupportedEffects` (fail-closed). */
+  timeline: ChunkTimelineSummary;
   /** process.env (or a test override). */
   env?: Record<string, string | undefined>;
 }
@@ -45,6 +84,41 @@ export interface ChunkPlanInput {
 function intEnv(env: Record<string, string | undefined>, key: string, fallback: number): number {
   const n = Number.parseInt(env[key] ?? "", 10);
   return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+/**
+ * Classify a timeline for chunking from its moments. Cuts + speed are chunkable
+ * (handled by the timeline map), so they only set diagnostic flags — they do NOT
+ * land in `unsupportedEffects`. Only an effect type outside the allowlist does.
+ */
+export function summarizeTimelineForChunking(
+  moments:
+    | ReadonlyArray<Pick<DetectedMoment, "effectType" | "cut" | "keyframes">>
+    | null
+    | undefined
+): ChunkTimelineSummary {
+  const list = moments ?? [];
+  const supported = new Set<string>(SUPPORTED_CHUNK_EFFECT_TYPES);
+  let hasCuts = false;
+  let hasSpeed = false;
+  let hasAnimations = false;
+  const unsupported = new Set<string>();
+  for (const m of list) {
+    const t = m.effectType as string;
+    if (t === "speed-up") hasSpeed = true;
+    // Restored cuts (active:false) don't remove time; the `cut` TYPE is supported
+    // either way (it never lands in unsupportedEffects).
+    if (t === "cut" && m.cut?.active !== false) hasCuts = true;
+    if (m.keyframes && m.keyframes.length > 0) hasAnimations = true;
+    if (!supported.has(t)) unsupported.add(t);
+  }
+  return {
+    hasCuts,
+    hasSpeed,
+    hasMusic: false, // no music schema yet — set here when audio tracks land
+    hasAnimations,
+    unsupportedEffects: [...unsupported].sort(),
+  };
 }
 
 /** EXPORT_CHUNKED_RENDER is the kill switch: chunking is OFF unless explicitly "1"/"true". */
@@ -59,15 +133,18 @@ function single(reason: string): ChunkPlan {
 
 /**
  * Decide single vs chunked and compute the chunk shape. Chunked requires ALL of:
- * kill switch ON, MP4, output >= EXPORT_CHUNK_MIN_VIDEO_SECONDS, a LINEAR timeline,
- * and a paid plan. Otherwise returns the proven single path with a `reason`.
+ * kill switch ON, MP4, a paid plan, NO unsupported effect types, output >=
+ * EXPORT_CHUNK_MIN_VIDEO_SECONDS, and >= 2 chunks. Cuts + speed are chunkable
+ * (the render core maps output→source time). Otherwise returns the proven single
+ * path with a `reason`.
  */
 export function planChunking(input: ChunkPlanInput): ChunkPlan {
   const env = input.env ?? {};
   if (!chunkingEnabled(env)) return single("kill_switch_off");
   if (input.format !== "mp4") return single("not_mp4");
   if (input.plan !== "pro" && input.plan !== "creator") return single("plan_no_cloud");
-  if (!input.linear) return single("nonlinear_timeline"); // cuts/speed → CLI can't chunk
+  // Fail-closed: any effect type the chunk renderer can't reproduce → single.
+  if (input.timeline.unsupportedEffects.length > 0) return single("unsupported_effects");
   const dur = input.outputDurationSeconds;
   if (!(Number.isFinite(dur) && dur > 0)) return single("invalid_duration");
 
@@ -95,4 +172,29 @@ export function planChunking(input: ChunkPlanInput): ChunkPlan {
   const chunkParallelism = Math.max(1, Math.min(maxParallel, chunkCount));
 
   return { renderMode: "chunked", chunkCount, chunkSeconds, chunkParallelism, reason: "eligible" };
+}
+
+/**
+ * The structured eligibility log — one flat object covering the decision + every
+ * input flag, so logs explain WHY a job chunked or fell back. Emitted by
+ * create-job.ts at decision time.
+ */
+export function chunkEligibilityLog(
+  input: ChunkPlanInput,
+  plan: ChunkPlan,
+  extra: { sourceDurationSeconds?: number } = {}
+): Record<string, unknown> {
+  return {
+    renderMode: plan.renderMode,
+    reason: plan.reason,
+    outputDurationSeconds: input.outputDurationSeconds,
+    sourceDurationSeconds: extra.sourceDurationSeconds ?? null,
+    hasCuts: input.timeline.hasCuts,
+    hasSpeed: input.timeline.hasSpeed,
+    hasMusic: input.timeline.hasMusic,
+    hasAnimations: input.timeline.hasAnimations,
+    unsupportedEffects: input.timeline.unsupportedEffects,
+    chunkCount: plan.chunkCount,
+    parallelism: plan.chunkParallelism,
+  };
 }

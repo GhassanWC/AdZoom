@@ -42,15 +42,29 @@ public sealed class MergeStep(
         var durationSeconds = Dbl(snap, "durationSeconds");
         var chunkCount = (int)Long(snap, JobFields.ChunkCount);
         if (chunkCount <= 0) chunkCount = Math.Max(1, opts.ChunkCount);
+        var sourceStoragePath = Str(snap, JobFields.SourceStoragePath) ?? "";
+        Dictionary<string, object> recipe;
+        try
+        {
+            recipe = snap.ContainsField("renderRecipe")
+                ? snap.GetValue<Dictionary<string, object>>("renderRecipe")
+                : new Dictionary<string, object>();
+        }
+        catch { recipe = new Dictionary<string, object>(); }
 
         var workDir = Path.Combine(opts.WorkDir, jobId, "merge");
         Directory.CreateDirectory(workDir);
+        // The chunks concat into a SILENT video; the global audio pass (audiomux)
+        // then muxes final audio into it to produce the final file.
+        var mergedVideoFile = Path.Combine(workDir, jobId + "-video.mp4");
         var outFile = Path.Combine(workDir, jobId + ".mp4");
 
         try
         {
-            // Confirm every chunk is present (markers + objects) and learn whether the
-            // source had audio (per-chunk audio was already verified by the render CLI).
+            // Confirm every chunk is present (markers + objects). Chunks are SILENT now
+            // (audio is composed globally in audiomux below); this per-chunk
+            // sourceHasAudio marker is only a FALLBACK for the preflight summary if the
+            // audiomux audio-verify event is missed.
             var markers = await fs.GetChunkMarkersAsync(uid, jobId);
             var sourceHasAudio = markers.Values.Any(m =>
                 m.ContainsField("sourceHasAudio") && m.GetValue<bool>("sourceHasAudio"));
@@ -69,12 +83,13 @@ public sealed class MergeStep(
                 inputs.Add(local);
             }
 
+            // ── 1. Concat the SILENT video chunks (lossless stream-copy). ────────
             BatchLog.Line($"merging {inputs.Count} chunks job={jobId}");
             var concatSpec = new Dictionary<string, object?>
             {
                 ["mode"] = "concat",
                 ["inputs"] = inputs,
-                ["outputPath"] = outFile,
+                ["outputPath"] = mergedVideoFile,
             };
             var concat = await render.RunAsync(jobId, concatSpec, workDir, _ => { }, ct, specName: "spec-concat.json");
             if (ct.IsCancellationRequested || concat.Canceled || concat.ExitCode == 2)
@@ -84,11 +99,66 @@ public sealed class MergeStep(
             }
             if (concat.ExitCode != 0 || concat.Done is null)
                 return await FailMerge(uid, jobId, $"concat failed: {concat.Error?.Code ?? "concat_failed"}");
+            if (!File.Exists(mergedVideoFile) || new FileInfo(mergedVideoFile).Length == 0)
+                return await FailMerge(uid, jobId, "merged video missing/empty");
 
-            // Validate: final exists + non-zero. (Duration == sum of exact chunk
-            // windows by construction; per-chunk audio already verified by the CLI.)
-            if (!File.Exists(outFile) || new FileInfo(outFile).Length == 0)
-                return await FailMerge(uid, jobId, "merged file missing/empty");
+            // ── 2. Acquire the audio source for the GLOBAL audio pass. Prefer the
+            //       normalized source persisted by chunk task 0 (no re-transcode,
+            //       bit-identical audio). Fallback: the original source (audiomux
+            //       re-normalizes it). ───────────────────────────────────────────
+            var normObjectPath = $"users/{uid}/projects/{projectId}/exports/{jobId}/normalized-source.mp4";
+            var audioSourceFile = Path.Combine(workDir, "normalized-source.mp4");
+            var reuseNormalized = false;
+            try
+            {
+                await storage.DownloadAsync(normObjectPath, audioSourceFile, ct);
+                reuseNormalized = File.Exists(audioSourceFile) && new FileInfo(audioSourceFile).Length > 0;
+            }
+            catch { reuseNormalized = false; }
+            if (!reuseNormalized)
+            {
+                var srcExt = Path.GetExtension(sourceStoragePath);
+                if (string.IsNullOrEmpty(srcExt)) srcExt = ".mp4";
+                audioSourceFile = Path.Combine(workDir, "source" + srcExt);
+                await storage.DownloadAsync(sourceStoragePath, audioSourceFile, ct);
+            }
+            BatchLog.Line($"audiomux job={jobId} reuseNormalized={reuseNormalized}");
+
+            // ── 3. Compose final audio over the WHOLE timeline + mux into the video
+            //       (video stream-copied). The CLI validates duration ≈ expected and
+            //       audio-present-if-expected BEFORE we upload. ────────────────────
+            var sourceHasAudioFinal = false;
+            void OnMuxEvent(RenderEvent ev)
+            {
+                if (ev.Type == "audio-verify" && ev.SourceHasAudio is { } sa) sourceHasAudioFinal = sa;
+            }
+            var audioSpec = new Dictionary<string, object?>
+            {
+                ["mode"] = "audiomux",
+                ["videoPath"] = mergedVideoFile,
+                ["sourcePath"] = audioSourceFile,
+                ["outputPath"] = outFile,
+                ["serializedRecipe"] = recipe,
+                // Reused normalized source ⇒ skip re-normalize; fallback ⇒ normalize.
+                ["normalizeEnabled"] = reuseNormalized ? false : opts.NormalizeEnabled,
+                ["normalizeCrf"] = opts.NormalizeCrf,
+                ["normalizePreset"] = opts.NormalizePreset,
+            };
+            var mux = await render.RunAsync(jobId, audioSpec, workDir, OnMuxEvent, ct, specName: "spec-audiomux.json");
+            if (ct.IsCancellationRequested || mux.Canceled || mux.ExitCode == 2)
+            {
+                BatchLog.Line($"merge canceled (audiomux) job={jobId}");
+                return 0;
+            }
+            if (mux.ExitCode != 0 || mux.Done is null)
+                return await FailMerge(uid, jobId, $"audiomux failed: {mux.Error?.Code ?? "audiomux_failed"}");
+
+            // ── 4. Validate the final file (CLI already checked duration/audio). ──
+            if (!File.Exists(outFile) || new FileInfo(outFile).Length <= 0)
+                return await FailMerge(uid, jobId, "final file missing/empty");
+            // sourceHasAudio prefers the audiomux audio-verify; chunk markers are a
+            // fallback (e.g. if the event was missed).
+            var sourceHasAudio2 = sourceHasAudioFinal || sourceHasAudio;
 
             BatchLog.Line($"uploading final MP4 job={jobId} → {outputPath}");
             var downloadUrl = await storage.UploadMp4Async(outFile, outputPath, ct);
@@ -96,12 +166,12 @@ public sealed class MergeStep(
             var preflight = new Dictionary<string, object?>
             {
                 ["videoCodec"] = "h264",
-                ["audioCodec"] = sourceHasAudio ? "aac" : "(none)",
+                ["audioCodec"] = sourceHasAudio2 ? "aac" : "(none)",
                 ["risky"] = false,
                 ["normalized"] = true,
-                ["audioStatus"] = sourceHasAudio ? "preserved" : "none",
+                ["audioStatus"] = sourceHasAudio2 ? "preserved" : "none",
             };
-            var warnings = concat.Done.Warnings?.Distinct().ToList() ?? new List<string>();
+            var warnings = mux.Done.Warnings?.Distinct().ToList() ?? new List<string>();
             var settled = await fs.SettleSuccessAsync(uid, jobId, month, estimate, downloadUrl, warnings, preflight);
 
             var mergeSeconds = (int)(DateTime.UtcNow - mergeStart).TotalSeconds;
@@ -131,12 +201,13 @@ public sealed class MergeStep(
                 BatchLog.Line($"merge: job already finalized (skipped settle) job={jobId}");
             }
 
-            // Best-effort cleanup of intermediate chunk objects (keep markers for diagnostics).
+            // Best-effort cleanup of intermediate objects (keep markers for diagnostics).
             for (var i = 0; i < chunkCount; i++)
             {
                 var objectPath = $"users/{uid}/projects/{projectId}/exports/{jobId}/chunks/chunk-{i}.mp4";
                 await storage.DeleteAsync(objectPath, CancellationToken.None);
             }
+            await storage.DeleteAsync(normObjectPath, CancellationToken.None);
             return 0;
         }
         catch (OperationCanceledException)

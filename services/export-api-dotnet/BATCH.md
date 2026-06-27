@@ -184,10 +184,15 @@ createCloudExportJob: planChunking() decides single vs chunked (renderMode on th
 ```
 
 **Eligibility (app-side, `chunk-plan.ts`):** kill switch ON, MP4, output ≥
-`EXPORT_CHUNK_MIN_VIDEO_SECONDS` (360s), a **LINEAR** timeline (no cuts/speed — the
-render CLI throws `chunk_unsupported_timeline` otherwise), valid metadata. Anything
-ineligible → the proven single path. `chunkCount = clamp(ceil(dur/EXPORT_CHUNK_SECONDS),
-2, EXPORT_CHUNK_MAX_TOTAL_CHUNKS)`; parallelism = Pro 2 / Creator 4 (capped at count).
+`EXPORT_CHUNK_MIN_VIDEO_SECONDS` (360s), and NO unsupported effect TYPES (fail-closed
+allowlist: `zoom, click-highlight, cursor-focus, speed-up, cut, crop`). **Timeline-aware:
+cuts + speed ARE chunkable** — chunks are sliced by OUTPUT time and the render core maps
+each output frame to source time via the recipe timeline map; only an effect type the
+chunk renderer can't reproduce (→ `chunk_unsupported_effects`) forces the single path.
+Each chunk renders SILENT; final audio is composed once over the whole timeline and muxed
+in by the merge leader (`audiomux`: video `-c copy`, audio direct/filter, `-shortest`).
+`chunkCount = clamp(ceil(dur/EXPORT_CHUNK_SECONDS), 2, EXPORT_CHUNK_MAX_TOTAL_CHUNKS)`;
+parallelism = Pro 2 / Creator 4 (capped at count).
 
 **Kill switch / rollout:** ship with `EXPORT_CHUNKED_RENDER` unset/`0` (single only).
 Set `EXPORT_CHUNKED_RENDER=1` on the **Next.js** runtime to enable; the submitter

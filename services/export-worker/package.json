@@ -11,7 +11,8 @@
     "build": "node esbuild.mjs && node esbuild.cli.mjs",
     "build:cli": "node esbuild.cli.mjs",
     "typecheck": "tsc --noEmit",
-    "test:e2e": "tsx --tsconfig tsconfig.json test/e2e.ts"
+    "test:e2e": "tsx --tsconfig tsconfig.json test/e2e.ts",
+    "test:chunk-parity": "tsx --tsconfig tsconfig.json test/chunk-parity.ts"
   },
   "dependencies": {
     "@napi-rs/canvas": "^0.1.65",

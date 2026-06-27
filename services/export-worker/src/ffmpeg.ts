@@ -570,13 +570,18 @@ export function spawnDecoder(
   fps: number,
   width: number,
   height: number,
-  /** Chunked render: input-seek to this OUTPUT second before decoding (the chunk
-   *  start). Only used on linear timelines (no cuts/speed), so output time ==
-   *  source time and the seek lands on the chunk's first frame. */
+  /** Chunked render: seek to this SOURCE second before decoding (the source time
+   *  the chunk's first OUTPUT frame samples, derived via the recipe timeline map —
+   *  works for cuts/speed, not just linear). Placed before `-i` (fast seek); when
+   *  TRANSCODING (we decode to rawvideo) modern ffmpeg makes input `-ss` FRAME-
+   *  ACCURATE — it fast-seeks to the keyframe at/before the target, decodes and
+   *  discards to the exact frame, and rebases PTS to ~0 so the `fps` filter grids
+   *  from the seek point. The render loop's decodedIndex must be initialized to
+   *  round(startSec*fps)-1 to match. (Parity test guards seam alignment.) */
   startSec?: number
 ): Decoder {
   const seekArgs =
-    typeof startSec === "number" && startSec > 0 ? ["-ss", String(startSec)] : [];
+    typeof startSec === "number" && startSec > 0 ? ["-ss", startSec.toFixed(6)] : [];
   const child = spawn(
     ffmpegBin(),
     [

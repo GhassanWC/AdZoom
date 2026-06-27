@@ -348,8 +348,11 @@ function buildSmartSignals(visualAnalysis, moments) {
 }
 
 // ../../src/lib/timeline/source-crop.ts
+function clamp2(v, lo, hi) {
+  return Math.max(lo, Math.min(hi, v));
+}
 function clamp01(v) {
-  return Math.max(0, Math.min(1, v));
+  return clamp2(v, 0, 1);
 }
 function resolveSourceRect(videoW, videoH, crop) {
   const W = videoW > 0 ? Math.floor(videoW) : 0;
@@ -1029,6 +1032,16 @@ function drawWatermark(ctx, canvasW, canvasH) {
   ctx.restore();
 }
 
+// ../../src/lib/export/chunk-plan.ts
+var SUPPORTED_CHUNK_EFFECT_TYPES = [
+  "zoom",
+  "click-highlight",
+  "cursor-focus",
+  "speed-up",
+  "cut",
+  "crop"
+];
+
 // src/ffmpeg.ts
 import { spawn } from "node:child_process";
 import { execFile } from "node:child_process";
@@ -1331,7 +1344,7 @@ function makeFrameReader(stream, frameBytes) {
   };
 }
 function spawnDecoder(path, fps, width, height, startSec) {
-  const seekArgs = typeof startSec === "number" && startSec > 0 ? ["-ss", String(startSec)] : [];
+  const seekArgs = typeof startSec === "number" && startSec > 0 ? ["-ss", startSec.toFixed(6)] : [];
   const child = spawn(
     ffmpegBin(),
     [
@@ -1556,7 +1569,7 @@ function atempoChain(mult) {
   parts.push(`atempo=${r.toFixed(6)}`);
   return parts;
 }
-function buildAudioFilterComplex(segments, moments, sampleRate) {
+function buildAudioFilterComplex(segments, moments, sampleRate, opts = {}) {
   if (!segments.length) return null;
   const chains = [];
   const labels = [];
@@ -1583,7 +1596,8 @@ function buildAudioFilterComplex(segments, moments, sampleRate) {
     chains.push(`[1:a]${filters.join(",")}[${out}]`);
     labels.push(`[${out}]`);
   });
-  const concat = `${labels.join("")}concat=n=${labels.length}:v=0:a=1[aout]`;
+  const tail = opts.padToFill ? ",apad" : "";
+  const concat = `${labels.join("")}concat=n=${labels.length}:v=0:a=1${tail}[aout]`;
   return [...chains, concat].join(";");
 }
 
@@ -1701,23 +1715,30 @@ async function renderToMp4(opts) {
   const outCanvas = createCanvas(canvasW, canvasH);
   const outCtx = outCanvas.getContext("2d");
   outCtx.imageSmoothingEnabled = true;
-  const chunkStartSec = opts.chunk ? Math.max(0, opts.chunk.startSec) : 0;
+  const renderStartSec = opts.chunk ? Math.max(0, opts.chunk.renderStartSec) : 0;
+  const seekSourceTime = opts.chunk ? sourceTimeForOutput(timelineMap, renderStartSec) : 0;
   const decoder = spawnDecoder(
     opts.sourcePath,
     fps,
     sourceWidth,
     sourceHeight,
-    opts.chunk ? chunkStartSec : void 0
+    opts.chunk ? seekSourceTime : void 0
   );
   const hasSpeed = recipe.moments.some((m) => m.effectType === "speed-up");
   const hasCuts = timelineMap.totalRemoved > 0;
-  if (opts.chunk && (hasSpeed || hasCuts)) {
-    throw new Error(
-      "chunk_unsupported_timeline: cannot chunk a render with cuts or speed changes"
-    );
+  if (opts.chunk) {
+    const supported = new Set(SUPPORTED_CHUNK_EFFECT_TYPES);
+    const unsupported = [
+      ...new Set(recipe.moments.map((m) => m.effectType))
+    ].filter((t) => !supported.has(t));
+    if (unsupported.length > 0) {
+      throw new Error(
+        `chunk_unsupported_effects: timeline has effect types the chunk renderer can't reproduce: ${unsupported.join(", ")}`
+      );
+    }
   }
   let audio;
-  if (!hasAudio) {
+  if (opts.chunk || !hasAudio) {
     audio = { kind: "none" };
   } else if (!hasSpeed && !hasCuts) {
     audio = { kind: "direct" };
@@ -1732,30 +1753,32 @@ async function renderToMp4(opts) {
   console.info("[worker:audio]", {
     hasAudio,
     mode: audio.kind,
+    chunked: !!opts.chunk,
     hasSpeed,
     hasCuts,
     segments: timelineMap.segments.length,
     sampleRate: info.audioSampleRate
   });
   const totalFrames = Math.max(1, Math.round(outputDuration * fps));
-  const startFrame = opts.chunk ? Math.min(totalFrames, Math.round(chunkStartSec * fps)) : 0;
-  const endFrame = opts.chunk ? Math.min(totalFrames, Math.round(opts.chunk.endSec * fps)) : totalFrames;
-  const windowFrames = Math.max(1, endFrame - startFrame);
+  const renderStartFrame = opts.chunk ? Math.min(totalFrames, Math.max(0, Math.round(renderStartSec * fps))) : 0;
+  const renderEndFrame = opts.chunk ? Math.min(totalFrames, Math.round(opts.chunk.renderEndSec * fps)) : totalFrames;
+  const trimStartFrame = opts.chunk ? Math.min(totalFrames, Math.max(0, Math.round(opts.chunk.trimStartSec * fps))) : 0;
+  const trimEndFrame = opts.chunk ? Math.min(totalFrames, Math.round(opts.chunk.trimEndSec * fps)) : totalFrames;
+  const renderWindowFrames = Math.max(1, renderEndFrame - renderStartFrame);
+  const emittedFrames = Math.max(1, trimEndFrame - trimStartFrame);
   const encoder = await spawnEncoder({
     width: canvasW,
     height: canvasH,
     fps,
     outputPath: opts.outputPath,
     sourcePath: opts.sourcePath,
+    // Chunks are silent (audio is muxed globally after concat) ⇒ no audioWindow.
     audio,
     crf: opts.crf,
-    preset: opts.preset,
-    // Direct audio + a chunk window ⇒ seek the source audio to the chunk so it
-    // aligns with the stdin video (which starts at PTS 0).
-    ...opts.chunk && audio.kind === "direct" ? { audioWindow: { startSec: chunkStartSec, durSec: opts.chunk.endSec - chunkStartSec } } : {}
+    preset: opts.preset
   });
   const frameBytes = sourceWidth * sourceHeight * 4;
-  let decodedIndex = startFrame - 1;
+  let decodedIndex = Math.round(seekSourceTime * fps) - 1;
   let currentFrame = null;
   let eof = false;
   async function frameForSourceTime(sourceTime) {
@@ -1787,6 +1810,7 @@ async function renderToMp4(opts) {
   const onAbort = () => killBoth();
   opts.signal.addEventListener("abort", onAbort);
   let lastPct = -1;
+  let wroteFirstFrame = false;
   const renderStartMs = Date.now();
   const rssSamples = [];
   try {
@@ -1796,13 +1820,19 @@ async function renderToMp4(opts) {
       canvasH,
       fps,
       totalFrames,
-      audio: audio.kind
+      audio: audio.kind,
+      chunked: !!opts.chunk,
+      ...opts.chunk ? {
+        renderWindow: [renderStartFrame, renderEndFrame],
+        trimWindow: [trimStartFrame, trimEndFrame],
+        seekSourceTime: Number(seekSourceTime.toFixed(3))
+      } : {}
     });
     opts.onProgress({ stage: "decoding", progress: 0.01 });
     armWatchdog();
-    for (let i = startFrame; i < endFrame; i++) {
+    for (let i = renderStartFrame; i < renderEndFrame; i++) {
       if (opts.signal.aborted) throw new CanceledError();
-      const pct = Math.floor((i - startFrame) / windowFrames * 95);
+      const pct = Math.floor((i - renderStartFrame) / renderWindowFrames * 95);
       if (pct !== lastPct) {
         lastPct = pct;
         opts.onProgress({ stage: "rendering", progress: pct / 100 });
@@ -1839,7 +1869,7 @@ async function renderToMp4(opts) {
       const outputTime = i / fps;
       const sourceTime = sourceTimeForOutput(timelineMap, outputTime);
       const frame = await frameForSourceTime(sourceTime);
-      if (i === 0) {
+      if (i === renderStartFrame) {
         console.info("[worker:first-decoded-frame]", {
           afterMs: Date.now() - renderStartMs,
           decodedToIndex: decodedIndex
@@ -1862,13 +1892,16 @@ async function renderToMp4(opts) {
         recipe,
         sourceTime
       );
-      if (i === 0) {
+      if (i === renderStartFrame) {
         console.info("[worker:first-composed-frame]", { afterMs: Date.now() - renderStartMs });
       }
-      const composited = outCanvas.data();
-      await encoder.writeFrame(composited);
-      if (i === 0) {
-        console.info("[worker:first-frame]", { afterMs: Date.now() - renderStartMs });
+      if (i >= trimStartFrame && i < trimEndFrame) {
+        const composited = outCanvas.data();
+        await encoder.writeFrame(composited);
+        if (!wroteFirstFrame) {
+          wroteFirstFrame = true;
+          console.info("[worker:first-frame]", { afterMs: Date.now() - renderStartMs });
+        }
       }
       armWatchdog();
     }
@@ -1880,6 +1913,7 @@ async function renderToMp4(opts) {
       outputHeight: canvasH,
       fps,
       frames: totalFrames,
+      ...opts.chunk ? { emittedFrames, renderedFrames: renderWindowFrames } : {},
       elapsedMs: Date.now() - renderStartMs,
       warnings: warnings.length
     });

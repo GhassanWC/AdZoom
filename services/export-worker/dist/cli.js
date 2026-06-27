@@ -1,7 +1,7 @@
 import { createRequire as _cr } from 'module'; const require = _cr(import.meta.url);
 
 // src/cli.ts
-import { existsSync as existsSync2, readFileSync, writeFileSync } from "node:fs";
+import { existsSync as existsSync2, readFileSync, writeFileSync, statSync } from "node:fs";
 import { spawn as spawn2 } from "node:child_process";
 import { dirname, join as join2 } from "node:path";
 import { createInterface } from "node:readline";
@@ -260,8 +260,11 @@ function buildSmartSignals(visualAnalysis, moments) {
 }
 
 // ../../src/lib/timeline/source-crop.ts
+function clamp2(v, lo, hi) {
+  return Math.max(lo, Math.min(hi, v));
+}
 function clamp01(v) {
-  return Math.max(0, Math.min(1, v));
+  return clamp2(v, 0, 1);
 }
 function resolveSourceRect(videoW, videoH, crop) {
   const W = videoW > 0 ? Math.floor(videoW) : 0;
@@ -941,6 +944,16 @@ function drawWatermark(ctx, canvasW, canvasH) {
   ctx.restore();
 }
 
+// ../../src/lib/export/chunk-plan.ts
+var SUPPORTED_CHUNK_EFFECT_TYPES = [
+  "zoom",
+  "click-highlight",
+  "cursor-focus",
+  "speed-up",
+  "cut",
+  "crop"
+];
+
 // src/ffmpeg.ts
 import { spawn } from "node:child_process";
 import { execFile } from "node:child_process";
@@ -1243,7 +1256,7 @@ function makeFrameReader(stream, frameBytes) {
   };
 }
 function spawnDecoder(path, fps, width, height, startSec) {
-  const seekArgs = typeof startSec === "number" && startSec > 0 ? ["-ss", String(startSec)] : [];
+  const seekArgs = typeof startSec === "number" && startSec > 0 ? ["-ss", startSec.toFixed(6)] : [];
   const child = spawn(
     ffmpegBin(),
     [
@@ -1468,7 +1481,7 @@ function atempoChain(mult) {
   parts.push(`atempo=${r.toFixed(6)}`);
   return parts;
 }
-function buildAudioFilterComplex(segments, moments, sampleRate) {
+function buildAudioFilterComplex(segments, moments, sampleRate, opts = {}) {
   if (!segments.length) return null;
   const chains = [];
   const labels = [];
@@ -1495,7 +1508,8 @@ function buildAudioFilterComplex(segments, moments, sampleRate) {
     chains.push(`[1:a]${filters.join(",")}[${out}]`);
     labels.push(`[${out}]`);
   });
-  const concat = `${labels.join("")}concat=n=${labels.length}:v=0:a=1[aout]`;
+  const tail = opts.padToFill ? ",apad" : "";
+  const concat = `${labels.join("")}concat=n=${labels.length}:v=0:a=1${tail}[aout]`;
   return [...chains, concat].join(";");
 }
 
@@ -1613,23 +1627,30 @@ async function renderToMp4(opts) {
   const outCanvas = createCanvas(canvasW, canvasH);
   const outCtx = outCanvas.getContext("2d");
   outCtx.imageSmoothingEnabled = true;
-  const chunkStartSec = opts.chunk ? Math.max(0, opts.chunk.startSec) : 0;
+  const renderStartSec = opts.chunk ? Math.max(0, opts.chunk.renderStartSec) : 0;
+  const seekSourceTime = opts.chunk ? sourceTimeForOutput(timelineMap, renderStartSec) : 0;
   const decoder = spawnDecoder(
     opts.sourcePath,
     fps,
     sourceWidth,
     sourceHeight,
-    opts.chunk ? chunkStartSec : void 0
+    opts.chunk ? seekSourceTime : void 0
   );
   const hasSpeed = recipe.moments.some((m) => m.effectType === "speed-up");
   const hasCuts = timelineMap.totalRemoved > 0;
-  if (opts.chunk && (hasSpeed || hasCuts)) {
-    throw new Error(
-      "chunk_unsupported_timeline: cannot chunk a render with cuts or speed changes"
-    );
+  if (opts.chunk) {
+    const supported = new Set(SUPPORTED_CHUNK_EFFECT_TYPES);
+    const unsupported = [
+      ...new Set(recipe.moments.map((m) => m.effectType))
+    ].filter((t) => !supported.has(t));
+    if (unsupported.length > 0) {
+      throw new Error(
+        `chunk_unsupported_effects: timeline has effect types the chunk renderer can't reproduce: ${unsupported.join(", ")}`
+      );
+    }
   }
   let audio;
-  if (!hasAudio) {
+  if (opts.chunk || !hasAudio) {
     audio = { kind: "none" };
   } else if (!hasSpeed && !hasCuts) {
     audio = { kind: "direct" };
@@ -1644,30 +1665,32 @@ async function renderToMp4(opts) {
   console.info("[worker:audio]", {
     hasAudio,
     mode: audio.kind,
+    chunked: !!opts.chunk,
     hasSpeed,
     hasCuts,
     segments: timelineMap.segments.length,
     sampleRate: info.audioSampleRate
   });
   const totalFrames = Math.max(1, Math.round(outputDuration * fps));
-  const startFrame = opts.chunk ? Math.min(totalFrames, Math.round(chunkStartSec * fps)) : 0;
-  const endFrame = opts.chunk ? Math.min(totalFrames, Math.round(opts.chunk.endSec * fps)) : totalFrames;
-  const windowFrames = Math.max(1, endFrame - startFrame);
+  const renderStartFrame = opts.chunk ? Math.min(totalFrames, Math.max(0, Math.round(renderStartSec * fps))) : 0;
+  const renderEndFrame = opts.chunk ? Math.min(totalFrames, Math.round(opts.chunk.renderEndSec * fps)) : totalFrames;
+  const trimStartFrame = opts.chunk ? Math.min(totalFrames, Math.max(0, Math.round(opts.chunk.trimStartSec * fps))) : 0;
+  const trimEndFrame = opts.chunk ? Math.min(totalFrames, Math.round(opts.chunk.trimEndSec * fps)) : totalFrames;
+  const renderWindowFrames = Math.max(1, renderEndFrame - renderStartFrame);
+  const emittedFrames = Math.max(1, trimEndFrame - trimStartFrame);
   const encoder = await spawnEncoder({
     width: canvasW,
     height: canvasH,
     fps,
     outputPath: opts.outputPath,
     sourcePath: opts.sourcePath,
+    // Chunks are silent (audio is muxed globally after concat) ⇒ no audioWindow.
     audio,
     crf: opts.crf,
-    preset: opts.preset,
-    // Direct audio + a chunk window ⇒ seek the source audio to the chunk so it
-    // aligns with the stdin video (which starts at PTS 0).
-    ...opts.chunk && audio.kind === "direct" ? { audioWindow: { startSec: chunkStartSec, durSec: opts.chunk.endSec - chunkStartSec } } : {}
+    preset: opts.preset
   });
   const frameBytes = sourceWidth * sourceHeight * 4;
-  let decodedIndex = startFrame - 1;
+  let decodedIndex = Math.round(seekSourceTime * fps) - 1;
   let currentFrame = null;
   let eof = false;
   async function frameForSourceTime(sourceTime) {
@@ -1699,6 +1722,7 @@ async function renderToMp4(opts) {
   const onAbort = () => killBoth();
   opts.signal.addEventListener("abort", onAbort);
   let lastPct = -1;
+  let wroteFirstFrame = false;
   const renderStartMs = Date.now();
   const rssSamples = [];
   try {
@@ -1708,13 +1732,19 @@ async function renderToMp4(opts) {
       canvasH,
       fps,
       totalFrames,
-      audio: audio.kind
+      audio: audio.kind,
+      chunked: !!opts.chunk,
+      ...opts.chunk ? {
+        renderWindow: [renderStartFrame, renderEndFrame],
+        trimWindow: [trimStartFrame, trimEndFrame],
+        seekSourceTime: Number(seekSourceTime.toFixed(3))
+      } : {}
     });
     opts.onProgress({ stage: "decoding", progress: 0.01 });
     armWatchdog();
-    for (let i = startFrame; i < endFrame; i++) {
+    for (let i = renderStartFrame; i < renderEndFrame; i++) {
       if (opts.signal.aborted) throw new CanceledError();
-      const pct = Math.floor((i - startFrame) / windowFrames * 95);
+      const pct = Math.floor((i - renderStartFrame) / renderWindowFrames * 95);
       if (pct !== lastPct) {
         lastPct = pct;
         opts.onProgress({ stage: "rendering", progress: pct / 100 });
@@ -1751,7 +1781,7 @@ async function renderToMp4(opts) {
       const outputTime = i / fps;
       const sourceTime = sourceTimeForOutput(timelineMap, outputTime);
       const frame = await frameForSourceTime(sourceTime);
-      if (i === 0) {
+      if (i === renderStartFrame) {
         console.info("[worker:first-decoded-frame]", {
           afterMs: Date.now() - renderStartMs,
           decodedToIndex: decodedIndex
@@ -1774,13 +1804,16 @@ async function renderToMp4(opts) {
         recipe,
         sourceTime
       );
-      if (i === 0) {
+      if (i === renderStartFrame) {
         console.info("[worker:first-composed-frame]", { afterMs: Date.now() - renderStartMs });
       }
-      const composited = outCanvas.data();
-      await encoder.writeFrame(composited);
-      if (i === 0) {
-        console.info("[worker:first-frame]", { afterMs: Date.now() - renderStartMs });
+      if (i >= trimStartFrame && i < trimEndFrame) {
+        const composited = outCanvas.data();
+        await encoder.writeFrame(composited);
+        if (!wroteFirstFrame) {
+          wroteFirstFrame = true;
+          console.info("[worker:first-frame]", { afterMs: Date.now() - renderStartMs });
+        }
       }
       armWatchdog();
     }
@@ -1792,6 +1825,7 @@ async function renderToMp4(opts) {
       outputHeight: canvasH,
       fps,
       frames: totalFrames,
+      ...opts.chunk ? { emittedFrames, renderedFrames: renderWindowFrames } : {},
       elapsedMs: Date.now() - renderStartMs,
       warnings: warnings.length
     });
@@ -1901,6 +1935,22 @@ console.info = toStderr;
 console.debug = toStderr;
 console.warn = toStderr;
 console.error = toStderr;
+function runFfmpeg(args, tag, failCode) {
+  return new Promise((resolve, reject) => {
+    const child = spawn2(ffmpegBin(), args, { stdio: ["ignore", "ignore", "pipe"] });
+    let tail = "";
+    child.stderr.on("data", (d) => {
+      tail = (tail + d.toString()).slice(-4e3);
+      const t = d.toString().trim();
+      if (t) toStderr(`[worker:${tag}]`, t);
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`${failCode}: ffmpeg exited ${code}: ${tail.trim().slice(-800)}`));
+    });
+  });
+}
 async function runConcat(spec) {
   const inputs = spec.inputs ?? [];
   if (inputs.length === 0) {
@@ -1934,21 +1984,126 @@ async function runConcat(spec) {
     "-y",
     spec.outputPath
   ];
-  await new Promise((resolve, reject) => {
-    const child = spawn2(ffmpegBin(), args, { stdio: ["ignore", "ignore", "pipe"] });
-    let tail = "";
-    child.stderr.on("data", (d) => {
-      tail = (tail + d.toString()).slice(-4e3);
-      const t = d.toString().trim();
-      if (t) toStderr("[worker:concat]", t);
-    });
-    child.on("error", reject);
-    child.on("close", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`concat_failed: ffmpeg exited ${code}: ${tail.trim().slice(-800)}`));
-    });
-  });
+  await runFfmpeg(args, "concat", "concat_failed");
   emit({ type: "done", warnings: [], merged: inputs.length });
+  process.exit(0);
+}
+async function runAudioMux(spec, signal) {
+  const videoPath = spec.videoPath ?? "";
+  if (!videoPath || !existsSync2(videoPath)) {
+    emit({ type: "error", code: "audiomux_no_video", message: `Merged video missing: ${videoPath}` });
+    process.exit(1);
+  }
+  if (!spec.sourcePath || !existsSync2(spec.sourcePath)) {
+    emit({ type: "error", code: "audiomux_no_source", message: `Audio source missing: ${spec.sourcePath}` });
+    process.exit(1);
+  }
+  emit({ type: "stage", name: "muxing-audio" });
+  const recipe = buildRenderRecipe({ ...spec.serializedRecipe, debugBorders: false });
+  const { fps, outputDuration, timelineMap } = recipe;
+  const hasSpeed = recipe.moments.some((m) => m.effectType === "speed-up");
+  const hasCuts = timelineMap.totalRemoved > 0;
+  let audioSource = spec.sourcePath;
+  let audioStatus;
+  if (spec.normalizeEnabled !== false) {
+    const normPath = join2(dirname(spec.outputPath), "normalized-source.mp4");
+    const norm = await normalizeSource({
+      sourcePath: spec.sourcePath,
+      outputPath: normPath,
+      crf: spec.normalizeCrf ?? 18,
+      preset: spec.normalizePreset ?? "veryfast",
+      signal
+    });
+    audioSource = normPath;
+    audioStatus = norm.audioStatus;
+  } else {
+    const probe = await probeSource(audioSource).catch(() => null);
+    audioStatus = probe?.hasAudio ? "preserved" : "none";
+  }
+  const srcProbe = await probeSource(audioSource).catch(() => null);
+  const sourceHasAudio = audioStatus === "preserved" && !!srcProbe?.hasAudio;
+  const muxWarnings = [];
+  if (audioStatus === "removed") {
+    muxWarnings.push(AUDIO_UNSUPPORTED_WARNING);
+    emit({ type: "warning", message: AUDIO_UNSUPPORTED_WARNING });
+  }
+  const args = ["-hide_banner", "-loglevel", "warning", "-i", videoPath];
+  if (!sourceHasAudio) {
+    args.push("-map", "0:v", "-c:v", "copy", "-movflags", "+faststart", "-y", spec.outputPath);
+  } else {
+    args.push("-i", audioSource);
+    const sampleRate = srcProbe?.audioSampleRate ?? 48e3;
+    const fc = !hasSpeed && !hasCuts ? null : buildAudioFilterComplex(timelineMap.segments, recipe.moments, sampleRate, {
+      padToFill: true
+    });
+    if (fc) {
+      const scriptPath = join2(dirname(spec.outputPath), "audiomux-afc.txt");
+      writeFileSync(scriptPath, fc, "utf8");
+      args.push("-filter_complex_script", scriptPath, "-map", "0:v", "-map", "[aout]");
+    } else {
+      args.push("-map", "0:v", "-map", "1:a:0?", "-af", "apad");
+    }
+    args.push(
+      "-c:v",
+      "copy",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "192k",
+      "-shortest",
+      "-movflags",
+      "+faststart",
+      "-y",
+      spec.outputPath
+    );
+  }
+  await runFfmpeg(args, "audiomux", "audiomux_failed");
+  const outProbe = await probeSource(spec.outputPath).catch(() => null);
+  const size = existsSync2(spec.outputPath) ? statSync(spec.outputPath).size : 0;
+  if (!outProbe || size <= 0) {
+    emit({ type: "error", code: "audiomux_failed", message: "audiomux produced no/empty output" });
+    process.exit(1);
+  }
+  const outDur = outProbe.durationSec ?? 0;
+  const tol = Math.max(0.5, 2 / fps);
+  emit({
+    type: "audio-verify",
+    audioStatus: sourceHasAudio ? "preserved" : "none",
+    sourceHasAudio,
+    outputHasAudio: outProbe.hasAudio,
+    outputAudioCodec: outProbe.audioCodec || "(none)",
+    outputDurationSec: outDur,
+    expectedDurationSec: outputDuration,
+    durationDiffSec: Math.abs(outDur - outputDuration),
+    fileSizeBytes: size
+  });
+  toStderr(
+    `[worker:audiomux] audio-verify sourceAudio=${sourceHasAudio} outputAudio=${outProbe.hasAudio} outDur=${outDur.toFixed(2)} expected=${outputDuration.toFixed(2)} tol=${tol.toFixed(2)} size=${size}`
+  );
+  if (sourceHasAudio && !outProbe.hasAudio) {
+    emit({
+      type: "error",
+      code: "audio_missing_after_render",
+      message: "audio expected but the final muxed output is silent"
+    });
+    process.exit(1);
+  }
+  if (Math.abs(outDur - outputDuration) > tol) {
+    emit({
+      type: "error",
+      code: "duration_mismatch",
+      message: `final duration ${outDur.toFixed(2)}s differs from expected ${outputDuration.toFixed(2)}s by more than ${tol.toFixed(2)}s`
+    });
+    process.exit(1);
+  }
+  emit({
+    type: "done",
+    warnings: muxWarnings,
+    merged: 1,
+    normalized: spec.normalizeEnabled !== false,
+    audioStatus: sourceHasAudio ? "preserved" : "none",
+    outputDurationSec: outDur
+  });
   process.exit(0);
 }
 async function main() {
@@ -1992,8 +2147,26 @@ async function main() {
   });
   rl.on("error", () => {
   });
+  if (spec.mode === "audiomux") {
+    try {
+      await runAudioMux(spec, controller.signal);
+    } catch (err) {
+      if (controller.signal.aborted) {
+        emit({ type: "canceled" });
+        rl.close();
+        process.exit(2);
+      }
+      const friendly = toUserFacingError(err);
+      toStderr("[worker:cli] audiomux failed:", err?.message ?? String(err));
+      emit({ type: "error", code: friendly.code, message: friendly.message });
+      rl.close();
+      process.exit(1);
+    }
+    return;
+  }
   const crf = spec.crf ?? 19;
   const preset = spec.preset ?? "veryfast";
+  const chunkSilent = !!spec.chunk;
   const warnings = [];
   const pushWarning = (w) => {
     if (!warnings.includes(w)) {
@@ -2044,7 +2217,7 @@ async function main() {
     }
     if (spec.audioAlreadyDropped && audioStatus === "preserved") audioStatus = "removed";
     const audioDropped = audioStatus !== "preserved";
-    if (audioStatus === "removed") pushWarning(AUDIO_UNSUPPORTED_WARNING);
+    if (audioStatus === "removed" && !chunkSilent) pushWarning(AUDIO_UNSUPPORTED_WARNING);
     emit({
       type: "render-input",
       inputFile: spec.sourcePath,
@@ -2109,7 +2282,7 @@ async function main() {
     toStderr(
       `[worker:cli] audio-verify audioStatus=${audioStatus} sourceAudio=${pf.info.hasAudio} normalizedAudio=${renderSrcProbe?.hasAudio} outputAudio=${outProbe?.hasAudio} outputCodec=${outProbe?.audioCodec || "(none)"} outDur=${outDur.toFixed(2)} vidDur=${srcDur.toFixed(2)} diff=${Math.abs(outDur - srcDur).toFixed(2)}`
     );
-    if (audioStatus === "preserved" && outProbe && !outProbe.hasAudio) {
+    if (audioStatus === "preserved" && !chunkSilent && outProbe && !outProbe.hasAudio) {
       throw new Error(
         "audio_missing_after_render: render source has audio but final output has none"
       );

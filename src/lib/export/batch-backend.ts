@@ -106,8 +106,12 @@ function chunkedTaskMaxRunSeconds(chunkSeconds: number, durationSeconds: number)
   const coldStart = intEnv("EXPORT_TASK_COLD_START_SECONDS", 180);
   const download = intEnv("EXPORT_TASK_DOWNLOAD_SECONDS", 300);
   const renderFactor = numEnv("EXPORT_CHUNK_RUNTIME_FACTOR", 8); // realtime multiple (incl. retry headroom)
-  const mergeBase = intEnv("EXPORT_MERGE_BASE_SECONDS", 120);
-  const mergeFactor = numEnv("EXPORT_MERGE_FACTOR", 0.5); // per output second (concat -c copy is cheap)
+  // Merge = concat (-c copy, cheap) + download the persisted normalized source +
+  // the GLOBAL audio pass (audiomux: video -c copy, audio AAC re-encode). The base
+  // covers the extra download + audiomux setup; the per-second factor covers the
+  // audio re-encode over the output (AAC is well under realtime).
+  const mergeBase = intEnv("EXPORT_MERGE_BASE_SECONDS", 180);
+  const mergeFactor = numEnv("EXPORT_MERGE_FACTOR", 0.5); // per output second
   const min = intEnv("EXPORT_CHUNK_TASK_MIN_SECONDS", 600);
   const max = intEnv("BATCH_MAX_RUN_SECONDS", 7200); // hard ceiling, shared with single
   const perChunkRender = Math.ceil(Math.max(1, chunkSeconds) * renderFactor);
