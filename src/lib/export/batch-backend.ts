@@ -415,10 +415,14 @@ export async function submitBatchJob({
   const machineType = process.env.BATCH_MACHINE_TYPE || "e2-standard-4";
   const taskCount = chunked ? workers : 1;
   const parallelism = chunked ? workers : 1;
+  // Mirrors chunk-plan.ts's dynamic worker math (workers ≈ chunkCount / target),
+  // logged so an over/under-provisioned fan-out is traceable to the target ratio.
+  const targetChunksPerWorker = intEnv("EXPORT_TARGET_CHUNKS_PER_WORKER", 3);
   console.log(
     `[export-enqueue] backend=batch config job=${jobId} ` +
       `allowedLocations=${allowedLocations.join("|")} machineType=${machineType} ` +
       `chunkCount=${chunked ? chunkCount : 1} workerCount=${taskCount} ` +
+      `targetChunksPerWorker=${targetChunksPerWorker} ` +
       `taskCount=${taskCount} parallelism=${parallelism} ` +
       `bootDiskGb=${bootDiskGb} estimatedTotalDiskGb=${chunked ? estimatedTotalDiskGb : bootDiskGb}`
   );

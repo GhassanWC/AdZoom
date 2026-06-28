@@ -68,15 +68,51 @@ test("SHARDING: 24-chunk export uses few workers, not one task per chunk", () =>
   assert.equal(creator.workerCount, 8); // 8 Batch tasks, NOT 24
 });
 
-test("worker count is capped by chunkCount (tiny videos)", () => {
-  // 60s / 15s = 4 chunks → min(8, 4) = 4 workers (min-duration overridden for the test)
+test("worker count scales DOWN for small exports (no one-VM-per-chunk)", () => {
+  // 60s / 15s = 4 chunks → ceil(4/3) = 2 workers (NOT 4 — don't over-provision VMs).
   const env = { EXPORT_CHUNKED_RENDER: "1", EXPORT_CHUNK_MIN_VIDEO_SECONDS: "30" } as Record<
     string,
     string | undefined
   >;
   const p = planChunking(base({ plan: "creator", outputDurationSeconds: 60, env }));
   assert.equal(p.chunkCount, 4);
-  assert.equal(p.workerCount, 4);
+  assert.equal(p.workerCount, 2);
+});
+
+// ── Dynamic worker count: ~chunkCount/target, clamped to the plan cap. ────────
+test("dynamic workerCount = ceil(chunkCount / target=3), clamped to plan cap", () => {
+  const env = { EXPORT_CHUNKED_RENDER: "1", EXPORT_CHUNK_MIN_VIDEO_SECONDS: "30" } as Record<
+    string,
+    string | undefined
+  >;
+  const wc = (sec: number, plan: "pro" | "creator") =>
+    planChunking(base({ outputDurationSeconds: sec, plan, env })).workerCount;
+  // chunkSeconds = 15, so chunkCount = ceil(sec/15); workers = ceil(chunkCount/3).
+  assert.equal(wc(60, "creator"), 2); // 4 chunks → 2
+  assert.equal(wc(90, "creator"), 2); // 6 chunks → 2
+  assert.equal(wc(165, "creator"), 4); // 11 chunks → 4 (the over-provisioning case)
+  assert.equal(wc(360, "creator"), 8); // 24 chunks → 8 (creator cap, long export still fans out)
+  assert.equal(wc(360, "pro"), 6); // 24 chunks → 8 desired, clamped to the pro cap of 6
+});
+
+test("EXPORT_TARGET_CHUNKS_PER_WORKER tunes the ratio (invalid → default 3)", () => {
+  const wc = (target: string) =>
+    planChunking(
+      base({
+        outputDurationSeconds: 165, // 11 chunks
+        plan: "creator",
+        env: {
+          EXPORT_CHUNKED_RENDER: "1",
+          EXPORT_CHUNK_MIN_VIDEO_SECONDS: "30",
+          EXPORT_TARGET_CHUNKS_PER_WORKER: target,
+        },
+      })
+    ).workerCount;
+  assert.equal(wc("3"), 4); // ceil(11/3) = 4
+  assert.equal(wc("6"), 2); // ceil(11/6) = 2
+  assert.equal(wc("2"), 6); // ceil(11/2) = 6
+  assert.equal(wc("0"), 4); // non-positive → default 3 → 4
+  assert.equal(wc("abc"), 4); // invalid → default 3 → 4
 });
 
 test("short videos fall back to single", () => {
@@ -128,18 +164,20 @@ test("max total chunks cap: count never exceeds cap, no empty trailing chunk", (
   assert.ok(p.workerCount <= 8, "worker count never exceeds the creator cap");
 });
 
-test("custom env overrides are honored", () => {
+test("custom env overrides are honored (chunkSeconds + worker cap binds)", () => {
   const env = {
     EXPORT_CHUNKED_RENDER: "1",
     EXPORT_CHUNK_MIN_VIDEO_SECONDS: "120",
     EXPORT_CHUNK_SECONDS: "60",
     EXPORT_CHUNK_MAX_PARALLEL_PRO: "3",
+    // 5 chunks at target 2 → ceil(5/2)=3 desired, so the pro cap of 3 binds exactly.
+    EXPORT_TARGET_CHUNKS_PER_WORKER: "2",
   } as Record<string, string | undefined>;
   const p = planChunking(base({ outputDurationSeconds: 300, env }));
   assert.equal(p.renderMode, "chunked");
   assert.equal(p.chunkSeconds, 60);
   assert.equal(p.chunkCount, 5); // ceil(300/60)
-  assert.equal(p.workerCount, 3); // EXPORT_CHUNK_MAX_PARALLEL_PRO = worker cap
+  assert.equal(p.workerCount, 3); // ceil(5/2)=3, clamped by EXPORT_CHUNK_MAX_PARALLEL_PRO=3
 });
 
 test("invalid duration → single", () => {

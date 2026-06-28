@@ -170,15 +170,20 @@ export function planChunking(input: ChunkPlanInput): ChunkPlan {
   if (chunkCount < 2) return single("not_enough_chunks");
 
   // workerCount = number of SHARD WORKERS (Batch tasks). Each worker renders a
-  // contiguous range of small chunks, so we cap the TASK count (not the chunk
-  // count) to avoid one-container-per-chunk overhead. EXPORT_CHUNK_MAX_PARALLEL_*
-  // is the per-plan WORKER cap (pro 6, creator 8). The Batch submitter further
-  // reduces this if workers × bootDiskGb would bust the SSD_TOTAL_GB quota.
-  const maxWorkers =
+  // contiguous range of small chunks. We DON'T spin one VM per chunk (Batch
+  // provisioning overhead would dominate a short/medium export — an 11-chunk job
+  // on 8 VMs spends minutes just starting up). Instead, scale workers to the work:
+  // aim for ~EXPORT_TARGET_CHUNKS_PER_WORKER chunks per VM (default 3), then clamp
+  // to the per-plan cap (EXPORT_CHUNK_MAX_PARALLEL_*: pro 6, creator 8). So 4→2,
+  // 6→2, 11→4, 24→8 workers. The Batch submitter further reduces this if
+  // workers × bootDiskGb would bust the SSD_TOTAL_GB quota.
+  const planMaxWorkers =
     input.plan === "creator"
       ? Math.max(1, intEnv(env, "EXPORT_CHUNK_MAX_PARALLEL_CREATOR", 8))
       : Math.max(1, intEnv(env, "EXPORT_CHUNK_MAX_PARALLEL_PRO", 6));
-  const workerCount = Math.max(1, Math.min(maxWorkers, chunkCount));
+  const targetChunksPerWorker = intEnv(env, "EXPORT_TARGET_CHUNKS_PER_WORKER", 3);
+  const desiredWorkers = Math.ceil(chunkCount / targetChunksPerWorker);
+  const workerCount = Math.max(1, Math.min(planMaxWorkers, desiredWorkers));
 
   return { renderMode: "chunked", chunkCount, chunkSeconds, workerCount, reason: "eligible" };
 }
