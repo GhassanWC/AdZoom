@@ -9,7 +9,7 @@
  * Quota model (per the product spec):
  *   • Free    — 0 cloud minutes. Cloud export is blocked; browser export only.
  *   • Pro     — 150 minutes / month, max video length 30 minutes.
- *   • Creator — 500 minutes / month, max video length 60 minutes.
+ *   • Creator — 250 minutes / month, max video length 60 minutes.
  *
  * Minutes are billed on OUTPUT duration (post cuts/speed) — the deliverable —
  * not source length, and not scaled by resolution (keeps the meter intuitive).
@@ -31,7 +31,7 @@ import type { MonthlyUsage } from "@/lib/firebase/schema";
 export const CLOUD_EXPORT_MINUTES: Record<PlanTier, number> = {
   free: 0,
   pro: 150,
-  creator: 500,
+  creator: 250,
 };
 
 /**

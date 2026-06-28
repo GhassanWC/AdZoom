@@ -65,8 +65,18 @@ public sealed class ChunkTaskRunner(
         // First worker to arrive flips the job to rendering (idempotent for the rest).
         await fs.EnsureChunkedRenderingAsync(uid, jobId);
 
+        // Per-worker heartbeat snapshot state (read by the 30s heartbeat task). Plain
+        // ints captured by the closure; eventual-consistency is fine for observability.
+        var assignedCount = assigned.Count;
+        var currentChunkIndex = -1;
+        var chunksRendered = 0;
+
         using var cancelCts = CancellationTokenSource.CreateLinkedTokenSource(stopping);
-        using var heartbeat = StartHeartbeat(uid, jobId, cancelCts.Token);
+        using var heartbeat = StartHeartbeat(
+            uid, jobId, workerIndex,
+            () => (currentChunkIndex, chunksRendered,
+                   assignedCount > 0 ? (int)Math.Floor(chunksRendered / (double)assignedCount * 100) : 0),
+            cancelCts.Token);
         using var cancelPoll = StartCancelPoll(uid, jobId, cancelCts);
 
         if (assigned.Count == 0)
@@ -110,7 +120,6 @@ public sealed class ChunkTaskRunner(
             await storage.DownloadAsync(sourcePath, srcFile, cancelCts.Token);
 
             var totalRenderSec = 0;
-            var rendered = 0;
             foreach (var ci in assigned)
             {
                 if (cancelCts.IsCancellationRequested)
@@ -118,6 +127,8 @@ public sealed class ChunkTaskRunner(
                     BatchLog.Line($"worker canceled job={jobId} worker={workerIndex}");
                     return 0;
                 }
+                // Surface the chunk this worker is on to the per-worker heartbeat.
+                currentChunkIndex = ci;
 
                 // Timeline-aware OUTPUT window (integer-frame tiling so seams concat
                 // cleanly). Output→source mapping handles cuts/speed.
@@ -125,10 +136,11 @@ public sealed class ChunkTaskRunner(
                     ci, chunkCount, chunkSeconds, fps, durationSeconds, opts.ChunkBoundaryPaddingSeconds);
                 if (!(win.TrimEndFrame > win.TrimStartFrame))
                 {
+                    // Deterministic timeline/setup error — re-running can't fix it.
                     BatchLog.Error($"worker: empty window chunk={ci} — failing job={jobId}");
                     await fs.FailJobFromChunkAsync(uid, jobId, JobFields.ErrChunkFailed,
                         "Export setup error (empty chunk window). Please try again.");
-                    return 1;
+                    return ExitCodes.Fatal;
                 }
 
                 var chunkFile = Path.Combine(workDir, $"chunk-{ci}.mp4");
@@ -136,7 +148,7 @@ public sealed class ChunkTaskRunner(
 
                 // Normalize ONCE per worker (its first rendered chunk). Later chunks
                 // read the normalized file → no re-transcode per chunk.
-                var firstRender = rendered == 0;
+                var firstRender = chunksRendered == 0;
                 var normalizeNow = firstRender && opts.NormalizeEnabled;
                 var renderSourcePath =
                     firstRender || !opts.NormalizeEnabled || !File.Exists(normalizedPath)
@@ -164,7 +176,7 @@ public sealed class ChunkTaskRunner(
                     },
                 };
 
-                BatchLog.Line($"chunk render start job={jobId} worker={workerIndex} chunk={ci} ({rendered + 1}/{assigned.Count}) trim=[{win.TrimStartSec:F1},{win.TrimEndSec:F1}]");
+                BatchLog.Line($"chunk render start job={jobId} worker={workerIndex} chunk={ci} ({chunksRendered + 1}/{assigned.Count}) trim=[{win.TrimStartSec:F1},{win.TrimEndSec:F1}]");
                 var renderStart = DateTime.UtcNow;
                 RenderOutcome? outcome = null;
                 var ok = false;
@@ -180,6 +192,13 @@ public sealed class ChunkTaskRunner(
                     }
                     if (outcome.ExitCode == 0 && outcome.Done is not null) { ok = true; break; }
                     log.LogWarning("[{Tag}:chunk-fail] job={JobId} chunk={Idx} code={Code}", opts.WorkerTag, jobId, ci, outcome.Error?.Code ?? "render_failed");
+                    // Deterministic error (bad input / unsupported codec / un-chunkable
+                    // timeline) — a retry would fail identically. Stop retrying now.
+                    if (JobFields.IsDeterministicError(outcome.Error?.Code))
+                    {
+                        BatchLog.Line($"chunk deterministic failure — not retrying job={jobId} chunk={ci} code={outcome.Error?.Code}");
+                        break;
+                    }
                 }
 
                 if (!ok)
@@ -190,16 +209,19 @@ public sealed class ChunkTaskRunner(
                         msg = "This export can't be split into chunks (it uses an effect that isn't chunk-compatible). Please try again.";
                     await fs.FailJobFromChunkAsync(uid, jobId, code, msg);
                     BatchLog.Error($"chunk render FAILED job={jobId} worker={workerIndex} chunk={ci} code={code} — job failed");
-                    return 1;
+                    // Deterministic → exit Fatal so Batch's lifecycle policy FAIL_TASKs it
+                    // (no retry VM). Transient → exit 1 (one Batch retry re-claims the job).
+                    return JobFields.IsDeterministicError(code) ? ExitCodes.Fatal : ExitCodes.TransientFailure;
                 }
 
                 // Backstop: never ship a chunk that skipped normalization while it was
                 // expected (only meaningful on the worker's first/normalizing render).
+                // Deterministic (stale image / setup) → Fatal, no retry.
                 if (normalizeNow && outcome!.Done!.Normalized == false)
                 {
                     await fs.FailJobFromChunkAsync(uid, jobId, "normalize_not_executed",
                         "The export could not be prepared (normalization did not run). Please try again.");
-                    return 1;
+                    return ExitCodes.Fatal;
                 }
 
                 var chunkSizeBytes = File.Exists(chunkFile) ? new FileInfo(chunkFile).Length : 0;
@@ -223,13 +245,16 @@ public sealed class ChunkTaskRunner(
                 }
 
                 totalRenderSec += (int)(DateTime.UtcNow - renderStart).TotalSeconds;
-                rendered++;
+                chunksRendered++;
 
                 var result = await fs.RecordChunkDoneAsync(uid, jobId, ci, chunkObjectPath, sourceHasAudio, workerIndex);
                 BatchLog.Line($"chunk recorded job={jobId} worker={workerIndex} chunk={ci} result={result}");
                 if (result == FirestoreService.ChunkRecordResult.AlreadyTerminal)
                     return 0; // job canceled/failed elsewhere — stop this worker
                 BatchLog.Line($"progress summary updated job={jobId} worker={workerIndex} chunk={ci}");
+
+                // Between chunks / during merge this worker isn't rendering a chunk.
+                currentChunkIndex = -1;
 
                 // Try merge after EVERY chunk: NotReady (cheap, read-only) until ALL
                 // chunks are recorded, then exactly one worker wins + merges. A
@@ -261,7 +286,9 @@ public sealed class ChunkTaskRunner(
         }
     }
 
-    private IDisposable StartHeartbeat(string uid, string jobId, CancellationToken ct)
+    private IDisposable StartHeartbeat(
+        string uid, string jobId, int workerIndex,
+        Func<(int chunk, int rendered, int pct)> snapshot, CancellationToken ct)
     {
         var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         _ = Task.Run(async () =>
@@ -271,7 +298,11 @@ public sealed class ChunkTaskRunner(
             {
                 while (await timer.WaitForNextTickAsync(cts.Token))
                 {
-                    try { await fs.HeartbeatAsync(uid, jobId); }
+                    try
+                    {
+                        var (chunk, rendered, pct) = snapshot();
+                        await fs.WorkerHeartbeatAsync(uid, jobId, workerIndex, chunk, rendered, pct);
+                    }
                     catch (Exception ex) { log.LogWarning(ex, "[export] chunk heartbeat failed job={JobId}", jobId); }
                 }
             }

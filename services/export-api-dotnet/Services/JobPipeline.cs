@@ -47,16 +47,17 @@ public sealed class JobPipeline(
         var srcFile = Path.Combine(workDir, "source" + srcExt);
         var outFile = Path.Combine(workDir, jobId + ".mp4");
 
-        // Cancellation: user-cancel (cancelRequested/status) OR host shutdown.
-        using var cancelCts = CancellationTokenSource.CreateLinkedTokenSource(stopping);
-        using var heartbeat = StartHeartbeat(uid, jobId, cancelCts.Token);
-        using var cancelPoll = StartCancelPoll(uid, jobId, cancelCts);
-
         // Render outcome state (mutated by the NDJSON event handler).
         var warnings = new List<string>();
         Dictionary<string, object?>? preflight = null;
         var lastStage = "";
         var lastPct = -1;
+
+        // Cancellation: user-cancel (cancelRequested/status) OR host shutdown. The
+        // heartbeat reports the latest progress percent (clamped ≥0) every 30s.
+        using var cancelCts = CancellationTokenSource.CreateLinkedTokenSource(stopping);
+        using var heartbeat = StartHeartbeat(uid, jobId, () => Math.Max(0, lastPct), cancelCts.Token);
+        using var cancelPoll = StartCancelPoll(uid, jobId, cancelCts);
         var lastLoggedPct = -1;
         var renderStart = DateTime.UtcNow;
         var normalizingStarted = false;
@@ -423,6 +424,13 @@ public sealed class JobPipeline(
                 if (outcome.ExitCode == 0 && outcome.Done is not null) { ok = true; break; }
                 log.LogWarning("[{Tag}:chunk-fail] job={JobId} chunk={Idx}/{N} code={Code}",
                     opts.WorkerTag, jobId, i + 1, chunkCount, outcome.Error?.Code ?? "render_failed");
+                // Deterministic error — a retry would fail identically. Stop now.
+                if (JobFields.IsDeterministicError(outcome.Error?.Code))
+                {
+                    log.LogWarning("[{Tag}:chunk-deterministic] job={JobId} chunk={Idx} code={Code} — not retrying",
+                        opts.WorkerTag, jobId, i + 1, outcome.Error?.Code);
+                    break;
+                }
             }
 
             if (!ok)
@@ -537,7 +545,8 @@ public sealed class JobPipeline(
         return ChunkOutcome.Done;
     }
 
-    private IDisposable StartHeartbeat(string uid, string jobId, CancellationToken ct)
+    private IDisposable StartHeartbeat(
+        string uid, string jobId, Func<int> pctSnapshot, CancellationToken ct)
     {
         var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         _ = Task.Run(async () =>
@@ -547,7 +556,12 @@ public sealed class JobPipeline(
             {
                 while (await timer.WaitForNextTickAsync(cts.Token))
                 {
-                    try { await fs.HeartbeatAsync(uid, jobId); Batch($"heartbeat job={jobId}"); }
+                    try
+                    {
+                        // Single render = one worker (index 0); no per-chunk index.
+                        await fs.WorkerHeartbeatAsync(uid, jobId, opts.TaskIndex, -1, 0, pctSnapshot());
+                        Batch($"heartbeat job={jobId}");
+                    }
                     catch (Exception ex) { log.LogWarning(ex, "[export] heartbeat failed job={JobId}", jobId); }
                 }
             }

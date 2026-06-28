@@ -5,6 +5,7 @@ import { getAdmin } from "@/lib/firebase/admin";
 import { isIndexError, tsComparand, uidFromSubDoc } from "@/lib/admin/query";
 import {
   inspectBatchJob,
+  cancelBatchJob,
   BatchCapacityError,
   BATCH_CAPACITY_ERROR_CODE,
   BATCH_CAPACITY_ERROR_MESSAGE,
@@ -15,6 +16,7 @@ import {
   BATCH_SLOT_STATUSES,
   QUEUE_REASON_WAITING_FOR_SLOT,
   maxActiveBatchJobs,
+  exportStaleProgressSeconds,
 } from "@/lib/export/batch-capacity";
 import type { ExportJobDoc, MonthlyUsage } from "@/lib/firebase/schema";
 
@@ -55,6 +57,14 @@ export const dynamic = "force-dynamic";
  * closed when the secret isn't configured.
  */
 const STALE_MS = 10 * 60_000;
+/** Error code + readable retry message written when the stale-progress watchdog
+ *  cancels an export that made no real progress (Req: "Please retry."). */
+const STALE_PROGRESS_ERROR_CODE = "stale_progress_timeout";
+const STALE_PROGRESS_ERROR_MESSAGE =
+  "Export stopped because no progress was detected. Please retry.";
+/** Statuses where a worker is actively rendering, so REAL progress (lastProgressAt)
+ *  is expected to advance — the stale-progress watchdog only inspects these. */
+const RENDER_PROGRESS_STATUSES: ExportJobDoc["status"][] = ["rendering", "uploading"];
 /** A batch_submitted job that hasn't progressed in this long is worth a Batch
  *  status check — catches a Google-canceled job in ~one cron tick instead of
  *  waiting out STALE_MS. Smaller cutoff ⇒ the stale set is a subset, so a single
@@ -98,7 +108,7 @@ async function failJobAndRefund(
   ref: FirebaseFirestore.DocumentReference,
   uid: string,
   fail: { errorCode: string; errorMessage: string },
-  opts?: { requireStaleMs?: number }
+  opts?: { requireStaleMs?: number; requireProgressStaleMs?: number; setCancelRequested?: boolean }
 ): Promise<boolean> {
   return db.runTransaction(async (tx) => {
     const snap = await tx.get(ref);
@@ -106,7 +116,14 @@ async function failJobAndRefund(
     const job = snap.data() as ExportJobDoc;
     if (!ACTIVE_STATUSES.includes(job.status)) return false; // already terminal
     if (opts?.requireStaleMs != null && Date.now() - toMillis(job.updatedAt) < opts.requireStaleMs) {
-      return false; // got fresh progress
+      return false; // got fresh heartbeat
+    }
+    if (opts?.requireProgressStaleMs != null) {
+      // Re-check REAL progress in-txn: a chunk recorded between the query and now
+      // (lastProgressAt advanced) means the job is healthy — leave it alone.
+      const lastProgress =
+        toMillis(job.lastProgressAt) || toMillis(job.startedAt) || toMillis(job.updatedAt);
+      if (Date.now() - lastProgress < opts.requireProgressStaleMs) return false;
     }
 
     // Release the reserved minutes (clamp at 0 — same as the worker/cancel
@@ -129,6 +146,9 @@ async function failJobAndRefund(
         status: "failed",
         errorCode: fail.errorCode,
         errorMessage: fail.errorMessage,
+        // Cooperative backstop to the real Batch cancel: a still-live sibling worker's
+        // 1s cancel-poll sees this and exits fast (the Batch cancel tears the VM down).
+        ...(opts?.setCancelRequested ? { cancelRequested: true } : {}),
         completedAt: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
       },
@@ -280,6 +300,85 @@ async function promoteQueuedJobs(
   return { submitted, activeBatchJobs, max };
 }
 
+/**
+ * Stale-PROGRESS watchdog — the cost-safety kill switch. A worker heartbeats every
+ * 30s (keeping `updatedAt` fresh) even when it is rendering NOTHING, so the
+ * `updatedAt` stale sweep below can NEVER catch an alive-but-stuck worker. This pass
+ * keys off `lastProgressAt` (last chunk recorded / real progress, never bumped by the
+ * bare heartbeat) instead: a `rendering`/`uploading` export with no progress for
+ * `EXPORT_STALE_PROGRESS_SECONDS` (default 720) gets its real Google Batch job
+ * CANCELLED (so the up-to-8 VMs stop billing — not just a Firestore write) and is
+ * failed `stale_progress_timeout` with a clear retry message.
+ *
+ * The `status in (rendering, uploading)` collection-group query reuses the same
+ * single-field index the promotion pass uses for `status == queued`; `lastProgressAt`
+ * is filtered in memory (the active-render set is bounded by the global active-job
+ * cap, default 1), so NO new composite index is needed. Best-effort: an index error
+ * degrades to a no-op.
+ */
+async function sweepStaleProgress(db: FirebaseFirestore.Firestore): Promise<number> {
+  const staleSecondsThreshold = exportStaleProgressSeconds();
+  const thresholdMs = staleSecondsThreshold * 1000;
+
+  let docs: FirebaseFirestore.QueryDocumentSnapshot[];
+  try {
+    const snap = await db
+      .collectionGroup("exportJobs")
+      .where("status", "in", [...RENDER_PROGRESS_STATUSES])
+      .limit(BATCH)
+      .get();
+    docs = snap.docs;
+  } catch (err) {
+    if (isIndexError(err)) return 0;
+    throw err;
+  }
+
+  const now = Date.now();
+  let failed = 0;
+  for (const d of docs) {
+    const uid = uidFromSubDoc(d.ref);
+    if (!uid) continue;
+    const job = d.data() as ExportJobDoc;
+    const lastProgress =
+      toMillis(job.lastProgressAt) || toMillis(job.startedAt) || toMillis(job.updatedAt);
+    if (!lastProgress) continue; // no progress baseline yet — judge it next tick
+    const staleSeconds = (now - lastProgress) / 1000;
+    if (staleSeconds < staleSecondsThreshold) continue;
+
+    console.warn("[reconcile-exports] stale-progress watchdog cancelling Batch job", {
+      exportId: d.id,
+      batchJobName: job.batchJobName ?? job.batchJobId ?? null,
+      lastProgressAt: new Date(lastProgress).toISOString(),
+      staleSeconds: Math.round(staleSeconds),
+      reason: STALE_PROGRESS_ERROR_CODE,
+    });
+
+    // Cancel the REAL Batch job FIRST so its VMs are torn down + stop billing — a
+    // Firestore-only write would leave them running to the task timeout. Best-effort
+    // and never throws; we fail the doc regardless of the cancel result.
+    if (job.batchJobName || job.batchJobId) {
+      try {
+        await cancelBatchJob({ jobName: job.batchJobName, batchJobId: job.batchJobId });
+      } catch (err) {
+        console.error("[reconcile-exports] stale-progress cancelBatchJob threw", {
+          exportId: d.id,
+          err,
+        });
+      }
+    }
+
+    const didFail = await failJobAndRefund(
+      db,
+      d.ref,
+      uid,
+      { errorCode: STALE_PROGRESS_ERROR_CODE, errorMessage: STALE_PROGRESS_ERROR_MESSAGE },
+      { requireProgressStaleMs: thresholdMs, setCancelRequested: true }
+    );
+    if (didFail) failed++;
+  }
+  return failed;
+}
+
 export async function POST(req: NextRequest) {
   if (!authorized(req)) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
@@ -365,6 +464,13 @@ export async function POST(req: NextRequest) {
       const waitingForSlot =
         job.status === "queued" && job.queueReason === QUEUE_REASON_WAITING_FOR_SLOT;
       if (!waitingForSlot && Date.now() - toMillis(job.updatedAt) >= STALE_MS) {
+        // A dead-heartbeat job may still have a wedged (not-yet-exited) Batch task
+        // billing a VM — cancel the real job too, not just the Firestore doc.
+        if (job.batchJobName || job.batchJobId) {
+          await cancelBatchJob({ jobName: job.batchJobName, batchJobId: job.batchJobId }).catch(
+            () => {}
+          );
+        }
         const didFail = await failJobAndRefund(
           db,
           d.ref,
@@ -373,7 +479,7 @@ export async function POST(req: NextRequest) {
             errorCode: "stale_timeout",
             errorMessage: "This export stalled and was stopped. Please try exporting again.",
           },
-          { requireStaleMs: STALE_MS }
+          { requireStaleMs: STALE_MS, setCancelRequested: true }
         );
         if (didFail) failed++;
       }
@@ -390,6 +496,16 @@ export async function POST(req: NextRequest) {
     });
   }
 
+  // Stale-PROGRESS watchdog: cancel + fail rendering jobs whose lastProgressAt has
+  // frozen (alive-but-stuck workers the updatedAt sweep above can't see). Cancels the
+  // real Batch job so its VMs stop billing. Best-effort — never blocks promotion.
+  let staleProgressFailed = 0;
+  try {
+    staleProgressFailed = await sweepStaleProgress(db);
+  } catch (err) {
+    console.error("[reconcile-exports] stale-progress sweep failed", err);
+  }
+
   // Promote deferred jobs into any freed Batch slots (Batch backend only — other
   // backends manage their own concurrency / claiming).
   let promoted = 0;
@@ -402,5 +518,12 @@ export async function POST(req: NextRequest) {
     console.error("[reconcile-exports] promotion failed", err);
   }
 
-  return NextResponse.json({ ok: true, checked: docs.length, failed, capacityFailed, promoted });
+  return NextResponse.json({
+    ok: true,
+    checked: docs.length,
+    failed,
+    capacityFailed,
+    staleProgressFailed,
+    promoted,
+  });
 }

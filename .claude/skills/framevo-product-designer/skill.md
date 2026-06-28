@@ -184,8 +184,8 @@ The export panel should clearly show:
 For Framevo plans:
 
 - Free: browser export only, max 3 minutes
-- Pro: cloud MP4 export, around 120–200 export minutes/month
-- Creator: higher cloud export minutes, priority queue
+- Pro: cloud MP4 export ($25/mo), 150 export minutes/month
+- Creator: cloud MP4 export ($49/mo), 250 export minutes/month, priority queue
 
 Paid export should feel like an upgrade in speed, reliability, and quality.
 

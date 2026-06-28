@@ -11,9 +11,9 @@ public static class Plan
     public const string Creator = "creator";
 
     /// <summary>Monthly cloud-export minute quota per tier (matches
-    /// src/lib/usage/cloud-minutes.ts: Free 0, Pro 150, Creator 500).</summary>
+    /// src/lib/usage/cloud-minutes.ts: Free 0, Pro 150, Creator 250).</summary>
     public static readonly IReadOnlyDictionary<string, int> CloudExportMinutes =
-        new Dictionary<string, int> { [Free] = 0, [Pro] = 150, [Creator] = 500 };
+        new Dictionary<string, int> { [Free] = 0, [Pro] = 150, [Creator] = 250 };
 
     /// <summary>Coerce an unknown user.plan value to a known tier (default free).</summary>
     public static string Normalize(string? raw) =>

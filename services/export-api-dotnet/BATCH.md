@@ -254,7 +254,7 @@ sees the count reach `chunkCount` and merges. Minutes are reserved once, settled
 |---------|--------------|-----------:|-----------------:|
 | Free    | ❌ (browser only, ≤3 min upload) | 0   | —      |
 | Pro     | ✅ Batch      | 150        | 30 min |
-| Creator | ✅ Batch (priority) | 500  | 60 min |
+| Creator | ✅ Batch (priority) | 250  | 60 min |
 
 `createCloudExportJob` blocks Free, enforces the length cap, reserves minutes at
 creation, and settles (consume) on success / releases (refund) on failure/cancel/

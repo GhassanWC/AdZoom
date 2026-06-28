@@ -123,6 +123,10 @@ public sealed class MergeStep(
                 await storage.DownloadAsync(sourceStoragePath, audioSourceFile, ct);
             }
             BatchLog.Line($"audiomux start job={jobId} reuseNormalized={reuseNormalized}");
+            // Refresh lastProgressAt at the concat→audiomux transition so the stale-
+            // progress watchdog never trips on a healthy (but non-trivial) merge.
+            try { await fs.PatchAsync(uid, jobId, new() { [JobFields.ProgressPercent] = 98 }); }
+            catch (Exception ex) { log.LogWarning(ex, "[export] audiomux-start progress patch failed job={JobId}", jobId); }
             var muxStart = DateTime.UtcNow;
 
             // ── 3. Compose final audio over the WHOLE timeline + mux into the video

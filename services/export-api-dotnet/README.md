@@ -201,7 +201,7 @@ superseded by a fresh export) · plus `decode_failed`/`unsupported_video`/`rende
 
 Ledger: `users/{uid}/usage/{YYYY-MM}` — `cloudMinutesReserved`,
 `cloudMinutesConsumed` (`remaining = limit − reserved − consumed`;
-free 0 / pro 150 / creator 600; `estimate = max(1, ceil(sec/60))`).
+free 0 / pro 150 / creator 250; `estimate = max(1, ceil(sec/60))`).
 
 ## API route examples
 

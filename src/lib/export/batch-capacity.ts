@@ -25,6 +25,16 @@ export const BATCH_SLOT_STATUSES: readonly ExportJobStatus[] = [
  *  keeps total SSD usage under the GCE SSD_TOTAL_GB quota. */
 export const DEFAULT_MAX_ACTIVE_BATCH_JOBS = 1;
 
+/**
+ * Cost-safety watchdog window: a `rendering`/`uploading` export whose `lastProgressAt`
+ * (last chunk recorded, or last real progress write — NOT the bare 30s heartbeat,
+ * which keeps `updatedAt` fresh even when nothing is happening) is older than this is
+ * cancelled in Google Batch and failed `stale_progress_timeout`. 12 min comfortably
+ * clears a healthy 4K/60 render (chunks complete every few seconds) and merge (~1–2
+ * min), but kills an alive-but-stuck worker fast. From EXPORT_STALE_PROGRESS_SECONDS.
+ */
+export const DEFAULT_STALE_PROGRESS_SECONDS = 720;
+
 /** Per-worker Batch boot disk (GB) + per-job total-disk cap. Batch boot disks are
  *  pd-balanced, which count toward the GCE SSD_TOTAL_GB quota, so a multi-worker
  *  shard job must keep workers × bootDiskGb under the cap or excess tasks sit
@@ -66,4 +76,15 @@ export function maxActiveBatchJobs(env: NodeJS.ProcessEnv = process.env): number
     if (Number.isFinite(n) && n > 0) return n;
   }
   return DEFAULT_MAX_ACTIVE_BATCH_JOBS;
+}
+
+/**
+ * Seconds of no real render progress after which the stale-progress watchdog
+ * (reconcile-exports cron) cancels the Batch job + fails the export. Reads
+ * `EXPORT_STALE_PROGRESS_SECONDS`; a missing/invalid/non-positive value uses the
+ * default (720). Pure — unit-tested.
+ */
+export function exportStaleProgressSeconds(env: NodeJS.ProcessEnv = process.env): number {
+  const n = Number.parseInt(env.EXPORT_STALE_PROGRESS_SECONDS ?? "", 10);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_STALE_PROGRESS_SECONDS;
 }

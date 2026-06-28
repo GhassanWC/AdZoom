@@ -222,17 +222,20 @@ public sealed class SingleJobRunner(
 
     /// <summary>Map the terminal Firestore status the pipeline wrote into a process
     /// exit code. ProcessAsync swallows its own errors (it fails the job in
-    /// Firestore), so we read the result back rather than catching here.</summary>
+    /// Firestore), so we read the result back rather than catching here. A `failed`
+    /// job with a DETERMINISTIC errorCode exits <see cref="ExitCodes.Fatal"/> so
+    /// Batch's lifecycle policy FAIL_TASKs it (no retry VM); any other failure exits
+    /// 1 (one Batch retry re-claims the still-non-terminal job).</summary>
     private async Task<int> ResolveExitCodeAsync(string uid, string jobId)
     {
-        var status = await fs.GetJobStatusAsync(uid, jobId);
+        var (status, errorCode) = await fs.GetJobStatusAndErrorAsync(uid, jobId);
         return status switch
         {
-            JobFields.Ready => 0,
-            JobFields.Canceled => 0, // user-initiated, not a system failure
-            // failed, or still non-terminal (shutdown mid-render) → non-zero so the
-            // Batch task is marked failed / eligible for a retry.
-            _ => 1,
+            JobFields.Ready => ExitCodes.Success,
+            JobFields.Canceled => ExitCodes.Success, // user-initiated, not a system failure
+            JobFields.Failed when JobFields.IsDeterministicError(errorCode) => ExitCodes.Fatal,
+            // failed (transient), or still non-terminal (shutdown mid-render) → exit 1.
+            _ => ExitCodes.TransientFailure,
         };
     }
 }

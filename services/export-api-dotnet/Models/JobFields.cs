@@ -16,6 +16,28 @@ public static class JobFields
     public static readonly string[] ActiveStatuses = { Queued, BatchSubmitted, Rendering, Uploading };
     public static bool IsTerminal(string? status) => status is Ready or Failed or Canceled;
 
+    /// <summary>
+    /// Error codes that are DETERMINISTIC — bad input / unsupported codec / a timeline
+    /// that can't be chunked / a missing source. Re-rendering cannot fix them, so the
+    /// worker must fail-fast: NO in-process retries, and exit with
+    /// <see cref="ExitCodes.Fatal"/> so Batch's lifecycle policy marks the task FAILED
+    /// without spinning a retry VM. (Transient codes like render_failed/upload_failed
+    /// are NOT here — they get the normal one retry.)
+    /// </summary>
+    public static readonly HashSet<string> DeterministicErrorCodes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "unsupported_video",
+        "decode_failed",
+        "audio_decode_failed",
+        "normalize_not_executed",
+        "normalize_failed",
+        "chunk_unsupported_effects",
+        "bad_invocation",
+    };
+
+    public static bool IsDeterministicError(string? code) =>
+        code is not null && DeterministicErrorCodes.Contains(code);
+
     // Job doc fields
     public const string Status = "status";
     public const string Stage = "stage";
@@ -49,6 +71,23 @@ public static class JobFields
     public const string HeartbeatAt = "heartbeatAt";
     public const string ExportPath = "exportPath";
     public const string SettingsHash = "settingsHash";
+
+    // ── Cost-safety watchdog (per-worker heartbeat + last real progress) ──────
+    /// <summary>Epoch ms of the most recent per-worker heartbeat from ANY shard
+    /// worker (main-doc mirror; per-worker detail lives in the workers subcollection).</summary>
+    public const string LastWorkerHeartbeatAt = "lastWorkerHeartbeatAt";
+    /// <summary>Best-effort count of shard workers heartbeating in the recent window.</summary>
+    public const string ActiveWorkerCount = "activeWorkerCount";
+    /// <summary>Chunk index a worker is currently rendering (per-worker doc), -1 if idle.</summary>
+    public const string CurrentChunkIndex = "currentChunkIndex";
+    /// <summary>Shard worker index (per-worker doc id mirror).</summary>
+    public const string WorkerIndex = "workerIndex";
+    /// <summary>Epoch ms of the last REAL render progress (chunk recorded / render
+    /// start / merge claim / frame progress) — NOT bumped by the bare heartbeat, so the
+    /// app-side stale-progress watchdog can spot an alive-but-stuck worker.</summary>
+    public const string LastProgressAt = "lastProgressAt";
+    /// <summary>Per-worker heartbeat marker subcollection under the job doc.</summary>
+    public const string WorkersCollection = "workers";
 
     // ── Sharded chunked render (one Batch job, workerCount shard tasks) ───────
     public const string RenderMode = "renderMode";

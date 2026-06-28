@@ -24,10 +24,10 @@ import {
   FREE_UPLOAD_MAX_DURATION_SECONDS,
 } from "../src/lib/usage/plan.ts";
 
-test("plan minutes: Free 0, Pro 150, Creator 600", () => {
+test("plan minutes: Free 0, Pro 150, Creator 250", () => {
   assert.equal(CLOUD_EXPORT_MINUTES.free, 0);
   assert.equal(CLOUD_EXPORT_MINUTES.pro, 150);
-  assert.equal(CLOUD_EXPORT_MINUTES.creator, 600);
+  assert.equal(CLOUD_EXPORT_MINUTES.creator, 250);
 });
 
 test("planAllowsCloudExport: only paid plans", () => {
@@ -70,7 +70,7 @@ test("Scenario 3 — Pro: cloud export allowed within remaining minutes", () => 
 
 // ── Scenario 4: Creator user ───────────────────────────────────────────────
 test("Scenario 4 — Creator: higher quota; priority is creator-only", () => {
-  assert.equal(cloudMinutesRemaining("creator", undefined), 600);
+  assert.equal(cloudMinutesRemaining("creator", undefined), 250);
   assert.equal(canCloudExport("creator", undefined, 10), true);
   // (The API maps creator → priority queue; pro/free → normal.)
 });

@@ -1486,6 +1486,22 @@ export interface ExportJobDoc {
   /** Epoch ms the single-job (Batch) worker bumps every 30s. Mirrors
    *  `lastHeartbeatAt`; kept distinct for the Batch liveness contract. */
   heartbeatAt?: number;
+  /** Epoch ms of the most recent per-worker heartbeat from ANY shard worker
+   *  (mirrors `lastHeartbeatAt`; the per-worker detail lives in the `workers`
+   *  subcollection). Bumped every 30s while running. */
+  lastWorkerHeartbeatAt?: number;
+  /** Best-effort count of shard workers that heartbeated within the recent window
+   *  (derived from fresh `workers/{i}` docs). Observability for the cost-safety
+   *  watchdog; not authoritative. */
+  activeWorkerCount?: number;
+  /**
+   * Epoch ms of the last REAL render progress — a chunk recorded, the render
+   * starting, a merge claim, or a frame-progress write. Deliberately NOT bumped by
+   * the bare 30s heartbeat (which keeps `updatedAt` fresh), so the stale-progress
+   * watchdog can detect an alive-but-stuck worker that heartbeats while rendering
+   * nothing. Drives `stale_progress_timeout` in the reconcile cron.
+   */
+  lastProgressAt?: number;
   /** Best-effort queue position recorded at enqueue (active jobs created before
    *  this one). Shown while `status === "queued"`; not updated live. */
   queuePosition?: number;
@@ -1610,6 +1626,31 @@ export interface ExportChunkMarkerDoc {
   workerId?: string;
   taskIndex?: number;
   completedAt?: number;
+}
+
+/**
+ * Per-worker heartbeat marker at `users/{uid}/exportJobs/{jobId}/workers/{workerIndex}`
+ * (doc id = the shard worker index). Each Batch shard worker rewrites its own doc every
+ * 30s while running, so a stuck worker can be pinpointed (which index, which chunk) and
+ * `activeWorkerCount` derived by counting fresh docs. Server-only writes (worker via
+ * Admin SDK); owner-readable for diagnostics. The 8 workers never clobber each other
+ * because each owns a distinct doc.
+ */
+export interface ExportWorkerHeartbeatDoc {
+  /** Shard worker index (0-based) — mirrors the doc id. */
+  workerIndex: number;
+  /** Chunk index this worker is currently rendering, or -1 when between chunks/idle. */
+  currentChunkIndex: number;
+  /** Chunks this worker has completed so far (its share, not the job total). */
+  chunksCompleted: number;
+  /** This worker's local progress 0..100 (rendered / assigned). */
+  progressPercent: number;
+  /** Id of the worker/task (EXPORT_WORKER_ID or hostname#pid). */
+  workerId?: string;
+  /** Worker build/version stamp. */
+  buildVersion?: string;
+  /** Epoch ms of this worker's last heartbeat write. */
+  lastWorkerHeartbeatAt?: number;
 }
 
 /** Friendly progress stages the export dialog shows (maps from status + stage). */

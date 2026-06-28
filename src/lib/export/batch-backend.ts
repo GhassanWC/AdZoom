@@ -51,7 +51,7 @@ export type { BatchJobInspection } from "@/lib/export/batch-status";
  *   BATCH_MEMORY_MIB          default 16384
  *   BATCH_BOOT_DISK_GB        default 50 (pd-balanced; counts toward SSD_TOTAL_GB)
  *   BATCH_MAX_TOTAL_DISK_GB   default 450 (cap on workers × bootDiskGb per job)
- *   BATCH_MAX_RUN_SECONDS     default 7200 (2h ceiling per export)
+ *   BATCH_MAX_RUN_SECONDS     default 2400 (40min ceiling per single-task export)
  *   BATCH_MAX_RETRY_COUNT     default 1
  *   BATCH_PROVISIONING_MODEL  "STANDARD" (default) | "SPOT"
  *   BATCH_CHUNKED_RENDER      "1" to enable the worker's chunked render path
@@ -108,8 +108,22 @@ function numEnv(key: string, fallback: number): number {
  * leader. Batch bills actual runtime, so a worker that finishes early costs nothing.
  */
 function chunkedTaskMaxRunSeconds(): number {
-  return intEnv("EXPORT_CHUNK_TASK_TIMEOUT_SECONDS", 5400);
+  // Cost-safety: a 4K/60fps 6-min export now finishes in ~10min, so a 30min
+  // per-task ceiling is a generous backstop while keeping a wedged shard worker
+  // from billing for an hour+. The 12-min stale-progress watchdog (reconcile cron)
+  // is the real guarantee; this is the last-resort hard kill. Env-overridable.
+  return intEnv("EXPORT_CHUNK_TASK_TIMEOUT_SECONDS", 1800);
 }
+
+/**
+ * Distinct process exit code the worker uses for a DETERMINISTIC (input/validation/
+ * timeline/source-missing) failure that re-running cannot fix. Batch's
+ * `lifecyclePolicies` map this code to FAIL_TASK so it is NEVER retried (a fresh
+ * VM would just fail the same way). Transient failures exit 1 and still retry up
+ * to maxRetryCount. MUST stay in sync with ExitCodes.Fatal in the .NET worker
+ * (services/export-api-dotnet/Models/ExitCodes.cs).
+ */
+const FATAL_EXIT_CODE = 42;
 
 /**
  * RFC1035-safe Batch job id derived from the Firestore job id (lowercase letters,
@@ -124,6 +138,22 @@ function batchJobId(jobId: string): string {
   return `${base}-${suffix}`;
 }
 
+/**
+ * Lifecycle policy: a task that exits with FATAL_EXIT_CODE (deterministic worker
+ * failure — bad input / unsupported codec / timeline that can't be chunked) is
+ * marked FAILED immediately and NOT retried. Re-running it on a fresh VM would just
+ * fail the same way and burn another VM, so we fail-fast. Any OTHER non-zero exit
+ * (transient crash/preemption) falls through to the default maxRetryCount behavior.
+ */
+function fatalFailTaskLifecyclePolicies(): protos.google.cloud.batch.v1.ILifecyclePolicy[] {
+  return [
+    {
+      action: protos.google.cloud.batch.v1.LifecyclePolicy.Action.FAIL_TASK,
+      actionCondition: { exitCodes: [FATAL_EXIT_CODE] },
+    },
+  ];
+}
+
 /** Build the Batch job spec. One task, one container, the env the worker needs. */
 function buildBatchJob(
   image: string,
@@ -136,7 +166,7 @@ function buildBatchJob(
   const cpuMilli = intEnv("BATCH_CPU_MILLI", 4000);
   const memoryMib = intEnv("BATCH_MEMORY_MIB", 16384);
   const bootDiskGb = intEnv("BATCH_BOOT_DISK_GB", 50);
-  const maxRunSeconds = intEnv("BATCH_MAX_RUN_SECONDS", 7200);
+  const maxRunSeconds = intEnv("BATCH_MAX_RUN_SECONDS", 2400);
   const maxRetryCount = intEnv("BATCH_MAX_RETRY_COUNT", 1);
   const provisioningModel = (process.env.BATCH_PROVISIONING_MODEL || "STANDARD").toUpperCase();
 
@@ -153,8 +183,11 @@ function buildBatchJob(
           // Hard ceiling so a wedged render can't run (and bill) forever.
           maxRunDuration: { seconds: maxRunSeconds },
           // Whole-task retries: a crash/preemption re-runs the container, which
-          // re-claims the (still non-terminal) job via forceReclaim.
+          // re-claims the (still non-terminal) job via forceReclaim. A deterministic
+          // failure (exit FATAL_EXIT_CODE) is exempted by the lifecycle policy below.
           maxRetryCount,
+          // Never retry a deterministic worker failure (FATAL_EXIT_CODE).
+          lifecyclePolicies: fatalFailTaskLifecyclePolicies(),
           runnables: [
             {
               container: {
@@ -235,8 +268,11 @@ function buildChunkedBatchJob(
           computeResource: { cpuMilli, memoryMib },
           maxRunDuration: { seconds: maxRunSeconds },
           // Per-CHUNK Batch retry (a crashed/preempted chunk task re-runs on a fresh
-          // VM; the re-run re-uploads its chunk idempotently and re-checks merge).
+          // VM; the re-run re-uploads its chunk idempotently and re-checks merge). A
+          // deterministic failure (exit FATAL_EXIT_CODE) is exempted by the policy below.
           maxRetryCount,
+          // Never retry a deterministic worker failure (FATAL_EXIT_CODE).
+          lifecyclePolicies: fatalFailTaskLifecyclePolicies(),
           runnables: [{ container: { imageUri: image } }],
         },
       },

@@ -15,6 +15,8 @@ import {
   QUEUE_REASON_WAITING_FOR_SLOT,
   WAITING_FOR_SLOT_MESSAGE,
   clampWorkersForDiskQuota,
+  exportStaleProgressSeconds,
+  DEFAULT_STALE_PROGRESS_SECONDS,
 } from "../src/lib/export/batch-capacity.ts";
 
 test("maxActiveBatchJobs: default is 1 when no env var is set", () => {
@@ -77,4 +79,23 @@ test("disk guard: fits exactly at the cap → unchanged", () => {
 
 test("disk guard: never returns < 1 even when one disk exceeds the cap", () => {
   assert.equal(clampWorkersForDiskQuota(8, 600, 450), 1);
+});
+
+// ── exportStaleProgressSeconds (cost-safety watchdog window) ──────────────────
+
+test("exportStaleProgressSeconds: default is 720 when no env var is set", () => {
+  assert.equal(exportStaleProgressSeconds({}), 720);
+  assert.equal(DEFAULT_STALE_PROGRESS_SECONDS, 720);
+});
+
+test("exportStaleProgressSeconds: reads EXPORT_STALE_PROGRESS_SECONDS", () => {
+  assert.equal(exportStaleProgressSeconds({ EXPORT_STALE_PROGRESS_SECONDS: "300" }), 300);
+  assert.equal(exportStaleProgressSeconds({ EXPORT_STALE_PROGRESS_SECONDS: "1200" }), 1200);
+});
+
+test("exportStaleProgressSeconds: invalid / non-positive values fall back to default", () => {
+  assert.equal(exportStaleProgressSeconds({ EXPORT_STALE_PROGRESS_SECONDS: "" }), 720);
+  assert.equal(exportStaleProgressSeconds({ EXPORT_STALE_PROGRESS_SECONDS: "abc" }), 720);
+  assert.equal(exportStaleProgressSeconds({ EXPORT_STALE_PROGRESS_SECONDS: "0" }), 720);
+  assert.equal(exportStaleProgressSeconds({ EXPORT_STALE_PROGRESS_SECONDS: "-5" }), 720);
 });

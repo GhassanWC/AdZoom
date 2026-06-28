@@ -122,6 +122,13 @@ service cloud.firestore {
           allow read: if isOwner(uid);
           allow create, update, delete: if false;
         }
+
+        // Per-worker heartbeat markers (one per shard worker; 30s cadence). Server-
+        // only writes (worker via Admin SDK); owner-readable for diagnostics.
+        match /workers/{workerId} {
+          allow read: if isOwner(uid);
+          allow create, update, delete: if false;
+        }
       }
 
       // ── Monthly usage counters ────────────────────────────────────────

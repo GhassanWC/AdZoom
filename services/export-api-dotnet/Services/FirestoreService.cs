@@ -165,6 +165,8 @@ public sealed class FirestoreService(FirestoreDb db, ExportOptions opts, ILogger
                 [JobFields.ClaimedAt] = FieldValue.ServerTimestamp,
                 [JobFields.LastHeartbeatAt] = FieldValue.ServerTimestamp,
                 [JobFields.HeartbeatAt] = FieldValue.ServerTimestamp,
+                // Render-start baseline for the stale-progress watchdog.
+                [JobFields.LastProgressAt] = FieldValue.ServerTimestamp,
                 [JobFields.Progress] = 0,
                 [JobFields.StartedAt] = FieldValue.ServerTimestamp,
                 [JobFields.UpdatedAt] = FieldValue.ServerTimestamp,
@@ -175,17 +177,23 @@ public sealed class FirestoreService(FirestoreDb db, ExportOptions opts, ILogger
         return (result, result == ClaimResult.Claimed ? claimed : null);
     }
 
-    /// <summary>Merge a patch + bump updatedAt + lastHeartbeatAt (server timestamps).
-    /// Every stage/progress write doubles as a liveness beat so stale detection only
-    /// fires for a genuinely dead worker.</summary>
+    /// <summary>Merge a patch + bump updatedAt + lastHeartbeatAt + lastProgressAt
+    /// (server timestamps). Every stage/progress write doubles as a liveness beat so
+    /// stale detection only fires for a genuinely dead worker, AND counts as real
+    /// progress so the stale-progress watchdog doesn't fire mid-render/mid-merge.</summary>
     public Task PatchAsync(string uid, string jobId, Dictionary<string, object?> data)
     {
         data[JobFields.UpdatedAt] = FieldValue.ServerTimestamp;
         data[JobFields.LastHeartbeatAt] = FieldValue.ServerTimestamp;
         data[JobFields.HeartbeatAt] = FieldValue.ServerTimestamp;
+        // A stage/progress write is REAL progress (unlike the bare heartbeat below).
+        data[JobFields.LastProgressAt] = FieldValue.ServerTimestamp;
         return JobRef(uid, jobId).SetAsync(data, SetOptions.MergeAll);
     }
 
+    /// <summary>Bare liveness beat (no progress). Bumps updatedAt/lastHeartbeatAt/
+    /// heartbeatAt but DELIBERATELY NOT lastProgressAt — a heartbeat must not mask a
+    /// stalled render from the stale-progress watchdog.</summary>
     public Task HeartbeatAsync(string uid, string jobId) =>
         JobRef(uid, jobId).SetAsync(new Dictionary<string, object>
         {
@@ -193,6 +201,55 @@ public sealed class FirestoreService(FirestoreDb db, ExportOptions opts, ILogger
             [JobFields.LastHeartbeatAt] = FieldValue.ServerTimestamp,
             [JobFields.HeartbeatAt] = FieldValue.ServerTimestamp,
         }, SetOptions.MergeAll);
+
+    /// <summary>
+    /// Per-worker heartbeat (30s cadence). Rewrites this shard worker's own doc at
+    /// users/{uid}/exportJobs/{jobId}/workers/{workerIndex} with its current chunk /
+    /// completed count / local progress, then mirrors a coarse activeWorkerCount +
+    /// lastWorkerHeartbeatAt + the usual liveness beat onto the MAIN doc. Per-worker
+    /// docs never clobber each other (distinct ids), so 8 workers can heartbeat
+    /// concurrently. Does NOT bump lastProgressAt (heartbeat ≠ progress).
+    /// </summary>
+    public async Task WorkerHeartbeatAsync(
+        string uid, string jobId, int workerIndex, int currentChunkIndex,
+        int chunksCompletedByWorker, int progressPercent)
+    {
+        var jobRef = JobRef(uid, jobId);
+        var workerRef = jobRef.Collection(JobFields.WorkersCollection).Document(workerIndex.ToString());
+        await workerRef.SetAsync(new Dictionary<string, object?>
+        {
+            [JobFields.WorkerIndex] = workerIndex,
+            [JobFields.CurrentChunkIndex] = currentChunkIndex,
+            [JobFields.ChunksCompleted] = chunksCompletedByWorker,
+            [JobFields.ProgressPercent] = progressPercent,
+            [JobFields.WorkerId] = opts.WorkerId,
+            [JobFields.BuildVersion] = opts.BuildVersion,
+            [JobFields.LastWorkerHeartbeatAt] = FieldValue.ServerTimestamp,
+        }, SetOptions.MergeAll);
+
+        // Best-effort live worker count: docs heartbeated within ~3× the cadence.
+        var activeWorkerCount = 0;
+        try
+        {
+            var freshMs = Math.Max(30, opts.HeartbeatSeconds) * 3 * 1000L;
+            var snap = await jobRef.Collection(JobFields.WorkersCollection).GetSnapshotAsync();
+            foreach (var d in snap.Documents)
+                if (AgeMs(d, JobFields.LastWorkerHeartbeatAt) <= freshMs) activeWorkerCount++;
+        }
+        catch (Exception ex)
+        {
+            log.LogWarning(ex, "[export] active-worker-count read failed job={JobId}", jobId);
+        }
+
+        await jobRef.SetAsync(new Dictionary<string, object?>
+        {
+            [JobFields.LastWorkerHeartbeatAt] = FieldValue.ServerTimestamp,
+            [JobFields.ActiveWorkerCount] = activeWorkerCount,
+            [JobFields.UpdatedAt] = FieldValue.ServerTimestamp,
+            [JobFields.LastHeartbeatAt] = FieldValue.ServerTimestamp,
+            [JobFields.HeartbeatAt] = FieldValue.ServerTimestamp,
+        }, SetOptions.MergeAll);
+    }
 
     // ── Parallel chunked render coordination ─────────────────────────────────
     public enum ChunkRecordResult { AlreadyTerminal, AlreadyCounted, Counted, AllComplete }
@@ -227,6 +284,8 @@ public sealed class FirestoreService(FirestoreDb db, ExportOptions opts, ILogger
                 [JobFields.UpdatedAt] = FieldValue.ServerTimestamp,
                 [JobFields.LastHeartbeatAt] = FieldValue.ServerTimestamp,
                 [JobFields.HeartbeatAt] = FieldValue.ServerTimestamp,
+                // Render-start baseline for the stale-progress watchdog.
+                [JobFields.LastProgressAt] = FieldValue.ServerTimestamp,
             });
             return true;
         });
@@ -295,6 +354,9 @@ public sealed class FirestoreService(FirestoreDb db, ExportOptions opts, ILogger
                 [JobFields.UpdatedAt] = FieldValue.ServerTimestamp,
                 [JobFields.LastHeartbeatAt] = FieldValue.ServerTimestamp,
                 [JobFields.HeartbeatAt] = FieldValue.ServerTimestamp,
+                // "A chunk has been recorded" — the core signal the stale-progress
+                // watchdog watches. A worker that stops recording chunks goes stale.
+                [JobFields.LastProgressAt] = FieldValue.ServerTimestamp,
             });
             return completed >= chunkCount ? ChunkRecordResult.AllComplete : ChunkRecordResult.Counted;
         });
@@ -332,6 +394,8 @@ public sealed class FirestoreService(FirestoreDb db, ExportOptions opts, ILogger
                 [JobFields.UpdatedAt] = FieldValue.ServerTimestamp,
                 [JobFields.LastHeartbeatAt] = FieldValue.ServerTimestamp,
                 [JobFields.HeartbeatAt] = FieldValue.ServerTimestamp,
+                // Merge start is real progress (keeps the watchdog off a healthy merge).
+                [JobFields.LastProgressAt] = FieldValue.ServerTimestamp,
             });
             return MergeClaim.Won;
         });
@@ -736,6 +800,17 @@ public sealed class FirestoreService(FirestoreDb db, ExportOptions opts, ILogger
     {
         var snap = await JobRef(uid, jobId).GetSnapshotAsync();
         return snap.Exists ? GetString(snap, JobFields.Status) : null;
+    }
+
+    /// <summary>Read the job's terminal status + errorCode (both null if the doc is
+    /// gone). The single-job runner uses the errorCode to pick a DETERMINISTIC
+    /// (fatal, no-retry) vs transient process exit code.</summary>
+    public async Task<(string? Status, string? ErrorCode)> GetJobStatusAndErrorAsync(string uid, string jobId)
+    {
+        var snap = await JobRef(uid, jobId).GetSnapshotAsync();
+        return snap.Exists
+            ? (GetString(snap, JobFields.Status), GetString(snap, JobFields.ErrorCode))
+            : (null, null);
     }
 
     public JobView ToView(DocumentSnapshot snap) => new()
