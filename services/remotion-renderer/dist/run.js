@@ -3,9 +3,9 @@ import { createRequire as _cr } from 'module'; const require = _cr(import.meta.u
 // src/worker.ts
 import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
-import { existsSync as existsSync2, statSync } from "node:fs";
+import { existsSync as existsSync2, statSync as statSync2 } from "node:fs";
 import { tmpdir, hostname } from "node:os";
-import { join as join2 } from "node:path";
+import { join as join3 } from "node:path";
 import { FieldValue } from "firebase-admin/firestore";
 import { makeCancelSignal } from "@remotion/renderer";
 
@@ -42,6 +42,8 @@ function loadConfig() {
     // below 60s total) so the worker can always settle the job first.
     hardTimeoutSeconds: Math.max(60, timeoutSeconds - timeoutGraceSeconds),
     sourceResolveTimeoutSeconds: intEnv("REMOTION_SOURCE_RESOLVE_TIMEOUT_SECONDS", 60),
+    downloadTimeoutSeconds: intEnv("REMOTION_DOWNLOAD_TIMEOUT_SECONDS", 600),
+    noProgressTimeoutMs: intEnv("REMOTION_NO_PROGRESS_TIMEOUT_MS", 12e4),
     perFrameTimeoutMs: intEnv("REMOTION_FRAME_TIMEOUT_MS", 6e4),
     cancelPollMs: intEnv("REMOTION_CANCEL_POLL_MS", 3e3),
     progressThrottleMs: intEnv("REMOTION_PROGRESS_THROTTLE_MS", 2e3),
@@ -103,6 +105,12 @@ function getServeUrl() {
   return cached2;
 }
 
+// src/source.ts
+import { createServer } from "node:http";
+import { createReadStream, createWriteStream, statSync } from "node:fs";
+import { join as join2, extname } from "node:path";
+import { pipeline } from "node:stream/promises";
+
 // src/errors.ts
 var SourceUnavailableError = class extends Error {
   code = "source_unavailable";
@@ -158,7 +166,66 @@ function withDeadline(p, ms, signal, label) {
     );
   });
 }
-async function resolveSource(job, opts) {
+function startLocalFileServer(filePath, routeName) {
+  const size = statSync(filePath).size;
+  const server = createServer((req, res) => {
+    const method = (req.method || "GET").toUpperCase();
+    if (method !== "GET" && method !== "HEAD") {
+      res.writeHead(405).end();
+      return;
+    }
+    res.setHeader("Content-Type", "video/mp4");
+    res.setHeader("Accept-Ranges", "bytes");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    const range = req.headers.range;
+    const match = range ? /bytes=(\d*)-(\d*)/.exec(range) : null;
+    let start = 0;
+    let end = size - 1;
+    let status = 200;
+    if (match) {
+      const s = match[1] ? Number.parseInt(match[1], 10) : NaN;
+      const e = match[2] ? Number.parseInt(match[2], 10) : NaN;
+      start = Number.isFinite(s) ? s : 0;
+      end = Number.isFinite(e) ? Math.min(e, size - 1) : size - 1;
+      if (start > end || start >= size) {
+        res.writeHead(416, { "Content-Range": `bytes */${size}` }).end();
+        return;
+      }
+      status = 206;
+      res.setHeader("Content-Range", `bytes ${start}-${end}/${size}`);
+    }
+    res.setHeader("Content-Length", String(end - start + 1));
+    res.writeHead(status);
+    if (method === "HEAD") {
+      res.end();
+      return;
+    }
+    const stream = createReadStream(filePath, { start, end });
+    stream.on("error", () => res.destroy());
+    res.on("error", () => stream.destroy());
+    stream.pipe(res);
+  });
+  return new Promise((resolve2, reject) => {
+    server.on("error", reject);
+    const sockets = /* @__PURE__ */ new Set();
+    server.on("connection", (sock) => {
+      sockets.add(sock);
+      sock.on("close", () => sockets.delete(sock));
+    });
+    server.listen(0, "127.0.0.1", () => {
+      const port = server.address().port;
+      resolve2({
+        url: `http://127.0.0.1:${port}/${routeName}`,
+        port,
+        close: () => new Promise((res) => {
+          for (const s of sockets) s.destroy();
+          server.close(() => res());
+        })
+      });
+    });
+  });
+}
+async function prepareSource(job, workDir, opts) {
   const file = bucket().file(job.sourceStoragePath);
   let bytes = 0;
   try {
@@ -179,30 +246,34 @@ async function resolveSource(job, opts) {
       `source object ${job.sourceStoragePath} is empty or has no readable size`
     );
   }
-  let renderUrl;
+  const ext = extname(job.sourceStoragePath) || ".mp4";
+  const routeName = `source${ext}`;
+  const localPath = join2(workDir, routeName);
+  const timeout = AbortSignal.timeout(Math.max(1, opts.downloadTimeoutMs));
+  const combined = opts.signal ? AbortSignal.any([opts.signal, timeout]) : timeout;
   try {
-    const [url] = await withDeadline(
-      file.getSignedUrl({
-        version: "v4",
-        action: "read",
-        expires: Date.now() + Math.max(6e4, opts.signedTtlMs)
-      }),
-      opts.resolveTimeoutMs,
-      opts.signal,
-      "source URL signing"
+    await pipeline(file.createReadStream(), createWriteStream(localPath), { signal: combined });
+  } catch (err) {
+    const e = err;
+    const aborted = e?.name === "AbortError" || e?.code === "ABORT_ERR";
+    throw new SourceUnavailableError(
+      `source download ${aborted ? "timed out / aborted" : "failed"} for ${job.sourceStoragePath}: ${e?.message ?? String(err)}`
     );
-    renderUrl = url;
+  }
+  let server;
+  try {
+    server = await startLocalFileServer(localPath, routeName);
   } catch (err) {
     throw new SourceUnavailableError(
-      `failed to sign source URL for ${job.sourceStoragePath} (the renderer SA may lack iam.serviceAccountTokenCreator): ${err instanceof Error ? err.message : String(err)}`
+      `failed to start local source server: ${err instanceof Error ? err.message : String(err)}`
     );
   }
-  if (!/^https?:\/\//i.test(renderUrl)) {
-    throw new SourceUnavailableError(
-      `resolved render URL is not http(s): ${renderUrl.slice(0, 16)}\u2026`
-    );
+  if (!/^http:\/\//i.test(server.url)) {
+    await server.close().catch(() => {
+    });
+    throw new SourceUnavailableError(`local source URL is not http: ${server.url.slice(0, 16)}\u2026`);
   }
-  return { renderUrl, bytes };
+  return { renderUrl: server.url, bytes, localPath, close: server.close };
 }
 
 // src/render.ts
@@ -329,6 +400,8 @@ async function processRemotionJob(uid, jobId) {
   const preAbort = new AbortController();
   let wasCanceled = false;
   let timedOut = false;
+  let noProgressTimedOut = false;
+  let progressWatchdog;
   const patch = (data) => jobRef.set(
     { ...data, lastHeartbeatAt: Date.now(), heartbeatAt: Date.now(), updatedAt: FieldValue.serverTimestamp() },
     { merge: true }
@@ -367,18 +440,19 @@ async function processRemotionJob(uid, jobId) {
     preAbort.abort();
   }, cfg.hardTimeoutSeconds * 1e3);
   let workDir = null;
+  let source = null;
   try {
-    workDir = await mkdtemp(join2(tmpdir(), `framevo-remotion-${jobId}-`));
-    const outPath = join2(workDir, `${jobId}.mp4`);
+    workDir = await mkdtemp(join3(tmpdir(), `framevo-remotion-${jobId}-`));
+    const outPath = join3(workDir, `${jobId}.mp4`);
     await progressPatch({ stage: "downloading", progress: 0.02, progressStage: "preparing" });
-    const source = await resolveSource(job, {
-      signedTtlMs: (cfg.timeoutSeconds + 600) * 1e3,
+    source = await prepareSource(job, workDir, {
       resolveTimeoutMs: cfg.sourceResolveTimeoutSeconds * 1e3,
+      downloadTimeoutMs: cfg.downloadTimeoutSeconds * 1e3,
       signal: preAbort.signal
     });
     const renderUrlProtocol = new URL(source.renderUrl).protocol.replace(/:$/, "");
-    log("source signed URL created", { uid, jobId, bytes: source.bytes, ttlMs: (cfg.timeoutSeconds + 600) * 1e3 });
-    log(`source render URL protocol=${renderUrlProtocol}`, { uid, jobId });
+    log("local source server started", { uid, jobId, url: source.renderUrl, bytes: source.bytes });
+    log(`render src protocol=${renderUrlProtocol}`, { uid, jobId });
     log("props loaded / source readable", { uid, jobId, bytes: source.bytes });
     const audioMode = "source";
     const inputProps = {
@@ -390,7 +464,21 @@ async function processRemotionJob(uid, jobId) {
     const serveUrl = await getServeUrl();
     log("composition bundle ready", { uid, jobId });
     const gate = makeThrottle(cfg.progressThrottleMs);
+    const armProgressWatchdog = () => {
+      if (progressWatchdog) clearTimeout(progressWatchdog);
+      progressWatchdog = setTimeout(() => {
+        noProgressTimedOut = true;
+        console.error("[remotion-worker] NO-PROGRESS TIMEOUT \u2014 aborting render", {
+          uid,
+          jobId,
+          noProgressTimeoutMs: cfg.noProgressTimeoutMs
+        });
+        cancel();
+        preAbort.abort();
+      }, cfg.noProgressTimeoutMs);
+    };
     log("render started", { uid, jobId });
+    armProgressWatchdog();
     const result = await renderExport({
       serveUrl,
       inputProps,
@@ -401,6 +489,7 @@ async function processRemotionJob(uid, jobId) {
       perFrameTimeoutMs: cfg.perFrameTimeoutMs,
       cancelSignal,
       onProgress: ({ progress, stitchStage }) => {
+        armProgressWatchdog();
         gate(
           () => void progressPatch({
             stage: stitchStage === "muxing" ? "encoding" : "rendering",
@@ -411,8 +500,9 @@ async function processRemotionJob(uid, jobId) {
         );
       }
     });
+    if (progressWatchdog) clearTimeout(progressWatchdog);
     log("render completed", { uid, jobId, frames: result.durationInFrames });
-    if (!existsSync2(outPath) || statSync(outPath).size <= 0) {
+    if (!existsSync2(outPath) || statSync2(outPath).size <= 0) {
       throw new Error("render produced no output file");
     }
     await progressPatch({ stage: "uploading", progress: 0.98, progressStage: "uploading" });
@@ -477,7 +567,10 @@ async function processRemotionJob(uid, jobId) {
       return "canceled";
     }
     const raw = err instanceof Error ? err.message : "Render failed.";
-    const friendly = timedOut ? { code: "render_timeout", message: "The export took too long and was stopped. Please try again." } : err instanceof SourceUnavailableError ? { code: err.code, message: SOURCE_UNAVAILABLE_MESSAGE } : toUserFacingError(err);
+    const friendly = noProgressTimedOut ? {
+      code: "render_no_progress_timeout",
+      message: "The export stalled before producing any video and was stopped. Please try again."
+    } : timedOut ? { code: "render_timeout", message: "The export took too long and was stopped. Please try again." } : err instanceof SourceUnavailableError ? { code: err.code, message: SOURCE_UNAVAILABLE_MESSAGE } : toUserFacingError(err);
     await db.runTransaction(async (tx) => {
       const snap = await tx.get(jobRef);
       if (!snap.exists) return;
@@ -510,6 +603,9 @@ async function processRemotionJob(uid, jobId) {
     clearInterval(cancelPoll);
     clearInterval(heartbeat);
     clearTimeout(hardTimeout);
+    if (progressWatchdog) clearTimeout(progressWatchdog);
+    if (source) await source.close().catch(() => {
+    });
     if (workDir) await rm(workDir, { recursive: true, force: true }).catch(() => {
     });
   }

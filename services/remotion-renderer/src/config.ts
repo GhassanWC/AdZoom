@@ -9,10 +9,10 @@ export interface RendererConfig {
   /** renderMedia concurrency; null = auto (half the CPU threads). */
   concurrency: number | null;
   /** The Cloud Run execution budget (== REMOTION_EXPORT_TIMEOUT_SECONDS, the
-   *  per-execution timeout the dispatcher + Job are configured with). The worker
-   *  uses it only to size the signed-URL TTL; the in-process kill fires EARLIER
-   *  (see `hardTimeoutSeconds`) so the worker always wins the race against the
-   *  platform SIGKILL and can write `failed` + release minutes. */
+   *  per-execution timeout the dispatcher + Job are configured with). The
+   *  in-process kill fires EARLIER (see `hardTimeoutSeconds`) so the worker always
+   *  wins the race against the platform SIGKILL and can write `failed` + release
+   *  minutes. */
   timeoutSeconds: number;
   /** In-process hard wall-clock kill = `timeoutSeconds - timeoutGraceSeconds`
    *  (floored). Strictly less than the platform timeout so the worker tears the
@@ -21,10 +21,16 @@ export interface RendererConfig {
   /** Margin reserved below the platform timeout for the worker's graceful
    *  abort + failed-finalize + minute release. */
   timeoutGraceSeconds: number;
-  /** Hard cap on the source metadata-read + signed-URL-mint control-plane calls
-   *  so a hung GCS API can't wedge the job BEFORE renderMedia starts (where the
-   *  render cancelSignal can't reach). */
+  /** Hard cap on the source metadata-read control-plane call so a hung GCS API
+   *  can't wedge the job before the download even starts. */
   sourceResolveTimeoutSeconds: number;
+  /** Hard cap on streaming the source object to local /tmp (served over the
+   *  local HTTP server). A hung GCS read fails the job instead of hanging. */
+  downloadTimeoutSeconds: number;
+  /** Render-progress watchdog: if `renderMedia` produces NO progress within this
+   *  window (e.g. the asset download stalls before the first frame), the worker
+   *  aborts and fails `render_no_progress_timeout` rather than hanging. */
+  noProgressTimeoutMs: number;
   /** Per-frame renderMedia timeout (a single stuck frame). */
   perFrameTimeoutMs: number;
   /** How often the worker polls Firestore for cancelRequested. */
@@ -64,6 +70,8 @@ export function loadConfig(): RendererConfig {
     // below 60s total) so the worker can always settle the job first.
     hardTimeoutSeconds: Math.max(60, timeoutSeconds - timeoutGraceSeconds),
     sourceResolveTimeoutSeconds: intEnv("REMOTION_SOURCE_RESOLVE_TIMEOUT_SECONDS", 60),
+    downloadTimeoutSeconds: intEnv("REMOTION_DOWNLOAD_TIMEOUT_SECONDS", 600),
+    noProgressTimeoutMs: intEnv("REMOTION_NO_PROGRESS_TIMEOUT_MS", 120_000),
     perFrameTimeoutMs: intEnv("REMOTION_FRAME_TIMEOUT_MS", 60_000),
     cancelPollMs: intEnv("REMOTION_CANCEL_POLL_MS", 3000),
     progressThrottleMs: intEnv("REMOTION_PROGRESS_THROTTLE_MS", 2000),

@@ -16,7 +16,7 @@ import { makeCancelSignal } from "@remotion/renderer";
 import { getAdmin, bucket } from "./firebase.js";
 import { loadConfig } from "./config.js";
 import { getServeUrl } from "./bundle.js";
-import { resolveSource, type ResolvedSource } from "./source.js";
+import { prepareSource, type PreparedSource } from "./source.js";
 import { renderExport } from "./render.js";
 import { makeThrottle } from "./progress.js";
 import { toUserFacingError, SourceUnavailableError, SOURCE_UNAVAILABLE_MESSAGE } from "./errors.js";
@@ -105,6 +105,11 @@ export async function processRemotionJob(uid: string, jobId: string): Promise<st
   const preAbort = new AbortController();
   let wasCanceled = false;
   let timedOut = false;
+  // Render-progress watchdog: armed at "render started", re-armed on every
+  // onProgress. If renderMedia produces NO progress within noProgressTimeoutMs
+  // (e.g. the asset fetch stalls before the first frame), abort + fail clearly.
+  let noProgressTimedOut = false;
+  let progressWatchdog: ReturnType<typeof setTimeout> | undefined;
 
   const patch = (data: Record<string, unknown>) =>
     jobRef.set(
@@ -164,24 +169,25 @@ export async function processRemotionJob(uid: string, jobId: string): Promise<st
   }, cfg.hardTimeoutSeconds * 1000);
 
   let workDir: string | null = null;
+  let source: PreparedSource | null = null;
   try {
     workDir = await mkdtemp(join(tmpdir(), `framevo-remotion-${jobId}-`));
     const outPath = join(workDir, `${jobId}.mp4`);
 
     // ── Source ──────────────────────────────────────────────────────────────
-    // Validation (object readable) and the RENDER src are deliberately separate:
-    // Remotion's compositor can only fetch http(s) assets, so <OffthreadVideo>
-    // gets a short-lived signed HTTPS URL — NEVER a file:// path (which throws
-    // "Can only download URLs starting with http:// or https://").
+    // Validate the GCS object, download it to /tmp, and serve it from a tiny
+    // local HTTP server. Remotion's compositor downloads OffthreadVideo assets
+    // Node-side: file:// is rejected and a remote signed URL can stall, so we
+    // hand it a NORMAL http://127.0.0.1 URL backed by bytes already on disk.
     await progressPatch({ stage: "downloading", progress: 0.02, progressStage: "preparing" });
-    const source: ResolvedSource = await resolveSource(job, {
-      signedTtlMs: (cfg.timeoutSeconds + 600) * 1000,
+    source = await prepareSource(job, workDir, {
       resolveTimeoutMs: cfg.sourceResolveTimeoutSeconds * 1000,
+      downloadTimeoutMs: cfg.downloadTimeoutSeconds * 1000,
       signal: preAbort.signal,
     });
     const renderUrlProtocol = new URL(source.renderUrl).protocol.replace(/:$/, "");
-    log("source signed URL created", { uid, jobId, bytes: source.bytes, ttlMs: (cfg.timeoutSeconds + 600) * 1000 });
-    log(`source render URL protocol=${renderUrlProtocol}`, { uid, jobId });
+    log("local source server started", { uid, jobId, url: source.renderUrl, bytes: source.bytes });
+    log(`render src protocol=${renderUrlProtocol}`, { uid, jobId });
     log("props loaded / source readable", { uid, jobId, bytes: source.bytes });
 
     // Paid cloud export always renders the source audio track (per-section speed
@@ -202,7 +208,24 @@ export async function processRemotionJob(uid: string, jobId: string): Promise<st
 
     // ── Render (single MP4; native audio mux) ────────────────────────────────
     const gate = makeThrottle(cfg.progressThrottleMs);
+    // Arm the no-progress watchdog: if renderMedia produces no progress within
+    // the window (asset fetch stall, wedged Chromium), abort + fail clearly
+    // instead of hanging silently after "composition selected".
+    const armProgressWatchdog = () => {
+      if (progressWatchdog) clearTimeout(progressWatchdog);
+      progressWatchdog = setTimeout(() => {
+        noProgressTimedOut = true;
+        console.error("[remotion-worker] NO-PROGRESS TIMEOUT — aborting render", {
+          uid,
+          jobId,
+          noProgressTimeoutMs: cfg.noProgressTimeoutMs,
+        });
+        cancel();
+        preAbort.abort();
+      }, cfg.noProgressTimeoutMs);
+    };
     log("render started", { uid, jobId });
+    armProgressWatchdog();
     const result = await renderExport({
       serveUrl,
       inputProps,
@@ -213,6 +236,9 @@ export async function processRemotionJob(uid: string, jobId: string): Promise<st
       perFrameTimeoutMs: cfg.perFrameTimeoutMs,
       cancelSignal,
       onProgress: ({ progress, stitchStage }) => {
+        // Re-arm on EVERY callback (not just throttled writes) so real progress
+        // always resets the watchdog.
+        armProgressWatchdog();
         gate(() =>
           void progressPatch({
             stage: stitchStage === "muxing" ? "encoding" : "rendering",
@@ -222,6 +248,7 @@ export async function processRemotionJob(uid: string, jobId: string): Promise<st
         );
       },
     });
+    if (progressWatchdog) clearTimeout(progressWatchdog);
     log("render completed", { uid, jobId, frames: result.durationInFrames });
 
     if (!existsSync(outPath) || statSync(outPath).size <= 0) {
@@ -299,11 +326,16 @@ export async function processRemotionJob(uid: string, jobId: string): Promise<st
       return "canceled";
     }
     const raw = err instanceof Error ? err.message : "Render failed.";
-    const friendly = timedOut
-      ? { code: "render_timeout", message: "The export took too long and was stopped. Please try again." }
-      : err instanceof SourceUnavailableError
-        ? { code: err.code, message: SOURCE_UNAVAILABLE_MESSAGE }
-        : toUserFacingError(err);
+    const friendly = noProgressTimedOut
+      ? {
+          code: "render_no_progress_timeout",
+          message: "The export stalled before producing any video and was stopped. Please try again.",
+        }
+      : timedOut
+        ? { code: "render_timeout", message: "The export took too long and was stopped. Please try again." }
+        : err instanceof SourceUnavailableError
+          ? { code: err.code, message: SOURCE_UNAVAILABLE_MESSAGE }
+          : toUserFacingError(err);
     await db
       .runTransaction(async (tx) => {
         const snap = await tx.get(jobRef);
@@ -338,6 +370,9 @@ export async function processRemotionJob(uid: string, jobId: string): Promise<st
     clearInterval(cancelPoll);
     clearInterval(heartbeat);
     clearTimeout(hardTimeout);
+    if (progressWatchdog) clearTimeout(progressWatchdog);
+    // Stop the local source server before deleting the dir it serves from.
+    if (source) await source.close().catch(() => {});
     if (workDir) await rm(workDir, { recursive: true, force: true }).catch(() => {});
   }
 }
