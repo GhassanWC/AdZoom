@@ -1,0 +1,30 @@
+{
+  "name": "framevo-remotion-renderer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Framevo paid cloud export — one-shot Cloud Run Job that renders ONE MP4 with @remotion/renderer and settles the Firestore export job.",
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/run.js",
+    "dev": "tsx src/run.ts",
+    "bundle:smoke": "node scripts/bundle-smoke.mjs"
+  },
+  "dependencies": {
+    "@remotion/bundler": "4.0.484",
+    "@remotion/renderer": "4.0.484",
+    "firebase-admin": "^13.9.0",
+    "react": "19.2.4",
+    "react-dom": "19.2.4",
+    "remotion": "4.0.484"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "esbuild": "^0.24.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5"
+  }
+}
