@@ -16,6 +16,7 @@
     "worker:typecheck": "npm --prefix services/export-worker run typecheck",
     "worker:deploy": "node scripts/deploy-worker.mjs",
     "export-api:deploy": "node scripts/deploy-export-api-dotnet.mjs",
+    "batch:build": "node scripts/build-batch-worker.mjs",
     "fb:whoami": "node scripts/firebase-active.mjs",
     "fb:use:dev": "firebase use dev",
     "fb:use:prod": "firebase use prod",

@@ -76,9 +76,12 @@ public sealed class SingleJobRunner(
         var jobId = opts.JobId;
         if (string.IsNullOrWhiteSpace(uid) || string.IsNullOrWhiteSpace(jobId))
         {
+            // Defensive: Program.RunSingleJobAsync already fails fast (exit 42) on
+            // missing job env, so we should never get here. If we somehow do, it's a
+            // DETERMINISTIC misconfig — exit Fatal so Batch FAIL_TASKs it (no retry).
             log.LogError("[batch:single-job] missing EXPORT_JOB_UID/EXPORT_JOB_ID — nothing to render");
             BatchLog.Error("missing EXPORT_JOB_UID/EXPORT_JOB_ID — nothing to render");
-            return 1;
+            return ExitCodes.Fatal;
         }
 
         log.LogInformation("[batch:single-job] start uid={Uid} jobId={JobId} build={Build} chunked={Chunked}",

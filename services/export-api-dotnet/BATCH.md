@@ -33,26 +33,44 @@ non-terminal job (`forceReclaim`).
 
 Build context is the **repo root** (the render-CLI bundle inlines shared code).
 
+> ⚠ **Production Batch jobs MUST pin an immutable tag — never `:latest`.** Batch
+> reads `BATCH_IMAGE` at submit time; a floating `:latest` silently diverged from
+> the code once (the Batch tasks ran an old image with NO `[batch-worker]` shard
+> logging, sitting RUNNING for minutes with only Google-agent logs). Build a new
+> `batch-vN` tag for every change and repoint `BATCH_IMAGE` to it only after
+> verifying it enters the real shard path. Keep the previous `batch-v(N-1)` tag
+> for rollback.
+
+The Batch worker image lives in the **`framevo-workers/export-worker`** repo (the
+one `BATCH_IMAGE` pulls from) — distinct from the Cloud Run `framevo/export-api`
+image. Build it with the dedicated script (Cloud Build — no local Docker needed):
+
+```bash
+# From the repo root. TAG is REQUIRED and must be immutable (script refuses :latest).
+TAG=batch-v9 npm run batch:build
+#   → builds us-central1-docker.pkg.dev/adzoom-prod/framevo-workers/export-worker:batch-v9
+#   → stamps BUILD_VERSION = git short sha; prints the digest + the BATCH_IMAGE to set
+```
+
+Equivalent raw command (what the script runs):
+
 ```bash
 PROJECT=adzoom-prod
 REGION=us-central1
-REPO=framevo
-IMAGE="$REGION-docker.pkg.dev/$PROJECT/$REPO/export-api"
+REPO=framevo-workers
+IMAGE="$REGION-docker.pkg.dev/$PROJECT/$REPO/export-worker:batch-v9"
 
-# One-time: create the Artifact Registry repo
-gcloud artifacts repositories create "$REPO" \
-  --repository-format=docker --location="$REGION" --project="$PROJECT"
-
-# Build (from repo root) and push
-gcloud auth configure-docker "$REGION-docker.pkg.dev"
-docker build -f services/export-api-dotnet/Dockerfile \
-  --build-arg BUILD_VERSION="$(git rev-parse --short HEAD)" \
-  -t "$IMAGE:latest" -t "$IMAGE:$(git rev-parse --short HEAD)" .
-docker push "$IMAGE:latest"
-docker push "$IMAGE:$(git rev-parse --short HEAD)"
+gcloud builds submit --project="$PROJECT" \
+  --config=services/export-api-dotnet/cloudbuild.yaml \
+  --substitutions=_IMAGE="$IMAGE",_BUILD_VERSION="$(git rev-parse --short HEAD)" .
 ```
 
-(Or `gcloud builds submit` using `services/export-api-dotnet/cloudbuild.yaml`.)
+One-time repo create (already done for `framevo-workers`):
+
+```bash
+gcloud artifacts repositories create framevo-workers \
+  --repository-format=docker --location=us-central1 --project=adzoom-prod
+```
 
 ---
 
@@ -120,9 +138,9 @@ CLOUD_EXPORT_ENABLED=true
 NEXT_PUBLIC_CLOUD_EXPORT_ENABLED=true
 EXPORT_BACKEND=batch
 
-# Batch target (required)
+# Batch target (required). Pin an IMMUTABLE tag — NEVER :latest (see §1).
 BATCH_REGION=us-central1
-BATCH_IMAGE=us-central1-docker.pkg.dev/adzoom-prod/framevo/export-api:latest
+BATCH_IMAGE=us-central1-docker.pkg.dev/adzoom-prod/framevo-workers/export-worker:batch-v9
 BATCH_SERVICE_ACCOUNT=framevo-export-worker@adzoom-prod.iam.gserviceaccount.com
 
 # Batch sizing (optional — defaults shown). Mirrors the old VM: 4 vCPU / 16 GB.

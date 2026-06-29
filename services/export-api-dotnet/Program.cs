@@ -18,11 +18,42 @@ static string EnvOr(string fallbackLabel, params string[] keys) =>
 BatchLog.Line("container started");
 BatchLog.Line($"build={EnvOr("(unset)", "BUILD_VERSION")}");
 BatchLog.Line($"EXPORT_WORKER_MODE={EnvOr("(unset)", "EXPORT_WORKER_MODE")}");
+BatchLog.Line($"EXPORT_RENDER_MODE={EnvOr("(unset)", "EXPORT_RENDER_MODE")}");
 BatchLog.Line($"EXPORT_JOB_ID={EnvOr("(unset)", "EXPORT_JOB_ID")}");
 BatchLog.Line($"EXPORT_JOB_UID={EnvOr("(unset)", "EXPORT_JOB_UID")}");
+BatchLog.Line($"BATCH_TASK_INDEX={EnvOr("(unset)", "BATCH_TASK_INDEX")} BATCH_TASK_COUNT={EnvOr("(unset)", "BATCH_TASK_COUNT")}");
+BatchLog.Line($"EXPORT_CHUNK_COUNT={EnvOr("(unset)", "EXPORT_CHUNK_COUNT")} EXPORT_WORKER_COUNT={EnvOr("(unset)", "EXPORT_WORKER_COUNT")}");
 BatchLog.Line($"FIREBASE_PROJECT_ID={EnvOr("(unset)", "FIREBASE_PROJECT_ID", "NEXT_PUBLIC_FIREBASE_PROJECT_ID", "GCLOUD_PROJECT", "GOOGLE_CLOUD_PROJECT")}");
 BatchLog.Line($"FIREBASE_STORAGE_BUCKET={EnvOr("(unset)", "FIREBASE_STORAGE_BUCKET", "NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET")}");
 
+// ── Run-mode detection (mirrors ExportOptions.Load) ───────────────────────────
+// single-job  ⇐ EXPORT_JOB_ID present OR EXPORT_WORKER_MODE=single-job. This is
+// the one-shot Google Cloud Batch task: it must enter the shard/render path
+// IMMEDIATELY and must NOT stand up Kestrel or a poll loop. We decide here, BEFORE
+// constructing any host, so a misconfigured single-job task can fail fast and a
+// healthy one never binds a port it doesn't use.
+var workerModeRaw = (Environment.GetEnvironmentVariable("EXPORT_WORKER_MODE") ?? "").Trim().ToLowerInvariant();
+var renderModeRaw = (Environment.GetEnvironmentVariable("EXPORT_RENDER_MODE") ?? "single").Trim().ToLowerInvariant();
+var isSingleJob = !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("EXPORT_JOB_ID"))
+                  || workerModeRaw == "single-job";
+var effectiveMode = isSingleJob ? "single-job" : (workerModeRaw.Length == 0 ? "firestore-poll" : workerModeRaw);
+// req: a single, greppable line that names the path this container is taking,
+// emitted before any heavy work (DI / credentials / render).
+BatchLog.Line($"env detected mode={effectiveMode} renderMode={renderModeRaw}");
+
+if (isSingleJob)
+{
+    // One-shot Google Cloud Batch task. NO web server, NO poll loop, NO reconciler:
+    // a headless generic Host runs ONLY the SingleJobRunner, which claims/renders
+    // its shard and stops the host so the container EXITS (0 success / non-zero
+    // failure). Idle compute cost is zero — nothing runs between exports.
+    await RunSingleJobAsync(args);
+    return;
+}
+
+// ── Long-lived deployments (GCE VM poll / Cloud Run control plane) ─────────────
+// These genuinely need the HTTP front door (health / enqueue-signal / cancel /
+// status), so they run the full web host. Single-job mode never reaches here.
 var builder = WebApplication.CreateBuilder(args);
 
 // Structured JSON logs for Cloud Logging. NOTE: this emits each entry as a
@@ -40,36 +71,14 @@ builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
 
 // Effective config (env wins, appsettings fallback).
 var opts = ExportOptions.Load(builder.Configuration);
-builder.Services.AddSingleton(opts);
+AddExportCore(builder.Services, opts);
 BatchLog.Line($"config loaded singleJob={opts.SingleJob} mode={opts.WorkerMode} project={opts.ProjectId ?? "(ADC default)"} bucket={opts.StorageBucket ?? "(MISSING)"} heartbeat={opts.HeartbeatSeconds}s startupTimeout={opts.StartupTimeoutSeconds}s");
 
-// Google clients via ADC (Cloud Run) or GOOGLE_APPLICATION_CREDENTIALS (local).
-builder.Services.AddSingleton(_ => new FirestoreDbBuilder { ProjectId = opts.ProjectId }.Build());
-builder.Services.AddSingleton(_ => StorageClient.Create());
-
-// Services + runner.
-builder.Services.AddSingleton<FirestoreService>();
-builder.Services.AddSingleton<StorageService>();
-builder.Services.AddSingleton<RenderSubprocess>();
-builder.Services.AddSingleton<JobPipeline>();
-builder.Services.AddSingleton<MergeStep>();
-builder.Services.AddSingleton<ChunkTaskRunner>();
-builder.Services.AddSingleton<JobSignal>();
-builder.Services.AddSingleton<LogBuffer>();
-// Execution role:
-//   • Single-job (Google Cloud Batch): EXPORT_JOB_ID set ⇒ claim that ONE job,
-//     render it, and EXIT (0 success / non-zero failure). No poll loop, no
-//     reconciler — zero idle cost. Stale jobs are swept by the
-//     /api/cron/reconcile-exports Cloud Scheduler.
+// Execution role (web host only):
 //   • Firestore-poll (GCE VM): long-lived poll/claim/render loop + reconciler.
 //   • disabled (Cloud Run control plane): HTTP endpoints only, never claims a job.
-// The HTTP endpoints (health/enqueue-signal/cancel/status) stay available in all
-// modes; the SingleJobRunner stops the host as soon as its one job is done.
-if (opts.SingleJob)
-{
-    builder.Services.AddHostedService<SingleJobRunner>();
-}
-else if (opts.RunWorker)
+// (Single-job / Batch is handled by RunSingleJobAsync above — it never gets here.)
+if (opts.RunWorker)
 {
     builder.Services.AddHostedService<ExportRunner>();
     builder.Services.AddHostedService<Reconciler>();
@@ -84,32 +93,115 @@ var app = builder.Build();
 // Startup config block + loud warnings (mirrors the Node worker's [worker:startup]).
 LogStartup(app.Services.GetRequiredService<ILogger<Program>>(), opts);
 
-// In single-job (Batch) mode, eagerly construct the Google clients so credential
-// (ADC) init happens NOW, with a clear log on both sides. A missing/denied SA is
-// the most common Batch misconfig; failing here surfaces it as an explicit
-// startup error instead of a silent hang deep inside the first Firestore call.
-if (opts.SingleJob)
+app.UseMiddleware<InternalSecretMiddleware>();
+app.MapExportEndpoints();
+
+app.Run();
+
+// ── Single-job (Google Cloud Batch) headless host ─────────────────────────────
+// A generic Host (NO Kestrel) that runs ONLY the SingleJobRunner. The HTTP
+// endpoints are intentionally absent: a Batch task has no ingress, polls its own
+// `cancelRequested`, and writes status straight to Firestore — so a web server
+// would only bind an unused port and muddy the "what is this container doing"
+// signal. The runner stops the host the moment its one job is done → the process
+// exits with the render's success/failure code.
+static async Task RunSingleJobAsync(string[] args)
 {
+    var builder = Host.CreateApplicationBuilder(args);
+    builder.Logging.ClearProviders();
+    builder.Logging.AddJsonConsole(o => o.IncludeScopes = false);
+    builder.Logging.SetMinimumLevel(LogLevel.Information);
+
+    BatchLog.Line("loading config");
+    var opts = ExportOptions.Load(builder.Configuration);
+    BatchLog.Line($"config loaded singleJob={opts.SingleJob} mode={opts.WorkerMode} renderMode={opts.RenderMode} chunkedTask={opts.IsChunkedTask} chunkCount={opts.ChunkCount} workerCount={opts.WorkerCount} taskIndex={opts.TaskIndex} taskCount={opts.TaskCount} project={opts.ProjectId ?? "(ADC default)"} bucket={opts.StorageBucket ?? "(MISSING)"} heartbeat={opts.HeartbeatSeconds}s startupTimeout={opts.StartupTimeoutSeconds}s");
+
+    // Fail fast on a misconfigured task. Missing required env is DETERMINISTIC —
+    // a Batch retry on a fresh VM would fail identically — so we exit
+    // ExitCodes.Fatal (42), which the job spec's lifecyclePolicy maps to FAIL_TASK
+    // (no retry VM, no wasted billing). This runs BEFORE DI / credentials / render.
+    var missing = MissingSingleJobEnv(opts);
+    if (missing.Count > 0)
+    {
+        BatchLog.Error($"FATAL: single-job mode is missing required env: {string.Join(", ", missing)}. " +
+                       $"Not entering the render path. Exiting {ExitCodes.Fatal}.");
+        Environment.Exit(ExitCodes.Fatal); // [DoesNotReturn] — the lines below never run
+    }
+
+    AddExportCore(builder.Services, opts);
+    builder.Services.AddHostedService<SingleJobRunner>();
+    builder.Services.Configure<HostOptions>(h => h.ShutdownTimeout = TimeSpan.FromSeconds(25));
+
+    var host = builder.Build();
+
+    // Startup config block + loud warnings (mirrors the Node worker's [worker:startup]).
+    LogStartup(host.Services.GetRequiredService<ILogger<Program>>(), opts);
+
+    // Eagerly construct the Google clients so credential (ADC) init happens NOW,
+    // with a clear log on both sides. A missing/denied SA is the most common Batch
+    // misconfig; failing here surfaces it as an explicit startup error instead of a
+    // silent hang deep inside the first Firestore call.
     BatchLog.Line("initializing Firebase/Google credentials (ADC)");
     try
     {
-        app.Services.GetRequiredService<FirestoreDb>();
-        app.Services.GetRequiredService<StorageClient>();
+        host.Services.GetRequiredService<FirestoreDb>();
+        host.Services.GetRequiredService<StorageClient>();
         BatchLog.Line("Firebase/Google credentials ready");
     }
     catch (Exception ex)
     {
         BatchLog.Error($"FATAL: Google credential/client init failed: {ex.Message}");
-        // Non-zero exit so the Batch task is marked failed and the VM is torn
-        // down (no idle billing). The stale-job reconciler refunds the minutes.
-        Environment.Exit(1);
+        // Non-zero exit so the Batch task is marked failed and the VM is torn down
+        // (no idle billing). The stale-job reconciler refunds the minutes.
+        Environment.Exit(1); // [DoesNotReturn]
     }
+
+    await host.RunAsync();
 }
 
-app.UseMiddleware<InternalSecretMiddleware>();
-app.MapExportEndpoints();
+// Shared service graph registered for BOTH hosts (web + single-job) so the render
+// pipeline resolves and behaves identically regardless of how the process started.
+static void AddExportCore(IServiceCollection services, ExportOptions opts)
+{
+    services.AddSingleton(opts);
+    // Google clients via ADC (Cloud Run / Batch VM) or GOOGLE_APPLICATION_CREDENTIALS (local).
+    services.AddSingleton(_ => new FirestoreDbBuilder { ProjectId = opts.ProjectId }.Build());
+    services.AddSingleton(_ => StorageClient.Create());
+    // Services + runners.
+    services.AddSingleton<FirestoreService>();
+    services.AddSingleton<StorageService>();
+    services.AddSingleton<RenderSubprocess>();
+    services.AddSingleton<JobPipeline>();
+    services.AddSingleton<MergeStep>();
+    services.AddSingleton<ChunkTaskRunner>();
+    services.AddSingleton<JobSignal>();
+    services.AddSingleton<LogBuffer>();
+}
 
-app.Run();
+// Which submitter/runtime-injected env vars are REQUIRED for this single-job task
+// but missing. Returns the names (not values) so the fail-fast log is actionable.
+// Always required: EXPORT_JOB_ID + EXPORT_JOB_UID (the job lives at
+// users/{uid}/exportJobs/{jobId}). A chunked shard task ALSO needs the fan-out the
+// submitter injects (EXPORT_CHUNK_COUNT / EXPORT_WORKER_COUNT) and the per-task
+// index Batch injects (BATCH_TASK_INDEX / BATCH_TASK_COUNT) — without the latter
+// every shard would silently default to worker 0 and render the SAME chunks.
+static List<string> MissingSingleJobEnv(ExportOptions o)
+{
+    var missing = new List<string>();
+    if (string.IsNullOrWhiteSpace(o.JobId)) missing.Add("EXPORT_JOB_ID");
+    if (string.IsNullOrWhiteSpace(o.JobUid)) missing.Add("EXPORT_JOB_UID");
+
+    if (o.RenderMode.Equals("chunked", StringComparison.OrdinalIgnoreCase))
+    {
+        if (o.ChunkCount <= 0) missing.Add("EXPORT_CHUNK_COUNT(>0)");
+        if (o.WorkerCount <= 0) missing.Add("EXPORT_WORKER_COUNT(>0)");
+        if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("BATCH_TASK_INDEX")))
+            missing.Add("BATCH_TASK_INDEX");
+        if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("BATCH_TASK_COUNT")))
+            missing.Add("BATCH_TASK_COUNT");
+    }
+    return missing;
+}
 
 static void LogStartup(ILogger logger, ExportOptions o)
 {
