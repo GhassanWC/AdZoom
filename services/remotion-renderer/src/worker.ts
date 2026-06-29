@@ -16,10 +16,10 @@ import { makeCancelSignal } from "@remotion/renderer";
 import { getAdmin, bucket } from "./firebase.js";
 import { loadConfig } from "./config.js";
 import { getServeUrl } from "./bundle.js";
-import { resolveSource } from "./source.js";
+import { resolveSource, type ResolvedSource } from "./source.js";
 import { renderExport } from "./render.js";
 import { makeThrottle } from "./progress.js";
-import { toUserFacingError } from "./errors.js";
+import { toUserFacingError, SourceUnavailableError, SOURCE_UNAVAILABLE_MESSAGE } from "./errors.js";
 import type { ExportJobDoc } from "@/lib/firebase/schema";
 import type { FramevoAudioMode, FramevoCompositionProps } from "@/remotion/types";
 
@@ -169,13 +169,20 @@ export async function processRemotionJob(uid: string, jobId: string): Promise<st
     const outPath = join(workDir, `${jobId}.mp4`);
 
     // ── Source ──────────────────────────────────────────────────────────────
+    // Validation (object readable) and the RENDER src are deliberately separate:
+    // Remotion's compositor can only fetch http(s) assets, so <OffthreadVideo>
+    // gets a short-lived signed HTTPS URL — NEVER a file:// path (which throws
+    // "Can only download URLs starting with http:// or https://").
     await progressPatch({ stage: "downloading", progress: 0.02, progressStage: "preparing" });
-    const source = await resolveSource(job, workDir, {
+    const source: ResolvedSource = await resolveSource(job, {
       signedTtlMs: (cfg.timeoutSeconds + 600) * 1000,
-      downloadTimeoutMs: cfg.downloadTimeoutSeconds * 1000,
+      resolveTimeoutMs: cfg.sourceResolveTimeoutSeconds * 1000,
       signal: preAbort.signal,
     });
-    log("props loaded / source readable", { uid, jobId, bytes: source.bytes, mode: source.localPath ? "download" : "signed" });
+    const renderUrlProtocol = new URL(source.renderUrl).protocol.replace(/:$/, "");
+    log("source signed URL created", { uid, jobId, bytes: source.bytes, ttlMs: (cfg.timeoutSeconds + 600) * 1000 });
+    log(`source render URL protocol=${renderUrlProtocol}`, { uid, jobId });
+    log("props loaded / source readable", { uid, jobId, bytes: source.bytes });
 
     // Paid cloud export always renders the source audio track (per-section speed
     // `audioMode:"mute"` is still honored from the recipe's moments inside the
@@ -184,7 +191,7 @@ export async function processRemotionJob(uid: string, jobId: string): Promise<st
     const audioMode: FramevoAudioMode = "source";
     const inputProps: FramevoCompositionProps = {
       recipe: job.renderRecipe,
-      src: source.src,
+      src: source.renderUrl,
       audioMode,
     };
 
@@ -294,7 +301,9 @@ export async function processRemotionJob(uid: string, jobId: string): Promise<st
     const raw = err instanceof Error ? err.message : "Render failed.";
     const friendly = timedOut
       ? { code: "render_timeout", message: "The export took too long and was stopped. Please try again." }
-      : toUserFacingError(err);
+      : err instanceof SourceUnavailableError
+        ? { code: err.code, message: SOURCE_UNAVAILABLE_MESSAGE }
+        : toUserFacingError(err);
     await db
       .runTransaction(async (tx) => {
         const snap = await tx.get(jobRef);

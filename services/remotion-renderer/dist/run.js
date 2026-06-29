@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { existsSync as existsSync2, statSync } from "node:fs";
 import { tmpdir, hostname } from "node:os";
-import { join as join3 } from "node:path";
+import { join as join2 } from "node:path";
 import { FieldValue } from "firebase-admin/firestore";
 import { makeCancelSignal } from "@remotion/renderer";
 
@@ -41,7 +41,7 @@ function loadConfig() {
     // Fire the in-process kill at least 60s before the platform timeout (and never
     // below 60s total) so the worker can always settle the job first.
     hardTimeoutSeconds: Math.max(60, timeoutSeconds - timeoutGraceSeconds),
-    downloadTimeoutSeconds: intEnv("REMOTION_DOWNLOAD_TIMEOUT_SECONDS", 600),
+    sourceResolveTimeoutSeconds: intEnv("REMOTION_SOURCE_RESOLVE_TIMEOUT_SECONDS", 60),
     perFrameTimeoutMs: intEnv("REMOTION_FRAME_TIMEOUT_MS", 6e4),
     cancelPollMs: intEnv("REMOTION_CANCEL_POLL_MS", 3e3),
     progressThrottleMs: intEnv("REMOTION_PROGRESS_THROTTLE_MS", 2e3),
@@ -103,36 +103,106 @@ function getServeUrl() {
   return cached2;
 }
 
-// src/source.ts
-import { createWriteStream } from "node:fs";
-import { join as join2, extname } from "node:path";
-import { pipeline } from "node:stream/promises";
-import { pathToFileURL } from "node:url";
-async function resolveSource(job, workDir, opts) {
-  const file = bucket().file(job.sourceStoragePath);
-  if ((process.env.REMOTION_SOURCE_MODE || "download").toLowerCase() === "signed") {
-    const [url] = await file.getSignedUrl({
-      action: "read",
-      expires: Date.now() + Math.max(6e4, opts.signedTtlMs)
-    });
-    return { src: url, bytes: 0 };
+// src/errors.ts
+var SourceUnavailableError = class extends Error {
+  code = "source_unavailable";
+  constructor(message) {
+    super(message);
+    this.name = "SourceUnavailableError";
   }
-  const ext = extname(job.sourceStoragePath) || ".mp4";
-  const localPath = join2(workDir, `source${ext}`);
-  const timeout = AbortSignal.timeout(Math.max(1, opts.downloadTimeoutMs));
-  const combined = opts.signal ? AbortSignal.any([opts.signal, timeout]) : timeout;
+};
+var SOURCE_UNAVAILABLE_MESSAGE = "Couldn't read the source recording. Please try again.";
+function toUserFacingError(err) {
+  const raw = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  if (raw.includes("render_timeout") || raw.includes("timed out") || raw.includes("timeout")) {
+    return { code: "render_timeout", message: "The export took too long and was stopped. Please try again." };
+  }
+  if (raw.includes("upload_failed") || raw.includes("upload")) {
+    return { code: "upload_failed", message: "The export rendered but couldn't be uploaded. Please try again." };
+  }
+  if (raw.includes("no such object") || raw.includes("not found") || raw.includes("download") || raw.includes("source")) {
+    return { code: "source_unavailable", message: "Couldn't read the source recording. Please try again." };
+  }
+  if (raw.includes("decode") || raw.includes("unsupported") || raw.includes("codec")) {
+    return { code: "unsupported_source", message: "This recording couldn't be processed for export." };
+  }
+  return { code: "render_failed", message: "Something went wrong while exporting your video. Please try again." };
+}
+
+// src/source.ts
+function withDeadline(p, ms, signal, label) {
+  return new Promise((resolve2, reject) => {
+    let settled = false;
+    const finish = (fn) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener("abort", onAbort);
+      fn();
+    };
+    const timer = setTimeout(
+      () => finish(() => reject(new Error(`${label} timed out after ${ms}ms`))),
+      ms
+    );
+    const onAbort = () => finish(() => reject(new Error(`${label} aborted`)));
+    if (signal) {
+      if (signal.aborted) {
+        finish(() => reject(new Error(`${label} aborted`)));
+        return;
+      }
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+    p.then(
+      (v) => finish(() => resolve2(v)),
+      (e) => finish(() => reject(e))
+    );
+  });
+}
+async function resolveSource(job, opts) {
+  const file = bucket().file(job.sourceStoragePath);
+  let bytes = 0;
   try {
-    await pipeline(file.createReadStream(), createWriteStream(localPath), { signal: combined });
+    const [meta] = await withDeadline(
+      file.getMetadata(),
+      opts.resolveTimeoutMs,
+      opts.signal,
+      "source metadata read"
+    );
+    bytes = Number(meta.size ?? 0) || 0;
   } catch (err) {
-    const e = err;
-    const aborted = e?.name === "AbortError" || e?.code === "ABORT_ERR";
-    throw new Error(
-      `source download ${aborted ? "timed out" : "failed"}: ${e?.message ?? String(err)}`
+    throw new SourceUnavailableError(
+      `source metadata read failed for ${job.sourceStoragePath}: ${err instanceof Error ? err.message : String(err)}`
     );
   }
-  const [meta] = await file.getMetadata().catch(() => [{ size: 0 }]);
-  const bytes = Number(meta.size ?? 0) || 0;
-  return { src: pathToFileURL(localPath).href, localPath, bytes };
+  if (!(bytes > 0)) {
+    throw new SourceUnavailableError(
+      `source object ${job.sourceStoragePath} is empty or has no readable size`
+    );
+  }
+  let renderUrl;
+  try {
+    const [url] = await withDeadline(
+      file.getSignedUrl({
+        version: "v4",
+        action: "read",
+        expires: Date.now() + Math.max(6e4, opts.signedTtlMs)
+      }),
+      opts.resolveTimeoutMs,
+      opts.signal,
+      "source URL signing"
+    );
+    renderUrl = url;
+  } catch (err) {
+    throw new SourceUnavailableError(
+      `failed to sign source URL for ${job.sourceStoragePath} (the renderer SA may lack iam.serviceAccountTokenCreator): ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+  if (!/^https?:\/\//i.test(renderUrl)) {
+    throw new SourceUnavailableError(
+      `resolved render URL is not http(s): ${renderUrl.slice(0, 16)}\u2026`
+    );
+  }
+  return { renderUrl, bytes };
 }
 
 // src/render.ts
@@ -188,24 +258,6 @@ function makeThrottle(ms) {
       fn();
     }
   };
-}
-
-// src/errors.ts
-function toUserFacingError(err) {
-  const raw = (err instanceof Error ? err.message : String(err)).toLowerCase();
-  if (raw.includes("render_timeout") || raw.includes("timed out") || raw.includes("timeout")) {
-    return { code: "render_timeout", message: "The export took too long and was stopped. Please try again." };
-  }
-  if (raw.includes("upload_failed") || raw.includes("upload")) {
-    return { code: "upload_failed", message: "The export rendered but couldn't be uploaded. Please try again." };
-  }
-  if (raw.includes("no such object") || raw.includes("not found") || raw.includes("download") || raw.includes("source")) {
-    return { code: "source_unavailable", message: "Couldn't read the source recording. Please try again." };
-  }
-  if (raw.includes("decode") || raw.includes("unsupported") || raw.includes("codec")) {
-    return { code: "unsupported_source", message: "This recording couldn't be processed for export." };
-  }
-  return { code: "render_failed", message: "Something went wrong while exporting your video. Please try again." };
 }
 
 // src/worker.ts
@@ -316,19 +368,22 @@ async function processRemotionJob(uid, jobId) {
   }, cfg.hardTimeoutSeconds * 1e3);
   let workDir = null;
   try {
-    workDir = await mkdtemp(join3(tmpdir(), `framevo-remotion-${jobId}-`));
-    const outPath = join3(workDir, `${jobId}.mp4`);
+    workDir = await mkdtemp(join2(tmpdir(), `framevo-remotion-${jobId}-`));
+    const outPath = join2(workDir, `${jobId}.mp4`);
     await progressPatch({ stage: "downloading", progress: 0.02, progressStage: "preparing" });
-    const source = await resolveSource(job, workDir, {
+    const source = await resolveSource(job, {
       signedTtlMs: (cfg.timeoutSeconds + 600) * 1e3,
-      downloadTimeoutMs: cfg.downloadTimeoutSeconds * 1e3,
+      resolveTimeoutMs: cfg.sourceResolveTimeoutSeconds * 1e3,
       signal: preAbort.signal
     });
-    log("props loaded / source readable", { uid, jobId, bytes: source.bytes, mode: source.localPath ? "download" : "signed" });
+    const renderUrlProtocol = new URL(source.renderUrl).protocol.replace(/:$/, "");
+    log("source signed URL created", { uid, jobId, bytes: source.bytes, ttlMs: (cfg.timeoutSeconds + 600) * 1e3 });
+    log(`source render URL protocol=${renderUrlProtocol}`, { uid, jobId });
+    log("props loaded / source readable", { uid, jobId, bytes: source.bytes });
     const audioMode = "source";
     const inputProps = {
       recipe: job.renderRecipe,
-      src: source.src,
+      src: source.renderUrl,
       audioMode
     };
     await progressPatch({ stage: "decoding", progress: 0.04, progressStage: "rendering" });
@@ -422,7 +477,7 @@ async function processRemotionJob(uid, jobId) {
       return "canceled";
     }
     const raw = err instanceof Error ? err.message : "Render failed.";
-    const friendly = timedOut ? { code: "render_timeout", message: "The export took too long and was stopped. Please try again." } : toUserFacingError(err);
+    const friendly = timedOut ? { code: "render_timeout", message: "The export took too long and was stopped. Please try again." } : err instanceof SourceUnavailableError ? { code: err.code, message: SOURCE_UNAVAILABLE_MESSAGE } : toUserFacingError(err);
     await db.runTransaction(async (tx) => {
       const snap = await tx.get(jobRef);
       if (!snap.exists) return;

@@ -5,6 +5,24 @@ export interface UserFacingError {
   message: string;
 }
 
+/**
+ * The source recording couldn't be made available to the renderer — the object
+ * is missing/empty, unreadable by the worker's SA, or a signed read URL could
+ * not be minted (e.g. the runtime SA lacks token-creator/signBlob rights). Always
+ * surfaced as `source_unavailable` regardless of the underlying message, so a
+ * signing failure never gets mislabeled as a generic render error or a timeout.
+ */
+export class SourceUnavailableError extends Error {
+  readonly code = "source_unavailable";
+  constructor(message: string) {
+    super(message);
+    this.name = "SourceUnavailableError";
+  }
+}
+
+export const SOURCE_UNAVAILABLE_MESSAGE =
+  "Couldn't read the source recording. Please try again.";
+
 export function toUserFacingError(err: unknown): UserFacingError {
   const raw = (err instanceof Error ? err.message : String(err)).toLowerCase();
   if (raw.includes("render_timeout") || raw.includes("timed out") || raw.includes("timeout")) {

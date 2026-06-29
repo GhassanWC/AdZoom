@@ -21,9 +21,10 @@ export interface RendererConfig {
   /** Margin reserved below the platform timeout for the worker's graceful
    *  abort + failed-finalize + minute release. */
   timeoutGraceSeconds: number;
-  /** Hard cap on the source download stage so a hung GCS read can't wedge the
-   *  job BEFORE renderMedia starts (where the render cancelSignal can't reach). */
-  downloadTimeoutSeconds: number;
+  /** Hard cap on the source metadata-read + signed-URL-mint control-plane calls
+   *  so a hung GCS API can't wedge the job BEFORE renderMedia starts (where the
+   *  render cancelSignal can't reach). */
+  sourceResolveTimeoutSeconds: number;
   /** Per-frame renderMedia timeout (a single stuck frame). */
   perFrameTimeoutMs: number;
   /** How often the worker polls Firestore for cancelRequested. */
@@ -62,7 +63,7 @@ export function loadConfig(): RendererConfig {
     // Fire the in-process kill at least 60s before the platform timeout (and never
     // below 60s total) so the worker can always settle the job first.
     hardTimeoutSeconds: Math.max(60, timeoutSeconds - timeoutGraceSeconds),
-    downloadTimeoutSeconds: intEnv("REMOTION_DOWNLOAD_TIMEOUT_SECONDS", 600),
+    sourceResolveTimeoutSeconds: intEnv("REMOTION_SOURCE_RESOLVE_TIMEOUT_SECONDS", 60),
     perFrameTimeoutMs: intEnv("REMOTION_FRAME_TIMEOUT_MS", 60_000),
     cancelPollMs: intEnv("REMOTION_CANCEL_POLL_MS", 3000),
     progressThrottleMs: intEnv("REMOTION_PROGRESS_THROTTLE_MS", 2000),
