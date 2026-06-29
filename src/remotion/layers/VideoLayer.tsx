@@ -18,25 +18,29 @@ import { useMemo, type ReactNode } from "react";
 import { AbsoluteFill, OffthreadVideo, Sequence, useCurrentFrame, useVideoConfig } from "remotion";
 import type { RenderRecipe } from "@/lib/render/recipe";
 import { resolveCameraFrame } from "@/lib/timeline/camera";
-import { activeSpeedAt, buildTimelineMap, type TimelineMap, type TimelineSegment } from "@/lib/timeline/crop-speed";
-import { cameraGroupStyle, croppedVideoStyle, coverBlurStyle, sourceTimeForOutput } from "../camera";
+import { activeSpeedAt, buildTimelineMap } from "@/lib/timeline/crop-speed";
+import {
+  cameraGroupStyle,
+  croppedVideoStyle,
+  coverBlurStyle,
+  buildOutputFrameSegments,
+  sourceTimeForFrame,
+  type OutputFrameSegment,
+} from "../camera";
 import type { FramevoAudioMode } from "../types";
 
-function segmentMidSource(s: TimelineSegment): number {
-  return (s.sourceStart + s.sourceEnd) / 2;
-}
-
-/** One `<OffthreadVideo>` per timeline segment. `blurred` → the background copy
- *  (cover-filled + blurred, always muted); else the cropped foreground. */
+/** One `<OffthreadVideo>` per timeline segment, tiled on the integer output-frame
+ *  grid (contiguous by construction — no gaps/overlaps). `blurred` → the
+ *  background copy (cover-filled + blurred, always muted); else the cropped fg. */
 function VideoSegments({
   recipe,
-  map,
+  segments,
   src,
   audioMode,
   blurred,
 }: {
   recipe: RenderRecipe;
-  map: TimelineMap;
+  segments: OutputFrameSegment[];
   src: string;
   audioMode: FramevoAudioMode;
   blurred: boolean;
@@ -48,13 +52,17 @@ function VideoSegments({
   );
   return (
     <>
-      {map.segments.map((s, i) => {
-        const from = Math.max(0, Math.round(s.outputStart * fps));
-        const durationInFrames = Math.max(1, Math.round((s.outputEnd - s.outputStart) * fps));
-        const speed = activeSpeedAt(recipe.moments, segmentMidSource(s));
+      {segments.map((s, i) => {
+        const midSource = (s.sourceStart + s.sourceEnd) / 2;
+        const speed = activeSpeedAt(recipe.moments, midSource);
         const muted = blurred || audioMode === "muted" || speed?.audioMode === "mute";
         return (
-          <Sequence key={i} from={from} durationInFrames={durationInFrames} name={`${blurred ? "bg" : "fg"}-seg-${i}`}>
+          <Sequence
+            key={i}
+            from={s.fromFrame}
+            durationInFrames={s.durInFrames}
+            name={`${blurred ? "bg" : "fg"}-seg-${i}`}
+          >
             <OffthreadVideo
               src={src}
               trimBefore={Math.max(0, Math.round(s.sourceStart * fps))}
@@ -81,13 +89,15 @@ export function VideoLayer({
   children?: ReactNode;
 }): React.JSX.Element {
   const frame = useCurrentFrame();
-  const { fps } = useVideoConfig();
-  const map = useMemo(
-    () => buildTimelineMap(recipe.moments, recipe.sourceDuration),
-    [recipe]
+  const { fps, durationInFrames } = useVideoConfig();
+  const segments = useMemo(
+    () => buildOutputFrameSegments(buildTimelineMap(recipe.moments, recipe.sourceDuration), fps, durationInFrames),
+    [recipe, fps, durationInFrames]
   );
 
-  const sourceTime = sourceTimeForOutput(map, frame / fps);
+  // Camera samples the SAME frame windows the videos are tiled on, so the
+  // transform always tracks the segment actually mounted at this frame.
+  const sourceTime = sourceTimeForFrame(segments, frame, fps, recipe.sourceDuration);
   const { camera } = resolveCameraFrame(recipe.moments, sourceTime, {
     autoZoom: recipe.effects.autoZoom,
   });
@@ -99,11 +109,11 @@ export function VideoLayer({
     <>
       {showBlurBg && (
         <AbsoluteFill>
-          <VideoSegments recipe={recipe} map={map} src={src} audioMode={audioMode} blurred />
+          <VideoSegments recipe={recipe} segments={segments} src={src} audioMode={audioMode} blurred />
         </AbsoluteFill>
       )}
       <div style={groupStyle}>
-        <VideoSegments recipe={recipe} map={map} src={src} audioMode={audioMode} blurred={false} />
+        <VideoSegments recipe={recipe} segments={segments} src={src} audioMode={audioMode} blurred={false} />
         {children}
       </div>
     </>

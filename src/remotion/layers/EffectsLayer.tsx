@@ -15,7 +15,7 @@ import type { RenderRecipe } from "@/lib/render/recipe";
 import { resolveCameraFrame } from "@/lib/timeline/camera";
 import { buildTimelineMap } from "@/lib/timeline/crop-speed";
 import { drawClickHighlight } from "@/lib/timeline/click-highlight";
-import { sourceTimeForOutput } from "../camera";
+import { buildOutputFrameSegments, sourceTimeForFrame } from "../camera";
 
 export function Background({ recipe }: { recipe: RenderRecipe }): React.JSX.Element | null {
   if (!recipe.bgActive || recipe.bgMode === "blur") return null;
@@ -43,10 +43,13 @@ export function Vignette({ recipe }: { recipe: RenderRecipe }): React.JSX.Elemen
 
 export function ClickHighlightOverlay({ recipe }: { recipe: RenderRecipe }): React.JSX.Element | null {
   const frame = useCurrentFrame();
-  const { fps } = useVideoConfig();
+  const { fps, durationInFrames } = useVideoConfig();
   const ref = useRef<HTMLCanvasElement | null>(null);
   const { base, canvasW, effects } = recipe;
-  const map = useMemo(() => buildTimelineMap(recipe.moments, recipe.sourceDuration), [recipe]);
+  const segments = useMemo(
+    () => buildOutputFrameSegments(buildTimelineMap(recipe.moments, recipe.sourceDuration), fps, durationInFrames),
+    [recipe, fps, durationInFrames]
+  );
 
   // Draw synchronously before paint so Remotion's frame capture includes it.
   useLayoutEffect(() => {
@@ -55,7 +58,7 @@ export function ClickHighlightOverlay({ recipe }: { recipe: RenderRecipe }): Rea
     if (!cv || !ctx) return;
     ctx.clearRect(0, 0, cv.width, cv.height);
     if (!effects.clickHighlights) return;
-    const sourceTime = sourceTimeForOutput(map, frame / fps);
+    const sourceTime = sourceTimeForFrame(segments, frame, fps, recipe.sourceDuration);
     const { moment } = resolveCameraFrame(recipe.moments, sourceTime, { autoZoom: effects.autoZoom });
     if (!moment || moment.effectType !== "click-highlight") return;
     const dur = Math.max(0.1, moment.endTime - moment.startTime);
@@ -75,7 +78,7 @@ export function ClickHighlightOverlay({ recipe }: { recipe: RenderRecipe }): Rea
       canvasW
     );
     ctx.restore();
-  }, [frame, fps, map, recipe, base, canvasW, effects]);
+  }, [frame, fps, segments, recipe, base, canvasW, effects]);
 
   if (!effects.clickHighlights) return null;
   return (

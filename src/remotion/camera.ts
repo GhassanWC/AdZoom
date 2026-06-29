@@ -25,19 +25,80 @@ import { canvasTranslateFor, type CameraState } from "@/lib/timeline/camera";
 import type { TimelineMap } from "@/lib/timeline/crop-speed";
 import { coverFitDims } from "@/lib/timeline/cover";
 
-/** Map an OUTPUT time (seconds) to the SOURCE time the editor/export samples,
- *  using the recipe's cut/speed timeline map. Identical to the browser loop. */
-export function sourceTimeForOutput(map: TimelineMap, outputTime: number): number {
+/**
+ * A timeline segment projected onto the integer OUTPUT-frame grid. Adjacent
+ * segments are contiguous BY CONSTRUCTION: segment i occupies frames
+ * `[fromFrame, fromFrame + durInFrames)` and the next segment's `fromFrame`
+ * equals this one's exclusive end — so there are NO gaps (black flashes), NO
+ * overlaps (two stacked <OffthreadVideo>s + doubled audio), and exact coverage
+ * of `[0, totalFrames)`. The fix for independent `round(start)` / `round(dur)`
+ * rounding, which drifts and double-covers / uncovers boundary frames.
+ */
+export interface OutputFrameSegment {
+  fromFrame: number;
+  durInFrames: number;
+  sourceStart: number;
+  sourceEnd: number;
+  speedMultiplier: number;
+}
+
+/**
+ * Project the cut/speed timeline map onto the integer output-frame grid by
+ * rounding each segment BOUNDARY once (shared between neighbors) instead of
+ * rounding `from` and `duration` independently. `totalFrames` is the
+ * composition's `durationInFrames` (== `round(outputDuration * fps)`), so the
+ * last segment fills exactly to the end. Sub-frame segments collapse to
+ * `durInFrames <= 0` and are dropped rather than forced to a 1-frame sliver
+ * that would overlap the next segment.
+ */
+export function buildOutputFrameSegments(
+  map: TimelineMap,
+  fps: number,
+  totalFrames: number
+): OutputFrameSegment[] {
   const segs = map.segments;
-  if (segs.length === 0) return outputTime;
-  for (const s of segs) {
-    if (outputTime >= s.outputStart && outputTime < s.outputEnd) {
-      return s.sourceStart + (outputTime - s.outputStart) * s.speedMultiplier;
+  const out: OutputFrameSegment[] = [];
+  for (let i = 0; i < segs.length; i++) {
+    const s = segs[i]!;
+    const fromFrame = Math.max(0, Math.round(s.outputStart * fps));
+    const nextBoundary =
+      i + 1 < segs.length
+        ? Math.max(0, Math.round(segs[i + 1]!.outputStart * fps))
+        : totalFrames;
+    const durInFrames = nextBoundary - fromFrame;
+    if (durInFrames <= 0) continue; // sub-frame sliver — drop it
+    out.push({
+      fromFrame,
+      durInFrames,
+      sourceStart: s.sourceStart,
+      sourceEnd: s.sourceEnd,
+      speedMultiplier: s.speedMultiplier,
+    });
+  }
+  return out;
+}
+
+/**
+ * Map an integer OUTPUT frame to the SOURCE time sampled at that frame, using
+ * the SAME rounded segment windows the <OffthreadVideo> tiling uses — so the
+ * camera + click-highlight always agree with the mounted video on which segment
+ * is active at every frame (no boundary-frame disagreement). Mirrors the
+ * browser loop's `sourceStart + elapsed * speed`, but keyed off the frame grid.
+ */
+export function sourceTimeForFrame(
+  outSegs: OutputFrameSegment[],
+  frame: number,
+  fps: number,
+  fallbackSourceTime: number
+): number {
+  for (const s of outSegs) {
+    if (frame >= s.fromFrame && frame < s.fromFrame + s.durInFrames) {
+      return s.sourceStart + ((frame - s.fromFrame) / fps) * s.speedMultiplier;
     }
   }
-  // Past the last segment (final frame rounding) → clamp to its end.
-  const last = segs[segs.length - 1]!;
-  return last.sourceEnd;
+  // Before the first / past the last segment (final-frame rounding) → clamp.
+  const last = outSegs[outSegs.length - 1];
+  return last ? last.sourceEnd : fallbackSourceTime;
 }
 
 /**

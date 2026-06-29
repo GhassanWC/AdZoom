@@ -18,6 +18,7 @@ import { FREE_VIDEO_DURATION_LIMIT_MESSAGE } from "@/lib/usage/plan";
 import { Button } from "@/components/ui/Button";
 import { EditorRealProvider, useEditorReal } from "./context";
 import { RealVideoPlayer } from "./RealVideoPlayer";
+import { RemotionPreviewPanel } from "./RemotionPreviewPanel";
 import { RealTimeline } from "./RealTimeline";
 import { MomentInspectorModal } from "./MomentInspectorModal";
 import { EffectsModal } from "./EffectsModal";
@@ -262,6 +263,9 @@ function Body() {
               player stays large and visible while you edit. */}
       <div className="space-y-4">
         <RealVideoPlayer />
+        {/* Flag-gated Remotion preview, alongside (never replacing) the canvas
+            preview above — visible only when NEXT_PUBLIC_REMOTION_PREVIEW is on. */}
+        <RemotionPreviewPanel />
       </div>
 
       {/* ── 5. Full-width timeline ───────────────────────────────────────── */}

@@ -39,6 +39,13 @@ export async function renderExport(args: RenderArgs): Promise<RenderResult> {
     id: COMPOSITION_ID,
     inputProps: args.inputProps,
   });
+  console.info("[remotion-worker] composition selected", {
+    id: COMPOSITION_ID,
+    width: composition.width,
+    height: composition.height,
+    fps: composition.fps,
+    durationInFrames: composition.durationInFrames,
+  });
 
   await renderMedia({
     composition,

@@ -40,7 +40,11 @@ COPY --from=build /app/services/remotion-renderer/dist ./dist
 COPY --from=build /app/src /app/src
 
 # Fetch + bake Chrome Headless Shell so the first render doesn't download it.
-RUN npx remotion browser ensure
+# Use the programmatic @remotion/renderer API (the `remotion`/@remotion/cli CLI is
+# NOT a dependency, so `npx remotion …` would have to fetch it from the network and
+# the build would be non-deterministic / could fail). `ensureBrowser()` downloads
+# the same Headless Shell into the Remotion cache reused at render time.
+RUN node -e "import('@remotion/renderer').then(m=>m.ensureBrowser()).then(()=>console.log('[remotion] chrome headless shell ensured')).catch(e=>{console.error(e);process.exit(1)})"
 
 # Run-to-completion Job: render one export, then exit.
 CMD ["node", "dist/run.js"]

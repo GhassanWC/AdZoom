@@ -73,6 +73,10 @@ async function claimJob(db: Firestore, uid: string, jobId: string): Promise<Clai
       claimedAt: FieldValue.serverTimestamp(),
       lastHeartbeatAt: Date.now(),
       heartbeatAt: Date.now(),
+      // Progress baseline so the reconciler's stale-PROGRESS watchdog measures
+      // from "claim", not a frozen `startedAt` fallback. Real progress writes
+      // (download/decode/render/upload) bump it; the bare heartbeat NEVER does.
+      lastProgressAt: Date.now(),
       updatedAt: FieldValue.serverTimestamp(),
     });
     return { action: "claimed", job };
@@ -95,6 +99,10 @@ export async function processRemotionJob(uid: string, jobId: string): Promise<st
   const monthKey = job.monthlyBucket;
 
   const { cancelSignal, cancel } = makeCancelSignal();
+  // Aborts pre-render stages the render `cancelSignal` can't reach (the source
+  // download runs BEFORE renderMedia). Fired by both the cancel poll and the
+  // hard timeout so neither a user-cancel nor a wedged download can hang the job.
+  const preAbort = new AbortController();
   let wasCanceled = false;
   let timedOut = false;
 
@@ -103,6 +111,12 @@ export async function processRemotionJob(uid: string, jobId: string): Promise<st
       { ...data, lastHeartbeatAt: Date.now(), heartbeatAt: Date.now(), updatedAt: FieldValue.serverTimestamp() },
       { merge: true }
     );
+  // Real-progress write: same as `patch` but also bumps `lastProgressAt` so the
+  // reconciler's stale-progress watchdog sees forward motion. The bare heartbeat
+  // (`patch({})`) deliberately does NOT bump it — that's what lets the watchdog
+  // still catch an alive-but-wedged render.
+  const progressPatch = (data: Record<string, unknown>) =>
+    patch({ ...data, lastProgressAt: Date.now() });
 
   // Cancel poll — the cancel route is authoritative (it sets canceled + releases
   // minutes). This just watches the flag and aborts the render.
@@ -117,6 +131,7 @@ export async function processRemotionJob(uid: string, jobId: string): Promise<st
         if (!snap.exists || snap.get("cancelRequested") === true || st === "canceled" || st === "failed") {
           wasCanceled = true;
           cancel();
+          preAbort.abort();
           clearInterval(cancelPoll);
         }
       })
@@ -133,15 +148,20 @@ export async function processRemotionJob(uid: string, jobId: string): Promise<st
   }, cfg.heartbeatMs);
 
   // Hard wall-clock timeout — kill the render so a wedged job can't run forever.
+  // Fires at `hardTimeoutSeconds` (< the Cloud Run execution timeout) so the
+  // worker aborts + writes `failed` + releases minutes BEFORE the platform
+  // SIGKILLs the container. Aborts both the render and any pre-render stage.
   const hardTimeout = setTimeout(() => {
     timedOut = true;
-    console.error("[remotion-worker] HARD TIMEOUT — canceling render", {
+    console.error("[remotion-worker] HARD TIMEOUT — aborting render", {
       uid,
       jobId,
-      timeoutSeconds: cfg.timeoutSeconds,
+      hardTimeoutSeconds: cfg.hardTimeoutSeconds,
+      platformTimeoutSeconds: cfg.timeoutSeconds,
     });
     cancel();
-  }, cfg.timeoutSeconds * 1000);
+    preAbort.abort();
+  }, cfg.hardTimeoutSeconds * 1000);
 
   let workDir: string | null = null;
   try {
@@ -149,12 +169,19 @@ export async function processRemotionJob(uid: string, jobId: string): Promise<st
     const outPath = join(workDir, `${jobId}.mp4`);
 
     // ── Source ──────────────────────────────────────────────────────────────
-    await patch({ stage: "downloading", progress: 0.02, progressStage: "preparing" });
-    const source = await resolveSource(job, workDir, (cfg.timeoutSeconds + 600) * 1000);
+    await progressPatch({ stage: "downloading", progress: 0.02, progressStage: "preparing" });
+    const source = await resolveSource(job, workDir, {
+      signedTtlMs: (cfg.timeoutSeconds + 600) * 1000,
+      downloadTimeoutMs: cfg.downloadTimeoutSeconds * 1000,
+      signal: preAbort.signal,
+    });
     log("props loaded / source readable", { uid, jobId, bytes: source.bytes, mode: source.localPath ? "download" : "signed" });
 
-    const audioMode: FramevoAudioMode =
-      ((job as { audioMode?: FramevoAudioMode }).audioMode ?? "source");
+    // Paid cloud export always renders the source audio track (per-section speed
+    // `audioMode:"mute"` is still honored from the recipe's moments inside the
+    // composition). A global "muted" mode is intentionally not wired from the
+    // client yet, so there is no job/recipe field to read here.
+    const audioMode: FramevoAudioMode = "source";
     const inputProps: FramevoCompositionProps = {
       recipe: job.renderRecipe,
       src: source.src,
@@ -162,7 +189,7 @@ export async function processRemotionJob(uid: string, jobId: string): Promise<st
     };
 
     // ── Bundle ──────────────────────────────────────────────────────────────
-    await patch({ stage: "decoding", progress: 0.04, progressStage: "rendering" });
+    await progressPatch({ stage: "decoding", progress: 0.04, progressStage: "rendering" });
     const serveUrl = await getServeUrl();
     log("composition bundle ready", { uid, jobId });
 
@@ -180,7 +207,7 @@ export async function processRemotionJob(uid: string, jobId: string): Promise<st
       cancelSignal,
       onProgress: ({ progress, stitchStage }) => {
         gate(() =>
-          void patch({
+          void progressPatch({
             stage: stitchStage === "muxing" ? "encoding" : "rendering",
             progressStage: "rendering",
             progress: Math.min(0.97, Math.max(0.04, progress)),
@@ -195,7 +222,7 @@ export async function processRemotionJob(uid: string, jobId: string): Promise<st
     }
 
     // ── Upload + Firebase download URL ───────────────────────────────────────
-    await patch({ stage: "uploading", progress: 0.98, progressStage: "uploading" });
+    await progressPatch({ stage: "uploading", progress: 0.98, progressStage: "uploading" });
     log("upload started", { uid, jobId, dest: job.outputPath });
     const token = randomUUID();
     try {

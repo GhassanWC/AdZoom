@@ -8,8 +8,22 @@ export interface RendererConfig {
   x264Preset: string;
   /** renderMedia concurrency; null = auto (half the CPU threads). */
   concurrency: number | null;
-  /** Hard wall-clock budget for the whole render before the worker kills it. */
+  /** The Cloud Run execution budget (== REMOTION_EXPORT_TIMEOUT_SECONDS, the
+   *  per-execution timeout the dispatcher + Job are configured with). The worker
+   *  uses it only to size the signed-URL TTL; the in-process kill fires EARLIER
+   *  (see `hardTimeoutSeconds`) so the worker always wins the race against the
+   *  platform SIGKILL and can write `failed` + release minutes. */
   timeoutSeconds: number;
+  /** In-process hard wall-clock kill = `timeoutSeconds - timeoutGraceSeconds`
+   *  (floored). Strictly less than the platform timeout so the worker tears the
+   *  render down + settles the job before Cloud Run kills the container. */
+  hardTimeoutSeconds: number;
+  /** Margin reserved below the platform timeout for the worker's graceful
+   *  abort + failed-finalize + minute release. */
+  timeoutGraceSeconds: number;
+  /** Hard cap on the source download stage so a hung GCS read can't wedge the
+   *  job BEFORE renderMedia starts (where the render cancelSignal can't reach). */
+  downloadTimeoutSeconds: number;
   /** Per-frame renderMedia timeout (a single stuck frame). */
   perFrameTimeoutMs: number;
   /** How often the worker polls Firestore for cancelRequested. */
@@ -30,6 +44,8 @@ function intEnv(key: string, fallback: number): number {
 export function loadConfig(): RendererConfig {
   if (cached) return cached;
   const concurrencyRaw = Number.parseInt(process.env.REMOTION_CONCURRENCY ?? "", 10);
+  const timeoutSeconds = intEnv("REMOTION_EXPORT_TIMEOUT_SECONDS", 1800);
+  const timeoutGraceSeconds = intEnv("REMOTION_TIMEOUT_GRACE_SECONDS", 120);
   cached = {
     projectId:
       process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID ||
@@ -41,7 +57,12 @@ export function loadConfig(): RendererConfig {
     crf: intEnv("REMOTION_CRF", 18),
     x264Preset: process.env.REMOTION_X264_PRESET || "medium",
     concurrency: Number.isFinite(concurrencyRaw) && concurrencyRaw > 0 ? concurrencyRaw : null,
-    timeoutSeconds: intEnv("REMOTION_EXPORT_TIMEOUT_SECONDS", 1800),
+    timeoutSeconds,
+    timeoutGraceSeconds,
+    // Fire the in-process kill at least 60s before the platform timeout (and never
+    // below 60s total) so the worker can always settle the job first.
+    hardTimeoutSeconds: Math.max(60, timeoutSeconds - timeoutGraceSeconds),
+    downloadTimeoutSeconds: intEnv("REMOTION_DOWNLOAD_TIMEOUT_SECONDS", 600),
     perFrameTimeoutMs: intEnv("REMOTION_FRAME_TIMEOUT_MS", 60_000),
     cancelPollMs: intEnv("REMOTION_CANCEL_POLL_MS", 3000),
     progressThrottleMs: intEnv("REMOTION_PROGRESS_THROTTLE_MS", 2000),
