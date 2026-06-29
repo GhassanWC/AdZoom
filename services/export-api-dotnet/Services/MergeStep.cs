@@ -148,12 +148,30 @@ public sealed class MergeStep(
                 ["normalizeEnabled"] = reuseNormalized ? false : opts.NormalizeEnabled,
                 ["normalizeCrf"] = opts.NormalizeCrf,
                 ["normalizePreset"] = opts.NormalizePreset,
+                // Hard budget for the audio-mux ffmpeg (the CLI kills it + falls back
+                // to a video-only final on exceed). See AudioMuxTimeoutSeconds.
+                ["audioMuxTimeoutSec"] = opts.AudioMuxTimeoutSeconds,
             };
-            var mux = await render.RunAsync(jobId, audioSpec, workDir, OnMuxEvent, ct, specName: "spec-audiomux.json");
+            // C# backstop > the CLI's own audiomux budget (which includes a quick
+            // video-only fallback): hard-kill a render-cli that's WEDGED past it so a
+            // hung mux can't keep the job (and the UI's "Merging") alive forever.
+            // When the persisted normalized source was MISSING (reuseNormalized=false),
+            // the CLI re-normalizes the ORIGINAL inside audiomux — a legitimately long
+            // transcode (bounded by the CLI's own 20-min normalize timeout). Widen the
+            // backstop on that path so we never hard-kill a HEALTHY re-normalize.
+            var renormalizeBudgetSeconds = (!reuseNormalized && opts.NormalizeEnabled) ? 20 * 60 : 0;
+            var muxBackstopSeconds = opts.AudioMuxTimeoutSeconds + 150 + renormalizeBudgetSeconds;
+            var mux = await render.RunAsync(jobId, audioSpec, workDir, OnMuxEvent, ct,
+                specName: "spec-audiomux.json", timeoutSeconds: muxBackstopSeconds);
             if (ct.IsCancellationRequested || mux.Canceled || mux.ExitCode == 2)
             {
                 BatchLog.Line($"merge canceled (audiomux) job={jobId}");
                 return 0;
+            }
+            if (mux.TimedOut)
+            {
+                BatchLog.Error($"audiomux TIMEOUT job={jobId} after ~{muxBackstopSeconds}s (render-cli hard-killed)");
+                return await FailMerge(uid, jobId, $"audiomux timed out after ~{muxBackstopSeconds}s (render-cli wedged, hard-killed)");
             }
             if (mux.ExitCode != 0 || mux.Done is null)
                 return await FailMerge(uid, jobId, $"audiomux failed: {mux.Error?.Code ?? "audiomux_failed"}");

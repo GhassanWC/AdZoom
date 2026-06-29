@@ -124,6 +124,13 @@ public sealed class ExportOptions
     /// leader is re-claimed BEFORE the reconciler fails the whole job as stale.</summary>
     public int MergeLeaseSeconds { get; set; } = 300;
 
+    /// <summary>Hard wall-clock budget (seconds) for the merge leader's final
+    /// audio-mux ffmpeg. Passed to the render CLI (which SIGKILLs ffmpeg on exceed
+    /// and falls back to a VIDEO-ONLY final); the C# side applies a slightly larger
+    /// backstop and hard-kills a wedged render-cli, failing the job clearly so the UI
+    /// never stays on "Merging" forever. From EXPORT_AUDIOMUX_TIMEOUT_SECONDS; 300s.</summary>
+    public int AudioMuxTimeoutSeconds { get; set; } = 300;
+
     /// <summary>Optional symmetric boundary padding (seconds) rendered on each side
     /// of a chunk window. Default 0 — boundaries are frame-deterministic +
     /// keyframe-aligned, so exact windows concat cleanly. From
@@ -226,6 +233,7 @@ public sealed class ExportOptions
         o.ChunkCount = EnvInt("EXPORT_CHUNK_COUNT", o.ChunkCount);
         o.WorkerCount = EnvInt("EXPORT_WORKER_COUNT", o.WorkerCount);
         o.MergeLeaseSeconds = EnvInt("EXPORT_MERGE_LEASE_SECONDS", o.MergeLeaseSeconds);
+        o.AudioMuxTimeoutSeconds = EnvInt("EXPORT_AUDIOMUX_TIMEOUT_SECONDS", o.AudioMuxTimeoutSeconds);
         if (double.TryParse(Environment.GetEnvironmentVariable("EXPORT_CHUNK_BOUNDARY_PADDING_SECONDS"),
                 System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var pad))
             o.ChunkBoundaryPaddingSeconds = Math.Max(0, pad);

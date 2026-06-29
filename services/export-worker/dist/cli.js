@@ -2014,6 +2014,10 @@ console.info = toStderr;
 console.debug = toStderr;
 console.warn = toStderr;
 console.error = toStderr;
+function envInt(key, fallback) {
+  const n = Number.parseInt(process.env[key] ?? "", 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
 function runFfmpeg(args, tag, failCode) {
   return new Promise((resolve, reject) => {
     const child = spawn2(ffmpegBin(), args, { stdio: ["ignore", "ignore", "pipe"] });
@@ -2027,6 +2031,83 @@ function runFfmpeg(args, tag, failCode) {
     child.on("close", (code) => {
       if (code === 0) resolve();
       else reject(new Error(`${failCode}: ffmpeg exited ${code}: ${tail.trim().slice(-800)}`));
+    });
+  });
+}
+function runFfmpegSupervised(args, opts) {
+  const { tag, failCode, label, timeoutMs, signal } = opts;
+  return new Promise((resolve, reject) => {
+    toStderr(`[worker:${tag}] ffmpeg start label=${label} timeoutSec=${Math.round(timeoutMs / 1e3)}`);
+    toStderr(`[worker:${tag}] ffmpeg cmd: ${ffmpegBin()} ${args.join(" ")}`);
+    const startMs = Date.now();
+    const child = spawn2(ffmpegBin(), args, { stdio: ["ignore", "ignore", "pipe"] });
+    let tail = "";
+    let settled = false;
+    let timedOut = false;
+    const elapsedSec = () => Math.round((Date.now() - startMs) / 1e3);
+    child.stderr.on("data", (d) => {
+      tail = (tail + d.toString()).slice(-4e3);
+      const t = d.toString().trim();
+      if (t) toStderr(`[worker:${tag}]`, t);
+    });
+    const heartbeat = setInterval(() => {
+      toStderr(`[worker:${tag}] still running label=${label} elapsed=${elapsedSec()}s`);
+      emit({ type: "audiomux-progress", stage: tag, label, elapsedSec: elapsedSec() });
+    }, 15e3);
+    if (typeof heartbeat.unref === "function") heartbeat.unref();
+    const timer = setTimeout(() => {
+      timedOut = true;
+      toStderr(`[worker:${tag}] TIMEOUT after ${Math.round(timeoutMs / 1e3)}s \u2014 killing ffmpeg label=${label}`);
+      try {
+        child.kill("SIGKILL");
+      } catch {
+      }
+    }, timeoutMs);
+    if (typeof timer.unref === "function") timer.unref();
+    const onAbort = () => {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+      }
+    };
+    if (signal) {
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
+    }
+    const cleanup = () => {
+      clearInterval(heartbeat);
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener("abort", onAbort);
+    };
+    child.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(err);
+    });
+    child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      const sec = elapsedSec();
+      if (timedOut) {
+        const e = new Error(
+          `${failCode}_timeout: ffmpeg killed after ${Math.round(timeoutMs / 1e3)}s (label=${label})`
+        );
+        e.timedOut = true;
+        reject(e);
+        return;
+      }
+      if (signal?.aborted) {
+        reject(new Error(`${failCode}_canceled`));
+        return;
+      }
+      if (code === 0) {
+        toStderr(`[worker:${tag}] ffmpeg done label=${label} in ${sec}s`);
+        resolve();
+        return;
+      }
+      reject(new Error(`${failCode}: ffmpeg exited ${code} after ${sec}s: ${tail.trim().slice(-800)}`));
     });
   });
 }
@@ -2078,8 +2159,11 @@ async function runAudioMux(spec, signal) {
     process.exit(1);
   }
   emit({ type: "stage", name: "muxing-audio" });
+  const timeoutSec = Math.max(30, spec.audioMuxTimeoutSec ?? envInt("EXPORT_AUDIOMUX_TIMEOUT_SECONDS", 300));
+  const timeoutMs = timeoutSec * 1e3;
+  const videoOnlyTimeoutMs = Math.min(timeoutMs, 12e4);
   toStderr(
-    `[worker:audiomux] start video=${videoPath} source=${spec.sourcePath} out=${spec.outputPath}`
+    `[worker:audiomux] start video=${videoPath} source=${spec.sourcePath} out=${spec.outputPath} timeoutSec=${timeoutSec}`
   );
   const recipe = buildRenderRecipe({ ...spec.serializedRecipe, debugBorders: false });
   const { fps, outputDuration, timelineMap } = recipe;
@@ -2103,17 +2187,53 @@ async function runAudioMux(spec, signal) {
     audioStatus = probe?.hasAudio ? "preserved" : "none";
   }
   const srcProbe = await probeSource(audioSource).catch(() => null);
-  const sourceHasAudio = audioStatus === "preserved" && !!srcProbe?.hasAudio;
+  let sourceHasAudio = audioStatus === "preserved" && !!srcProbe?.hasAudio;
+  const vidProbe = await probeSource(videoPath).catch(() => null);
+  const vidSize = existsSync2(videoPath) ? statSync(videoPath).size : 0;
+  const srcSize = existsSync2(audioSource) ? statSync(audioSource).size : 0;
+  toStderr(
+    `[worker:audiomux] input.video path=${videoPath} exists=${existsSync2(videoPath)} size=${vidSize} probe=${JSON.stringify(vidProbe)}`
+  );
+  toStderr(
+    `[worker:audiomux] input.audioSource path=${audioSource} exists=${existsSync2(audioSource)} size=${srcSize} audioStatus=${audioStatus} sourceHasAudio=${sourceHasAudio} hasCuts=${hasCuts} hasSpeed=${hasSpeed} probe=${JSON.stringify(srcProbe)}`
+  );
+  emit({
+    type: "audiomux-inputs",
+    videoPath,
+    videoExists: existsSync2(videoPath),
+    videoSize: vidSize,
+    videoProbe: vidProbe,
+    sourcePath: audioSource,
+    sourceExists: existsSync2(audioSource),
+    sourceSize: srcSize,
+    sourceProbe: srcProbe,
+    audioStatus,
+    sourceHasAudio,
+    hasCuts,
+    hasSpeed
+  });
   const muxWarnings = [];
   if (audioStatus === "removed") {
     muxWarnings.push(AUDIO_UNSUPPORTED_WARNING);
     emit({ type: "warning", message: AUDIO_UNSUPPORTED_WARNING });
   }
-  const args = ["-hide_banner", "-loglevel", "warning", "-i", videoPath];
-  if (!sourceHasAudio) {
-    args.push("-map", "0:v", "-c:v", "copy", "-movflags", "+faststart", "-y", spec.outputPath);
-  } else {
-    args.push("-i", audioSource);
+  const videoOnlyArgs = [
+    "-hide_banner",
+    "-loglevel",
+    "warning",
+    "-i",
+    videoPath,
+    "-map",
+    "0:v",
+    "-c:v",
+    "copy",
+    "-movflags",
+    "+faststart",
+    "-y",
+    spec.outputPath
+  ];
+  const buildWithAudioArgs = () => {
+    const a = ["-hide_banner", "-loglevel", "warning", "-i", videoPath, "-i", audioSource];
     const sampleRate = srcProbe?.audioSampleRate ?? 48e3;
     const fc = !hasSpeed && !hasCuts ? null : buildAudioFilterComplex(timelineMap.segments, recipe.moments, sampleRate, {
       padToFill: true
@@ -2121,33 +2241,90 @@ async function runAudioMux(spec, signal) {
     if (fc) {
       const scriptPath = join2(dirname(spec.outputPath), "audiomux-afc.txt");
       writeFileSync(scriptPath, fc, "utf8");
-      args.push("-filter_complex_script", scriptPath, "-map", "0:v", "-map", "[aout]");
+      a.push("-filter_complex_script", scriptPath, "-map", "0:v", "-map", "[aout]");
     } else {
-      args.push("-map", "0:v", "-map", "1:a:0?", "-af", "apad");
+      a.push("-map", "0:v", "-map", "1:a:0?", "-af", "apad");
     }
-    args.push(
-      "-c:v",
-      "copy",
-      "-c:a",
-      "aac",
-      "-b:a",
-      "192k",
-      "-shortest",
-      "-movflags",
-      "+faststart",
-      "-y",
-      spec.outputPath
-    );
+    a.push("-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", "-y", spec.outputPath);
+    return a;
+  };
+  if (!sourceHasAudio) {
+    await runFfmpegSupervised(videoOnlyArgs, {
+      tag: "audiomux",
+      failCode: "audiomux_failed",
+      label: "video-only",
+      timeoutMs: videoOnlyTimeoutMs,
+      signal
+    });
+  } else {
+    try {
+      await runFfmpegSupervised(buildWithAudioArgs(), {
+        tag: "audiomux",
+        failCode: "audiomux_failed",
+        label: "with-audio",
+        timeoutMs,
+        signal
+      });
+    } catch (err) {
+      if (signal.aborted) throw err;
+      const detail = err?.message ?? String(err);
+      const why = err?.timedOut ? `timed out after ${timeoutSec}s` : "errored";
+      toStderr(`[worker:audiomux] with-audio mux ${why} \u2014 falling back to VIDEO-ONLY. detail=${detail}`);
+      emit({ type: "warning", message: AUDIO_UNSUPPORTED_WARNING });
+      if (!muxWarnings.includes(AUDIO_UNSUPPORTED_WARNING)) muxWarnings.push(AUDIO_UNSUPPORTED_WARNING);
+      sourceHasAudio = false;
+      audioStatus = "removed";
+      await runFfmpegSupervised(videoOnlyArgs, {
+        tag: "audiomux",
+        failCode: "audiomux_failed",
+        label: "video-only-fallback",
+        timeoutMs: videoOnlyTimeoutMs,
+        signal
+      });
+    }
   }
-  await runFfmpeg(args, "audiomux", "audiomux_failed");
-  const outProbe = await probeSource(spec.outputPath).catch(() => null);
-  const size = existsSync2(spec.outputPath) ? statSync(spec.outputPath).size : 0;
-  if (!outProbe || size <= 0) {
-    emit({ type: "error", code: "audiomux_failed", message: "audiomux produced no/empty output" });
+  const tol = Math.max(0.5, 2 / fps);
+  const validateFinal = async (expectAudio) => {
+    const outProbe2 = await probeSource(spec.outputPath).catch(() => null);
+    const size2 = existsSync2(spec.outputPath) ? statSync(spec.outputPath).size : 0;
+    if (!outProbe2 || size2 <= 0) {
+      return { ok: false, recoverable: false, code: "audiomux_failed", message: "audiomux produced no/empty output" };
+    }
+    const outDur2 = outProbe2.durationSec ?? 0;
+    if (expectAudio && !outProbe2.hasAudio) {
+      return { ok: false, recoverable: true, code: "audio_missing_after_render", message: "audio expected but the final muxed output is silent" };
+    }
+    if (Math.abs(outDur2 - outputDuration) > tol) {
+      return {
+        ok: false,
+        recoverable: true,
+        code: "duration_mismatch",
+        message: `final duration ${outDur2.toFixed(2)}s differs from expected ${outputDuration.toFixed(2)}s by more than ${tol.toFixed(2)}s`
+      };
+    }
+    return { ok: true, outProbe: outProbe2, outDur: outDur2, size: size2 };
+  };
+  let result = await validateFinal(sourceHasAudio);
+  if (!result.ok && result.recoverable && sourceHasAudio) {
+    toStderr(`[worker:audiomux] with-audio output failed validation (${result.code}) \u2014 falling back to VIDEO-ONLY`);
+    emit({ type: "warning", message: AUDIO_UNSUPPORTED_WARNING });
+    if (!muxWarnings.includes(AUDIO_UNSUPPORTED_WARNING)) muxWarnings.push(AUDIO_UNSUPPORTED_WARNING);
+    sourceHasAudio = false;
+    audioStatus = "removed";
+    await runFfmpegSupervised(videoOnlyArgs, {
+      tag: "audiomux",
+      failCode: "audiomux_failed",
+      label: "video-only-postvalidate",
+      timeoutMs: videoOnlyTimeoutMs,
+      signal
+    });
+    result = await validateFinal(false);
+  }
+  if (!result.ok) {
+    emit({ type: "error", code: result.code, message: result.message });
     process.exit(1);
   }
-  const outDur = outProbe.durationSec ?? 0;
-  const tol = Math.max(0.5, 2 / fps);
+  const { outProbe, outDur, size } = result;
   emit({
     type: "audio-verify",
     audioStatus: sourceHasAudio ? "preserved" : "none",
@@ -2162,22 +2339,6 @@ async function runAudioMux(spec, signal) {
   toStderr(
     `[worker:audiomux] audio-verify sourceAudio=${sourceHasAudio} outputAudio=${outProbe.hasAudio} outDur=${outDur.toFixed(2)} expected=${outputDuration.toFixed(2)} tol=${tol.toFixed(2)} size=${size}`
   );
-  if (sourceHasAudio && !outProbe.hasAudio) {
-    emit({
-      type: "error",
-      code: "audio_missing_after_render",
-      message: "audio expected but the final muxed output is silent"
-    });
-    process.exit(1);
-  }
-  if (Math.abs(outDur - outputDuration) > tol) {
-    emit({
-      type: "error",
-      code: "duration_mismatch",
-      message: `final duration ${outDur.toFixed(2)}s differs from expected ${outputDuration.toFixed(2)}s by more than ${tol.toFixed(2)}s`
-    });
-    process.exit(1);
-  }
   emit({
     type: "done",
     warnings: muxWarnings,

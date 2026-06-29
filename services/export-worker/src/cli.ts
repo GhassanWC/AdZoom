@@ -56,7 +56,7 @@ console.error = toStderr as typeof console.error;
 
 import { renderToMp4 } from "./render.js";
 import { computePreflight, AUDIO_UNSUPPORTED_WARNING } from "./preflight.js";
-import { normalizeSource, probeSource, ffmpegBin } from "./ffmpeg.js";
+import { normalizeSource, probeSource, ffmpegBin, type SourceInfo } from "./ffmpeg.js";
 import { buildAudioFilterComplex } from "./audio.js";
 import { buildRenderRecipe } from "@/lib/render/recipe";
 import { toUserFacingError } from "./errors.js";
@@ -97,6 +97,16 @@ interface JobSpec {
   inputs?: string[];
   /** audiomux mode: the concatenated SILENT video to add audio to. */
   videoPath?: string;
+  /** audiomux mode: hard wall-clock budget (seconds) for the audio-mux ffmpeg
+   *  before it's killed and we fall back to a video-only final. Falls back to
+   *  EXPORT_AUDIOMUX_TIMEOUT_SECONDS, then 300. */
+  audioMuxTimeoutSec?: number;
+}
+
+/** Read a positive-integer env var with a fallback (0/negative/NaN ⇒ fallback). */
+function envInt(key: string, fallback: number): number {
+  const n = Number.parseInt(process.env[key] ?? "", 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
 /** Spawn ffmpeg, stream stderr to logs, resolve on exit 0, reject otherwise. */
@@ -113,6 +123,103 @@ function runFfmpeg(args: string[], tag: string, failCode: string): Promise<void>
     child.on("close", (code) => {
       if (code === 0) resolve();
       else reject(new Error(`${failCode}: ffmpeg exited ${code}: ${tail.trim().slice(-800)}`));
+    });
+  });
+}
+
+/** Error thrown by {@link runFfmpegSupervised} when ffmpeg is killed for exceeding
+ *  its wall-clock budget — distinguishable from a normal non-zero exit. */
+interface FfmpegTimeoutError extends Error {
+  timedOut: true;
+}
+
+/**
+ * Like {@link runFfmpeg}, but for stages that can WEDGE (audiomux): adds a hard
+ * wall-clock timeout (SIGKILLs ffmpeg on exceed → rejects with `timedOut`), a 15s
+ * liveness heartbeat (stderr + an NDJSON `audiomux-progress` event so a stall is
+ * visible within seconds, not after the watchdog), cooperative abort (cancel), and
+ * logs the full ffmpeg command up front. Resolves on exit 0.
+ */
+function runFfmpegSupervised(
+  args: string[],
+  opts: { tag: string; failCode: string; label: string; timeoutMs: number; signal?: AbortSignal }
+): Promise<void> {
+  const { tag, failCode, label, timeoutMs, signal } = opts;
+  return new Promise<void>((resolve, reject) => {
+    toStderr(`[worker:${tag}] ffmpeg start label=${label} timeoutSec=${Math.round(timeoutMs / 1000)}`);
+    toStderr(`[worker:${tag}] ffmpeg cmd: ${ffmpegBin()} ${args.join(" ")}`);
+    const startMs = Date.now();
+    const child = spawn(ffmpegBin(), args, { stdio: ["ignore", "ignore", "pipe"] });
+    let tail = "";
+    let settled = false;
+    let timedOut = false;
+    const elapsedSec = (): number => Math.round((Date.now() - startMs) / 1000);
+
+    child.stderr.on("data", (d: Buffer) => {
+      tail = (tail + d.toString()).slice(-4000);
+      const t = d.toString().trim();
+      if (t) toStderr(`[worker:${tag}]`, t);
+    });
+
+    // req: a progress log every 15s while ffmpeg runs — proves liveness and makes a
+    // stall obvious immediately (the timeout is the hard backstop, this is the signal).
+    const heartbeat = setInterval(() => {
+      toStderr(`[worker:${tag}] still running label=${label} elapsed=${elapsedSec()}s`);
+      emit({ type: "audiomux-progress", stage: tag, label, elapsedSec: elapsedSec() });
+    }, 15_000);
+    if (typeof heartbeat.unref === "function") heartbeat.unref();
+
+    // req: hard timeout — SIGKILL ffmpeg if it exceeds the budget (a hung mux).
+    const timer = setTimeout(() => {
+      timedOut = true;
+      toStderr(`[worker:${tag}] TIMEOUT after ${Math.round(timeoutMs / 1000)}s — killing ffmpeg label=${label}`);
+      try { child.kill("SIGKILL"); } catch { /* already gone */ }
+    }, timeoutMs);
+    if (typeof timer.unref === "function") timer.unref();
+
+    const onAbort = (): void => {
+      try { child.kill("SIGKILL"); } catch { /* already gone */ }
+    };
+    if (signal) {
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
+    }
+
+    const cleanup = (): void => {
+      clearInterval(heartbeat);
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener("abort", onAbort);
+    };
+
+    child.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(err);
+    });
+    child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      const sec = elapsedSec();
+      if (timedOut) {
+        const e = new Error(
+          `${failCode}_timeout: ffmpeg killed after ${Math.round(timeoutMs / 1000)}s (label=${label})`
+        ) as FfmpegTimeoutError;
+        e.timedOut = true;
+        reject(e);
+        return;
+      }
+      if (signal?.aborted) {
+        reject(new Error(`${failCode}_canceled`));
+        return;
+      }
+      if (code === 0) {
+        toStderr(`[worker:${tag}] ffmpeg done label=${label} in ${sec}s`);
+        resolve();
+        return;
+      }
+      reject(new Error(`${failCode}: ffmpeg exited ${code} after ${sec}s: ${tail.trim().slice(-800)}`));
     });
   });
 }
@@ -182,8 +289,13 @@ async function runAudioMux(spec: JobSpec, signal: AbortSignal): Promise<void> {
     process.exit(1);
   }
   emit({ type: "stage", name: "muxing-audio" });
+  const timeoutSec = Math.max(30, spec.audioMuxTimeoutSec ?? envInt("EXPORT_AUDIOMUX_TIMEOUT_SECONDS", 300));
+  const timeoutMs = timeoutSec * 1000;
+  // The video-only fallback is a stream-copy (`-c:v copy`) — near-instant even for a
+  // long video — so cap it tightly regardless of the (larger) audio-mux budget.
+  const videoOnlyTimeoutMs = Math.min(timeoutMs, 120_000);
   toStderr(
-    `[worker:audiomux] start video=${videoPath} source=${spec.sourcePath} out=${spec.outputPath}`
+    `[worker:audiomux] start video=${videoPath} source=${spec.sourcePath} out=${spec.outputPath} timeoutSec=${timeoutSec}`
   );
 
   const recipe = buildRenderRecipe({ ...spec.serializedRecipe, debugBorders: false });
@@ -213,7 +325,34 @@ async function runAudioMux(spec: JobSpec, signal: AbortSignal): Promise<void> {
   }
 
   const srcProbe = await probeSource(audioSource).catch(() => null);
-  const sourceHasAudio = audioStatus === "preserved" && !!srcProbe?.hasAudio;
+  let sourceHasAudio = audioStatus === "preserved" && !!srcProbe?.hasAudio;
+
+  // ── req: detailed input diagnostics BEFORE any ffmpeg work (so a hang/failure is
+  //    self-explanatory in the logs: paths, existence, sizes, ffprobe streams). ──
+  const vidProbe = await probeSource(videoPath).catch(() => null);
+  const vidSize = existsSync(videoPath) ? statSync(videoPath).size : 0;
+  const srcSize = existsSync(audioSource) ? statSync(audioSource).size : 0;
+  toStderr(
+    `[worker:audiomux] input.video path=${videoPath} exists=${existsSync(videoPath)} size=${vidSize} probe=${JSON.stringify(vidProbe)}`
+  );
+  toStderr(
+    `[worker:audiomux] input.audioSource path=${audioSource} exists=${existsSync(audioSource)} size=${srcSize} audioStatus=${audioStatus} sourceHasAudio=${sourceHasAudio} hasCuts=${hasCuts} hasSpeed=${hasSpeed} probe=${JSON.stringify(srcProbe)}`
+  );
+  emit({
+    type: "audiomux-inputs",
+    videoPath,
+    videoExists: existsSync(videoPath),
+    videoSize: vidSize,
+    videoProbe: vidProbe,
+    sourcePath: audioSource,
+    sourceExists: existsSync(audioSource),
+    sourceSize: srcSize,
+    sourceProbe: srcProbe,
+    audioStatus,
+    sourceHasAudio,
+    hasCuts,
+    hasSpeed,
+  });
 
   // Surface the unsupported-audio notice ONCE for the final output (the per-chunk
   // renders suppress it). Only knowable here when audiomux re-normalized the source.
@@ -223,12 +362,14 @@ async function runAudioMux(spec: JobSpec, signal: AbortSignal): Promise<void> {
     emit({ type: "warning", message: AUDIO_UNSUPPORTED_WARNING });
   }
 
-  const args: string[] = ["-hide_banner", "-loglevel", "warning", "-i", videoPath];
-  if (!sourceHasAudio) {
-    // No usable audio → final stays silent (copy the video only).
-    args.push("-map", "0:v", "-c:v", "copy", "-movflags", "+faststart", "-y", spec.outputPath);
-  } else {
-    args.push("-i", audioSource);
+  // Video-only final (silent): stream-copy the concatenated video. Used when the
+  // source has no usable audio, OR as the FALLBACK when the audio mux fails/times out.
+  const videoOnlyArgs: string[] = [
+    "-hide_banner", "-loglevel", "warning", "-i", videoPath,
+    "-map", "0:v", "-c:v", "copy", "-movflags", "+faststart", "-y", spec.outputPath,
+  ];
+  const buildWithAudioArgs = (): string[] => {
+    const a: string[] = ["-hide_banner", "-loglevel", "warning", "-i", videoPath, "-i", audioSource];
     const sampleRate = srcProbe?.audioSampleRate ?? 48000;
     const fc =
       !hasSpeed && !hasCuts
@@ -240,37 +381,99 @@ async function runAudioMux(spec: JobSpec, signal: AbortSignal): Promise<void> {
       // Cuts/speed: rebuild audio from the timeline segments (already apad-padded).
       const scriptPath = join(dirname(spec.outputPath), "audiomux-afc.txt");
       writeFileSync(scriptPath, fc, "utf8");
-      args.push("-filter_complex_script", scriptPath, "-map", "0:v", "-map", "[aout]");
+      a.push("-filter_complex_script", scriptPath, "-map", "0:v", "-map", "[aout]");
     } else {
       // Linear: map the source audio straight through, padded to the video length.
-      args.push("-map", "0:v", "-map", "1:a:0?", "-af", "apad");
+      a.push("-map", "0:v", "-map", "1:a:0?", "-af", "apad");
     }
-    args.push(
-      "-c:v",
-      "copy",
-      "-c:a",
-      "aac",
-      "-b:a",
-      "192k",
-      "-shortest",
-      "-movflags",
-      "+faststart",
-      "-y",
-      spec.outputPath
-    );
+    a.push("-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", "-y", spec.outputPath);
+    return a;
+  };
+
+  if (!sourceHasAudio) {
+    // No usable audio → final stays silent (copy the video only).
+    await runFfmpegSupervised(videoOnlyArgs, {
+      tag: "audiomux", failCode: "audiomux_failed", label: "video-only", timeoutMs: videoOnlyTimeoutMs, signal,
+    });
+  } else {
+    try {
+      await runFfmpegSupervised(buildWithAudioArgs(), {
+        tag: "audiomux", failCode: "audiomux_failed", label: "with-audio", timeoutMs, signal,
+      });
+    } catch (err) {
+      if (signal.aborted) throw err; // cancel — handled by the caller (exit 2)
+      // req: invalid / unmuxable / HUNG audio must not lose the whole export, and
+      // must not hang forever. The audio mux failed or timed out → deliver a
+      // VIDEO-ONLY final (silent) and warn, instead of failing. Only a failure of
+      // THIS fallback is a true audiomux failure.
+      const detail = (err as Error)?.message ?? String(err);
+      const why = (err as Partial<FfmpegTimeoutError>)?.timedOut
+        ? `timed out after ${timeoutSec}s`
+        : "errored";
+      toStderr(`[worker:audiomux] with-audio mux ${why} — falling back to VIDEO-ONLY. detail=${detail}`);
+      emit({ type: "warning", message: AUDIO_UNSUPPORTED_WARNING });
+      if (!muxWarnings.includes(AUDIO_UNSUPPORTED_WARNING)) muxWarnings.push(AUDIO_UNSUPPORTED_WARNING);
+      sourceHasAudio = false;
+      audioStatus = "removed";
+      await runFfmpegSupervised(videoOnlyArgs, {
+        tag: "audiomux", failCode: "audiomux_failed", label: "video-only-fallback", timeoutMs: videoOnlyTimeoutMs, signal,
+      });
+    }
   }
 
-  await runFfmpeg(args, "audiomux", "audiomux_failed");
+  // ── Validate BEFORE the orchestrator uploads/settles, WITH a video-only safety
+  //    net. A with-audio mux that "succeeded" but produced a silent / wrong-length
+  //    file means the AUDIO muxing went wrong — degrade to a video-only final
+  //    (correct video, no audio) rather than hard-failing the whole export (req:
+  //    audio problems never lose the export). Only a video-only output that ALSO
+  //    fails validation is fatal. ────────────────────────────────────────────────
+  const tol = Math.max(0.5, 2 / fps);
+  const validateFinal = async (
+    expectAudio: boolean
+  ): Promise<
+    | { ok: true; outProbe: SourceInfo; outDur: number; size: number }
+    | { ok: false; recoverable: boolean; code: string; message: string }
+  > => {
+    const outProbe = await probeSource(spec.outputPath).catch(() => null);
+    const size = existsSync(spec.outputPath) ? statSync(spec.outputPath).size : 0;
+    if (!outProbe || size <= 0) {
+      return { ok: false, recoverable: false, code: "audiomux_failed", message: "audiomux produced no/empty output" };
+    }
+    const outDur = outProbe.durationSec ?? 0;
+    // Audio expected (source had usable audio, not muted-by-design) but final silent.
+    if (expectAudio && !outProbe.hasAudio) {
+      return { ok: false, recoverable: true, code: "audio_missing_after_render", message: "audio expected but the final muxed output is silent" };
+    }
+    if (Math.abs(outDur - outputDuration) > tol) {
+      return {
+        ok: false,
+        recoverable: true,
+        code: "duration_mismatch",
+        message: `final duration ${outDur.toFixed(2)}s differs from expected ${outputDuration.toFixed(2)}s by more than ${tol.toFixed(2)}s`,
+      };
+    }
+    return { ok: true, outProbe, outDur, size };
+  };
 
-  // ── Validate BEFORE the orchestrator uploads/settles. ───────────────────────
-  const outProbe = await probeSource(spec.outputPath).catch(() => null);
-  const size = existsSync(spec.outputPath) ? statSync(spec.outputPath).size : 0;
-  if (!outProbe || size <= 0) {
-    emit({ type: "error", code: "audiomux_failed", message: "audiomux produced no/empty output" });
+  let result = await validateFinal(sourceHasAudio);
+  if (!result.ok && result.recoverable && sourceHasAudio) {
+    // The audio output is bad (silent/wrong-length) — fall back to a video-only final.
+    toStderr(`[worker:audiomux] with-audio output failed validation (${result.code}) — falling back to VIDEO-ONLY`);
+    emit({ type: "warning", message: AUDIO_UNSUPPORTED_WARNING });
+    if (!muxWarnings.includes(AUDIO_UNSUPPORTED_WARNING)) muxWarnings.push(AUDIO_UNSUPPORTED_WARNING);
+    sourceHasAudio = false;
+    audioStatus = "removed";
+    await runFfmpegSupervised(videoOnlyArgs, {
+      tag: "audiomux", failCode: "audiomux_failed", label: "video-only-postvalidate", timeoutMs: videoOnlyTimeoutMs, signal,
+    });
+    result = await validateFinal(false);
+  }
+  if (!result.ok) {
+    emit({ type: "error", code: result.code, message: result.message });
     process.exit(1);
   }
-  const outDur = outProbe.durationSec ?? 0;
-  const tol = Math.max(0.5, 2 / fps);
+
+  const { outProbe, outDur, size } = result;
   emit({
     type: "audio-verify",
     audioStatus: sourceHasAudio ? "preserved" : "none",
@@ -286,24 +489,6 @@ async function runAudioMux(spec: JobSpec, signal: AbortSignal): Promise<void> {
     `[worker:audiomux] audio-verify sourceAudio=${sourceHasAudio} outputAudio=${outProbe.hasAudio} ` +
       `outDur=${outDur.toFixed(2)} expected=${outputDuration.toFixed(2)} tol=${tol.toFixed(2)} size=${size}`
   );
-  // Audio expected (source had usable audio, not muted-by-design) but final silent
-  // → real bug; fail so the orchestrator never uploads a wrongly-silent export.
-  if (sourceHasAudio && !outProbe.hasAudio) {
-    emit({
-      type: "error",
-      code: "audio_missing_after_render",
-      message: "audio expected but the final muxed output is silent",
-    });
-    process.exit(1);
-  }
-  if (Math.abs(outDur - outputDuration) > tol) {
-    emit({
-      type: "error",
-      code: "duration_mismatch",
-      message: `final duration ${outDur.toFixed(2)}s differs from expected ${outputDuration.toFixed(2)}s by more than ${tol.toFixed(2)}s`,
-    });
-    process.exit(1);
-  }
 
   emit({
     type: "done",

@@ -391,6 +391,9 @@ export async function submitBatchJob({
           ...(process.env.EXPORT_MERGE_LEASE_SECONDS
             ? { EXPORT_MERGE_LEASE_SECONDS: process.env.EXPORT_MERGE_LEASE_SECONDS }
             : {}),
+          ...(process.env.EXPORT_AUDIOMUX_TIMEOUT_SECONDS
+            ? { EXPORT_AUDIOMUX_TIMEOUT_SECONDS: process.env.EXPORT_AUDIOMUX_TIMEOUT_SECONDS }
+            : {}),
           ...(process.env.EXPORT_CHUNK_MAX_RETRIES
             ? { EXPORT_CHUNK_MAX_RETRIES: process.env.EXPORT_CHUNK_MAX_RETRIES }
             : {}),

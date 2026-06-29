@@ -4,7 +4,7 @@ using ExportApi.Models;
 
 namespace ExportApi.Services;
 
-public sealed record RenderOutcome(int ExitCode, bool Canceled, RenderEvent? Done, RenderEvent? Error);
+public sealed record RenderOutcome(int ExitCode, bool Canceled, RenderEvent? Done, RenderEvent? Error, bool TimedOut = false);
 
 /// <summary>
 /// Spawns the bundled Node render CLI (services/export-worker/dist/cli.js) for
@@ -20,7 +20,8 @@ public sealed class RenderSubprocess(ExportOptions opts, LogBuffer logs, ILogger
         string workDir,
         Action<RenderEvent> onEvent,
         CancellationToken cancel,
-        string specName = "spec.json")
+        string specName = "spec.json",
+        int timeoutSeconds = 0)
     {
         Directory.CreateDirectory(workDir);
         var specPath = Path.Combine(workDir, specName);
@@ -73,8 +74,8 @@ public sealed class RenderSubprocess(ExportOptions opts, LogBuffer logs, ILogger
             }
         });
 
-        // Cooperative cancel: write "cancel" to stdin → CLI aborts ffmpeg; then
-        // escalate to a process-tree kill so nothing orphans.
+        // Cooperative cancel: write "cancel" to stdin → CLI aborts ffmpeg (exits 2 =
+        // canceled); then escalate to a process-tree kill so nothing orphans.
         using var reg = cancel.Register(() =>
         {
             try { proc.StandardInput.WriteLine("cancel"); proc.StandardInput.Flush(); }
@@ -90,9 +91,30 @@ public sealed class RenderSubprocess(ExportOptions opts, LogBuffer logs, ILogger
             });
         });
 
+        // Hard timeout backstop (timeoutSeconds > 0): if the CLI doesn't exit in time
+        // it's WEDGED (e.g. ffmpeg ignoring its own kill). HARD-kill the whole process
+        // tree — NOT the cooperative "cancel" (which exits 2 = a clean user-cancel the
+        // caller treats as success). A SIGKILL yields a non-zero exit + TimedOut=true so
+        // the caller fails the job CLEARLY instead of hanging the UI forever. The Node
+        // CLI has its OWN (shorter) audiomux timeout, so this only fires if the whole
+        // process is stuck — give it a generous margin over the CLI's budget.
+        var timedOut = false;
+        using var timeoutCts = new CancellationTokenSource();
+        Task? timeoutTask = timeoutSeconds <= 0 ? null : Task.Run(async () =>
+        {
+            try { await Task.Delay(TimeSpan.FromSeconds(timeoutSeconds), timeoutCts.Token); }
+            catch (OperationCanceledException) { return; } // exited in time — stand down
+            if (proc.HasExited) return; // finished in the boundary race
+            timedOut = true;
+            BatchLog.Error($"render-cli TIMEOUT after {timeoutSeconds}s job={jobId} spec={specName} — hard-killing the process tree");
+            try { proc.Kill(entireProcessTree: true); } catch { /* already gone */ }
+        });
+
         await proc.WaitForExitAsync(CancellationToken.None);
+        timeoutCts.Cancel(); // stand the watchdog down
+        if (timeoutTask is not null) { try { await timeoutTask; } catch { /* non-fatal */ } }
         await Task.WhenAll(stdoutTask, stderrTask);
 
-        return new RenderOutcome(proc.ExitCode, cancel.IsCancellationRequested, doneEvent, errorEvent);
+        return new RenderOutcome(proc.ExitCode, cancel.IsCancellationRequested, doneEvent, errorEvent, timedOut);
     }
 }
