@@ -3,6 +3,7 @@ import { FieldValue } from "firebase-admin/firestore";
 import { getAdmin } from "@/lib/firebase/admin";
 import { exportBackend, dotnetCancel } from "@/lib/export/dotnet-backend";
 import { cancelBatchJob } from "@/lib/export/batch-backend";
+import { cancelRemotionExecution } from "@/lib/export/remotion-backend";
 import type { ExportJobDoc } from "@/lib/firebase/schema";
 
 export const runtime = "nodejs";
@@ -83,12 +84,13 @@ export async function POST(req: NextRequest) {
       const snap = await tx.get(jobRef);
       if (!snap.exists) return { status: 404 as const };
       const job = snap.data() as ExportJobDoc;
-      // Captured for the post-txn Batch teardown (stop the VM so it can't keep
+      // Captured for the post-txn teardown (stop the VM/execution so it can't keep
       // charging after we mark the job canceled).
       const batch = {
         priorStatus: job.status,
         batchJobName: job.batchJobName ?? null,
         batchJobId: job.batchJobId ?? null,
+        remotionExecutionName: job.remotionExecutionName ?? null,
       };
 
       // Already terminal — nothing to do (idempotent).
@@ -161,6 +163,27 @@ export async function POST(req: NextRequest) {
         // cancel-poll still exits, and the stale reconciler/max-run ceiling is the
         // final backstop. Surface it for ops.
         console.error("[export-cancel] batch teardown threw (job already canceled in Firestore)", {
+          jobId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    // Stop the Remotion Cloud Run Job execution so a canceled export stops billing.
+    // The worker's own cancelRequested poll is the backstop that aborts the render;
+    // this only tears the VM down sooner. Best-effort — never fails the cancel.
+    if (
+      result.remotionExecutionName &&
+      result.priorStatus !== "ready" &&
+      result.priorStatus !== "failed"
+    ) {
+      try {
+        const stopped = await cancelRemotionExecution({ executionName: result.remotionExecutionName });
+        console.log(
+          `[export-cancel] remotion teardown job=${jobId} priorStatus=${result.priorStatus} stopped=${stopped}`
+        );
+      } catch (err) {
+        console.error("[export-cancel] remotion teardown threw (job already canceled in Firestore)", {
           jobId,
           error: err instanceof Error ? err.message : String(err),
         });

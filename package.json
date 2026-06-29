@@ -17,6 +17,10 @@
     "worker:deploy": "node scripts/deploy-worker.mjs",
     "export-api:deploy": "node scripts/deploy-export-api-dotnet.mjs",
     "batch:build": "node scripts/build-batch-worker.mjs",
+    "remotion:install": "npm --prefix services/remotion-renderer install",
+    "remotion:build": "npm --prefix services/remotion-renderer run build",
+    "remotion:typecheck": "npm --prefix services/remotion-renderer run typecheck",
+    "remotion:deploy": "node scripts/deploy-remotion-renderer.mjs",
     "fb:whoami": "node scripts/firebase-active.mjs",
     "fb:use:dev": "firebase use dev",
     "fb:use:prod": "firebase use prod",
@@ -31,8 +35,10 @@
   },
   "dependencies": {
     "@google-cloud/batch": "^2.3.1",
+    "@google-cloud/run": "^3.3.0",
     "@google-cloud/tasks": "^6.2.3",
     "@google/genai": "^2.2.0",
+    "@remotion/player": "4.0.484",
     "clsx": "^2.1.1",
     "firebase": "^12.13.0",
     "firebase-admin": "^13.9.0",
@@ -43,6 +49,7 @@
     "next": "16.2.6",
     "react": "19.2.4",
     "react-dom": "19.2.4",
+    "remotion": "4.0.484",
     "tailwind-merge": "^3.6.0"
   },
   "devDependencies": {

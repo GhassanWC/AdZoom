@@ -20,6 +20,7 @@ const nextConfig: NextConfig = {
   serverExternalPackages: [
     "@google-cloud/tasks",
     "@google-cloud/batch",
+    "@google-cloud/run",
     "google-gax",
     "@grpc/grpc-js",
     "@grpc/proto-loader",
@@ -41,26 +42,31 @@ const nextConfig: NextConfig = {
     "/api/export/cloud": [
       "./node_modules/@google-cloud/tasks/build/protos/**",
       "./node_modules/@google-cloud/batch/build/protos/**",
+      "./node_modules/@google-cloud/run/build/protos/**",
       "./node_modules/google-gax/build/protos/**",
     ],
     "/api/export/retry": [
       "./node_modules/@google-cloud/tasks/build/protos/**",
       "./node_modules/@google-cloud/batch/build/protos/**",
+      "./node_modules/@google-cloud/run/build/protos/**",
       "./node_modules/google-gax/build/protos/**",
     ],
-    // Cancel stops the running Batch job (cancelBatchJob → @google-cloud/batch), so
-    // its standalone bundle needs the Batch + gax proto assets traced in too.
+    // Cancel stops the running render — Batch (cancelBatchJob → @google-cloud/batch)
+    // OR the Remotion Cloud Run Job execution (cancelRemotionExecution →
+    // @google-cloud/run) — so trace both clients' + gax proto assets.
     "/api/export/cancel": [
       "./node_modules/@google-cloud/batch/build/protos/**",
+      "./node_modules/@google-cloud/run/build/protos/**",
       "./node_modules/google-gax/build/protos/**",
     ],
     // The reconciler polls Batch job status (inspectBatchJob → @google-cloud/batch)
     // to detect jobs Google canceled before render (zone capacity) AND promotes the
-    // deferred export queue (enqueueExportJob → Batch and/or Cloud Tasks), so it
-    // needs the Batch + Tasks + gax proto assets traced in.
+    // deferred export queue (enqueueExportJob → Batch / Cloud Tasks / Cloud Run), so
+    // it needs the Batch + Tasks + Run + gax proto assets traced in.
     "/api/cron/reconcile-exports": [
       "./node_modules/@google-cloud/tasks/build/protos/**",
       "./node_modules/@google-cloud/batch/build/protos/**",
+      "./node_modules/@google-cloud/run/build/protos/**",
       "./node_modules/google-gax/build/protos/**",
     ],
   },

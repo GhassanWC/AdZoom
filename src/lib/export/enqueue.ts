@@ -6,6 +6,7 @@ import "server-only";
 import { CloudTasksClient } from "@google-cloud/tasks";
 import { exportBackend, dotnetEnqueueSignal } from "./dotnet-backend";
 import { submitBatchJob } from "./batch-backend";
+import { runRemotionJob } from "./remotion-backend";
 
 /**
  * Export-job dispatch — hands a created `exportJobs/{jobId}` doc to the Cloud
@@ -45,6 +46,16 @@ export interface EnqueueParams {
  *  can fail the job + release its minute reservation. */
 export async function enqueueExportJob(params: EnqueueParams): Promise<void> {
   const backend = exportBackend();
+
+  // EXPORT_BACKEND=remotion → trigger ONE Cloud Run Job execution of the Remotion
+  // renderer (single MP4, native audio — no chunking/merge/audiomux). Next.js
+  // already CREATED + reserved the job; this only starts the container. Throws on
+  // failure so the caller rolls back the reservation + fails the job. Chunk/render-
+  // mode params are ignored (the Remotion path never shards).
+  if (backend === "remotion") {
+    await runRemotionJob({ uid: params.uid, jobId: params.jobId, priority: params.priority });
+    return;
+  }
 
   // EXPORT_BACKEND=batch → submit a one-shot Google Cloud Batch task running the
   // .NET worker in single-job mode (claim one job, render, exit). This is the

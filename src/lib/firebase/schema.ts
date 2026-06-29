@@ -1543,6 +1543,15 @@ export interface ExportJobDoc {
   batchJobName?: string;
   /** Epoch ms when the Batch task was submitted (status → batch_submitted). */
   batchSubmittedAt?: number;
+  // ── Remotion Cloud Run Job backend (EXPORT_BACKEND=remotion) ──────────────────
+  /** Cloud Run Job EXECUTION resource name
+   *  (`projects/{p}/locations/{region}/jobs/{job}/executions/{exec}`), recorded at
+   *  dispatch so a cancel can stop the running execution (cost). Best-effort. */
+  remotionExecutionName?: string;
+  /** Server timestamp when the Remotion Cloud Run Job execution was triggered. */
+  remotionSubmittedAt?: unknown;
+  /** Build/version stamp of the Remotion renderer image that ran this job. */
+  remotionRendererVersion?: string;
   // ── Chunked render progress (long videos; only when chunking is enabled) ──────
   /** 1-based index of the chunk currently rendering. */
   chunkIndex?: number;
