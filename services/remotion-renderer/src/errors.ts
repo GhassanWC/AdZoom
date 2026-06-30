@@ -23,6 +23,23 @@ export class SourceUnavailableError extends Error {
 export const SOURCE_UNAVAILABLE_MESSAGE =
   "Couldn't read the source recording. Please try again.";
 
+/**
+ * Frame 0 couldn't be rendered/decoded in the pre-render smoke test — the source
+ * video can't be decoded by the compositor (bad codec, corrupt file, or the
+ * OffthreadVideo pipeline can't read it). Fails fast before committing to a long
+ * full render that would only hang.
+ */
+export class VideoDecodeError extends Error {
+  readonly code = "video_decode_failed";
+  constructor(message: string) {
+    super(message);
+    this.name = "VideoDecodeError";
+  }
+}
+
+export const VIDEO_DECODE_FAILED_MESSAGE =
+  "Could not decode the source video for cloud export.";
+
 export function toUserFacingError(err: unknown): UserFacingError {
   const raw = (err instanceof Error ? err.message : String(err)).toLowerCase();
   if (raw.includes("render_timeout") || raw.includes("timed out") || raw.includes("timeout")) {

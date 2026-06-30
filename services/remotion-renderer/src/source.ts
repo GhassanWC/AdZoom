@@ -86,8 +86,42 @@ function startLocalFileServer(
 ): Promise<{ url: string; port: number; close: () => Promise<void> }> {
   const size = statSync(filePath).size;
   const server: Server = createServer((req, res) => {
+    const startedAt = Date.now();
     const method = (req.method || "GET").toUpperCase();
+    const rangeHeader = req.headers.range ?? "";
+    const userAgent = req.headers["user-agent"] ?? "";
+    const url = req.url ?? "";
+    // Log on ARRIVAL so we know Remotion/Chromium reached the server even if the
+    // response later stalls (received without a matching "done" ⇒ a serving hang;
+    // no "received" at all ⇒ the render never fetched the source).
+    console.info("[local-source] request received", { method, url, range: rangeHeader, userAgent });
+
+    let status = 200;
+    let bytesPlanned = 0;
+    res.on("finish", () =>
+      console.info("[local-source] request done", {
+        method,
+        url,
+        range: rangeHeader,
+        status,
+        bytes: bytesPlanned,
+        durationMs: Date.now() - startedAt,
+      })
+    );
+    res.on("close", () => {
+      if (!res.writableFinished) {
+        console.warn("[local-source] request closed before finish", {
+          method,
+          url,
+          range: rangeHeader,
+          status,
+          durationMs: Date.now() - startedAt,
+        });
+      }
+    });
+
     if (method !== "GET" && method !== "HEAD") {
+      status = 405;
       res.writeHead(405).end();
       return;
     }
@@ -95,24 +129,24 @@ function startLocalFileServer(
     res.setHeader("Accept-Ranges", "bytes");
     res.setHeader("Access-Control-Allow-Origin", "*");
 
-    const range = req.headers.range;
-    const match = range ? /bytes=(\d*)-(\d*)/.exec(range) : null;
+    const match = rangeHeader ? /bytes=(\d*)-(\d*)/.exec(rangeHeader) : null;
     let start = 0;
     let end = size - 1;
-    let status = 200;
     if (match) {
       const s = match[1] ? Number.parseInt(match[1], 10) : NaN;
       const e = match[2] ? Number.parseInt(match[2], 10) : NaN;
       start = Number.isFinite(s) ? s : 0;
       end = Number.isFinite(e) ? Math.min(e, size - 1) : size - 1;
       if (start > end || start >= size) {
+        status = 416;
         res.writeHead(416, { "Content-Range": `bytes */${size}` }).end();
         return;
       }
       status = 206;
       res.setHeader("Content-Range", `bytes ${start}-${end}/${size}`);
     }
-    res.setHeader("Content-Length", String(end - start + 1));
+    bytesPlanned = end - start + 1;
+    res.setHeader("Content-Length", String(bytesPlanned));
     res.writeHead(status);
     if (method === "HEAD") {
       res.end();

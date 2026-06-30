@@ -44,6 +44,9 @@ function loadConfig() {
     sourceResolveTimeoutSeconds: intEnv("REMOTION_SOURCE_RESOLVE_TIMEOUT_SECONDS", 60),
     downloadTimeoutSeconds: intEnv("REMOTION_DOWNLOAD_TIMEOUT_SECONDS", 600),
     noProgressTimeoutMs: intEnv("REMOTION_NO_PROGRESS_TIMEOUT_MS", 12e4),
+    smokeTestTimeoutMs: intEnv("REMOTION_SMOKE_TIMEOUT_MS", 6e4),
+    gl: process.env.REMOTION_GL || "swiftshader",
+    logLevel: process.env.REMOTION_LOG_LEVEL || "verbose",
     perFrameTimeoutMs: intEnv("REMOTION_FRAME_TIMEOUT_MS", 6e4),
     cancelPollMs: intEnv("REMOTION_CANCEL_POLL_MS", 3e3),
     progressThrottleMs: intEnv("REMOTION_PROGRESS_THROTTLE_MS", 2e3),
@@ -120,6 +123,14 @@ var SourceUnavailableError = class extends Error {
   }
 };
 var SOURCE_UNAVAILABLE_MESSAGE = "Couldn't read the source recording. Please try again.";
+var VideoDecodeError = class extends Error {
+  code = "video_decode_failed";
+  constructor(message) {
+    super(message);
+    this.name = "VideoDecodeError";
+  }
+};
+var VIDEO_DECODE_FAILED_MESSAGE = "Could not decode the source video for cloud export.";
 function toUserFacingError(err) {
   const raw = (err instanceof Error ? err.message : String(err)).toLowerCase();
   if (raw.includes("render_timeout") || raw.includes("timed out") || raw.includes("timeout")) {
@@ -169,32 +180,62 @@ function withDeadline(p, ms, signal, label) {
 function startLocalFileServer(filePath, routeName) {
   const size = statSync(filePath).size;
   const server = createServer((req, res) => {
+    const startedAt = Date.now();
     const method = (req.method || "GET").toUpperCase();
+    const rangeHeader = req.headers.range ?? "";
+    const userAgent = req.headers["user-agent"] ?? "";
+    const url = req.url ?? "";
+    console.info("[local-source] request received", { method, url, range: rangeHeader, userAgent });
+    let status = 200;
+    let bytesPlanned = 0;
+    res.on(
+      "finish",
+      () => console.info("[local-source] request done", {
+        method,
+        url,
+        range: rangeHeader,
+        status,
+        bytes: bytesPlanned,
+        durationMs: Date.now() - startedAt
+      })
+    );
+    res.on("close", () => {
+      if (!res.writableFinished) {
+        console.warn("[local-source] request closed before finish", {
+          method,
+          url,
+          range: rangeHeader,
+          status,
+          durationMs: Date.now() - startedAt
+        });
+      }
+    });
     if (method !== "GET" && method !== "HEAD") {
+      status = 405;
       res.writeHead(405).end();
       return;
     }
     res.setHeader("Content-Type", "video/mp4");
     res.setHeader("Accept-Ranges", "bytes");
     res.setHeader("Access-Control-Allow-Origin", "*");
-    const range = req.headers.range;
-    const match = range ? /bytes=(\d*)-(\d*)/.exec(range) : null;
+    const match = rangeHeader ? /bytes=(\d*)-(\d*)/.exec(rangeHeader) : null;
     let start = 0;
     let end = size - 1;
-    let status = 200;
     if (match) {
       const s = match[1] ? Number.parseInt(match[1], 10) : NaN;
       const e = match[2] ? Number.parseInt(match[2], 10) : NaN;
       start = Number.isFinite(s) ? s : 0;
       end = Number.isFinite(e) ? Math.min(e, size - 1) : size - 1;
       if (start > end || start >= size) {
+        status = 416;
         res.writeHead(416, { "Content-Range": `bytes */${size}` }).end();
         return;
       }
       status = 206;
       res.setHeader("Content-Range", `bytes ${start}-${end}/${size}`);
     }
-    res.setHeader("Content-Length", String(end - start + 1));
+    bytesPlanned = end - start + 1;
+    res.setHeader("Content-Length", String(bytesPlanned));
     res.writeHead(status);
     if (method === "HEAD") {
       res.end();
@@ -279,14 +320,22 @@ async function prepareSource(job, workDir, opts) {
 // src/render.ts
 import {
   selectComposition,
-  renderMedia
+  renderMedia,
+  renderStill
 } from "@remotion/renderer";
 var COMPOSITION_ID = "Framevo";
-async function renderExport(args) {
+function browserLog(scope) {
+  return (l) => console.info(`[remotion-browser:${scope}] ${l.type}: ${(l.text || "").slice(0, 800)}`);
+}
+function onAssetDownload(src) {
+  console.info("[remotion-download] asset fetch start", { src: src.slice(0, 180) });
+  return void 0;
+}
+async function selectFramevoComposition(serveUrl, inputProps) {
   const composition = await selectComposition({
-    serveUrl: args.serveUrl,
+    serveUrl,
     id: COMPOSITION_ID,
-    inputProps: args.inputProps
+    inputProps
   });
   console.info("[remotion-worker] composition selected", {
     id: COMPOSITION_ID,
@@ -295,8 +344,28 @@ async function renderExport(args) {
     fps: composition.fps,
     durationInFrames: composition.durationInFrames
   });
+  return composition;
+}
+async function renderFirstFrame(args) {
+  await renderStill({
+    composition: args.composition,
+    serveUrl: args.serveUrl,
+    output: args.output,
+    frame: 0,
+    inputProps: args.inputProps,
+    imageFormat: "jpeg",
+    chromiumOptions: {
+      gl: args.gl,
+      enableMultiProcessOnLinux: true
+    },
+    timeoutInMilliseconds: args.timeoutMs,
+    logLevel: args.logLevel,
+    onBrowserLog: browserLog("still")
+  });
+}
+async function renderExport(args) {
   await renderMedia({
-    composition,
+    composition: args.composition,
     serveUrl: args.serveUrl,
     codec: "h264",
     audioCodec: "aac",
@@ -306,16 +375,22 @@ async function renderExport(args) {
     x264Preset: args.x264Preset,
     imageFormat: "jpeg",
     concurrency: args.concurrency,
-    chromiumOptions: { enableMultiProcessOnLinux: true },
+    chromiumOptions: {
+      gl: args.gl,
+      enableMultiProcessOnLinux: true
+    },
     timeoutInMilliseconds: args.perFrameTimeoutMs,
     cancelSignal: args.cancelSignal,
-    onProgress: args.onProgress
+    onProgress: args.onProgress,
+    logLevel: args.logLevel,
+    onBrowserLog: browserLog("media"),
+    onDownload: onAssetDownload
   });
   return {
-    width: composition.width,
-    height: composition.height,
-    fps: composition.fps,
-    durationInFrames: composition.durationInFrames
+    width: args.composition.width,
+    height: args.composition.height,
+    fps: args.composition.fps,
+    durationInFrames: args.composition.durationInFrames
   };
 }
 
@@ -341,6 +416,47 @@ function toMs(v) {
 }
 function log(msg, extra) {
   console.info(`[remotion-worker] ${msg}`, extra ?? {});
+}
+async function raceTimeout(p, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  try {
+    return await Promise.race([p, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+function makeProgressWatchdog(timeoutMs, onFire) {
+  let timer;
+  let reject;
+  let fired = false;
+  let stopped = false;
+  const promise = new Promise((_, rej) => {
+    reject = rej;
+  });
+  const arm = () => {
+    if (stopped || fired) return;
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      fired = true;
+      onFire();
+      reject?.(new Error("render_no_progress_timeout"));
+    }, timeoutMs);
+  };
+  return {
+    promise,
+    start: arm,
+    bump: arm,
+    stop: () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+    },
+    get fired() {
+      return fired;
+    }
+  };
 }
 async function claimJob(db, uid, jobId) {
   const jobRef = db.doc(`users/${uid}/exportJobs/${jobId}`);
@@ -401,7 +517,7 @@ async function processRemotionJob(uid, jobId) {
   let wasCanceled = false;
   let timedOut = false;
   let noProgressTimedOut = false;
-  let progressWatchdog;
+  let renderWatchdog;
   const patch = (data) => jobRef.set(
     { ...data, lastHeartbeatAt: Date.now(), heartbeatAt: Date.now(), updatedAt: FieldValue.serverTimestamp() },
     { merge: true }
@@ -463,44 +579,83 @@ async function processRemotionJob(uid, jobId) {
     await progressPatch({ stage: "decoding", progress: 0.04, progressStage: "rendering" });
     const serveUrl = await getServeUrl();
     log("composition bundle ready", { uid, jobId });
+    if (!/^http:\/\/127\.0\.0\.1:\d+\//.test(inputProps.src)) {
+      throw new Error(`render src must be a local http URL, got: ${String(inputProps.src).slice(0, 40)}`);
+    }
+    log("render src verified", { uid, jobId, src: inputProps.src });
+    const composition = await selectFramevoComposition(serveUrl, inputProps);
+    log("first frame smoke test started", { uid, jobId, timeoutMs: cfg.smokeTestTimeoutMs });
+    try {
+      await raceTimeout(
+        renderFirstFrame({
+          composition,
+          serveUrl,
+          inputProps,
+          output: join3(workDir, "frame0.jpg"),
+          timeoutMs: cfg.smokeTestTimeoutMs,
+          gl: cfg.gl,
+          logLevel: cfg.logLevel
+        }),
+        cfg.smokeTestTimeoutMs,
+        "first frame smoke test"
+      );
+    } catch (err) {
+      if (wasCanceled) throw err;
+      throw new VideoDecodeError(
+        `first frame smoke test failed: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+    log("first frame smoke test passed", { uid, jobId });
     const gate = makeThrottle(cfg.progressThrottleMs);
-    const armProgressWatchdog = () => {
-      if (progressWatchdog) clearTimeout(progressWatchdog);
-      progressWatchdog = setTimeout(() => {
-        noProgressTimedOut = true;
-        console.error("[remotion-worker] NO-PROGRESS TIMEOUT \u2014 aborting render", {
-          uid,
-          jobId,
-          noProgressTimeoutMs: cfg.noProgressTimeoutMs
-        });
-        cancel();
-        preAbort.abort();
-      }, cfg.noProgressTimeoutMs);
-    };
-    log("render started", { uid, jobId });
-    armProgressWatchdog();
-    const result = await renderExport({
-      serveUrl,
-      inputProps,
-      outputLocation: outPath,
-      crf: cfg.crf,
-      x264Preset: cfg.x264Preset,
-      concurrency: cfg.concurrency,
-      perFrameTimeoutMs: cfg.perFrameTimeoutMs,
-      cancelSignal,
-      onProgress: ({ progress, stitchStage }) => {
-        armProgressWatchdog();
-        gate(
-          () => void progressPatch({
-            stage: stitchStage === "muxing" ? "encoding" : "rendering",
-            progressStage: "rendering",
-            progress: Math.min(0.97, Math.max(0.04, progress))
-          }).catch(() => {
-          })
-        );
-      }
+    let sawProgress = false;
+    renderWatchdog = makeProgressWatchdog(cfg.noProgressTimeoutMs, () => {
+      noProgressTimedOut = true;
+      console.error("[remotion-worker] no progress for the watchdog window \u2014 aborting render", {
+        uid,
+        jobId,
+        noProgressTimeoutMs: cfg.noProgressTimeoutMs
+      });
+      cancel();
+      preAbort.abort();
+      setTimeout(() => {
+        console.error("[remotion-worker] forcing exit(1) after no-progress timeout");
+        process.exit(1);
+      }, 45e3).unref();
     });
-    if (progressWatchdog) clearTimeout(progressWatchdog);
+    log("renderMedia started", { uid, jobId });
+    renderWatchdog.start();
+    const result = await Promise.race([
+      renderExport({
+        composition,
+        serveUrl,
+        inputProps,
+        outputLocation: outPath,
+        crf: cfg.crf,
+        x264Preset: cfg.x264Preset,
+        concurrency: cfg.concurrency,
+        perFrameTimeoutMs: cfg.perFrameTimeoutMs,
+        gl: cfg.gl,
+        logLevel: cfg.logLevel,
+        cancelSignal,
+        onProgress: ({ progress, stitchStage }) => {
+          renderWatchdog?.bump();
+          if (!sawProgress) {
+            sawProgress = true;
+            log("render progress", { uid, jobId, progress: Math.round(progress * 100) / 100 });
+          }
+          gate(
+            () => void progressPatch({
+              stage: stitchStage === "muxing" ? "encoding" : "rendering",
+              progressStage: "rendering",
+              progress: Math.min(0.97, Math.max(0.04, progress))
+            }).catch(() => {
+            })
+          );
+        }
+      }),
+      renderWatchdog.promise
+    ]);
+    renderWatchdog.stop();
     log("render completed", { uid, jobId, frames: result.durationInFrames });
     if (!existsSync2(outPath) || statSync2(outPath).size <= 0) {
       throw new Error("render produced no output file");
@@ -570,7 +725,7 @@ async function processRemotionJob(uid, jobId) {
     const friendly = noProgressTimedOut ? {
       code: "render_no_progress_timeout",
       message: "The export stalled before producing any video and was stopped. Please try again."
-    } : timedOut ? { code: "render_timeout", message: "The export took too long and was stopped. Please try again." } : err instanceof SourceUnavailableError ? { code: err.code, message: SOURCE_UNAVAILABLE_MESSAGE } : toUserFacingError(err);
+    } : err instanceof VideoDecodeError ? { code: err.code, message: VIDEO_DECODE_FAILED_MESSAGE } : timedOut ? { code: "render_timeout", message: "The export took too long and was stopped. Please try again." } : err instanceof SourceUnavailableError ? { code: err.code, message: SOURCE_UNAVAILABLE_MESSAGE } : toUserFacingError(err);
     await db.runTransaction(async (tx) => {
       const snap = await tx.get(jobRef);
       if (!snap.exists) return;
@@ -603,9 +758,12 @@ async function processRemotionJob(uid, jobId) {
     clearInterval(cancelPoll);
     clearInterval(heartbeat);
     clearTimeout(hardTimeout);
-    if (progressWatchdog) clearTimeout(progressWatchdog);
-    if (source) await source.close().catch(() => {
-    });
+    renderWatchdog?.stop();
+    if (source) {
+      await source.close().catch(() => {
+      });
+      log("local source server closed", { uid, jobId });
+    }
     if (workDir) await rm(workDir, { recursive: true, force: true }).catch(() => {
     });
   }

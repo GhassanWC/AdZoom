@@ -17,9 +17,15 @@ import { getAdmin, bucket } from "./firebase.js";
 import { loadConfig } from "./config.js";
 import { getServeUrl } from "./bundle.js";
 import { prepareSource, type PreparedSource } from "./source.js";
-import { renderExport } from "./render.js";
+import { selectFramevoComposition, renderFirstFrame, renderExport } from "./render.js";
 import { makeThrottle } from "./progress.js";
-import { toUserFacingError, SourceUnavailableError, SOURCE_UNAVAILABLE_MESSAGE } from "./errors.js";
+import {
+  toUserFacingError,
+  SourceUnavailableError,
+  SOURCE_UNAVAILABLE_MESSAGE,
+  VideoDecodeError,
+  VIDEO_DECODE_FAILED_MESSAGE,
+} from "./errors.js";
 import type { ExportJobDoc } from "@/lib/firebase/schema";
 import type { FramevoAudioMode, FramevoCompositionProps } from "@/remotion/types";
 
@@ -39,6 +45,58 @@ function toMs(v: unknown): number {
 
 function log(msg: string, extra?: Record<string, unknown>): void {
   console.info(`[remotion-worker] ${msg}`, extra ?? {});
+}
+
+/** Reject if `p` doesn't settle within `ms`. The underlying op may keep running
+ *  in the background; callers fail + (the run entry) exits, so nothing hangs. */
+async function raceTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  try {
+    return await Promise.race([p, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * Sliding no-progress watchdog. `promise` REJECTS if `bump()` isn't called within
+ * `timeoutMs`. Race it against the render so the awaited render call returns the
+ * instant the watchdog fires — even if Remotion's own cancel can't unblock a
+ * pre-first-frame hang (the bug where the old setTimeout fired but `await render`
+ * never returned). `onFire` is the best-effort clean cancel.
+ */
+function makeProgressWatchdog(timeoutMs: number, onFire: () => void) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let reject: ((e: Error) => void) | undefined;
+  let fired = false;
+  let stopped = false;
+  const promise = new Promise<never>((_, rej) => {
+    reject = rej;
+  });
+  const arm = () => {
+    if (stopped || fired) return;
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      fired = true;
+      onFire();
+      reject?.(new Error("render_no_progress_timeout"));
+    }, timeoutMs);
+  };
+  return {
+    promise,
+    start: arm,
+    bump: arm,
+    stop: () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+    },
+    get fired() {
+      return fired;
+    },
+  };
 }
 
 async function claimJob(db: Firestore, uid: string, jobId: string): Promise<ClaimResult> {
@@ -105,11 +163,12 @@ export async function processRemotionJob(uid: string, jobId: string): Promise<st
   const preAbort = new AbortController();
   let wasCanceled = false;
   let timedOut = false;
-  // Render-progress watchdog: armed at "render started", re-armed on every
+  // Render-progress watchdog: started before renderMedia, re-armed on every
   // onProgress. If renderMedia produces NO progress within noProgressTimeoutMs
-  // (e.g. the asset fetch stalls before the first frame), abort + fail clearly.
+  // (e.g. the asset fetch stalls before the first frame), its promise REJECTS
+  // (raced against the render) so the await returns and we fail clearly.
   let noProgressTimedOut = false;
-  let progressWatchdog: ReturnType<typeof setTimeout> | undefined;
+  let renderWatchdog: ReturnType<typeof makeProgressWatchdog> | undefined;
 
   const patch = (data: Record<string, unknown>) =>
     jobRef.set(
@@ -206,49 +265,97 @@ export async function processRemotionJob(uid: string, jobId: string): Promise<st
     const serveUrl = await getServeUrl();
     log("composition bundle ready", { uid, jobId });
 
-    // ── Render (single MP4; native audio mux) ────────────────────────────────
+    // ── Verify the render src is exactly the local HTTP URL (no file://, no
+    //    remote URL, no undefined) before handing it to the compositor. ───────
+    if (!/^http:\/\/127\.0\.0\.1:\d+\//.test(inputProps.src)) {
+      throw new Error(`render src must be a local http URL, got: ${String(inputProps.src).slice(0, 40)}`);
+    }
+    log("render src verified", { uid, jobId, src: inputProps.src });
+
+    // ── Select the composition once (metadata only — no video load). ──────────
+    const composition = await selectFramevoComposition(serveUrl, inputProps);
+
+    // ── First-frame smoke test: decode frame 0 through the SAME OffthreadVideo
+    //    pipeline. If it can't decode/render in time, fail FAST as
+    //    video_decode_failed instead of entering a long full render that hangs. ─
+    log("first frame smoke test started", { uid, jobId, timeoutMs: cfg.smokeTestTimeoutMs });
+    try {
+      await raceTimeout(
+        renderFirstFrame({
+          composition,
+          serveUrl,
+          inputProps,
+          output: join(workDir, "frame0.jpg"),
+          timeoutMs: cfg.smokeTestTimeoutMs,
+          gl: cfg.gl,
+          logLevel: cfg.logLevel,
+        }),
+        cfg.smokeTestTimeoutMs,
+        "first frame smoke test"
+      );
+    } catch (err) {
+      if (wasCanceled) throw err; // a cancel during the smoke test → handled as canceled
+      throw new VideoDecodeError(
+        `first frame smoke test failed: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+    log("first frame smoke test passed", { uid, jobId });
+
+    // ── Full render (single MP4; native audio mux) with a sliding no-progress
+    //    watchdog RACED against the render so a stall returns within the window. ─
     const gate = makeThrottle(cfg.progressThrottleMs);
-    // Arm the no-progress watchdog: if renderMedia produces no progress within
-    // the window (asset fetch stall, wedged Chromium), abort + fail clearly
-    // instead of hanging silently after "composition selected".
-    const armProgressWatchdog = () => {
-      if (progressWatchdog) clearTimeout(progressWatchdog);
-      progressWatchdog = setTimeout(() => {
-        noProgressTimedOut = true;
-        console.error("[remotion-worker] NO-PROGRESS TIMEOUT — aborting render", {
-          uid,
-          jobId,
-          noProgressTimeoutMs: cfg.noProgressTimeoutMs,
-        });
-        cancel();
-        preAbort.abort();
-      }, cfg.noProgressTimeoutMs);
-    };
-    log("render started", { uid, jobId });
-    armProgressWatchdog();
-    const result = await renderExport({
-      serveUrl,
-      inputProps,
-      outputLocation: outPath,
-      crf: cfg.crf,
-      x264Preset: cfg.x264Preset,
-      concurrency: cfg.concurrency,
-      perFrameTimeoutMs: cfg.perFrameTimeoutMs,
-      cancelSignal,
-      onProgress: ({ progress, stitchStage }) => {
-        // Re-arm on EVERY callback (not just throttled writes) so real progress
-        // always resets the watchdog.
-        armProgressWatchdog();
-        gate(() =>
-          void progressPatch({
-            stage: stitchStage === "muxing" ? "encoding" : "rendering",
-            progressStage: "rendering",
-            progress: Math.min(0.97, Math.max(0.04, progress)),
-          }).catch(() => {})
-        );
-      },
+    let sawProgress = false;
+    renderWatchdog = makeProgressWatchdog(cfg.noProgressTimeoutMs, () => {
+      noProgressTimedOut = true;
+      console.error("[remotion-worker] no progress for the watchdog window — aborting render", {
+        uid,
+        jobId,
+        noProgressTimeoutMs: cfg.noProgressTimeoutMs,
+      });
+      cancel(); // best-effort clean cancel
+      preAbort.abort();
+      // Last-resort: if settle/cleanup wedges, force a non-zero exit so the
+      // container can never live on after a no-progress failure.
+      setTimeout(() => {
+        console.error("[remotion-worker] forcing exit(1) after no-progress timeout");
+        process.exit(1);
+      }, 45_000).unref();
     });
-    if (progressWatchdog) clearTimeout(progressWatchdog);
+    log("renderMedia started", { uid, jobId });
+    renderWatchdog.start();
+    const result = await Promise.race([
+      renderExport({
+        composition,
+        serveUrl,
+        inputProps,
+        outputLocation: outPath,
+        crf: cfg.crf,
+        x264Preset: cfg.x264Preset,
+        concurrency: cfg.concurrency,
+        perFrameTimeoutMs: cfg.perFrameTimeoutMs,
+        gl: cfg.gl,
+        logLevel: cfg.logLevel,
+        cancelSignal,
+        onProgress: ({ progress, stitchStage }) => {
+          // Re-arm on EVERY callback (not just throttled writes) so real progress
+          // always resets the watchdog.
+          renderWatchdog?.bump();
+          if (!sawProgress) {
+            sawProgress = true;
+            log("render progress", { uid, jobId, progress: Math.round(progress * 100) / 100 });
+          }
+          gate(() =>
+            void progressPatch({
+              stage: stitchStage === "muxing" ? "encoding" : "rendering",
+              progressStage: "rendering",
+              progress: Math.min(0.97, Math.max(0.04, progress)),
+            }).catch(() => {})
+          );
+        },
+      }),
+      renderWatchdog.promise,
+    ]);
+    renderWatchdog.stop();
     log("render completed", { uid, jobId, frames: result.durationInFrames });
 
     if (!existsSync(outPath) || statSync(outPath).size <= 0) {
@@ -331,11 +438,13 @@ export async function processRemotionJob(uid: string, jobId: string): Promise<st
           code: "render_no_progress_timeout",
           message: "The export stalled before producing any video and was stopped. Please try again.",
         }
-      : timedOut
-        ? { code: "render_timeout", message: "The export took too long and was stopped. Please try again." }
-        : err instanceof SourceUnavailableError
-          ? { code: err.code, message: SOURCE_UNAVAILABLE_MESSAGE }
-          : toUserFacingError(err);
+      : err instanceof VideoDecodeError
+        ? { code: err.code, message: VIDEO_DECODE_FAILED_MESSAGE }
+        : timedOut
+          ? { code: "render_timeout", message: "The export took too long and was stopped. Please try again." }
+          : err instanceof SourceUnavailableError
+            ? { code: err.code, message: SOURCE_UNAVAILABLE_MESSAGE }
+            : toUserFacingError(err);
     await db
       .runTransaction(async (tx) => {
         const snap = await tx.get(jobRef);
@@ -370,9 +479,12 @@ export async function processRemotionJob(uid: string, jobId: string): Promise<st
     clearInterval(cancelPoll);
     clearInterval(heartbeat);
     clearTimeout(hardTimeout);
-    if (progressWatchdog) clearTimeout(progressWatchdog);
+    renderWatchdog?.stop();
     // Stop the local source server before deleting the dir it serves from.
-    if (source) await source.close().catch(() => {});
+    if (source) {
+      await source.close().catch(() => {});
+      log("local source server closed", { uid, jobId });
+    }
     if (workDir) await rm(workDir, { recursive: true, force: true }).catch(() => {});
   }
 }

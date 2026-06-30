@@ -31,6 +31,14 @@ export interface RendererConfig {
    *  window (e.g. the asset download stalls before the first frame), the worker
    *  aborts and fails `render_no_progress_timeout` rather than hanging. */
   noProgressTimeoutMs: number;
+  /** Budget for the pre-render first-frame smoke test (renderStill frame 0). If
+   *  frame 0 can't decode/render in time, fail fast as `video_decode_failed`. */
+  smokeTestTimeoutMs: number;
+  /** Chromium GL backend. "swiftshader" (software) is the reliable headless
+   *  default on Cloud Run; override via REMOTION_GL if a GPU backend is wanted. */
+  gl: string;
+  /** Remotion log verbosity ("error"|"warn"|"info"|"verbose"|"trace"). */
+  logLevel: string;
   /** Per-frame renderMedia timeout (a single stuck frame). */
   perFrameTimeoutMs: number;
   /** How often the worker polls Firestore for cancelRequested. */
@@ -72,6 +80,9 @@ export function loadConfig(): RendererConfig {
     sourceResolveTimeoutSeconds: intEnv("REMOTION_SOURCE_RESOLVE_TIMEOUT_SECONDS", 60),
     downloadTimeoutSeconds: intEnv("REMOTION_DOWNLOAD_TIMEOUT_SECONDS", 600),
     noProgressTimeoutMs: intEnv("REMOTION_NO_PROGRESS_TIMEOUT_MS", 120_000),
+    smokeTestTimeoutMs: intEnv("REMOTION_SMOKE_TIMEOUT_MS", 60_000),
+    gl: process.env.REMOTION_GL || "swiftshader",
+    logLevel: process.env.REMOTION_LOG_LEVEL || "verbose",
     perFrameTimeoutMs: intEnv("REMOTION_FRAME_TIMEOUT_MS", 60_000),
     cancelPollMs: intEnv("REMOTION_CANCEL_POLL_MS", 3000),
     progressThrottleMs: intEnv("REMOTION_PROGRESS_THROTTLE_MS", 2000),
