@@ -39,7 +39,7 @@ import type {
 export interface StartCloudExportInput {
   projectId: string;
   projectTitle: string;
-  resolution: "1080p" | "4K";
+  resolution: "720p" | "1080p" | "4K";
   fps: 30 | 60;
   format: ExportFormat;
   sourceWidth: number;

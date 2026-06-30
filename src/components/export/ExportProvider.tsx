@@ -109,7 +109,7 @@ export interface ExportRenderParams {
   visualAnalysis?: VisualAnalysis;
   /** Global source-frame crop — sampled off the source rect at render. */
   sourceCrop?: SourceCrop;
-  resolution: "1080p" | "4K";
+  resolution: "720p" | "1080p" | "4K";
   fps: 30 | 60;
   format: ExportFormat;
   /** Desired output container ("webm" | "mp4"). MP4 needs WebCodecs; if absent

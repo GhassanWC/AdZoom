@@ -1055,6 +1055,19 @@ export interface MonthlyUsage {
   cloudMinutesConsumed?: number;
   /** Epoch ms of the most recent cloud-export settlement. */
   lastCloudExportAt?: number;
+  /**
+   * CLOUD (Remotion) exports STARTED this month. Free is hard-capped at
+   * FREE_MONTHLY_CLOUD_EXPORTS; paid plans meter `cloudMinutes*` instead but
+   * still track this for context. Reserved (incremented) on a successful start
+   * and refunded (decremented) on a system failure — see ExportJobDoc
+   * `monthlyUsageApplied`. Server-written; absent ⇒ 0. Distinct from the
+   * browser-export `exportCount` permit counter above.
+   */
+  exportsUsedThisMonth?: number;
+  /** "YYYY-MM" key this counter belongs to (mirrors the usage doc id). */
+  exportMonthKey?: string;
+  /** Plan snapshot at the most recent cloud-export start. */
+  lastExportPlan?: "free" | "pro" | "creator";
 }
 
 export interface ProjectDoc {
@@ -1372,7 +1385,7 @@ export interface SerializedRenderRecipe {
   sourceWidth: number;
   sourceHeight: number;
   fps: 30 | 60;
-  resolution: "1080p" | "4K";
+  resolution: "720p" | "1080p" | "4K";
   format: ExportFormat;
   /** Full SOURCE duration in seconds (pre cuts/speed). */
   sourceDuration: number;
@@ -1556,6 +1569,22 @@ export interface ExportJobDoc {
    *  the worker on claim). Drives backend-specific UI (e.g. the Remotion path
    *  shows "Rendering video" + frame/ETA progress, never the Batch chunk count). */
   backend?: "remotion" | "batch" | "vm" | "dotnet" | "cloudtasks";
+  // ── Plan policy + queue (server-enforced; never trusted from the client) ──────
+  /** Plan snapshot at creation — drives plan-specific UI + audit. */
+  planAtExport?: "free" | "pro" | "creator";
+  /** Numeric queue priority — HIGHER served first (creator>pro>free). */
+  priorityRank?: number;
+  /** Epoch ms the job entered the queue (FIFO within the same priority). */
+  queuedAt?: number;
+  /** Preset the client REQUESTED ("1080p · 30fps") before normalization. */
+  requestedPreset?: string;
+  /** Preset actually applied after server-side plan normalization. */
+  normalizedPreset?: string;
+  /** Why a create attempt was blocked by an active-export cap (audit only). */
+  activeLimitReason?: string;
+  /** True while this job holds a slot of the user's monthly cloud-export count,
+   *  so a refund on system failure decrements it exactly once. */
+  monthlyUsageApplied?: boolean;
   // ── Remotion per-frame render progress (EXPORT_BACKEND=remotion) ──────────────
   /** Frames rendered so far (from renderMedia onProgress). */
   renderedFrames?: number;

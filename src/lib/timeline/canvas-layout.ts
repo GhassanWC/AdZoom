@@ -110,7 +110,7 @@ export function resolveCanvasDims(
   resolution: OutputResolution,
   custom?: { width: number; height: number }
 ): { canvasW: number; canvasH: number } {
-  const longEdge = resolution === "4K" ? 3840 : 1920;
+  const longEdge = resolution === "4K" ? 3840 : resolution === "720p" ? 1280 : 1920;
 
   let rw: number;
   let rh: number;

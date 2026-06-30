@@ -12,6 +12,7 @@ import {
 } from "@/lib/export/batch-backend";
 import { enqueueExportJob } from "@/lib/export/enqueue";
 import { exportBackend } from "@/lib/export/dotnet-backend";
+import { globalActiveExportLimit } from "@/lib/export/plan-policy";
 import {
   BATCH_SLOT_STATUSES,
   QUEUE_REASON_WAITING_FOR_SLOT,
@@ -126,16 +127,26 @@ async function failJobAndRefund(
       if (Date.now() - lastProgress < opts.requireProgressStaleMs) return false;
     }
 
-    // Release the reserved minutes (clamp at 0 — same as the worker/cancel
-    // paths). ALL reads happen before any writes per Firestore txn rules.
+    // Release the reserved minutes AND refund the monthly export COUNT (so a
+    // stale/capacity system failure never burns a Free user's allowance). Clamp
+    // at 0. ALL reads happen before any writes per Firestore txn rules.
     const estimate = job.estimatedExportMinutes ?? 0;
-    if (estimate > 0 && job.monthlyBucket) {
+    const countApplied = job.monthlyUsageApplied === true;
+    if (job.monthlyBucket && (estimate > 0 || countApplied)) {
       const usageRef = db.doc(`users/${uid}/usage/${job.monthlyBucket}`);
       const uSnap = await tx.get(usageRef);
-      const reserved = (uSnap.data() as MonthlyUsage | undefined)?.cloudMinutesReserved ?? 0;
+      const u = uSnap.data() as MonthlyUsage | undefined;
       tx.set(
         usageRef,
-        { cloudMinutesReserved: Math.max(0, reserved - estimate), updatedAt: Date.now() },
+        {
+          ...(estimate > 0
+            ? { cloudMinutesReserved: Math.max(0, (u?.cloudMinutesReserved ?? 0) - estimate) }
+            : {}),
+          ...(countApplied
+            ? { exportsUsedThisMonth: Math.max(0, (u?.exportsUsedThisMonth ?? 0) - 1) }
+            : {}),
+          updatedAt: Date.now(),
+        },
         { merge: true }
       );
     }
@@ -146,6 +157,7 @@ async function failJobAndRefund(
         status: "failed",
         errorCode: fail.errorCode,
         errorMessage: fail.errorMessage,
+        ...(countApplied ? { monthlyUsageApplied: false } : {}),
         // Cooperative backstop to the real Batch cancel: a still-live sibling worker's
         // 1s cancel-poll sees this and exits fast (the Batch cancel tears the VM down).
         ...(opts?.setCancelRequested ? { cancelRequested: true } : {}),
@@ -379,6 +391,110 @@ async function sweepStaleProgress(db: FirebaseFirestore.Firestore): Promise<numb
   return failed;
 }
 
+/**
+ * Promote deferred Remotion exports (status `queued`) into freed GLOBAL slots,
+ * strictly by priority: Creator → Pro → Free, then FIFO by `queuedAt`. Counts
+ * platform-wide active (rendering/uploading) jobs, then dispatches the highest-
+ * priority waiting jobs until the global limit is reached. Each is claimed
+ * transactionally so overlapping cron runs can't double-dispatch. Sorting is done
+ * in memory (single-field `status == queued` query) so no composite index is
+ * needed. Best-effort: index / dispatch errors are swallowed.
+ */
+async function promoteQueuedRemotionJobs(
+  db: FirebaseFirestore.Firestore
+): Promise<{ promoted: number; active: number; limit: number }> {
+  const limit = globalActiveExportLimit();
+
+  let active = 0;
+  try {
+    const activeSnap = await db
+      .collectionGroup("exportJobs")
+      .where("status", "in", [...RENDER_PROGRESS_STATUSES])
+      .count()
+      .get();
+    active = activeSnap.data().count ?? 0;
+  } catch (err) {
+    if (isIndexError(err)) return { promoted: 0, active: 0, limit };
+    throw err;
+  }
+  let available = limit - active;
+  if (available <= 0) return { promoted: 0, active, limit };
+
+  let docs: FirebaseFirestore.QueryDocumentSnapshot[];
+  try {
+    const qSnap = await db
+      .collectionGroup("exportJobs")
+      .where("status", "==", "queued")
+      .limit(100)
+      .get();
+    docs = qSnap.docs;
+  } catch (err) {
+    if (isIndexError(err)) return { promoted: 0, active, limit };
+    throw err;
+  }
+
+  // Priority order: higher priorityRank first (creator>pro>free), then FIFO.
+  const queued = docs
+    .map((d) => ({ d, job: d.data() as ExportJobDoc }))
+    .filter(({ job }) => (job.backend ?? "remotion") === "remotion")
+    .sort(
+      (a, b) =>
+        (b.job.priorityRank ?? 0) - (a.job.priorityRank ?? 0) ||
+        toMillis(a.job.queuedAt) - toMillis(b.job.queuedAt)
+    );
+
+  let promoted = 0;
+  const now = Date.now();
+  for (const { d, job } of queued) {
+    if (available <= 0) break;
+    const uid = uidFromSubDoc(d.ref);
+    if (!uid) continue;
+    const claimed = await db.runTransaction(async (tx) => {
+      const s = await tx.get(d.ref);
+      if (!s.exists) return false;
+      const j = s.data() as ExportJobDoc;
+      if (j.status !== "queued") return false;
+      if (j.promotionClaimedAt && now - toMillis(j.promotionClaimedAt) <= PROMOTION_CLAIM_STALE_MS) {
+        return false; // freshly claimed by another run
+      }
+      tx.set(
+        d.ref,
+        { promotionClaimedAt: FieldValue.serverTimestamp(), updatedAt: FieldValue.serverTimestamp() },
+        { merge: true }
+      );
+      return true;
+    });
+    if (!claimed) continue;
+    try {
+      await enqueueExportJob({
+        uid,
+        jobId: d.id,
+        priority: job.priority === "priority" ? "priority" : "normal",
+      });
+      // Clear the "waiting for slot" marker so the UI stops showing it.
+      await d.ref
+        .set({ queueReason: FieldValue.delete(), updatedAt: FieldValue.serverTimestamp() }, { merge: true })
+        .catch(() => {});
+      promoted++;
+      available--;
+      console.info("[reconcile-exports] promoted remotion job", {
+        jobId: d.id,
+        uid,
+        priorityRank: job.priorityRank ?? 0,
+        active: active + promoted,
+        limit,
+      });
+    } catch (err) {
+      // Release the claim so it retries next tick.
+      await d.ref
+        .set({ promotionClaimedAt: FieldValue.delete(), updatedAt: FieldValue.serverTimestamp() }, { merge: true })
+        .catch(() => {});
+      console.error("[reconcile-exports] remotion promotion dispatch failed", { jobId: d.id, err });
+    }
+  }
+  return { promoted, active, limit };
+}
+
 export async function POST(req: NextRequest) {
   if (!authorized(req)) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
@@ -513,6 +629,11 @@ export async function POST(req: NextRequest) {
     if (exportBackend() === "batch") {
       const res = await promoteQueuedJobs(db);
       promoted = res.submitted;
+    } else if (exportBackend() === "remotion") {
+      // Drain the Remotion queue by priority (Creator>Pro>Free, FIFO) into any
+      // free global slots, keeping platform-wide active ≤ GLOBAL_ACTIVE_EXPORT_LIMIT.
+      const res = await promoteQueuedRemotionJobs(db);
+      promoted = res.promoted;
     }
   } catch (err) {
     console.error("[reconcile-exports] promotion failed", err);

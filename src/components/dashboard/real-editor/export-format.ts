@@ -60,8 +60,12 @@ export function isExportContainer(v: unknown): v is ExportContainer {
 // High bitrates by resolution × fps — shared by BOTH the WebM (VP9/Opus) and
 // MP4 (H.264/AAC) sinks, so WebM is NOT lower quality just because it's WebM.
 
-export function videoBitrateFor(resolution: "1080p" | "4K", fps: 30 | 60): number {
+export function videoBitrateFor(
+  resolution: "720p" | "1080p" | "4K",
+  fps: 30 | 60
+): number {
   if (resolution === "4K") return fps >= 60 ? 45_000_000 : 28_000_000;
+  if (resolution === "720p") return fps >= 60 ? 7_000_000 : 5_000_000;
   return fps >= 60 ? 14_000_000 : 10_000_000;
 }
 
@@ -97,7 +101,7 @@ export async function canEncodeMp4(opts: {
   fps: 30 | 60;
   /** Probe with the bitrate the encoder will ACTUALLY use, so the gate predicts
    *  the real configure() (4K uses a much higher bitrate than 1080p). */
-  resolution: "1080p" | "4K";
+  resolution: "720p" | "1080p" | "4K";
 }): Promise<boolean> {
   if (typeof window === "undefined") return false;
   if (typeof VideoEncoder === "undefined" || typeof AudioEncoder === "undefined") {

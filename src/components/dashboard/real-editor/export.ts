@@ -367,7 +367,7 @@ interface RenderInput {
   duration: number;
   moments: DetectedMoment[];
   effects: EffectsSettings;
-  resolution: "1080p" | "4K";
+  resolution: "720p" | "1080p" | "4K";
   fps: 30 | 60;
   format: ExportFormat;
   /**

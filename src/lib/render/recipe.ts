@@ -74,7 +74,7 @@ export interface RenderRecipeInput {
   sourceWidth: number;
   sourceHeight: number;
   fps: 30 | 60;
-  resolution: "1080p" | "4K";
+  resolution: "720p" | "1080p" | "4K";
   format: ExportFormat;
   /** Full SOURCE duration in seconds (pre cuts/speed). */
   sourceDuration: number;
@@ -93,7 +93,7 @@ export interface RenderRecipe {
   sourceWidth: number;
   sourceHeight: number;
   fps: 30 | 60;
-  resolution: "1080p" | "4K";
+  resolution: "720p" | "1080p" | "4K";
   format: ExportFormat;
   sourceDuration: number;
   /** Output duration in seconds (post cuts/speed) — from the timeline map. */

@@ -22,7 +22,7 @@ import type { EffectsSettings, ExportFormat } from "@/lib/firebase/schema";
  * past the browser-stable encode budget.
  */
 
-export type OutputResolution = "1080p" | "4K";
+export type OutputResolution = "720p" | "1080p" | "4K";
 
 export interface OutputDims {
   /** Canvas / encoded width in pixels (always even — H.264 requires it). */
@@ -72,8 +72,8 @@ export function resolveOutputDims(
   // Explicit vertical crop preset — fixed 9:16, source center-cropped.
   if (vertical) {
     return {
-      canvasW: resolution === "4K" ? 2160 : 1080,
-      canvasH: resolution === "4K" ? 3840 : 1920,
+      canvasW: resolution === "4K" ? 2160 : resolution === "720p" ? 720 : 1080,
+      canvasH: resolution === "4K" ? 3840 : resolution === "720p" ? 1280 : 1920,
       cropped: true,
       mode: "crop-9:16",
     };
@@ -82,15 +82,15 @@ export function resolveOutputDims(
   // Explicit horizontal crop preset — fixed 16:9, source center-cropped.
   if (format === "YouTube 16:9" || format === "Custom") {
     return {
-      canvasW: resolution === "4K" ? 3840 : 1920,
-      canvasH: resolution === "4K" ? 2160 : 1080,
+      canvasW: resolution === "4K" ? 3840 : resolution === "720p" ? 1280 : 1920,
+      canvasH: resolution === "4K" ? 2160 : resolution === "720p" ? 720 : 1080,
       cropped: true,
       mode: "crop-16:9",
     };
   }
 
   // Default "Source" mode — canvas aspect == source aspect, no crop.
-  const longEdge = resolution === "4K" ? 3840 : 1920;
+  const longEdge = resolution === "4K" ? 3840 : resolution === "720p" ? 1280 : 1920;
   const aspect = safeSrcW / safeSrcH;
   let canvasW: number;
   let canvasH: number;

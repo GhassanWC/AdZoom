@@ -751,11 +751,20 @@ async function processRemotionJob(uid, jobId) {
       if (!snap.exists) return;
       const st = snap.get("status");
       if (st === "ready" || st === "failed" || st === "canceled") return;
-      if (estimate > 0 && monthKey) {
+      const countApplied = snap.get("monthlyUsageApplied") === true;
+      if (monthKey && (estimate > 0 || countApplied)) {
         const usageRef = db.doc(`users/${uid}/usage/${monthKey}`);
         const uSnap = await tx.get(usageRef);
-        const reserved = uSnap.data()?.cloudMinutesReserved ?? 0;
-        tx.set(usageRef, { cloudMinutesReserved: Math.max(0, reserved - estimate), updatedAt: Date.now() }, { merge: true });
+        const u = uSnap.data();
+        tx.set(
+          usageRef,
+          {
+            ...estimate > 0 ? { cloudMinutesReserved: Math.max(0, (u?.cloudMinutesReserved ?? 0) - estimate) } : {},
+            ...countApplied ? { exportsUsedThisMonth: Math.max(0, (u?.exportsUsedThisMonth ?? 0) - 1) } : {},
+            updatedAt: Date.now()
+          },
+          { merge: true }
+        );
       }
       tx.set(
         jobRef,
@@ -763,6 +772,7 @@ async function processRemotionJob(uid, jobId) {
           status: "failed",
           errorCode: friendly.code,
           errorMessage: friendly.message,
+          ...countApplied ? { monthlyUsageApplied: false } : {},
           workerId: WORKER_ID,
           buildVersion: BUILD_VERSION,
           remotionRendererVersion: RENDERER_VERSION,

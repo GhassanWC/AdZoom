@@ -38,6 +38,12 @@ import { buildTimelineMap } from "@/lib/timeline/crop-speed";
 import type { ExportFormat, ExportUiStage, FitMode } from "@/lib/firebase/schema";
 import { useStoragePlan } from "@/lib/usage/useStoragePlan";
 import { planMeetsMinimum } from "@/lib/usage/plan";
+import {
+  availableResolutionsForPlan,
+  MAX_EXPORT_RESOLUTION,
+  MAX_EXPORT_FPS,
+  FREE_MONTHLY_CLOUD_EXPORTS,
+} from "@/lib/export/plan-policy";
 import { useCloudMinutes } from "@/lib/usage/useCloudMinutes";
 import { estimateExportMinutes } from "@/lib/usage/cloud-minutes";
 import { useCloudExport } from "@/components/export/useCloudExport";
@@ -50,7 +56,6 @@ import {
   type ExportJobView,
 } from "@/lib/firebase/export-jobs";
 
-const resolutions = ["1080p", "4K"] as const;
 const fpsOptions = [30, 60] as const;
 
 const FIT_LABEL: Record<FitMode, string> = {
@@ -139,25 +144,26 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
 
   const { plan } = useStoragePlan();
   const isPaid = planMeetsMinimum(plan.tier, "pro");
-  // Server (VM) MP4 export is the primary path for paid plans. The flag keeps it
-  // dark until the worker is verified in an environment.
+  // Cloud (Remotion) MP4 export is available to EVERY plan when enabled — Free is
+  // capped server-side to 720p + 2 exports/month (see plan-policy). The flag keeps
+  // it dark until the worker is verified in an environment.
   const serverEnabled = process.env.NEXT_PUBLIC_CLOUD_EXPORT_ENABLED === "true";
-  const canServerMp4 = isPaid && serverEnabled;
+  const canServerMp4 = serverEnabled;
   const minutes = useCloudMinutes();
 
   const cloud = useCloudExport(project.id);
   const { job: bJob, isExporting, startExport, cancelExport, clearJob, downloadCurrent } =
     useExport();
 
-  // 4K and 60fps are Pro+; Free is capped at 1080p/30.
-  const canExport4k = planMeetsMinimum(plan.tier, "pro");
-  const canExport60 = planMeetsMinimum(plan.tier, "pro");
-  const availableResolutions = (
-    canExport4k ? resolutions : (["1080p"] as const)
-  ) as readonly ("1080p" | "4K")[];
+  // Plan caps (server-enforced; mirrored here). 4K is disabled for ALL plans for
+  // now; Free → 720p/30, Pro/Creator → up to 1080p/60. No "high quality" for Free.
+  const maxResolution = MAX_EXPORT_RESOLUTION[plan.tier]; // "720p" | "1080p"
+  const canExport1080 = maxResolution === "1080p";
+  const canExport60 = MAX_EXPORT_FPS[plan.tier] === 60;
+  const availableResolutions = availableResolutionsForPlan(plan.tier); // never 4K
   const availableFps = (canExport60 ? fpsOptions : ([30] as const)) as readonly (30 | 60)[];
 
-  const [resolution, setResolution] = React.useState<"1080p" | "4K">("1080p");
+  const [resolution, setResolution] = React.useState<"720p" | "1080p">("1080p");
   const [fps, setFps] = React.useState<30 | 60>(30);
   // MP4 is the headline format (server VM for paid). WebM always renders in the
   // browser. The format choice transparently picks the engine — no "cloud" copy.
@@ -167,14 +173,15 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
 
   const engine: "server" | "browser" =
     container === "mp4" && canServerMp4 ? "server" : "browser";
-  // Free picked MP4 → it's a paid feature → upgrade nudge. Paid users always get
-  // MP4: server when enabled, otherwise the browser WebCodecs path as a fallback.
-  const mp4NeedsUpgrade = container === "mp4" && !isPaid;
+  // MP4 is available to every plan now (cloud for Free at 720p, or browser),
+  // so there's no MP4-specific upgrade nudge.
+  const mp4NeedsUpgrade = false;
 
-  // Defensive: a downgrade mid-session snaps 4K/60 back to the free caps.
+  // Defensive: a downgrade mid-session (or the async plan load) snaps the
+  // selection back to the plan caps — Free → 720p/30, 60fps → 30.
   React.useEffect(() => {
-    if (!canExport4k && resolution === "4K") setResolution("1080p");
-  }, [canExport4k, resolution]);
+    if (!canExport1080 && resolution === "1080p") setResolution("720p");
+  }, [canExport1080, resolution]);
   React.useEffect(() => {
     if (!canExport60 && fps === 60) setFps(30);
   }, [canExport60, fps]);
@@ -396,7 +403,11 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
 
           {/* ── Settings ──────────────────────────────────────────────────── */}
           <div className="grid grid-cols-2 gap-3">
-            <Field label="Quality" lockHref={!canExport4k ? "/pricing" : undefined} lockLabel="4K — Pro">
+            <Field
+              label="Quality"
+              lockHref={!canExport1080 ? "/pricing" : undefined}
+              lockLabel="1080p — Pro"
+            >
               <Segmented
                 options={availableResolutions}
                 value={resolution}
@@ -412,6 +423,19 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
               />
             </Field>
           </div>
+
+          {!isPaid && (
+            <p className="-mt-1 text-[10.5px] leading-relaxed text-fog/80">
+              Free includes {FREE_MONTHLY_CLOUD_EXPORTS} cloud exports/month at 720p.{" "}
+              <a
+                href="/pricing"
+                className="font-medium text-violet-300 transition-colors hover:text-violet-200"
+              >
+                Upgrade to Pro
+              </a>{" "}
+              for 1080p and more.
+            </p>
+          )}
 
           <Field label="Format">
             <Segmented
@@ -558,11 +582,16 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
                   ~{fmtDuration(estRenderSeconds)} to export
                 </div>
               )}
-              {engine === "server" && Number.isFinite(minutes.limit) && (
+              {engine === "server" && isPaid && Number.isFinite(minutes.limit) && (
                 <div className="mt-0.5 text-fog/80">
                   <span className="font-mono tabular-nums text-white/85">{minutes.remaining}</span>
                   {" / "}
                   {minutes.limit} min left · ~{estMinutes} this export
+                </div>
+              )}
+              {engine === "server" && !isPaid && (
+                <div className="mt-0.5 text-fog/80">
+                  {FREE_MONTHLY_CLOUD_EXPORTS} cloud exports/month · 720p
                 </div>
               )}
             </div>

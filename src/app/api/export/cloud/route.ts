@@ -16,7 +16,8 @@ export const dynamic = "force-dynamic";
 interface CloudExportBody {
   projectId?: string;
   projectTitle?: string;
-  resolution?: "1080p" | "4K";
+  /** Client REQUEST — the server normalizes it per the user's actual plan. */
+  resolution?: "720p" | "1080p" | "4K";
   fps?: 30 | 60;
   format?: ExportFormat;
   /** Live editor render state (what the browser exporter would use). */
@@ -68,7 +69,7 @@ export async function POST(req: NextRequest) {
     if (
       typeof projectId !== "string" ||
       typeof projectTitle !== "string" ||
-      (resolution !== "1080p" && resolution !== "4K") ||
+      (resolution !== "720p" && resolution !== "1080p" && resolution !== "4K") ||
       (fps !== 30 && fps !== 60) ||
       (format !== "Source" &&
         format !== "TikTok 9:16" &&

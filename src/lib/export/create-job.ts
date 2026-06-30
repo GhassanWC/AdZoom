@@ -2,17 +2,27 @@ import "server-only";
 import { FieldValue } from "firebase-admin/firestore";
 import { getUserPlan } from "@/lib/usage/gating";
 import { currentMonthKey } from "@/lib/usage/usage";
-import { normalizePlan, planMeetsMinimum } from "@/lib/usage/plan";
+import { normalizePlan, type PlanTier } from "@/lib/usage/plan";
+import {
+  type ExportResolution,
+  normalizeResolution,
+  normalizeFps,
+  presetLabel,
+  priorityLabelForPlan,
+  MAX_ACTIVE_EXPORTS_PER_PLAN,
+  FREE_MONTHLY_CLOUD_EXPORTS,
+  EXPORT_PRIORITY_RANK,
+  globalActiveExportLimit,
+  MonthlyExportLimitError,
+} from "@/lib/export/plan-policy";
 import {
   CLOUD_EXPORT_MINUTES,
   CLOUD_EXPORT_MAX_DURATION_SECONDS,
-  CloudExportNotAllowedError,
   CloudMinutesError,
   canCloudExport,
   cloudMinutesRemaining,
   estimateExportMinutes,
   exceedsCloudExportDuration,
-  planAllowsCloudExport,
 } from "@/lib/usage/cloud-minutes";
 import { buildRenderRecipe } from "@/lib/render/recipe";
 import { enqueueExportJob } from "@/lib/export/enqueue";
@@ -80,7 +90,8 @@ export interface CreateCloudExportInput {
   uid: string;
   projectId: string;
   projectTitle: string;
-  resolution: "1080p" | "4K";
+  /** Client-REQUESTED resolution. Normalized server-side per plan (never trusted). */
+  resolution: ExportResolution;
   fps: 30 | 60;
   format: ExportFormat;
   sourceWidth?: number;
@@ -103,8 +114,9 @@ export type CreateCloudExportResult =
       queuedForSlot?: boolean;
       estimatedExportMinutes: number;
       outputDurationSeconds: number;
-      plan: "pro" | "creator";
+      plan: PlanTier;
       priority: "normal" | "priority";
+      /** Free: monthly cloud-export count limit. Paid: monthly minutes limit. */
       limit: number;
     }
   | {
@@ -166,12 +178,28 @@ export async function createCloudExportJob(
   }
 
   const effectiveCrop = input.sourceCrop ?? project.sourceCrop ?? null;
+
+  // ── Plan + SERVER-SIDE normalization (never trust client quality/priority) ──
+  // The user's actual plan caps resolution (Free→720p, Pro/Creator→1080p, 4K
+  // disabled everywhere) and fps (Free→30). The normalized values drive the
+  // recipe, the settingsHash (so dedup matches the real output), and the job doc.
+  const plan = await getUserPlan(uid);
+  const normalizedResolution = normalizeResolution(plan, resolution);
+  const normalizedFps = normalizeFps(plan, fps);
+  const requestedPreset = presetLabel(resolution, fps);
+  const normalizedPreset = presetLabel(normalizedResolution, normalizedFps);
+  const priorityLabel = priorityLabelForPlan(plan);
+  const priorityRank = EXPORT_PRIORITY_RANK[plan];
+  const isFree = plan === "free";
+  /** Free uses a monthly COUNT limit; paid uses the minutes quota. */
+  const planLimit = isFree ? FREE_MONTHLY_CLOUD_EXPORTS : CLOUD_EXPORT_MINUTES[plan];
+
   const settingsHash = computeSettingsHash({
     projectId,
     sourceObjectPath: sourceStoragePath,
     format,
-    resolution,
-    fps,
+    resolution: normalizedResolution,
+    fps: normalizedFps,
     effects: input.effects,
     moments: input.moments,
     sourceCrop: effectiveCrop,
@@ -198,7 +226,7 @@ export async function createCloudExportJob(
     const staleIds: string[] = []; // heartbeat-stale (dead worker)
     const staleBatchIds: string[] = []; // doc says active but the Batch job is gone
     let freshDuplicateId: string | null = null;
-    let freshOtherActive = false;
+    let freshActiveOthers = 0; // distinct live active exports (for the per-plan cap)
     const batchBackend = exportBackend() === "batch";
 
     for (const d of activeSnap.docs) {
@@ -262,7 +290,7 @@ export async function createCloudExportJob(
       if (isDuplicate) {
         freshDuplicateId = d.id; // identical export with a LIVE Batch job
       } else {
-        freshOtherActive = true; // a different export is genuinely in flight
+        freshActiveOthers += 1; // a different export is genuinely in flight
       }
     }
 
@@ -277,8 +305,6 @@ export async function createCloudExportJob(
         (ACTIVE_STATUSES as readonly string[]).includes(dup.status) &&
         dup.cancelRequested !== true;
       if (reusable) {
-        const plan = await getUserPlan(uid);
-        const paidPlan = plan === "creator" ? "creator" : "pro";
         console.log("[export-create] dedup — returning existing active job", {
           uid,
           jobId: freshDuplicateId,
@@ -290,9 +316,9 @@ export async function createCloudExportJob(
           deduped: true,
           estimatedExportMinutes: (dup.estimatedExportMinutes as number) ?? 0,
           outputDurationSeconds: (dup.durationSeconds as number) ?? 0,
-          plan: paidPlan,
-          priority: paidPlan === "creator" ? "priority" : "normal",
-          limit: CLOUD_EXPORT_MINUTES[paidPlan],
+          plan,
+          priority: priorityLabel,
+          limit: planLimit,
         };
       }
       // Candidate is no longer reusable (terminal/canceled in the race) → ignore it
@@ -322,12 +348,18 @@ export async function createCloudExportJob(
       );
     }
 
-    // A DIFFERENT export is genuinely running → one at a time.
-    if (freshOtherActive) {
+    // Per-plan ACTIVE export cap (Free 1, Pro 1, Creator 2). The would-be-new
+    // job is the (freshActiveOthers + 1)-th, so block once we're already at the
+    // cap. (A duplicate was returned above and never reaches here.)
+    const activeCap = MAX_ACTIVE_EXPORTS_PER_PLAN[plan];
+    if (freshActiveOthers >= activeCap) {
       return {
         ok: false,
         status: 409,
-        error: "You already have an export running. Wait for it to finish or cancel it.",
+        error:
+          activeCap > 1
+            ? `You already have ${activeCap} exports running. Wait for one to finish or cancel it.`
+            : "You already have an export running. Wait for it to finish or cancel it.",
         kind: "export_already_running",
       };
     }
@@ -335,33 +367,16 @@ export async function createCloudExportJob(
     console.warn("[export-create] active/dedup check failed (continuing)", err);
   }
 
-  // ── Plan gate ────────────────────────────────────────────────────────────
-  const plan = await getUserPlan(uid);
-  if (!planAllowsCloudExport(plan)) {
-    return {
-      ok: false,
-      status: 402,
-      error: "Cloud MP4 export requires a Pro or Creator plan.",
-      kind: "cloud_export_requires_paid",
-    };
-  }
-  const paidPlan = plan === "creator" ? "creator" : "pro";
+  // Billing-plan alias for the (Batch-only) chunk planner, which predates Free
+  // cloud export. Free/Remotion never chunks, so this is inert for them.
+  const paidPlan: "pro" | "creator" = plan === "creator" ? "creator" : "pro";
 
-  if ((resolution === "4K" || fps === 60) && !planMeetsMinimum(plan, "pro")) {
-    return {
-      ok: false,
-      status: 402,
-      error: "4K and 60fps exports require a Pro or Creator plan.",
-      kind: "tier_requires_pro",
-    };
-  }
-
-  // ── Recipe → output dims + billed duration ───────────────────────────────
+  // ── Recipe → output dims + billed duration (NORMALIZED quality) ───────────
   const recipe = buildRenderRecipe({
     sourceWidth,
     sourceHeight,
-    fps,
-    resolution,
+    fps: normalizedFps,
+    resolution: normalizedResolution,
     format,
     sourceDuration,
     moments: input.moments,
@@ -384,7 +399,9 @@ export async function createCloudExportJob(
       error:
         plan === "creator"
           ? `Cloud export supports videos up to ${maxMin} minutes.`
-          : `The Pro plan supports cloud exports up to ${maxMin} minutes. Upgrade to Creator for up to 60 minutes.`,
+          : plan === "pro"
+            ? `The Pro plan supports cloud exports up to ${maxMin} minutes. Upgrade to Creator for up to 60 minutes.`
+            : `Free cloud exports support videos up to ${maxMin} minutes. Upgrade to Pro for longer exports.`,
       kind: "cloud_export_too_long",
     };
   }
@@ -392,8 +409,8 @@ export async function createCloudExportJob(
   const serializedRecipe: SerializedRenderRecipe = {
     sourceWidth,
     sourceHeight,
-    fps,
-    resolution,
+    fps: normalizedFps,
+    resolution: normalizedResolution,
     format,
     sourceDuration,
     moments: input.moments,
@@ -479,9 +496,44 @@ export async function createCloudExportJob(
     } catch {
       /* no index → skip cap (fail open: dispatch immediately) */
     }
+  } else if (isRemotion) {
+    // GLOBAL active-export cap for Remotion (cost guard, backend-agnostic). Count
+    // platform-wide RENDERING/UPLOADING jobs (queued = waiting, not occupying a
+    // slot). Over the limit → DEFER as `queued`; the reconcile cron promotes
+    // queued jobs by priority (Creator>Pro>Free, FIFO) when a slot frees.
+    try {
+      const limit = globalActiveExportLimit();
+      const activeSnap = await db
+        .collectionGroup("exportJobs")
+        .where("status", "in", ["rendering", "uploading"])
+        .count()
+        .get();
+      const activeGlobal = activeSnap.data().count ?? 0;
+      deferred = activeGlobal >= limit;
+      console.log("[export-create] global remotion capacity check", {
+        jobId,
+        activeGlobal,
+        globalActiveExportLimit: limit,
+        deferred,
+      });
+      if (deferred) {
+        const waitingSnap = await db
+          .collectionGroup("exportJobs")
+          .where("status", "==", "queued")
+          .count()
+          .get();
+        queuePosition = activeGlobal + (waitingSnap.data().count ?? 0) + 1;
+      }
+    } catch {
+      /* no index → fail open (dispatch immediately) */
+    }
   }
 
-  // ── Transaction: re-check + reserve minutes + create the job ─────────────
+  // ── Transaction: re-check limits + reserve + create the job ──────────────
+  // Re-reads the LIVE plan + usage so two concurrent requests can't both pass.
+  // Free is gated by the monthly COUNT (no minutes); paid by the minutes quota.
+  // Every plan increments the monthly export count (refunded on system failure
+  // via `monthlyUsageApplied`).
   try {
     await db.runTransaction(async (tx) => {
       const userSnap = await tx.get(userRef);
@@ -489,13 +541,16 @@ export async function createCloudExportJob(
       const livePlan = normalizePlan(
         (userSnap.data() as { plan?: unknown } | undefined)?.plan
       );
-      if (!planAllowsCloudExport(livePlan)) {
-        throw new CloudExportNotAllowedError(livePlan);
-      }
       const usage = (usageSnap.exists ? usageSnap.data() : undefined) as
         | MonthlyUsage
         | undefined;
-      if (!canCloudExport(livePlan, usage, estimate)) {
+      const usedThisMonth = Math.max(0, usage?.exportsUsedThisMonth ?? 0);
+
+      if (livePlan === "free") {
+        if (usedThisMonth >= FREE_MONTHLY_CLOUD_EXPORTS) {
+          throw new MonthlyExportLimitError(livePlan, usedThisMonth, FREE_MONTHLY_CLOUD_EXPORTS);
+        }
+      } else if (!canCloudExport(livePlan, usage, estimate)) {
         throw new CloudMinutesError(
           cloudMinutesRemaining(livePlan, usage),
           estimate,
@@ -507,7 +562,14 @@ export async function createCloudExportJob(
       tx.set(
         usageRef,
         {
-          cloudMinutesReserved: (usage?.cloudMinutesReserved ?? 0) + estimate,
+          // Minutes are reserved for PAID plans only (Free has 0 minutes).
+          ...(livePlan !== "free"
+            ? { cloudMinutesReserved: (usage?.cloudMinutesReserved ?? 0) + estimate }
+            : {}),
+          // Monthly cloud-export COUNT — reserved for everyone; the Free gate above.
+          exportsUsedThisMonth: usedThisMonth + 1,
+          exportMonthKey: monthKey,
+          lastExportPlan: livePlan,
           lastCloudExportAt: now,
           updatedAt: now,
         },
@@ -520,7 +582,13 @@ export async function createCloudExportJob(
         projectTitle,
         status: "queued",
         plan: livePlan === "creator" ? "creator" : "pro",
-        priority: livePlan === "creator" ? "priority" : "normal",
+        planAtExport: livePlan,
+        priority: priorityLabelForPlan(livePlan),
+        priorityRank: EXPORT_PRIORITY_RANK[livePlan],
+        queuedAt: now,
+        requestedPreset,
+        normalizedPreset,
+        monthlyUsageApplied: true,
         sourceStoragePath,
         outputPath,
         format: "mp4",
@@ -529,7 +597,7 @@ export async function createCloudExportJob(
         buildVersion,
         outputWidth: recipe.canvasW,
         outputHeight: recipe.canvasH,
-        fps,
+        fps: normalizedFps,
         durationSeconds: outputDurationSeconds,
         estimatedExportMinutes: estimate,
         progress: 0,
@@ -564,12 +632,14 @@ export async function createCloudExportJob(
       });
     });
   } catch (err) {
-    if (err instanceof CloudExportNotAllowedError) {
+    if (err instanceof MonthlyExportLimitError) {
       return {
         ok: false,
-        status: 402,
-        error: "Cloud MP4 export requires a Pro or Creator plan.",
-        kind: "cloud_export_requires_paid",
+        status: 429,
+        error: `You've used all ${err.limit} free cloud exports this month. Upgrade to Pro for more exports and 1080p.`,
+        kind: "free_monthly_export_limit",
+        remaining: 0,
+        requested: 1,
       };
     }
     if (err instanceof CloudMinutesError) {
@@ -611,9 +681,9 @@ export async function createCloudExportJob(
       queuedForSlot: true,
       estimatedExportMinutes: estimate,
       outputDurationSeconds,
-      plan: paidPlan,
-      priority: paidPlan === "creator" ? "priority" : "normal",
-      limit: CLOUD_EXPORT_MINUTES[paidPlan],
+      plan,
+      priority: priorityLabel,
+      limit: planLimit,
     };
   }
 
@@ -621,7 +691,7 @@ export async function createCloudExportJob(
     await enqueueExportJob({
       uid,
       jobId,
-      priority: paidPlan === "creator" ? "priority" : "normal",
+      priority: priorityLabel,
       renderMode: chunk.renderMode,
       ...(chunk.renderMode === "chunked"
         ? {
@@ -672,9 +742,9 @@ export async function createCloudExportJob(
     deduped: false,
     estimatedExportMinutes: estimate,
     outputDurationSeconds,
-    plan: paidPlan,
-    priority: paidPlan === "creator" ? "priority" : "normal",
-    limit: CLOUD_EXPORT_MINUTES[paidPlan],
+    plan,
+    priority: priorityLabel,
+    limit: planLimit,
   };
 }
 
@@ -698,19 +768,32 @@ async function failStaleJob(
   await db.runTransaction(async (tx) => {
     const snap = await tx.get(jobRef);
     if (!snap.exists) return;
-    const job = snap.data() as { status?: string; monthlyBucket?: string; estimatedExportMinutes?: number };
+    const job = snap.data() as {
+      status?: string;
+      monthlyBucket?: string;
+      estimatedExportMinutes?: number;
+      monthlyUsageApplied?: boolean;
+    };
     if (job.status === "ready" || job.status === "failed" || job.status === "canceled") {
       return; // already terminal — don't clobber a job the worker just settled
     }
-    if (job.monthlyBucket && (job.estimatedExportMinutes ?? 0) > 0) {
+    const needMinutesRelease = !!job.monthlyBucket && (job.estimatedExportMinutes ?? 0) > 0;
+    const needCountRefund = !!job.monthlyBucket && job.monthlyUsageApplied === true;
+    if (needMinutesRelease || needCountRefund) {
       const usageRef = db.doc(`users/${uid}/usage/${job.monthlyBucket}`);
       const uSnap = await tx.get(usageRef);
-      const reserved =
-        (uSnap.data() as { cloudMinutesReserved?: number } | undefined)?.cloudMinutesReserved ?? 0;
+      const u = uSnap.data() as
+        | { cloudMinutesReserved?: number; exportsUsedThisMonth?: number }
+        | undefined;
       tx.set(
         usageRef,
         {
-          cloudMinutesReserved: Math.max(0, reserved - (job.estimatedExportMinutes ?? 0)),
+          ...(needMinutesRelease
+            ? { cloudMinutesReserved: Math.max(0, (u?.cloudMinutesReserved ?? 0) - (job.estimatedExportMinutes ?? 0)) }
+            : {}),
+          ...(needCountRefund
+            ? { exportsUsedThisMonth: Math.max(0, (u?.exportsUsedThisMonth ?? 0) - 1) }
+            : {}),
           updatedAt: Date.now(),
         },
         { merge: true }
@@ -722,6 +805,7 @@ async function failStaleJob(
         status: "failed",
         errorCode: reason.errorCode,
         errorMessage: reason.errorMessage,
+        ...(needCountRefund ? { monthlyUsageApplied: false } : {}),
         failedAt: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
       },
@@ -745,12 +829,22 @@ async function releaseAndFail(
   const usageRef = db.doc(`users/${uid}/usage/${monthKey}`);
   const jobRef = db.doc(`users/${uid}/exportJobs/${jobId}`);
   await db.runTransaction(async (tx) => {
+    const jobSnap = await tx.get(jobRef);
     const usageSnap = await tx.get(usageRef);
-    const reserved =
-      (usageSnap.data() as MonthlyUsage | undefined)?.cloudMinutesReserved ?? 0;
+    // Refund the monthly export COUNT only if this job still holds a slot — so a
+    // dispatch failure never unfairly burns a Free user's 2/month allowance.
+    const countApplied =
+      (jobSnap.data() as { monthlyUsageApplied?: boolean } | undefined)?.monthlyUsageApplied === true;
+    const u = usageSnap.data() as MonthlyUsage | undefined;
     tx.set(
       usageRef,
-      { cloudMinutesReserved: Math.max(0, reserved - estimate), updatedAt: Date.now() },
+      {
+        cloudMinutesReserved: Math.max(0, (u?.cloudMinutesReserved ?? 0) - estimate),
+        ...(countApplied
+          ? { exportsUsedThisMonth: Math.max(0, (u?.exportsUsedThisMonth ?? 0) - 1) }
+          : {}),
+        updatedAt: Date.now(),
+      },
       { merge: true }
     );
     tx.set(
@@ -759,6 +853,7 @@ async function releaseAndFail(
         status: "failed",
         errorCode: fail.errorCode,
         errorMessage: fail.errorMessage,
+        ...(countApplied ? { monthlyUsageApplied: false } : {}),
         failedAt: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
         completedAt: FieldValue.serverTimestamp(),

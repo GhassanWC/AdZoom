@@ -41,7 +41,9 @@ export const CLOUD_EXPORT_MINUTES: Record<PlanTier, number> = {
  * monthly minutes quota. `0` ⇒ no cloud export allowed.
  */
 export const CLOUD_EXPORT_MAX_DURATION_SECONDS: Record<PlanTier, number> = {
-  free: 0,
+  // Free cloud export is allowed (count-gated, see plan-policy) but bounded to
+  // the 3-minute Free upload cap. Pro ≤ 30 min, Creator ≤ 60 min.
+  free: 3 * 60,
   pro: 30 * 60,
   creator: 60 * 60,
 };

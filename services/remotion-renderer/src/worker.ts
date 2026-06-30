@@ -472,11 +472,29 @@ export async function processRemotionJob(uid: string, jobId: string): Promise<st
         if (!snap.exists) return;
         const st = snap.get("status") as string | undefined;
         if (st === "ready" || st === "failed" || st === "canceled") return;
-        if (estimate > 0 && monthKey) {
+        // A SYSTEM failure must not unfairly consume the user's monthly export:
+        // release the minutes reservation (paid) AND refund the monthly export
+        // COUNT (any plan) when this job still holds the slot (monthlyUsageApplied).
+        const countApplied = snap.get("monthlyUsageApplied") === true;
+        if (monthKey && (estimate > 0 || countApplied)) {
           const usageRef = db.doc(`users/${uid}/usage/${monthKey}`);
           const uSnap = await tx.get(usageRef);
-          const reserved = (uSnap.data() as { cloudMinutesReserved?: number } | undefined)?.cloudMinutesReserved ?? 0;
-          tx.set(usageRef, { cloudMinutesReserved: Math.max(0, reserved - estimate), updatedAt: Date.now() }, { merge: true });
+          const u = uSnap.data() as
+            | { cloudMinutesReserved?: number; exportsUsedThisMonth?: number }
+            | undefined;
+          tx.set(
+            usageRef,
+            {
+              ...(estimate > 0
+                ? { cloudMinutesReserved: Math.max(0, (u?.cloudMinutesReserved ?? 0) - estimate) }
+                : {}),
+              ...(countApplied
+                ? { exportsUsedThisMonth: Math.max(0, (u?.exportsUsedThisMonth ?? 0) - 1) }
+                : {}),
+              updatedAt: Date.now(),
+            },
+            { merge: true }
+          );
         }
         tx.set(
           jobRef,
@@ -484,6 +502,7 @@ export async function processRemotionJob(uid: string, jobId: string): Promise<st
             status: "failed",
             errorCode: friendly.code,
             errorMessage: friendly.message,
+            ...(countApplied ? { monthlyUsageApplied: false } : {}),
             workerId: WORKER_ID,
             buildVersion: BUILD_VERSION,
             remotionRendererVersion: RENDERER_VERSION,

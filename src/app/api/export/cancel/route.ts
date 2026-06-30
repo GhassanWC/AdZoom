@@ -108,13 +108,20 @@ export async function POST(req: NextRequest) {
       // already canceled — does NOT release again (no double-spend).
       const usageRef = db.doc(`users/${uid}/usage/${job.monthlyBucket}`);
       const usageSnap = await tx.get(usageRef);
-      const reserved =
-        (usageSnap.data() as { cloudMinutesReserved?: number } | undefined)
-          ?.cloudMinutesReserved ?? 0;
+      const u = usageSnap.data() as
+        | { cloudMinutesReserved?: number; exportsUsedThisMonth?: number }
+        | undefined;
+      // Release the minutes reservation AND refund the monthly export COUNT (so a
+      // canceled export doesn't burn a Free user's 2/month) when the job still
+      // holds the slot.
+      const countApplied = job.monthlyUsageApplied === true;
       tx.set(
         usageRef,
         {
-          cloudMinutesReserved: Math.max(0, reserved - (job.estimatedExportMinutes ?? 0)),
+          cloudMinutesReserved: Math.max(0, (u?.cloudMinutesReserved ?? 0) - (job.estimatedExportMinutes ?? 0)),
+          ...(countApplied
+            ? { exportsUsedThisMonth: Math.max(0, (u?.exportsUsedThisMonth ?? 0) - 1) }
+            : {}),
           updatedAt: Date.now(),
         },
         { merge: true }
@@ -124,6 +131,7 @@ export async function POST(req: NextRequest) {
         {
           status: "canceled",
           cancelRequested: true,
+          ...(countApplied ? { monthlyUsageApplied: false } : {}),
           canceledAt: FieldValue.serverTimestamp(),
           updatedAt: FieldValue.serverTimestamp(),
         },
