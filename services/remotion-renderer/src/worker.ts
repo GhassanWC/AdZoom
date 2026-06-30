@@ -124,6 +124,10 @@ async function claimJob(db: Firestore, uid: string, jobId: string): Promise<Clai
       stage: "downloading",
       progressStage: "preparing",
       progress: 0,
+      // Re-stamp the backend so the UI shows Remotion progress (not chunks) even
+      // for jobs created before `backend` was written at creation.
+      backend: "remotion",
+      renderMode: "single",
       workerId: WORKER_ID,
       buildVersion: BUILD_VERSION,
       remotionRendererVersion: RENDERER_VERSION,
@@ -321,8 +325,10 @@ export async function processRemotionJob(uid: string, jobId: string): Promise<st
         process.exit(1);
       }, 45_000).unref();
     });
-    log("renderMedia started", { uid, jobId });
+    log("renderMedia started", { uid, jobId, concurrency: cfg.concurrency });
     renderWatchdog.start();
+    const totalFrames = composition.durationInFrames;
+    const renderStartedAt = Date.now();
     const result = await Promise.race([
       renderExport({
         composition,
@@ -336,7 +342,7 @@ export async function processRemotionJob(uid: string, jobId: string): Promise<st
         gl: cfg.gl,
         logLevel: cfg.logLevel,
         cancelSignal,
-        onProgress: ({ progress, stitchStage }) => {
+        onProgress: ({ progress, stitchStage, renderedFrames }) => {
           // Re-arm on EVERY callback (not just throttled writes) so real progress
           // always resets the watchdog.
           renderWatchdog?.bump();
@@ -344,13 +350,28 @@ export async function processRemotionJob(uid: string, jobId: string): Promise<st
             sawProgress = true;
             log("render progress", { uid, jobId, progress: Math.round(progress * 100) / 100 });
           }
-          gate(() =>
+          // Firestore writes are throttled (~7s) — compute frame/fps/eta so the UI
+          // can show "Rendering video" with a real percentage + ETA.
+          gate(() => {
+            const elapsedSec = Math.max(0.001, (Date.now() - renderStartedAt) / 1000);
+            const fpsEstimate =
+              renderedFrames > 0 ? Math.round((renderedFrames / elapsedSec) * 10) / 10 : 0;
+            const remaining = Math.max(0, totalFrames - renderedFrames);
+            const etaSeconds = fpsEstimate > 0 ? Math.round(remaining / fpsEstimate) : undefined;
+            const clamped = Math.min(0.97, Math.max(0.04, progress));
             void progressPatch({
               stage: stitchStage === "muxing" ? "encoding" : "rendering",
               progressStage: "rendering",
-              progress: Math.min(0.97, Math.max(0.04, progress)),
-            }).catch(() => {})
-          );
+              progress: clamped,
+              // Explicit 0–100 percentage too (safe for Remotion: the chunk-count
+              // UI path is bypassed, so this never reads as a chunk percent).
+              progressPercent: Math.round(clamped * 100),
+              renderedFrames,
+              totalFrames,
+              fpsEstimate,
+              ...(etaSeconds != null ? { etaSeconds } : {}),
+            }).catch(() => {});
+          });
         },
       }),
       renderWatchdog.promise,

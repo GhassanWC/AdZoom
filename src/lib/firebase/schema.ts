@@ -1552,6 +1552,19 @@ export interface ExportJobDoc {
   remotionSubmittedAt?: unknown;
   /** Build/version stamp of the Remotion renderer image that ran this job. */
   remotionRendererVersion?: string;
+  /** Which render backend owns this job, stamped at creation (and re-stamped by
+   *  the worker on claim). Drives backend-specific UI (e.g. the Remotion path
+   *  shows "Rendering video" + frame/ETA progress, never the Batch chunk count). */
+  backend?: "remotion" | "batch" | "vm" | "dotnet" | "cloudtasks";
+  // ── Remotion per-frame render progress (EXPORT_BACKEND=remotion) ──────────────
+  /** Frames rendered so far (from renderMedia onProgress). */
+  renderedFrames?: number;
+  /** Total frames in the composition. */
+  totalFrames?: number;
+  /** Live render speed estimate (renderedFrames / elapsed render seconds). */
+  fpsEstimate?: number;
+  /** Estimated seconds remaining for the render (totalFrames-rendered ÷ fps). */
+  etaSeconds?: number;
   // ── Chunked render progress (long videos; only when chunking is enabled) ──────
   /** 1-based index of the chunk currently rendering. */
   chunkIndex?: number;

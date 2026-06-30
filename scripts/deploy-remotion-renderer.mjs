@@ -57,6 +57,12 @@ const IMAGE = `${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REPO}/remotion-
 const REMOTION_CRF = env("REMOTION_CRF", "18");
 const REMOTION_X264_PRESET = env("REMOTION_X264_PRESET", "medium");
 const REMOTION_EXPORT_TIMEOUT_SECONDS = env("REMOTION_EXPORT_TIMEOUT_SECONDS", "1800");
+// Production sizing: 8 vCPU / 16Gi with renderMedia concurrency 4 (≈ half the
+// cores) — Remotion parallelises frame rendering across browser tabs. All
+// overridable via CPU / MEMORY / REMOTION_CONCURRENCY env.
+const CPU = env("CPU", "8");
+const MEMORY = env("MEMORY", "16Gi");
+const REMOTION_CONCURRENCY = env("REMOTION_CONCURRENCY", "4");
 
 console.log("\n→ Framevo Remotion renderer (Cloud Run Job) deploy");
 console.log(`  Project:     ${PROJECT_ID}`);
@@ -65,6 +71,7 @@ console.log(`  Job:         ${JOB_NAME}`);
 console.log(`  Image:       ${IMAGE}`);
 console.log(`  Runtime SA:  ${RENDERER_SA}`);
 console.log(`  Bucket:      gs://${BUCKET}`);
+console.log(`  Sizing:      ${CPU} vCPU / ${MEMORY}, concurrency=${REMOTION_CONCURRENCY}`);
 console.log(`  Build:       ${BUILD_VERSION}`);
 
 // ── 1. Build the image (repo-root context via cloudbuild.yaml) ──
@@ -88,6 +95,7 @@ const envVars = [
   `REMOTION_CRF=${REMOTION_CRF}`,
   `REMOTION_X264_PRESET=${REMOTION_X264_PRESET}`,
   `REMOTION_EXPORT_TIMEOUT_SECONDS=${REMOTION_EXPORT_TIMEOUT_SECONDS}`,
+  `REMOTION_CONCURRENCY=${REMOTION_CONCURRENCY}`,
 ];
 run(
   [
@@ -96,9 +104,9 @@ run(
     `--image=${IMAGE}`,
     `--region=${REGION}`,
     `--service-account=${RENDERER_SA}`,
-    "--cpu=4",
-    "--memory=8Gi",
-    "--task-timeout=1800",
+    `--cpu=${CPU}`,
+    `--memory=${MEMORY}`,
+    `--task-timeout=${REMOTION_EXPORT_TIMEOUT_SECONDS}`,
     "--max-retries=0",
     `--set-env-vars=${envVars.join(",")}`,
   ],

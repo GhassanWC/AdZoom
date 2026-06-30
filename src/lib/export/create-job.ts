@@ -429,6 +429,11 @@ export async function createCloudExportJob(
     env: process.env,
   };
   const chunk = planChunking(chunkInput);
+  // Remotion renders ONE MP4 (never sharded), so its job doc must NOT carry Batch
+  // chunk fields — they'd make the UI show a frozen "Rendering chunks: 0/N". Stamp
+  // the backend so the UI picks the right progress treatment (frame/ETA, not chunks).
+  const backend = exportBackend();
+  const isRemotion = backend === "remotion";
   console.log("[export-create] render mode decided", {
     uid,
     jobId,
@@ -530,10 +535,13 @@ export async function createCloudExportJob(
         progress: 0,
         stage: "queued",
         progressStage: "queued",
+        backend,
         ...(queuePosition ? { queuePosition } : {}),
         ...(deferred ? { queueReason: QUEUE_REASON_WAITING_FOR_SLOT } : {}),
-        renderMode: chunk.renderMode,
-        ...(chunk.renderMode === "chunked"
+        // Remotion never shards → "single" + no chunk fields, so the UI shows
+        // "Rendering video" with real frame progress instead of a chunk count.
+        renderMode: isRemotion ? "single" : chunk.renderMode,
+        ...(!isRemotion && chunk.renderMode === "chunked"
           ? {
               chunkCount: chunk.chunkCount, // TOTAL chunks (UI shows chunksCompleted/chunkCount)
               chunkSeconds: chunk.chunkSeconds,

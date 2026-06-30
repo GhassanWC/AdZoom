@@ -46,10 +46,12 @@ function loadConfig() {
     noProgressTimeoutMs: intEnv("REMOTION_NO_PROGRESS_TIMEOUT_MS", 12e4),
     smokeTestTimeoutMs: intEnv("REMOTION_SMOKE_TIMEOUT_MS", 6e4),
     gl: process.env.REMOTION_GL || "swiftshader",
-    logLevel: process.env.REMOTION_LOG_LEVEL || "verbose",
+    logLevel: process.env.REMOTION_LOG_LEVEL || (process.env.REMOTION_DEBUG === "1" ? "verbose" : "info"),
     perFrameTimeoutMs: intEnv("REMOTION_FRAME_TIMEOUT_MS", 6e4),
     cancelPollMs: intEnv("REMOTION_CANCEL_POLL_MS", 3e3),
-    progressThrottleMs: intEnv("REMOTION_PROGRESS_THROTTLE_MS", 2e3),
+    // Throttle Firestore progress writes to ~every 7s (5–10s band) so the UI
+    // updates smoothly without hammering Firestore.
+    progressThrottleMs: intEnv("REMOTION_PROGRESS_THROTTLE_MS", 7e3),
     heartbeatMs: intEnv("REMOTION_HEARTBEAT_MS", 3e4)
   };
   return cached;
@@ -483,6 +485,10 @@ async function claimJob(db, uid, jobId) {
       stage: "downloading",
       progressStage: "preparing",
       progress: 0,
+      // Re-stamp the backend so the UI shows Remotion progress (not chunks) even
+      // for jobs created before `backend` was written at creation.
+      backend: "remotion",
+      renderMode: "single",
       workerId: WORKER_ID,
       buildVersion: BUILD_VERSION,
       remotionRendererVersion: RENDERER_VERSION,
@@ -622,8 +628,10 @@ async function processRemotionJob(uid, jobId) {
         process.exit(1);
       }, 45e3).unref();
     });
-    log("renderMedia started", { uid, jobId });
+    log("renderMedia started", { uid, jobId, concurrency: cfg.concurrency });
     renderWatchdog.start();
+    const totalFrames = composition.durationInFrames;
+    const renderStartedAt = Date.now();
     const result = await Promise.race([
       renderExport({
         composition,
@@ -637,20 +645,32 @@ async function processRemotionJob(uid, jobId) {
         gl: cfg.gl,
         logLevel: cfg.logLevel,
         cancelSignal,
-        onProgress: ({ progress, stitchStage }) => {
+        onProgress: ({ progress, stitchStage, renderedFrames }) => {
           renderWatchdog?.bump();
           if (!sawProgress) {
             sawProgress = true;
             log("render progress", { uid, jobId, progress: Math.round(progress * 100) / 100 });
           }
-          gate(
-            () => void progressPatch({
+          gate(() => {
+            const elapsedSec = Math.max(1e-3, (Date.now() - renderStartedAt) / 1e3);
+            const fpsEstimate = renderedFrames > 0 ? Math.round(renderedFrames / elapsedSec * 10) / 10 : 0;
+            const remaining = Math.max(0, totalFrames - renderedFrames);
+            const etaSeconds = fpsEstimate > 0 ? Math.round(remaining / fpsEstimate) : void 0;
+            const clamped = Math.min(0.97, Math.max(0.04, progress));
+            void progressPatch({
               stage: stitchStage === "muxing" ? "encoding" : "rendering",
               progressStage: "rendering",
-              progress: Math.min(0.97, Math.max(0.04, progress))
+              progress: clamped,
+              // Explicit 0–100 percentage too (safe for Remotion: the chunk-count
+              // UI path is bypassed, so this never reads as a chunk percent).
+              progressPercent: Math.round(clamped * 100),
+              renderedFrames,
+              totalFrames,
+              fpsEstimate,
+              ...etaSeconds != null ? { etaSeconds } : {}
             }).catch(() => {
-            })
-          );
+            });
+          });
         }
       }),
       renderWatchdog.promise

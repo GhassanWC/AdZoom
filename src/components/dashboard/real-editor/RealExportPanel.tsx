@@ -770,21 +770,36 @@ function StatusView({
 /** Dev-only diagnostics for a cloud export — render mode, chunk progress, and the
  *  cold-start / render / merge timings the worker records. */
 function ExportDiagnostics({ job }: { job: ExportJobView }) {
-  const rows: Array<[string, string | number | undefined]> = [
-    ["renderMode", job.renderMode],
-    ["chunkCount", job.chunkCount],
-    ["workerCount", job.workerCount ?? job.chunkParallelism],
-    ["chunksCompleted", job.chunkCount != null ? `${job.chunksCompleted ?? 0} / ${job.chunkCount}` : undefined],
-    ["chunksFailed", job.chunksFailed],
-    ["coldStartSeconds", job.coldStartSeconds],
-    ["chunkRenderSeconds", job.chunkRenderSeconds],
-    ["mergeSeconds", job.mergeSeconds],
-    ["totalSeconds", job.totalSeconds],
-    ["batchJobName", job.batchJobName],
-    ["workerImage", job.workerImage],
-    ["machineType", job.machineType],
-    ["jobId", job.id],
-  ];
+  // Remotion jobs render one video — show frame/fps/ETA, NOT chunk counts.
+  const rows: Array<[string, string | number | undefined]> =
+    job.backend === "remotion"
+      ? [
+          ["backend", job.backend],
+          [
+            "renderedFrames",
+            job.totalFrames != null
+              ? `${job.renderedFrames ?? 0} / ${job.totalFrames}`
+              : job.renderedFrames,
+          ],
+          ["fpsEstimate", job.fpsEstimate],
+          ["etaSeconds", job.etaSeconds],
+          ["jobId", job.id],
+        ]
+      : [
+          ["renderMode", job.renderMode],
+          ["chunkCount", job.chunkCount],
+          ["workerCount", job.workerCount ?? job.chunkParallelism],
+          ["chunksCompleted", job.chunkCount != null ? `${job.chunksCompleted ?? 0} / ${job.chunkCount}` : undefined],
+          ["chunksFailed", job.chunksFailed],
+          ["coldStartSeconds", job.coldStartSeconds],
+          ["chunkRenderSeconds", job.chunkRenderSeconds],
+          ["mergeSeconds", job.mergeSeconds],
+          ["totalSeconds", job.totalSeconds],
+          ["batchJobName", job.batchJobName],
+          ["workerImage", job.workerImage],
+          ["machineType", job.machineType],
+          ["jobId", job.id],
+        ];
   const visible = rows.filter(([, v]) => v !== undefined && v !== null && v !== "");
   if (visible.length === 0) return null;
   return (
@@ -841,6 +856,17 @@ function stageDisplayPercent(stage: ExportUiStage, rawPct: number): number {
   }
 }
 
+/** Remotion render label — "Rendering video", enriched with a coarse ETA once the
+ *  worker has reported enough frames to estimate one. Never shows a chunk count. */
+function remotionRenderLabel(j: { etaSeconds?: number; renderedFrames?: number }): string {
+  const eta = j.etaSeconds;
+  if (eta != null && eta > 0 && (j.renderedFrames ?? 0) > 0) {
+    const etaText = eta >= 90 ? `~${Math.round(eta / 60)}m left` : `~${eta}s left`;
+    return `Rendering video · ${etaText}`;
+  }
+  return "Rendering video";
+}
+
 function serverView(cloud: ReturnType<typeof useCloudExport>): ExportView | null {
   const j = cloud.job;
   if (!j) return null;
@@ -852,10 +878,11 @@ function serverView(cloud: ReturnType<typeof useCloudExport>): ExportView | null
       : j.status === "failed"
         ? "failed"
         : "canceled";
-  // Parallel chunked render: the worker writes `chunksCompleted` (not per-frame
-  // progress), so drive both the label and the bar from chunks-done. Falls back to
-  // the legacy sequential "chunk X/Y" and then to plain raw progress.
-  const isChunked = j.renderMode === "chunked";
+  // Remotion renders ONE video (never sharded) and writes per-frame progress, so
+  // it must NEVER show the Batch chunk count. The Batch path keeps driving label +
+  // bar from chunks-done (falling back to legacy sequential, then raw progress).
+  const isRemotion = j.backend === "remotion";
+  const isChunked = !isRemotion && j.renderMode === "chunked";
   const chunkTot = j.chunkCount ?? j.chunkTotal ?? 0;
   const chunkDone = j.chunksCompleted ?? 0;
   const chunkedRendering = stage === "rendering" && isChunked && chunkTot > 1;
@@ -865,13 +892,15 @@ function serverView(cloud: ReturnType<typeof useCloudExport>): ExportView | null
       : Math.round((j.progress ?? 0) * 100);
   const stageLabel = isWaitingForSlot(j)
     ? WAITING_FOR_SLOT_MESSAGE
-    : stage === "merging"
-      ? "Merging chunks"
-      : chunkedRendering
-        ? `Rendering chunks: ${chunkDone} / ${chunkTot}`
-        : (j.chunkTotal ?? 0) > 1 && (j.chunkIndex ?? 0) > 0
-          ? `Rendering chunk ${j.chunkIndex}/${j.chunkTotal}` // legacy sequential
-          : EXPORT_STAGE_LABEL[stage];
+    : isRemotion && stage === "rendering"
+      ? remotionRenderLabel(j)
+      : stage === "merging"
+        ? "Merging chunks"
+        : chunkedRendering
+          ? `Rendering chunks: ${chunkDone} / ${chunkTot}`
+          : (j.chunkTotal ?? 0) > 1 && (j.chunkIndex ?? 0) > 0
+            ? `Rendering chunk ${j.chunkIndex}/${j.chunkTotal}` // legacy sequential
+            : EXPORT_STAGE_LABEL[stage];
   return {
     engine: "server",
     phase,

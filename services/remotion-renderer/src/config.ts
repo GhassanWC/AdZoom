@@ -37,7 +37,8 @@ export interface RendererConfig {
   /** Chromium GL backend. "swiftshader" (software) is the reliable headless
    *  default on Cloud Run; override via REMOTION_GL if a GPU backend is wanted. */
   gl: string;
-  /** Remotion log verbosity ("error"|"warn"|"info"|"verbose"|"trace"). */
+  /** Remotion log verbosity. Defaults to "info"; "verbose" only when
+   *  REMOTION_DEBUG=1 (or an explicit REMOTION_LOG_LEVEL). */
   logLevel: string;
   /** Per-frame renderMedia timeout (a single stuck frame). */
   perFrameTimeoutMs: number;
@@ -82,10 +83,14 @@ export function loadConfig(): RendererConfig {
     noProgressTimeoutMs: intEnv("REMOTION_NO_PROGRESS_TIMEOUT_MS", 120_000),
     smokeTestTimeoutMs: intEnv("REMOTION_SMOKE_TIMEOUT_MS", 60_000),
     gl: process.env.REMOTION_GL || "swiftshader",
-    logLevel: process.env.REMOTION_LOG_LEVEL || "verbose",
+    logLevel:
+      process.env.REMOTION_LOG_LEVEL ||
+      (process.env.REMOTION_DEBUG === "1" ? "verbose" : "info"),
     perFrameTimeoutMs: intEnv("REMOTION_FRAME_TIMEOUT_MS", 60_000),
     cancelPollMs: intEnv("REMOTION_CANCEL_POLL_MS", 3000),
-    progressThrottleMs: intEnv("REMOTION_PROGRESS_THROTTLE_MS", 2000),
+    // Throttle Firestore progress writes to ~every 7s (5–10s band) so the UI
+    // updates smoothly without hammering Firestore.
+    progressThrottleMs: intEnv("REMOTION_PROGRESS_THROTTLE_MS", 7000),
     heartbeatMs: intEnv("REMOTION_HEARTBEAT_MS", 30_000),
   };
   return cached;
