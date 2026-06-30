@@ -4,12 +4,13 @@
  * Tier hierarchy (free < pro < creator). Display names match the internal
  * keys 1:1, and each key binds to the like-named LS variant
  * (`pro` → PRO_VARIANT_ID, `creator` → CREATOR_VARIANT_ID):
- *   • Free   — onboarding / try-the-product. 5 GB storage.
+ *   • Free   — onboarding / try-the-product. 5 GB storage. 2 cloud exports/mo
+ *              at 720p with a watermark (see plan-policy + cloud-minutes).
  *   • Pro    — main paid plan (~$25/mo), "most popular". 50 GB storage.
- *              Unlimited exports, no watermark, 4K + 60fps, advanced AI
- *              editing, priority rendering, all premium presets.
- *   • Creator — team / agency plan (~$49/mo). 500 GB storage. "Everything in
- *              Pro" plus brand-kit presets, team seats, and API access.
+ *              150 cloud export minutes/mo, 1080p MP4, no watermark, all AI
+ *              effects, brand/export presets, 1 active cloud export.
+ *   • Creator — top tier (~$49/mo). 500 GB storage. 250 cloud export minutes/mo,
+ *              1080p MP4, no watermark, priority render queue, 2 active exports.
  *
  * Note the ordering: Creator is the TOP tier (it's the $49 superset), so
  * `planRank` puts creator above pro. A user's tier is read from

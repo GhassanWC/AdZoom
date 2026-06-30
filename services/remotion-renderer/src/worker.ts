@@ -47,6 +47,19 @@ function log(msg: string, extra?: Record<string, unknown>): void {
   console.info(`[remotion-worker] ${msg}`, extra ?? {});
 }
 
+/** Friendly, filesystem-safe download name: Framevo-export-{project}-{YYYY-MM-DD}.mp4 */
+function buildExportFilename(projectTitle: string | undefined): string {
+  const safe =
+    (projectTitle || "video")
+      .normalize("NFKD")
+      .replace(/[^\w\s-]+/g, "")
+      .trim()
+      .replace(/\s+/g, "-")
+      .slice(0, 60) || "video";
+  const date = new Date().toISOString().slice(0, 10);
+  return `Framevo-export-${safe}-${date}.mp4`;
+}
+
 /** Reject if `p` doesn't settle within `ms`. The underlying op may keep running
  *  in the background; callers fail + (the run entry) exits, so nothing hangs. */
 async function raceTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
@@ -382,21 +395,30 @@ export async function processRemotionJob(uid: string, jobId: string): Promise<st
     if (!existsSync(outPath) || statSync(outPath).size <= 0) {
       throw new Error("render produced no output file");
     }
+    const outputSizeBytes = statSync(outPath).size;
 
     // ── Upload + Firebase download URL ───────────────────────────────────────
+    // Set Content-Disposition: attachment on the object so EVERY direct URL
+    // (signed URL or the Firebase token URL) downloads with a friendly filename
+    // instead of previewing inline — the client never proxies the bytes.
+    const outputFilename = buildExportFilename(job.projectTitle);
     await progressPatch({ stage: "uploading", progress: 0.98, progressStage: "uploading" });
     log("upload started", { uid, jobId, dest: job.outputPath });
     const token = randomUUID();
     try {
       await bucket().upload(outPath, {
         destination: job.outputPath,
-        metadata: { contentType: "video/mp4", metadata: { firebaseStorageDownloadTokens: token } },
+        metadata: {
+          contentType: "video/mp4",
+          contentDisposition: `attachment; filename="${outputFilename}"`,
+          metadata: { firebaseStorageDownloadTokens: token },
+        },
       });
     } catch (err) {
       throw new Error(`upload_failed: ${err instanceof Error ? err.message : String(err)}`);
     }
     const downloadUrl = `https://firebasestorage.googleapis.com/v0/b/${bucketName}/o/${encodeURIComponent(job.outputPath)}?alt=media&token=${token}`;
-    log("upload completed", { uid, jobId });
+    log("upload completed", { uid, jobId, bytes: outputSizeBytes, filename: outputFilename });
 
     // ── Settle minutes + mark ready (atomic, guarded against a late cancel) ───
     const finalized = await db.runTransaction(async (tx) => {
@@ -425,6 +447,15 @@ export async function processRemotionJob(uid: string, jobId: string): Promise<st
           progressStage: "ready",
           progress: 1,
           downloadUrl,
+          // Direct-download handoff fields (the /api/export/download route reads
+          // outputPath/outputBucket; the UI shows the filename/size).
+          backend: "remotion",
+          outputPath: job.outputPath,
+          outputBucket: bucketName,
+          outputSizeBytes,
+          outputContentType: "video/mp4",
+          outputFilename,
+          readyAt: Date.now(),
           consumedExportMinutes: estimate,
           remotionRendererVersion: RENDERER_VERSION,
           completedAt: FieldValue.serverTimestamp(),

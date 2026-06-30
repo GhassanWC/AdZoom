@@ -13,6 +13,7 @@ import { ManageSubscriptionButton } from "@/components/billing/ManageSubscriptio
 import { cn } from "@/lib/cn";
 import { logFramevoEvent } from "@/lib/firebase/analytics";
 import { EVENTS } from "@/lib/analytics/events";
+import { pricingTiers } from "@/lib/mockData";
 import type { Subscription } from "@/lib/firebase/schema";
 
 interface PlanCopy {
@@ -21,45 +22,20 @@ interface PlanCopy {
   features: string[];
 }
 
-// Keyed by INTERNAL tier; names/prices match the /pricing page 1:1.
+// Keyed by INTERNAL tier; copy is the SAME source as the /pricing + landing
+// pages (src/lib/mockData `pricingTiers`) so plan benefits never drift.
+function tierCopy(name: "free" | "pro" | "creator"): PlanCopy {
+  const t = pricingTiers.find((x) => x.name.toLowerCase() === name);
+  return {
+    price: t?.price ?? "$0",
+    cadence: t?.priceUnit ?? "forever",
+    features: t?.features ?? [],
+  };
+}
 const PLAN_COPY: Record<PlanTier, PlanCopy> = {
-  free: {
-    price: "$0",
-    cadence: "forever",
-    features: [
-      "5 exports per month",
-      "1080p exports",
-      "Watermark included",
-      "All AI effects",
-      "Community presets",
-    ],
-  },
-  pro: {
-    // "Pro" — the $25 "For serious creators" tier.
-    price: "$25",
-    cadence: "month",
-    features: [
-      "Unlimited exports",
-      "4K + 60fps exports",
-      "No watermark",
-      "All AI effects + presets",
-      "Vertical & TikTok reframes",
-      "Priority render queue",
-    ],
-  },
-  creator: {
-    // "Creator" — the $49 "Teams & agencies" tier.
-    price: "$49",
-    cadence: "month",
-    features: [
-      "Everything in Pro",
-      "Team workspace, 5 seats",
-      "Brand presets & lockups",
-      "API access",
-      "Priority support",
-      "Custom export formats",
-    ],
-  },
+  free: tierCopy("free"),
+  pro: tierCopy("pro"),
+  creator: tierCopy("creator"),
 };
 
 function fmtDate(epochMs?: number): string | null {
@@ -281,7 +257,7 @@ export default function BillingPage() {
                 ? usage.remaining > 0
                   ? `${usage.remaining} remaining`
                   : "Cap reached — upgrade to keep exporting"
-                : "Unlimited"}
+                : "Included with your plan"}
             </div>
           </div>
 

@@ -419,6 +419,11 @@ function toMs(v) {
 function log(msg, extra) {
   console.info(`[remotion-worker] ${msg}`, extra ?? {});
 }
+function buildExportFilename(projectTitle) {
+  const safe = (projectTitle || "video").normalize("NFKD").replace(/[^\w\s-]+/g, "").trim().replace(/\s+/g, "-").slice(0, 60) || "video";
+  const date = (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
+  return `Framevo-export-${safe}-${date}.mp4`;
+}
 async function raceTimeout(p, ms, label) {
   let timer;
   const timeout = new Promise((_, reject) => {
@@ -680,19 +685,25 @@ async function processRemotionJob(uid, jobId) {
     if (!existsSync2(outPath) || statSync2(outPath).size <= 0) {
       throw new Error("render produced no output file");
     }
+    const outputSizeBytes = statSync2(outPath).size;
+    const outputFilename = buildExportFilename(job.projectTitle);
     await progressPatch({ stage: "uploading", progress: 0.98, progressStage: "uploading" });
     log("upload started", { uid, jobId, dest: job.outputPath });
     const token = randomUUID();
     try {
       await bucket().upload(outPath, {
         destination: job.outputPath,
-        metadata: { contentType: "video/mp4", metadata: { firebaseStorageDownloadTokens: token } }
+        metadata: {
+          contentType: "video/mp4",
+          contentDisposition: `attachment; filename="${outputFilename}"`,
+          metadata: { firebaseStorageDownloadTokens: token }
+        }
       });
     } catch (err) {
       throw new Error(`upload_failed: ${err instanceof Error ? err.message : String(err)}`);
     }
     const downloadUrl = `https://firebasestorage.googleapis.com/v0/b/${bucketName}/o/${encodeURIComponent(job.outputPath)}?alt=media&token=${token}`;
-    log("upload completed", { uid, jobId });
+    log("upload completed", { uid, jobId, bytes: outputSizeBytes, filename: outputFilename });
     const finalized = await db.runTransaction(async (tx) => {
       const snap = await tx.get(jobRef);
       if (!snap.exists) return false;
@@ -719,6 +730,15 @@ async function processRemotionJob(uid, jobId) {
           progressStage: "ready",
           progress: 1,
           downloadUrl,
+          // Direct-download handoff fields (the /api/export/download route reads
+          // outputPath/outputBucket; the UI shows the filename/size).
+          backend: "remotion",
+          outputPath: job.outputPath,
+          outputBucket: bucketName,
+          outputSizeBytes,
+          outputContentType: "video/mp4",
+          outputFilename,
+          readyAt: Date.now(),
           consumedExportMinutes: estimate,
           remotionRendererVersion: RENDERER_VERSION,
           completedAt: FieldValue.serverTimestamp(),

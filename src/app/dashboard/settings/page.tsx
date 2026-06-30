@@ -37,7 +37,7 @@ import { BUILTIN_PRESETS } from "@/lib/presets";
 import { cn } from "@/lib/cn";
 import type { ApiKeyDoc, ExportFormat } from "@/lib/firebase/schema";
 
-const EXPORT_FORMATS: ExportFormat[] = ["YouTube 16:9", "TikTok 9:16", "1080p", "4K"];
+const EXPORT_FORMATS: ExportFormat[] = ["YouTube 16:9", "TikTok 9:16", "1080p"];
 
 export default function SettingsPage() {
   return (

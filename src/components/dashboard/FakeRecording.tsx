@@ -69,7 +69,7 @@ export function FakeRecording() {
             <div className="pl-3 text-amber-200">  vertical: <span className="text-rose-300/80">true</span></div>
             <div className="text-violet-300/80">{"});"}</div>
             <div className="mt-1 text-violet-300/80">
-              await result.<span className="text-emerald-300/80">export</span>(<span className="text-emerald-300/80">"4k"</span>);
+              await result.<span className="text-emerald-300/80">export</span>(<span className="text-emerald-300/80">"1080p"</span>);
             </div>
           </div>
         </div>

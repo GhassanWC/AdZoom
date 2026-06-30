@@ -361,7 +361,7 @@ export function ExportProvider({ children }: { children: React.ReactNode }) {
           if (!permitRes.ok || !permitJson.ok) {
             const friendly =
               permitJson.kind === "plan_required"
-                ? "Pro plan required for 4K export. Upgrade in /pricing."
+                ? "A paid plan is required for this export quality. Upgrade in /pricing."
                 : permitJson.kind === "limit_reached"
                   ? `Export limit reached (${permitJson.used}/${permitJson.limit}). Upgrade to keep exporting.`
                   : permitJson.error || `Export blocked (${permitRes.status})`;

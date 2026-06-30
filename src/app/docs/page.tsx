@@ -41,7 +41,7 @@ const SECTIONS = [
     href: "#export",
     Icon: Download,
     title: "Export",
-    body: "Render 1080p or 4K. Switch to vertical for Shorts and Reels. What changes when you pick a preset.",
+    body: "Render 720p or 1080p MP4. Switch to vertical for Shorts and Reels. What changes when you pick a preset.",
   },
   {
     href: "/api-reference",
@@ -227,7 +227,7 @@ export default function DocsPage() {
               you made.
             </p>
             <ul className="list-disc space-y-2 pl-6 marker:text-violet-400">
-              <li>1080p on Free; 4K on Creator and above.</li>
+              <li>720p on Free; 1080p MP4 on Pro and Creator.</li>
               <li>16:9, 9:16 (vertical), or square output.</li>
               <li>Watermark on Free; watermark-free on paid plans.</li>
               <li>

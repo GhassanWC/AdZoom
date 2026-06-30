@@ -29,14 +29,14 @@ export const DEFAULT_EFFECTS: EffectsState = {
 };
 
 export interface ExportState {
-  resolution: "1080p" | "4K";
+  resolution: "720p" | "1080p";
   fps: 30 | 60;
   format: "TikTok 9:16" | "YouTube 16:9" | "Custom";
 }
 
 export const DEFAULT_EXPORT: ExportState = {
-  resolution: "4K",
-  fps: 60,
+  resolution: "1080p",
+  fps: 30,
   format: "YouTube 16:9",
 };
 

@@ -8,7 +8,7 @@ import {
   exportUiStage,
   type ExportJobView,
 } from "@/lib/firebase/export-jobs";
-import { downloadFile } from "@/lib/download";
+import { startServerDownload } from "@/lib/download";
 import type {
   DetectedMoment,
   EffectsSettings,
@@ -89,11 +89,9 @@ const sessionExportJobIds = new Set<string>();
 /** Jobs already auto-downloaded once this page load (the spam guard). */
 const autoDownloadedJobIds = new Set<string>();
 
-/** Fetch + save the job's MP4 under a friendly filename. */
-function downloadJobFile(j: ExportJobView): Promise<void> {
-  if (!j.downloadUrl) return Promise.resolve();
-  const filename = `${(j.projectTitle || "framevo-export").replace(/[^\w.-]+/g, "_")}.mp4`;
-  return downloadFile(j.downloadUrl, filename);
+/** A job is downloadable once it's ready with an output file. */
+function isDownloadable(j: ExportJobView): boolean {
+  return j.status === "ready" && (!!j.outputPath || !!j.downloadUrl);
 }
 
 export function useCloudExport(projectId: string) {
@@ -201,7 +199,7 @@ export function useCloudExport(projectId: string) {
   // the fresh on-screen result (so it isn't offered twice).
   const previousExport = React.useMemo<ExportJobView | null>(() => {
     const ready = jobs.filter(
-      (j) => j.projectId === projectId && j.status === "ready" && !!j.downloadUrl
+      (j) => j.projectId === projectId && isDownloadable(j)
     );
     const top = ready[0] ?? null; // subscription is createdAt desc
     if (!top) return null;
@@ -233,12 +231,36 @@ export function useCloudExport(projectId: string) {
     }
   }, [job, uiStage, queuePosition]);
 
-  // ── Auto-download ONCE on completion — ONLY for this session's export ──────
+  // ── Direct-from-storage download (no Blob, no proxying) ────────────────────
   const [downloadStarted, setDownloadStarted] = React.useState(false);
   const [downloading, setDownloading] = React.useState(false);
+  const [downloadingPrevious, setDownloadingPrevious] = React.useState(false);
+  const [downloadError, setDownloadError] = React.useState<string | null>(null);
+
+  // Kick off a direct download via the secure route → short-lived signed URL.
+  // There's no completion event for a navigated download, so re-enable the
+  // button a few seconds after it starts.
+  const runServerDownload = React.useCallback(
+    async (jobId: string, setBusy: (b: boolean) => void) => {
+      setBusy(true);
+      setDownloadError(null);
+      try {
+        const token = await getIdToken();
+        if (!token) throw new Error("not-signed-in");
+        await startServerDownload(jobId, token);
+        window.setTimeout(() => setBusy(false), 3000);
+      } catch {
+        setDownloadError(
+          "Export is ready, but we couldn't start the download. Please try again."
+        );
+        setBusy(false);
+      }
+    },
+    [getIdToken]
+  );
 
   React.useEffect(() => {
-    if (!job || job.status !== "ready" || !job.downloadUrl) return;
+    if (!job || !isDownloadable(job)) return;
     // Gate strictly: only auto-download a job we watched go active→ready in THIS
     // open dialog. Never for old Firestore exports, hydration, or a job that
     // finished while the dialog was closed (those get a manual download).
@@ -249,27 +271,22 @@ export function useCloudExport(projectId: string) {
     }
     autoDownloadedJobIds.add(job.id);
     console.log("[export-ui:complete]", { jobId: job.id, auto: true });
-    setDownloading(true);
     setDownloadStarted(true);
-    void downloadJobFile(job).finally(() => setDownloading(false));
-  }, [job]);
+    void runServerDownload(job.id, setDownloading);
+  }, [job, runServerDownload]);
 
-  // Manual re-download of the CURRENT result — spam-proof (disabled + "Preparing…"
-  // while the bytes fetch).
+  // Manual re-download of the CURRENT result.
   const downloadAgain = React.useCallback(() => {
-    if (!job || !job.downloadUrl || downloading) return;
-    setDownloading(true);
+    if (!job || !isDownloadable(job) || downloading) return;
     setDownloadStarted(true);
-    void downloadJobFile(job).finally(() => setDownloading(false));
-  }, [job, downloading]);
+    void runServerDownload(job.id, setDownloading);
+  }, [job, downloading, runServerDownload]);
 
   // Manual download of a PREVIOUS completed export — always manual, never auto.
-  const [downloadingPrevious, setDownloadingPrevious] = React.useState(false);
   const downloadPrevious = React.useCallback(() => {
-    if (!previousExport || !previousExport.downloadUrl || downloadingPrevious) return;
-    setDownloadingPrevious(true);
-    void downloadJobFile(previousExport).finally(() => setDownloadingPrevious(false));
-  }, [previousExport, downloadingPrevious]);
+    if (!previousExport || !isDownloadable(previousExport) || downloadingPrevious) return;
+    void runServerDownload(previousExport.id, setDownloadingPrevious);
+  }, [previousExport, downloadingPrevious, runServerDownload]);
 
   const startCloudExport = React.useCallback(
     async (input: StartCloudExportInput): Promise<StartCloudExportResult> => {
@@ -389,6 +406,11 @@ export function useCloudExport(projectId: string) {
     downloadAgain,
     downloadingPrevious,
     downloadPrevious,
-    clearError: React.useCallback(() => setError(null), []),
+    /** Set when the direct-download handoff failed (clear, user-facing copy). */
+    downloadError,
+    clearError: React.useCallback(() => {
+      setError(null);
+      setDownloadError(null);
+    }, []),
   };
 }

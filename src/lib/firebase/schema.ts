@@ -1454,6 +1454,17 @@ export interface ExportJobDoc {
   outputPath: string;
   /** Public download URL — set once the upload finishes. */
   downloadUrl?: string;
+  // ── Download handoff (direct-from-storage; written by the worker on success) ──
+  /** GCS bucket the output object lives in. */
+  outputBucket?: string;
+  /** Output MP4 size in bytes. */
+  outputSizeBytes?: number;
+  /** Output MIME — always "video/mp4". */
+  outputContentType?: string;
+  /** Suggested download filename: Framevo-export-{project}-{date}.mp4. */
+  outputFilename?: string;
+  /** Epoch ms the output became ready (upload settled). */
+  readyAt?: number;
   format: "mp4";
   outputWidth: number;
   outputHeight: number;

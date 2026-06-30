@@ -27,7 +27,7 @@ import {
 } from "@/lib/firebase/export-jobs";
 import { useExport } from "@/components/export/ExportProvider";
 import type { ExportDoc } from "@/lib/firebase/schema";
-import { downloadFile } from "@/lib/download";
+import { downloadFile, startServerDownload } from "@/lib/download";
 import { cn } from "@/lib/cn";
 
 const TONE: Record<string, string> = {
@@ -221,6 +221,29 @@ export default function ExportsPage() {
     [getIdToken, retryingId]
   );
 
+  // Download a finished export. Cloud rows go through the secure direct-download
+  // route (signed URL, no Blob/proxy — fast for large MP4s); browser rows keep
+  // the existing object-URL save (their bytes are already public/local).
+  const downloadRow = React.useCallback(
+    async (row: UnifiedRow) => {
+      if (row.source === "cloud") {
+        try {
+          const token = await getIdToken();
+          if (!token) throw new Error("not-signed-in");
+          await startServerDownload(row.id, token);
+          return;
+        } catch (err) {
+          console.warn("[exports] cloud download failed", err);
+          // Fall back to the stored URL if present (best-effort).
+          if (row.downloadUrl) window.open(row.downloadUrl, "_blank", "noreferrer");
+          return;
+        }
+      }
+      if (row.downloadUrl) void downloadFile(row.downloadUrl, downloadName(row));
+    },
+    [getIdToken]
+  );
+
   // The live browser session job owns the card above; hide its persisted doc so
   // it isn't shown twice. Merge browser + cloud, newest first, then split into
   // ACTIVE (in-flight) vs HISTORY (terminal) so the page reads cleanly.
@@ -363,6 +386,7 @@ export default function ExportsPage() {
                   retryingId={retryingId}
                   onCancel={cancelCloud}
                   onRetry={retryCloud}
+                  onDownload={downloadRow}
                 />
               ))}
             </Section>
@@ -378,6 +402,7 @@ export default function ExportsPage() {
                   retryingId={retryingId}
                   onCancel={cancelCloud}
                   onRetry={retryCloud}
+                  onDownload={downloadRow}
                 />
               ))}
             </Section>
@@ -424,12 +449,14 @@ function RowItem({
   retryingId,
   onCancel,
   onRetry,
+  onDownload,
 }: {
   row: UnifiedRow;
   last: boolean;
   retryingId: string | null;
   onCancel: (jobId: string) => void;
   onRetry: (jobId: string) => void;
+  onDownload: (row: UnifiedRow) => void;
 }) {
   const isFailed = row.status === "failed";
   return (
@@ -507,12 +534,12 @@ function RowItem({
               )}
             </button>
           )}
-          {row.downloadUrl && (
+          {(row.downloadUrl || (row.source === "cloud" && row.status === "ready")) && (
             <button
               type="button"
-              onClick={() => void downloadFile(row.downloadUrl!, downloadName(row))}
-              aria-label="Download previous export"
-              title="Download previous export"
+              onClick={() => onDownload(row)}
+              aria-label="Download export"
+              title="Download export"
               className="inline-flex size-8 items-center justify-center rounded-md border border-white/10 bg-white/[0.02] text-fog transition-colors duration-200 hover:border-white/20 hover:text-white"
             >
               <Download size={13} />

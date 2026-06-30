@@ -37,7 +37,7 @@ export const FAQ_ITEMS: FaqItem[] = [
   },
   {
     q: "What are the free plan limits?",
-    a: "The free plan includes the full AI editor with a limited number of exports per month at 1080p with a watermark. Upgrade for unlimited exports, 4K, no watermark, and advanced export formats.",
+    a: "The free plan includes the full AI editor plus 2 cloud exports per month at 720p with a watermark (browser export is also available). Upgrade to Pro for 150 cloud export minutes a month, 1080p MP4, and no watermark — or Creator for 250 minutes and a priority render queue.",
   },
 ];
 

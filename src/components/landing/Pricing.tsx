@@ -17,7 +17,7 @@ export function Pricing() {
           <span className="text-gradient-violet">Polished output.</span>
         </>
       }
-      subtitle="Start free. Upgrade when you need longer videos, advanced exports, and watermark-free 4K."
+      subtitle="Start free. Upgrade for more cloud export minutes, 1080p MP4 exports, and a watermark-free, priority render queue."
     >
       <div className="mx-auto grid max-w-5xl grid-cols-1 gap-5 lg:grid-cols-3">
         {pricingTiers.map((t, i) => (

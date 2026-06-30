@@ -207,7 +207,7 @@ export function HeroMockup() {
       />
       <FloatingChip
         icon={<Smartphone size={12} />}
-        label="Export 4K"
+        label="Export 1080p"
         className="-left-3 bottom-10 sm:-left-6"
         delay={1.4}
       />

@@ -251,7 +251,7 @@ export function EditorPreviewMock() {
       {/* Floating chips */}
       <FloatingChip icon={<Sparkles size={12} />} label="Auto Zoom On" className="-left-3 top-16 sm:-left-6" delay={0.4} />
       <FloatingChip icon={<MousePointer2 size={12} />} label="Cursor Smoothing" className="-right-3 top-1/3 sm:-right-6" delay={0.9} />
-      <FloatingChip icon={<Download size={12} />} label="Export MP4 · 4K" className="-left-3 bottom-12 sm:-left-6" delay={1.4} />
+      <FloatingChip icon={<Download size={12} />} label="Export MP4 · 1080p" className="-left-3 bottom-12 sm:-left-6" delay={1.4} />
     </div>
   );
 }

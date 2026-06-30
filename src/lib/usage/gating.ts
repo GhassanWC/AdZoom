@@ -17,10 +17,11 @@ import { BUILTIN_PRESETS_BY_ID } from "@/lib/presets";
  * same tier via the existing `useStoragePlan()` hook for UI display, but
  * the authoritative checks happen here.
  *
- * Monthly export limits live in `EXPORT_LIMITS`. The Free cap (5/mo) is the
- * "$0 trial" funnel; both paid tiers are uncapped — the marketing copy
- * promises "Unlimited exports" starting at the $25 Pro tier.
- * Adjust by editing the constant.
+ * Monthly export limits live in `EXPORT_LIMITS` — these gate the legacy
+ * BROWSER-export permit flow only (Free 5/mo; paid uncapped, since browser
+ * renders cost us nothing). CLOUD (Remotion) export quotas are separate: Free is
+ * 2 cloud exports/mo and paid plans meter minutes — see src/lib/export/plan-policy
+ * + src/lib/usage/cloud-minutes. Public copy never promises "unlimited exports".
  */
 
 /** Monthly export caps per plan tier. Both paid tiers are uncapped. */

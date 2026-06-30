@@ -289,8 +289,8 @@ function ExportPane() {
       </div>
 
       <p className="mt-3 text-[12.5px] leading-relaxed text-fog">
-        Render in your browser on the free plan, or unlock 4K and watermark-free
-        exports on Pro. Reframe the same edit for vertical and square too.
+        Render in your browser on the free plan, or unlock 1080p, watermark-free
+        cloud exports on Pro. Reframe the same edit for vertical and square too.
       </p>
     </div>
   );

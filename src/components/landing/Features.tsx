@@ -52,7 +52,7 @@ export const FEATURE_CARDS: FeatureCard[] = [
     Icon: Download,
     title: "Flexible export",
     description:
-      "Render in your browser on the free plan, or unlock 4K and watermark-free exports on Pro — and reframe the same edit for every platform.",
+      "Render in your browser on the free plan, or unlock 1080p, watermark-free cloud exports on Pro — and reframe the same edit for every platform.",
   },
 ];
 

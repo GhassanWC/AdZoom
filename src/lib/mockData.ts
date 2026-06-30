@@ -128,17 +128,24 @@ export const featureList: Feature[] = [
   },
 ];
 
+// SINGLE SOURCE OF TRUTH for public pricing copy — must match the server-enforced
+// export policy in src/lib/export/plan-policy.ts + src/lib/usage/cloud-minutes.ts:
+//   Free    — 2 cloud exports/month, 720p, watermark.
+//   Pro     — 150 cloud export minutes/month, 1080p, no watermark, 1 active.
+//   Creator — 250 cloud export minutes/month, 1080p, priority queue, 2 active.
+// No 4K, no "unlimited exports", no API/teams/custom formats (not implemented).
 export const pricingTiers: PricingTier[] = [
   {
     name: "Free",
-    tagline: "Try the magic.",
+    tagline: "Try Framevo with lightweight exports.",
     price: "$0",
     priceUnit: "forever",
     features: [
-      "5 exports per month",
-      "1080p exports",
+      "2 cloud exports per month",
+      "720p cloud exports",
+      "Browser export available",
       "Watermark included",
-      "All AI effects",
+      "Basic AI edits",
       "Community presets",
     ],
     cta: "Start Free",
@@ -146,32 +153,32 @@ export const pricingTiers: PricingTier[] = [
   },
   {
     name: "Pro",
-    tagline: "For serious creators.",
+    tagline: "For creators who export regularly.",
     price: "$25",
-    priceUnit: "per month",
+    priceUnit: "month",
     features: [
-      "Unlimited exports",
-      "4K + 60fps exports",
+      "150 cloud export minutes/month",
+      "1080p MP4 exports",
       "No watermark",
-      "All AI effects + presets",
-      "Vertical & TikTok reframes",
-      "Priority render queue",
+      "All AI effects",
+      "Brand/export presets",
+      "1 active cloud export at a time",
     ],
     cta: "Go Pro",
     highlighted: true,
   },
   {
     name: "Creator",
-    tagline: "Teams & agencies.",
+    tagline: "For high-volume creators.",
     price: "$49",
-    priceUnit: "per month",
+    priceUnit: "month",
     features: [
-      "Everything in Pro",
-      "Team workspace, 5 seats",
-      "Brand presets & lockups",
-      "API access",
-      "Priority support",
-      "Custom export formats",
+      "250 cloud export minutes/month",
+      "1080p MP4 exports",
+      "No watermark",
+      "All AI effects + presets",
+      "Priority render queue",
+      "2 active cloud exports at a time",
     ],
     cta: "Start Creator",
     highlighted: false,

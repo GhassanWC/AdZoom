@@ -410,6 +410,7 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
           estTotalSeconds={estRenderSeconds}
           downloadStarted={view.engine === "server" ? cloud.downloadStarted : true}
           downloading={view.engine === "server" ? cloud.downloading : false}
+          downloadError={view.engine === "server" ? cloud.downloadError : null}
           onDownloadAgain={
             view.engine === "server" ? cloud.downloadAgain : downloadCurrent
           }
@@ -678,6 +679,7 @@ function StatusView({
   estTotalSeconds,
   downloadStarted,
   downloading,
+  downloadError,
   onDownloadAgain,
   onCancel,
   onExportAgain,
@@ -689,6 +691,7 @@ function StatusView({
   estTotalSeconds: number;
   downloadStarted: boolean;
   downloading: boolean;
+  downloadError?: string | null;
   onDownloadAgain: () => void;
   onCancel: () => void;
   onExportAgain: () => void;
@@ -779,6 +782,7 @@ function StatusView({
               : "Your video is ready."}
           </p>
           {view.warningText && <Notice tone="amber">{view.warningText}</Notice>}
+          {downloadError && <Notice tone="amber">{downloadError}</Notice>}
           <div className="flex items-center gap-2">
             <Button
               onClick={onDownloadAgain}
@@ -788,10 +792,10 @@ function StatusView({
               leftIcon={downloading ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
             >
               {downloading
-                ? "Preparing download…"
+                ? "Starting download…"
                 : downloadStarted
                   ? "Download again"
-                  : "Download"}
+                  : "Download MP4"}
             </Button>
             <Button onClick={onExportAgain} variant="ghost" size="lg">
               Export again
@@ -1119,7 +1123,7 @@ function PreviousExportCard({
         }
         className="shrink-0 whitespace-nowrap"
       >
-        {downloading ? "Preparing…" : "Download previous export"}
+        {downloading ? "Starting download…" : "Download previous export"}
       </Button>
     </div>
   );

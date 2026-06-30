@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/Button";
 import { useEditor } from "./editor-state";
 import { cn } from "@/lib/cn";
 
-const resolutions = ["1080p", "4K"] as const;
+const resolutions = ["720p", "1080p"] as const;
 const fpsOptions = [30, 60] as const;
 const formats = [
   { id: "TikTok 9:16" as const, label: "TikTok", desc: "9:16", Icon: Smartphone },
@@ -113,7 +113,7 @@ export function ExportPanel() {
         <p className="text-center text-[11px] text-fog">
           Est. render time:{" "}
           <span className="font-mono text-white/80">
-            {exportSettings.resolution === "4K" ? "1m 42s" : "32s"}
+            {exportSettings.resolution === "720p" ? "24s" : "32s"}
           </span>
         </p>
       </div>

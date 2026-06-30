@@ -6,39 +6,21 @@ import { CheckoutButton } from "@/components/billing/CheckoutButton";
 import { TrackView } from "@/components/analytics/TrackView";
 import { EVENTS } from "@/lib/analytics/events";
 import { buildMetadata } from "@/lib/seo";
+import { pricingTiers } from "@/lib/mockData";
 
 export const metadata: Metadata = buildMetadata({
   title: "Pricing — Framevo",
   description:
-    "Framevo pricing — start free with the full AI editor. Upgrade for longer videos, 4K, no watermark, and advanced exports for YouTube, TikTok, Reels, and Shorts.",
+    "Framevo pricing — start free with the full AI editor. Upgrade for more cloud export minutes, 1080p MP4 exports, no watermark, and a priority render queue.",
   path: "/pricing",
 });
 
-const FREE_FEATURES = [
-  "5 exports per month",
-  "1080p exports",
-  "Watermark included",
-  "All AI effects",
-  "Community presets",
-];
-
-const PRO_FEATURES = [
-  "Unlimited exports",
-  "4K + 60fps exports",
-  "No watermark",
-  "All AI effects + presets",
-  "Vertical & TikTok reframes",
-  "Priority render queue",
-];
-
-const CREATOR_FEATURES = [
-  "Everything in Pro",
-  "Team workspace, 5 seats",
-  "Brand presets & lockups",
-  "API access",
-  "Priority support",
-  "Custom export formats",
-];
+/** Per-plan icon for the pricing cards (copy lives in `pricingTiers`). */
+const PLAN_ICON: Record<string, React.ReactNode> = {
+  Free: <Sparkles size={14} />,
+  Pro: <Crown size={14} />,
+  Creator: <Users size={14} />,
+};
 
 export default function PricingPage() {
   return (
@@ -66,43 +48,29 @@ export default function PricingPage() {
       </div>
 
       <div className="mx-auto mt-12 grid max-w-6xl grid-cols-1 gap-5 lg:grid-cols-3">
-        {/* Free */}
-        <PlanCard
-          name="Free"
-          price="$0"
-          cadence="forever"
-          tagline="Try the magic."
-          features={FREE_FEATURES}
-          icon={<Sparkles size={14} />}
-          cta={
-            <Button variant="ghost" size="md" href="/login">
-              Start Free
-            </Button>
-          }
-        />
-
-        {/* Pro — featured / most popular ($25, mid paid tier). */}
-        <PlanCard
-          name="Pro"
-          price="$25"
-          cadence="per month"
-          tagline="For serious creators."
-          features={PRO_FEATURES}
-          icon={<Crown size={14} />}
-          featured
-          cta={<CheckoutButton plan="pro" label="Go Pro" variant="primary" />}
-        />
-
-        {/* Creator — teams & agencies ($49, top tier; "Everything in Pro"). */}
-        <PlanCard
-          name="Creator"
-          price="$49"
-          cadence="per month"
-          tagline="Teams & agencies."
-          features={CREATOR_FEATURES}
-          icon={<Users size={14} />}
-          cta={<CheckoutButton plan="creator" label="Start Creator" variant="primary" />}
-        />
+        {pricingTiers.map((tier) => (
+          <PlanCard
+            key={tier.name}
+            name={tier.name}
+            price={tier.price}
+            cadence={tier.priceUnit}
+            tagline={tier.tagline}
+            features={tier.features}
+            icon={PLAN_ICON[tier.name] ?? <Sparkles size={14} />}
+            featured={tier.highlighted}
+            cta={
+              tier.name === "Pro" ? (
+                <CheckoutButton plan="pro" label={tier.cta} variant="primary" />
+              ) : tier.name === "Creator" ? (
+                <CheckoutButton plan="creator" label={tier.cta} variant="primary" />
+              ) : (
+                <Button variant="ghost" size="md" href="/login">
+                  {tier.cta}
+                </Button>
+              )
+            }
+          />
+        ))}
       </div>
 
       <p className="mx-auto mt-10 max-w-xl text-center text-[13px] text-fog">
