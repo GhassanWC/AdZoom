@@ -52,11 +52,36 @@ import {
   exportUiStage,
   isIndeterminateStage,
   isWaitingForSlot,
-  WAITING_FOR_SLOT_MESSAGE,
   type ExportJobView,
 } from "@/lib/firebase/export-jobs";
 
 const fpsOptions = [30, 60] as const;
+
+/** Friendly, user-facing copy for known export error/queue codes (UI-only). The
+ *  server's raw message is the fallback for anything not mapped here. */
+const EXPORT_ERROR_MESSAGES: Record<string, string> = {
+  free_monthly_export_limit:
+    "You've used your 2 free cloud exports this month. Upgrade to export more.",
+  render_no_progress_timeout: "Export took too long to render. Please try again.",
+  render_timeout: "Export took too long to render. Please try again.",
+  video_decode_failed:
+    "We couldn't read this video for cloud export. Try another recording or export locally.",
+  active_export_limit: "You already have an export running. Please wait for it to finish.",
+  export_already_running: "You already have an export running. Please wait for it to finish.",
+  global_export_queue_full:
+    "Your export is queued. We'll start it automatically when a render slot is free.",
+  queued_due_to_capacity:
+    "Your export is queued. We'll start it automatically when a render slot is free.",
+};
+
+/** Map an export error/queue code to friendly copy, falling back to `raw`. */
+function friendlyExportError(code: string | undefined, raw: string | undefined): string | undefined {
+  if (code && EXPORT_ERROR_MESSAGES[code]) return EXPORT_ERROR_MESSAGES[code];
+  return raw;
+}
+
+/** Shown while a job is queued behind the global cap (friendlier than the raw marker). */
+const QUEUED_FOR_SLOT_LABEL = "Queued — starts automatically when a slot is free";
 
 const FIT_LABEL: Record<FitMode, string> = {
   fit: "Fit",
@@ -173,6 +198,9 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
 
   const engine: "server" | "browser" =
     container === "mp4" && canServerMp4 ? "server" : "browser";
+  // Free user who has used their 2 monthly cloud exports → block the cloud path
+  // and show an upgrade CTA. (They can still switch to WebM = browser export.)
+  const freeCloudLimitReached = engine === "server" && minutes.freeLimitReached;
   // MP4 is available to every plan now (cloud for Free at 720p, or browser),
   // so there's no MP4-specific upgrade nudge.
   const mp4NeedsUpgrade = false;
@@ -289,7 +317,8 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
           console.log("[export-ui:cloud-submit]", { jobId: r.jobId });
         } else {
           console.log("[export-ui:error]", { source: "cloud", code: r.kind ?? "start_failed" });
-          if (r.error) setBlockedWarning(r.error);
+          const msg = friendlyExportError(r.kind, r.error);
+          if (msg) setBlockedWarning(msg);
         }
       });
       return;
@@ -426,14 +455,16 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
 
           {!isPaid && (
             <p className="-mt-1 text-[10.5px] leading-relaxed text-fog/80">
-              Free includes {FREE_MONTHLY_CLOUD_EXPORTS} cloud exports/month at 720p.{" "}
+              {minutes.freeLimitReached
+                ? "You've used your 2 free cloud exports this month. "
+                : "Free exports at 720p. "}
               <a
                 href="/pricing"
                 className="font-medium text-violet-300 transition-colors hover:text-violet-200"
               >
                 Upgrade to Pro
               </a>{" "}
-              for 1080p and more.
+              {minutes.freeLimitReached ? "to export more." : "for 1080p and more."}
             </p>
           )}
 
@@ -591,7 +622,15 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
               )}
               {engine === "server" && !isPaid && (
                 <div className="mt-0.5 text-fog/80">
-                  {FREE_MONTHLY_CLOUD_EXPORTS} cloud exports/month · 720p
+                  <span
+                    className={cn(
+                      "font-mono tabular-nums",
+                      minutes.freeLimitReached ? "text-rose-300" : "text-white/85"
+                    )}
+                  >
+                    {minutes.monthlyExportsUsed}
+                  </span>{" "}
+                  of {FREE_MONTHLY_CLOUD_EXPORTS} cloud exports used this month · 720p
                 </div>
               )}
             </div>
@@ -599,12 +638,12 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
               <Button onClick={() => onClose?.()} variant="ghost" size="lg">
                 Cancel
               </Button>
-              {mp4NeedsUpgrade ? (
+              {mp4NeedsUpgrade || freeCloudLimitReached ? (
                 <Link
                   href="/pricing"
                   className="inline-flex h-11 items-center justify-center gap-2 rounded-xl bg-violet-500 px-5 text-sm font-semibold text-white hover:bg-violet-400"
                 >
-                  Upgrade to export MP4
+                  Upgrade to export more
                 </Link>
               ) : (
                 <Button
@@ -920,7 +959,7 @@ function serverView(cloud: ReturnType<typeof useCloudExport>): ExportView | null
       ? Math.round((chunkDone / chunkTot) * 100)
       : Math.round((j.progress ?? 0) * 100);
   const stageLabel = isWaitingForSlot(j)
-    ? WAITING_FOR_SLOT_MESSAGE
+    ? QUEUED_FOR_SLOT_LABEL
     : isRemotion && stage === "rendering"
       ? remotionRenderLabel(j)
       : stage === "merging"
@@ -940,9 +979,12 @@ function serverView(cloud: ReturnType<typeof useCloudExport>): ExportView | null
     queuePosition: cloud.queuePosition,
     isStale: cloud.isStale,
     jobId: j.id,
-    errorText: j.errorMessage
-      ? `${j.errorMessage}${j.errorCode ? ` (${j.errorCode})` : ""}`
-      : undefined,
+    errorText:
+      j.errorCode && EXPORT_ERROR_MESSAGES[j.errorCode]
+        ? EXPORT_ERROR_MESSAGES[j.errorCode]
+        : j.errorMessage
+          ? `${j.errorMessage}${j.errorCode ? ` (${j.errorCode})` : ""}`
+          : undefined,
     warningText: j.warnings && j.warnings.length ? j.warnings.join(" ") : undefined,
   };
 }

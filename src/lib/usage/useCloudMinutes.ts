@@ -13,6 +13,7 @@ import {
   cloudMinutesUsed,
   planAllowsCloudExport,
 } from "./cloud-minutes";
+import { FREE_MONTHLY_CLOUD_EXPORTS } from "@/lib/export/plan-policy";
 
 export interface CloudMinutesState {
   /** Included minutes for the plan (0 for Free). */
@@ -25,6 +26,15 @@ export interface CloudMinutesState {
   allowed: boolean;
   plan: PlanTier;
   loading: boolean;
+  // ── Free monthly cloud-export COUNT (Free is count-gated, not minutes) ──
+  /** Cloud exports started this month (from the usage doc; live). */
+  monthlyExportsUsed: number;
+  /** Free monthly cloud-export allowance (Infinity for paid plans). */
+  monthlyExportLimit: number;
+  /** Free exports remaining this month (Infinity for paid plans). */
+  monthlyExportsRemaining: number;
+  /** True when a Free user has used all their monthly cloud exports. */
+  freeLimitReached: boolean;
 }
 
 function currentMonthKey(d = new Date()): string {
@@ -64,6 +74,10 @@ export function useCloudMinutes(): CloudMinutesState {
   }, [uid]);
 
   const tier = plan.tier;
+  const monthlyExportsUsed = Math.max(0, usage?.exportsUsedThisMonth ?? 0);
+  const isFree = tier === "free";
+  const monthlyExportLimit = isFree ? FREE_MONTHLY_CLOUD_EXPORTS : Number.POSITIVE_INFINITY;
+  const monthlyExportsRemaining = Math.max(0, monthlyExportLimit - monthlyExportsUsed);
   return {
     limit: CLOUD_EXPORT_MINUTES[tier],
     used: cloudMinutesUsed(usage),
@@ -71,5 +85,9 @@ export function useCloudMinutes(): CloudMinutesState {
     allowed: planAllowsCloudExport(tier),
     plan: tier,
     loading: !!uid && !loaded,
+    monthlyExportsUsed,
+    monthlyExportLimit,
+    monthlyExportsRemaining,
+    freeLimitReached: isFree && monthlyExportsUsed >= FREE_MONTHLY_CLOUD_EXPORTS,
   };
 }
