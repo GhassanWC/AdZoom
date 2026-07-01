@@ -25,6 +25,7 @@ import type {
 import {
   normalizeSelectedVideoType,
 } from "@/lib/analysis/video-type";
+import { isOverlayEffectType, DEFAULT_BLUR_STRENGTH } from "@/lib/firebase/schema";
 import { applyPresetToSettings } from "@/lib/presets";
 import { useInteractions } from "./useInteractions";
 import type { Interaction } from "@/lib/recording/types";
@@ -299,6 +300,14 @@ const DEFAULT_EFFECT_LABEL: Record<EffectType, string> = {
   "speed-up": "Speed",
   cut: "Cut",
   crop: "Crop / Reframe",
+  captions: "Captions",
+  "hook-text": "Hook text",
+  "text-overlay": "Text overlay",
+  "smart-crop": "Smart crop",
+  callout: "Callout",
+  "blur-redaction": "Blur / Redaction",
+  transition: "Transition",
+  "branding-cta": "Branding / CTA",
 };
 
 function isGoodDuration(d: number | undefined | null): d is number {
@@ -718,7 +727,22 @@ export function EditorRealProvider({
         const isCrop = effectType === "crop";
         const isSpeed = effectType === "speed-up";
         const isCut = effectType === "cut";
-        const span = isSpeed ? 2.6 : isCrop ? 3 : isCut ? 2 : 1.8;
+        const isOverlay = isOverlayEffectType(effectType);
+        const span = isSpeed
+          ? 2.6
+          : isCrop
+            ? 3
+            : isCut
+              ? 2
+              : effectType === "transition"
+                ? 0.6
+                : effectType === "branding-cta"
+                  ? 4
+                  : effectType === "hook-text"
+                    ? 2.2
+                    : isOverlay
+                      ? 2.4
+                      : 1.8;
         const total = duration || project.duration || 0;
         const start = total > 0 ? Math.min(currentTime, Math.max(0, total - span)) : currentTime;
         // Source aspect drives the initial crop box shape — use the EFFECTIVE
@@ -760,6 +784,31 @@ export function EditorRealProvider({
           ...(isCrop ? { crop: { ...DEFAULT_CROP } } : {}),
           ...(isSpeed ? { speed: { ...DEFAULT_SPEED } } : {}),
           ...(isCut ? { cut: { ...DEFAULT_CUT } } : {}),
+          // Phase-3 overlay settings (only the matching one is attached).
+          ...(effectType === "captions"
+            ? { captions: { text: "Caption", stylePreset: "clean" as const, position: "bottom" as const } }
+            : {}),
+          ...(effectType === "hook-text"
+            ? { hookText: { text: "Your hook here", stylePreset: "bold" as const, position: "center" as const, animation: "pop" as const } }
+            : {}),
+          ...(effectType === "text-overlay"
+            ? { textOverlay: { text: "Add text", position: "bottom-center" as const, size: "medium" as const, alignment: "center" as const, backgroundStyle: "pill" as const, animation: "fade" as const } }
+            : {}),
+          ...(effectType === "callout"
+            ? { callout: { text: "Look here", style: "box" as const } }
+            : {}),
+          ...(effectType === "blur-redaction"
+            ? { blurRedaction: { blurStrength: DEFAULT_BLUR_STRENGTH, reasonType: "manual" as const } }
+            : {}),
+          ...(effectType === "transition"
+            ? { transition: { style: "fade" as const } }
+            : {}),
+          ...(effectType === "branding-cta"
+            ? { brandingCta: { ctaText: "Follow for more", position: "bottom-right" as const, stylePreset: "creator" as const } }
+            : {}),
+          ...(effectType === "smart-crop"
+            ? { smartCrop: { aspectRatio: "9:16" as const, focusTarget: "center" as const } }
+            : {}),
         };
         const next = [...momentsRef.current, m].sort(
           (a, b) => a.startTime - b.startTime

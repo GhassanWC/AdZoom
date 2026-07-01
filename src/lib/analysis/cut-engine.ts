@@ -71,7 +71,10 @@ export function cutSectionsForChunk(
   window: ChunkWindow,
   project: ProjectDoc,
   cameraMoments: DetectedMoment[],
-  primaryEnd: number
+  primaryEnd: number,
+  /** Recipe intensity (0..1). 0.5 = baseline (unchanged). Higher = more +
+   *  shorter cuts (aggressive); lower = fewer + longer (conservative). */
+  intensity = 0.5
 ): { sections: DetectedMoment[]; diag: CutDiagnostics } {
   void project;
   const reasons: Record<string, number> = {};
@@ -79,6 +82,15 @@ export function cutSectionsForChunk(
     reasons[r] = (reasons[r] ?? 0) + 1;
   };
   const sections: DetectedMoment[] = [];
+
+  // Scale the dead-detection thresholds + min length by intensity. At 0.5 the
+  // multipliers are exactly 1.0, so baseline behavior is byte-for-byte unchanged.
+  const it = clamp01(intensity);
+  const sens = 0.6 + 0.8 * it; // wider "dead" window when higher → more cuts
+  const minCutS = MIN_CUT_S * (1.4 - 0.8 * it); // shorter cuts allowed when higher
+  const maxMotion = MAX_MOTION * sens;
+  const maxDelta = MAX_DELTA * sens;
+  const maxAttention = MAX_ATTENTION * sens;
 
   const n = va.motion?.length ?? 0;
   const rate = va.sampleRate || 1;
@@ -110,7 +122,7 @@ export function cutSectionsForChunk(
     const de = dequantize(va.delta[i] ?? 0);
     const at = attn[i] ?? 0;
     const den = dequantize(va.density[i] ?? 0);
-    if (mo >= MAX_MOTION || at >= MAX_ATTENTION || de >= MAX_DELTA) return false;
+    if (mo >= maxMotion || at >= maxAttention || de >= maxDelta) return false;
     // Reading guard: dense text with any real frame delta is not dead.
     if (den >= TEXT_DENSITY && de >= FROZEN_DELTA) return false;
     return true;
@@ -133,7 +145,7 @@ export function cutSectionsForChunk(
     const absStart = window.startTime + i * bucket;
     const absEnd = Math.min(window.startTime + j * bucket, primaryEnd);
     const dur = absEnd - absStart;
-    if (dur >= MIN_CUT_S) {
+    if (dur >= minCutS) {
       const meanDelta = runLen ? sumDelta / runLen : 0;
       const frozen = meanDelta < FROZEN_DELTA * 1.5; // loading / idle / frozen
       // Longer + deader runs are higher-confidence cut candidates.

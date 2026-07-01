@@ -1446,6 +1446,14 @@ export function effectTypeBreakdown(
     "speed-up": 0,
     cut: 0,
     crop: 0,
+    captions: 0,
+    "hook-text": 0,
+    "text-overlay": 0,
+    "smart-crop": 0,
+    callout: 0,
+    "blur-redaction": 0,
+    transition: 0,
+    "branding-cta": 0,
   };
   for (const m of moments) out[m.effectType]++;
   return out;

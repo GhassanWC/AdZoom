@@ -14,6 +14,7 @@ import {
   Diamond,
   Bug,
   Activity,
+  Layers,
 } from "lucide-react";
 import { useEditorReal } from "../context";
 import { cn } from "@/lib/cn";
@@ -21,6 +22,7 @@ import { distributionScore } from "@/lib/timeline-balancer";
 import { buildTimelineMap } from "@/lib/timeline/crop-speed";
 import { CvSignalTracks } from "../CvSignalTracks";
 import type { DetectedMoment } from "@/lib/firebase/schema";
+import { isOverlayEffectType } from "@/lib/firebase/schema";
 import type { AnalysisOptions, EngineLayer } from "@/lib/analysis/engine-layers";
 import {
   EFFECT_TONES,
@@ -99,9 +101,18 @@ export function RealTimeline() {
   // Crop is demoted: any legacy crop moments are excluded from Edits but have
   // no dedicated track.
   const isOwnTrack = (m: DetectedMoment) =>
-    m.effectType === "crop" || m.effectType === "speed-up" || m.effectType === "cut";
+    m.effectType === "crop" ||
+    m.effectType === "speed-up" ||
+    m.effectType === "cut" ||
+    isOverlayEffectType(m.effectType);
   const cutMoments = React.useMemo(
     () => moments.filter((m) => m.effectType === "cut"),
+    [moments]
+  );
+  // Phase-3 overlays (captions/hook/text/callout/blur/transition/branding +
+  // smart-crop) share ONE "Overlays" lane so they never crowd the Edits lane.
+  const overlayMoments = React.useMemo(
+    () => moments.filter((m) => isOverlayEffectType(m.effectType)),
     [moments]
   );
   // Cut summary for the track header — "{active} active · {removed}s removed".
@@ -636,6 +647,37 @@ export function RealTimeline() {
         />
       ),
     },
+    // Overlays — one shared lane for the Phase-3 Core AI Edit Pack. Only shown
+    // once at least one overlay exists (added via the toolbar or generated), so
+    // it never sits empty.
+    ...(overlayMoments.length > 0
+      ? ([
+          {
+            id: "overlays",
+            kind: "overlays",
+            label: "Overlays",
+            Icon: Layers,
+            height: TRACK_HEIGHTS.user,
+            tone: "cyan",
+            interactive: true,
+            count: overlayMoments.length,
+            renderLane: () => (
+              <MomentLane
+                moments={overlayMoments}
+                total={total}
+                selectedMomentId={selectedMomentId}
+                multiSelectIds={multiSelectIds}
+                draftId={draft?.id ?? null}
+                withDraft={withDraft}
+                onBeginDrag={beginDrag}
+                onDuplicate={(id) => void duplicateMoment(id)}
+                onDelete={(id) => void deleteMoment(id)}
+                onEdit={onEditMoment}
+              />
+            ),
+          },
+        ] as TimelineTrackDescriptor[])
+      : []),
     // Cursor / Focus — last, and only present when there's real cursor data.
     ...(showInteractionsTrack
       ? ([

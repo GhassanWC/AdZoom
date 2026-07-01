@@ -28,6 +28,7 @@ import type {
   EaseKind,
   MomentKeyframe,
 } from "@/lib/firebase/schema";
+import { isOverlayEffectType } from "@/lib/firebase/schema";
 
 export interface CameraState {
   /** Final zoom scale applied to the frame (≥ 1). */
@@ -382,8 +383,11 @@ function pickActiveMoment(
   let pick: DetectedMoment | null = null;
   let pickPri = -1;
   for (const m of moments) {
-    // Speed + Cut moments never move the camera (timing-only effects).
+    // Speed + Cut moments never move the camera (timing-only effects); Phase-3
+    // overlays (captions/text/callout/blur/transition/branding) + smart-crop
+    // (applied via the output canvas) never move the per-moment camera either.
     if (m.effectType === "speed-up" || m.effectType === "cut") continue;
+    if (isOverlayEffectType(m.effectType)) continue;
     if (insideActiveCut(m)) continue;
     if (t < m.startTime || t > m.endTime) continue;
     const pri = cameraPriority(m);

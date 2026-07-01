@@ -15,6 +15,11 @@ import type { RenderRecipe } from "@/lib/render/recipe";
 import { resolveCameraFrame } from "@/lib/timeline/camera";
 import { buildTimelineMap } from "@/lib/timeline/crop-speed";
 import { drawClickHighlight } from "@/lib/timeline/click-highlight";
+import {
+  drawInCameraOverlays,
+  drawOutputOverlays,
+  hasOverlayMoments,
+} from "@/lib/render/overlay-draw";
 import { buildOutputFrameSegments, sourceTimeForFrame } from "../camera";
 
 export function Background({ recipe }: { recipe: RenderRecipe }): React.JSX.Element | null {
@@ -87,6 +92,80 @@ export function ClickHighlightOverlay({ recipe }: { recipe: RenderRecipe }): Rea
       width={Math.max(1, Math.round(base.drawW))}
       height={Math.max(1, Math.round(base.drawH))}
       style={{ position: "absolute", left: 0, top: 0, width: base.drawW, height: base.drawH }}
+    />
+  );
+}
+
+/**
+ * Phase-3 IN-CAMERA overlays (callout / blur-redaction). A `<canvas>` sized to
+ * the base placement, placed INSIDE the camera group (VideoLayer children) so
+ * the parent CSS scale magnifies it with the zoom — exactly like the canvas
+ * exporter draws these inside the camera transform. Reuses `drawInCameraOverlays`
+ * verbatim (guaranteed parity with the browser + worker paths).
+ */
+export function InCameraOverlaysLayer({ recipe }: { recipe: RenderRecipe }): React.JSX.Element | null {
+  const frame = useCurrentFrame();
+  const { fps, durationInFrames } = useVideoConfig();
+  const ref = useRef<HTMLCanvasElement | null>(null);
+  const { base } = recipe;
+  const segments = useMemo(
+    () => buildOutputFrameSegments(buildTimelineMap(recipe.moments, recipe.sourceDuration), fps, durationInFrames),
+    [recipe, fps, durationInFrames]
+  );
+  useLayoutEffect(() => {
+    const cv = ref.current;
+    const ctx = cv?.getContext("2d");
+    if (!cv || !ctx) return;
+    ctx.clearRect(0, 0, cv.width, cv.height);
+    const sourceTime = sourceTimeForFrame(segments, frame, fps, recipe.sourceDuration);
+    ctx.save();
+    ctx.translate(base.drawW / 2, base.drawH / 2);
+    drawInCameraOverlays(ctx, recipe.moments, sourceTime, base.drawW, base.drawH);
+    ctx.restore();
+  }, [frame, fps, segments, recipe, base]);
+
+  if (!hasOverlayMoments(recipe.moments)) return null;
+  return (
+    <canvas
+      ref={ref}
+      width={Math.max(1, Math.round(base.drawW))}
+      height={Math.max(1, Math.round(base.drawH))}
+      style={{ position: "absolute", left: 0, top: 0, width: base.drawW, height: base.drawH }}
+    />
+  );
+}
+
+/**
+ * Phase-3 OUTPUT-anchored overlays (captions / hook text / text overlays /
+ * branding CTA / transition). A full-canvas `<canvas>` at the composition root
+ * (OUTSIDE the camera group) so overlays stay pinned to the frame. Reuses
+ * `drawOutputOverlays` verbatim.
+ */
+export function OutputOverlaysLayer({ recipe }: { recipe: RenderRecipe }): React.JSX.Element | null {
+  const frame = useCurrentFrame();
+  const { fps, durationInFrames } = useVideoConfig();
+  const ref = useRef<HTMLCanvasElement | null>(null);
+  const { canvasW, canvasH } = recipe;
+  const segments = useMemo(
+    () => buildOutputFrameSegments(buildTimelineMap(recipe.moments, recipe.sourceDuration), fps, durationInFrames),
+    [recipe, fps, durationInFrames]
+  );
+  useLayoutEffect(() => {
+    const cv = ref.current;
+    const ctx = cv?.getContext("2d");
+    if (!cv || !ctx) return;
+    ctx.clearRect(0, 0, cv.width, cv.height);
+    const sourceTime = sourceTimeForFrame(segments, frame, fps, recipe.sourceDuration);
+    drawOutputOverlays(ctx, recipe.moments, sourceTime, { canvasW, canvasH });
+  }, [frame, fps, segments, recipe, canvasW, canvasH]);
+
+  if (!hasOverlayMoments(recipe.moments)) return null;
+  return (
+    <canvas
+      ref={ref}
+      width={Math.max(1, Math.round(canvasW))}
+      height={Math.max(1, Math.round(canvasH))}
+      style={{ position: "absolute", left: 0, top: 0, width: canvasW, height: canvasH }}
     />
   );
 }

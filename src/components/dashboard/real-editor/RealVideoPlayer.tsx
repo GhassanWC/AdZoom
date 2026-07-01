@@ -44,6 +44,7 @@ import { probeVideoBottomBand } from "@/lib/recording/health-check";
 import { resolveSourceRect } from "@/lib/timeline/source-crop";
 import { CropEditorOverlay } from "./CropEditorOverlay";
 import { FocalPathOverlay } from "./FocalPathOverlay";
+import { PreviewInCameraOverlays, PreviewOutputOverlays } from "./PreviewOverlays";
 import type {
   BackgroundMode,
   DetectedMoment,
@@ -990,6 +991,17 @@ export function RealVideoPlayer() {
                     currentTime={currentTime}
                   />
                 )}
+
+                {/* Phase-3 IN-CAMERA overlay preview (callout / blur). Inside
+                    the camera-transform wrapper so the browser applies the SAME
+                    base-placement + zoom/pan transform the video gets — the
+                    canvas box then equals the export's `base` placement, so
+                    these track the content with no math here (WYSIWYG). */}
+                <PreviewInCameraOverlays
+                  videoRef={videoRef}
+                  moments={project.analysis?.detectedMoments ?? []}
+                  enabled={previewMode && !cropEditing}
+                />
               </div>
 
               {/* Source-space overlays — click highlights, focal path, crop
@@ -1041,6 +1053,16 @@ export function RealVideoPlayer() {
             </div>
           </div>
         </div>
+
+        {/* Phase-3 OUTPUT-anchored overlay preview (captions / hook / text /
+            CTA / transition). At the OUTPUT frame level — outside the placed
+            source + camera wrappers — so it stays pinned to the frame, matching
+            the export's post-camera draw. Same pure functions the export runs. */}
+        <PreviewOutputOverlays
+          videoRef={videoRef}
+          moments={project.analysis?.detectedMoments ?? []}
+          enabled={previewMode && !cropEditing}
+        />
 
         {/* Manual reposition surface — drag the whole video inside the canvas.
             Only in Manual fit mode; above the video, below the controls. */}

@@ -73,7 +73,10 @@ export function speedSectionsForChunk(
   project: ProjectDoc,
   zoomMoments: DetectedMoment[],
   cutMoments: DetectedMoment[],
-  primaryEnd: number
+  primaryEnd: number,
+  /** Recipe intensity (0..1). 0.5 = baseline (unchanged). Higher = speeds more +
+   *  shorter boring runs; lower = fewer, longer-only. */
+  intensity = 0.5
 ): { sections: DetectedMoment[]; diag: SpeedDiagnostics } {
   void project;
   const reasons: Record<string, number> = {};
@@ -81,6 +84,15 @@ export function speedSectionsForChunk(
     reasons[r] = (reasons[r] ?? 0) + 1;
   };
   const sections: DetectedMoment[] = [];
+
+  // Scale the boring-detection thresholds + min length by intensity. At 0.5 the
+  // multipliers are exactly 1.0 → baseline behavior is unchanged.
+  const it = clamp01(intensity);
+  const sens = 0.6 + 0.8 * it;
+  const minSpeedS = MIN_SPEED_S * (1.4 - 0.8 * it);
+  const maxMotion = MAX_MOTION * sens;
+  const maxDelta = MAX_DELTA * sens;
+  const maxAttention = MAX_ATTENTION * sens;
 
   const n = va.motion?.length ?? 0;
   const rate = va.sampleRate || 1;
@@ -118,7 +130,7 @@ export function speedSectionsForChunk(
     const de = dequantize(va.delta[i] ?? 0);
     const at = attn[i] ?? 0;
     const den = dequantize(va.density[i] ?? 0);
-    if (mo >= MAX_MOTION || at >= MAX_ATTENTION || de >= MAX_DELTA) return false;
+    if (mo >= maxMotion || at >= maxAttention || de >= maxDelta) return false;
     // Reading guard: dense text with real frame delta isn't boring.
     if (den >= TEXT_DENSITY && de >= IDLE_DELTA) return false;
     return true;
@@ -141,7 +153,7 @@ export function speedSectionsForChunk(
     const absStart = window.startTime + i * bucket;
     const absEnd = Math.min(window.startTime + j * bucket, primaryEnd);
     const dur = absEnd - absStart;
-    if (dur >= MIN_SPEED_S) {
+    if (dur >= minSpeedS) {
       const meanDelta = runLen ? sumDelta / runLen : 0;
       const idle = meanDelta < IDLE_DELTA * 1.5;
       const multiplier = idle || dur >= 5 ? 2 : 1.5; // capped ≤ 2× for auto

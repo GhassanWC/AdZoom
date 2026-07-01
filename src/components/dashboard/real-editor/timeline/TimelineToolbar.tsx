@@ -18,6 +18,13 @@ import {
   MousePointer2,
   Target,
   FastForward,
+  Type,
+  Sparkles,
+  Megaphone,
+  EyeOff,
+  BadgeCheck,
+  Captions,
+  Shuffle,
   type LucideIcon,
 } from "lucide-react";
 import { cn } from "@/lib/cn";
@@ -245,12 +252,23 @@ function IconBtn({ Icon, label, tip, onClick, disabled, danger, bare }: IconBtnP
   );
 }
 
-const ADD_EFFECTS: { id: EffectType; label: string; Icon: LucideIcon; hint: string }[] = [
-  { id: "zoom", label: "Zoom", Icon: Zap, hint: "Cinematic zoom into a region" },
-  { id: "cursor-focus", label: "Focus", Icon: MousePointer2, hint: "Soft focus / cursor follow" },
-  { id: "click-highlight", label: "Click", Icon: Target, hint: "Click highlight" },
-  { id: "cut", label: "Cut", Icon: Scissors, hint: "Mark a dead section to remove" },
-  { id: "speed-up", label: "Speed", Icon: FastForward, hint: "Speed up a slow stretch" },
+type AddEffectSpec = { id: EffectType; label: string; Icon: LucideIcon; hint: string; group: "edit" | "overlay" };
+const ADD_EFFECTS: AddEffectSpec[] = [
+  { id: "zoom", label: "Zoom", Icon: Zap, hint: "Cinematic zoom into a region", group: "edit" },
+  { id: "cursor-focus", label: "Focus", Icon: MousePointer2, hint: "Soft focus / cursor follow", group: "edit" },
+  { id: "click-highlight", label: "Click", Icon: Target, hint: "Click highlight", group: "edit" },
+  { id: "cut", label: "Cut", Icon: Scissors, hint: "Mark a dead section to remove", group: "edit" },
+  { id: "speed-up", label: "Speed", Icon: FastForward, hint: "Speed up a slow stretch", group: "edit" },
+  // Phase-3 overlays — manually addable text / annotation / redaction edits.
+  { id: "text-overlay", label: "Text overlay", Icon: Type, hint: "Positioned text label", group: "overlay" },
+  { id: "hook-text", label: "Hook text", Icon: Sparkles, hint: "Big attention line", group: "overlay" },
+  { id: "captions", label: "Caption", Icon: Captions, hint: "A subtitle line you type", group: "overlay" },
+  { id: "callout", label: "Callout", Icon: Megaphone, hint: "Point at part of the frame", group: "overlay" },
+  { id: "blur-redaction", label: "Blur", Icon: EyeOff, hint: "Hide a sensitive region", group: "overlay" },
+  { id: "branding-cta", label: "CTA", Icon: BadgeCheck, hint: "End-card call to action", group: "overlay" },
+  { id: "transition", label: "Transition", Icon: Shuffle, hint: "Quick fade between scenes", group: "overlay" },
+  // NB: smart-crop is applied via the Canvas tool (output framing), not a
+  // playhead moment, so it's intentionally not offered here.
 ];
 
 function AddMenu({ onAdd }: { onAdd: (e: EffectType) => void }) {
@@ -280,25 +298,31 @@ function AddMenu({ onAdd }: { onAdd: (e: EffectType) => void }) {
         <ChevronDown size={11} className="opacity-70" />
       </button>
       {open && (
-        <div className="absolute left-0 top-10 z-40 w-52 overflow-hidden rounded-xl border border-white/10 bg-ink/95 p-1 shadow-cinematic backdrop-blur-xl">
-          {ADD_EFFECTS.map(({ id, label, Icon, hint }) => (
-            <button
-              key={id}
-              type="button"
-              onClick={() => {
-                onAdd(id);
-                setOpen(false);
-              }}
-              className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors duration-150 hover:bg-white/[0.06]"
-            >
-              <span className="inline-flex size-7 shrink-0 items-center justify-center rounded-md bg-white/[0.05] text-violet-200 ring-1 ring-white/10">
-                <Icon size={13} />
-              </span>
-              <span className="min-w-0">
-                <span className="block text-[12px] font-medium text-white">{label}</span>
-                <span className="block truncate text-[10.5px] text-fog">{hint}</span>
-              </span>
-            </button>
+        <div className="absolute left-0 top-10 z-40 max-h-[70vh] w-52 overflow-y-auto rounded-xl border border-white/10 bg-ink/95 p-1 shadow-cinematic backdrop-blur-xl">
+          {ADD_EFFECTS.map(({ id, label, Icon, hint, group }, i) => (
+            <React.Fragment key={id}>
+              {group === "overlay" && ADD_EFFECTS[i - 1]?.group === "edit" && (
+                <div className="mx-2 my-1 border-t border-white/[0.07] pt-1 text-[9.5px] font-semibold uppercase tracking-[0.14em] text-fog/70">
+                  Overlays
+                </div>
+              )}
+              <button
+                type="button"
+                onClick={() => {
+                  onAdd(id);
+                  setOpen(false);
+                }}
+                className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors duration-150 hover:bg-white/[0.06]"
+              >
+                <span className="inline-flex size-7 shrink-0 items-center justify-center rounded-md bg-white/[0.05] text-violet-200 ring-1 ring-white/10">
+                  <Icon size={13} />
+                </span>
+                <span className="min-w-0">
+                  <span className="block text-[12px] font-medium text-white">{label}</span>
+                  <span className="block truncate text-[10.5px] text-fog">{hint}</span>
+                </span>
+              </button>
+            </React.Fragment>
           ))}
         </div>
       )}

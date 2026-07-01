@@ -9,7 +9,13 @@ import { useMemo } from "react";
 import { AbsoluteFill } from "remotion";
 import { buildRenderRecipe } from "@/lib/render/recipe";
 import { VideoLayer } from "./layers/VideoLayer";
-import { Background, Vignette, ClickHighlightOverlay } from "./layers/EffectsLayer";
+import {
+  Background,
+  Vignette,
+  ClickHighlightOverlay,
+  InCameraOverlaysLayer,
+  OutputOverlaysLayer,
+} from "./layers/EffectsLayer";
 import type { FramevoCompositionProps } from "./types";
 
 export function FramevoComposition({
@@ -27,8 +33,15 @@ export function FramevoComposition({
       <Background recipe={compiled} />
       <VideoLayer recipe={compiled} src={src} audioMode={audioMode}>
         <ClickHighlightOverlay recipe={compiled} />
+        {/* In-camera Phase-3 overlays (callout / blur) — inside the camera group
+            so they track the zoom, matching composeFrame's applyCameraFrame. */}
+        <InCameraOverlaysLayer recipe={compiled} />
       </VideoLayer>
       {compiled.effects.vignette && <Vignette recipe={compiled} />}
+      {/* Output-anchored Phase-3 overlays (captions / hook / text / CTA /
+          transition) — outside the camera, after the vignette, matching
+          composeFrame's ordering. */}
+      <OutputOverlaysLayer recipe={compiled} />
     </AbsoluteFill>
   );
 }

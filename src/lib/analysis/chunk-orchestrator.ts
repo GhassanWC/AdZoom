@@ -13,8 +13,15 @@ import type {
   AnalysisJob,
   DetectedMoment,
   ProjectDoc,
+  SelectedVideoType,
   VisualAnalysis,
 } from "../firebase/schema";
+import {
+  resolveEditRecipe,
+  editGenerationControls,
+  disablesAllImplementedEdits,
+  type CategoryControl,
+} from "./edit-recipe";
 import type { Interaction } from "../recording/types";
 import { momentsFromEvents } from "../attention/events";
 import { CvTaintedError } from "../cv/types";
@@ -111,9 +118,65 @@ export async function runChunkedAnalysis(args: ChunkedRunArgs): Promise<void> {
   const existingAiLayers = aiLayersPresent(
     carryOver.length ? carryOver : project.analysis?.detectedMoments ?? []
   );
-  const runCamera = shouldRunLayer("camera", options, existingAiLayers);
-  const runCut = shouldRunLayer("cut", options, existingAiLayers);
-  const runSpeed = shouldRunLayer("speed", options, existingAiLayers);
+
+  // ── Edit Recipe Engine → real generation controls ─────────────────────────
+  // Resolve the recipe for the selected type (missing → "auto"), reduce it to
+  // gate + intensity knobs for the IMPLEMENTED engines, and FOLD its gating into
+  // the engine options so both the per-chunk engines below AND the server
+  // finalize (via shouldRunLayer) honor it. A missing plan → baseline controls
+  // (old behavior). Never lets the recipe disable EVERY edit (fallback → cuts).
+  const selectedVideoType: SelectedVideoType = options.selectedVideoType ?? "auto";
+  const recipePlan = resolveEditRecipe({
+    selectedVideoType,
+    signals: {
+      hasTranscript: false, // no transcript pipeline yet → captions stay planned
+      hasAudioAnalysis: false,
+      hasSceneData: true, // CV produces scene changes
+      hasVisualMoments: true, // CV produces zoom/callout targets
+      hasInteractionData:
+        project.interactionScope === "tab" || (interactions?.length ?? 0) > 0,
+      isScreenRecording:
+        selectedVideoType === "screen-recording" || project.interactionScope === "tab",
+      durationSeconds: project.duration ?? undefined,
+    },
+  });
+  let controls = editGenerationControls(recipePlan);
+  let recipeFallback = false;
+  if (disablesAllImplementedEdits(controls)) {
+    // Fallback protection — never produce an empty timeline: keep safe cuts.
+    recipeFallback = true;
+    controls = {
+      ...controls,
+      cut: {
+        enabled: true,
+        intensity: 0.5,
+        reason: "fallback: recipe disabled all edits — keeping safe cuts",
+      },
+    };
+  }
+  const recipeOptions: AnalysisOptions = {
+    ...options,
+    generateCameraEdits: options.generateCameraEdits && controls.zoom.enabled,
+    generateCut: options.generateCut && controls.cut.enabled,
+    generateSpeed: options.generateSpeed && controls.speed.enabled,
+  };
+
+  const runCamera = shouldRunLayer("camera", recipeOptions, existingAiLayers);
+  const runCut = shouldRunLayer("cut", recipeOptions, existingAiLayers);
+  const runSpeed = shouldRunLayer("speed", recipeOptions, existingAiLayers);
+  const skippedPlanned = recipePlan.operations.filter((o) => o.planned).map((o) => o.category);
+  console.info("[edit-recipe:generation]", {
+    projectId: project.id,
+    requestedVideoType: controls.requestedVideoType,
+    effectiveVideoType: controls.effectiveVideoType,
+    recipe: controls.recipeName,
+    fromRecipe: controls.fromRecipe,
+    cut: { enabled: runCut, intensity: controls.cut.intensity, reason: controls.cut.reason },
+    zoom: { enabled: runCamera, intensity: controls.zoom.intensity, reason: controls.zoom.reason },
+    speed: { enabled: runSpeed, intensity: controls.speed.intensity, reason: controls.speed.reason },
+    skippedPlanned,
+    fallback: recipeFallback,
+  });
   const { db } = getFirebase();
   const pid = project.id;
   const projectRef = doc(db, "users", uid, "projects", pid);
@@ -252,7 +315,9 @@ export async function runChunkedAnalysis(args: ChunkedRunArgs): Promise<void> {
             status: "analyzing",
             stage: "Analyzing in chunks",
             detectedMoments: stripUndefined(carryOver),
-            lastRunOptions: options,
+            // Recipe-gated options so the finalize pass + timeline labels reflect
+            // which layers the recipe actually enabled for this run.
+            lastRunOptions: recipeOptions,
             startedAt: Date.now(),
             cancelRequested: false,
             errorKind: null,
@@ -371,17 +436,27 @@ export async function runChunkedAnalysis(args: ChunkedRunArgs): Promise<void> {
         // Order matters: camera → cut → speed. Cut claims the deadest ranges and
         // is fed to speed so a range is never both cut AND sped. Both cut and
         // speed carve protective buffers around the camera edits.
+        // Recipe intensity tunes each engine (0.5 = baseline). Zoom density is
+        // tuned in deterministicChunkMoments; cut/speed pass intensity through.
         const zoom = runCamera
-          ? deterministicChunkMoments(w, va, interactions, project)
+          ? deterministicChunkMoments(w, va, interactions, project, controls.zoom.intensity)
           : [];
         const primaryEnd = w.primaryEnd;
         const cutRes = runCut
-          ? cutSectionsForChunk(va, w, project, zoom, primaryEnd)
+          ? cutSectionsForChunk(va, w, project, zoom, primaryEnd, controls.cut.intensity)
           : { sections: [] as DetectedMoment[], diag: undefined };
         const speedRes = runSpeed
-          ? speedSectionsForChunk(va, w, project, zoom, cutRes.sections, primaryEnd)
+          ? speedSectionsForChunk(va, w, project, zoom, cutRes.sections, primaryEnd, controls.speed.intensity)
           : { sections: [] as DetectedMoment[], diag: undefined };
-        const moments = [...zoom, ...cutRes.sections, ...speedRes.sections];
+        // Stamp recipe provenance (additive — keeps existing source/provenance)
+        // so every generated edit explains which recipe + category produced it.
+        const moments = controls.fromRecipe
+          ? [
+              ...stampRecipe(zoom, "zoom", controls.effectiveVideoType, controls.zoom),
+              ...stampRecipe(cutRes.sections, "cut", controls.effectiveVideoType, controls.cut),
+              ...stampRecipe(speedRes.sections, "speed", controls.effectiveVideoType, controls.speed),
+            ]
+          : [...zoom, ...cutRes.sections, ...speedRes.sections];
         if (process.env.NODE_ENV !== "production") {
           const cell = (run: boolean, n: number) => (run ? String(n) : "skipped");
           console.info(
@@ -557,7 +632,8 @@ export async function runChunkedAnalysis(args: ChunkedRunArgs): Promise<void> {
       await finalizeWithAi(project.id, idTokenGetter, {
         chunkCount: windows.length,
         progressiveCount: counters.momentsSoFar,
-        options,
+        // Recipe-gated so the server's gap-fill can't re-add a recipe-disabled layer.
+        options: recipeOptions,
       });
     } catch (finalizeErr) {
       if (counters.momentsSoFar <= 0) throw finalizeErr;
@@ -621,7 +697,10 @@ function deterministicChunkMoments(
   w: ChunkWindow,
   windowVa: VisualAnalysis,
   interactions: Interaction[] | null,
-  project: ProjectDoc
+  project: ProjectDoc,
+  /** Recipe zoom intensity (0..1). 0.5 = baseline spacing. Higher → denser
+   *  (more punch-in zooms); lower → sparser (subtler). */
+  zoomIntensity = 0.5
 ): DetectedMoment[] {
   const duration = project.duration ?? 0;
   // Ownership: only emit moments inside this chunk's PRIMARY span so the 2s
@@ -660,7 +739,11 @@ function deterministicChunkMoments(
     .filter((m) => m.startTime < primaryEnd)
     .sort((a, b) => a.startTime - b.startTime);
 
-  return thinBySpacing(all, 1.0);
+  // Zoom density from recipe intensity: baseline 1.0s spacing at 0.5; denser
+  // (down to ~0.4s) at high intensity, sparser (up to ~1.6s) at low.
+  const i = zoomIntensity < 0 ? 0 : zoomIntensity > 1 ? 1 : zoomIntensity;
+  const spacing = 1.6 - 1.2 * i;
+  return thinBySpacing(all, spacing);
 }
 
 /** Drop moments that start within `minGap`s of an already-kept (higher-attention) one. */
@@ -671,6 +754,25 @@ function thinBySpacing(moments: DetectedMoment[], minGap: number): DetectedMomen
     if (!tooClose) kept.push(m);
   }
   return kept;
+}
+
+/** Stamp recipe provenance on generated moments (additive — keeps `source`/`provenance`). */
+function stampRecipe(
+  moments: DetectedMoment[],
+  category: "cut" | "zoom" | "speed",
+  recipeType: string,
+  control: CategoryControl
+): DetectedMoment[] {
+  return moments.map((m) => ({
+    ...m,
+    recipe: {
+      source: "recipe" as const,
+      recipeType,
+      category,
+      reason: control.reason,
+      intensity: control.intensity,
+    },
+  }));
 }
 
 function eventTime(e: Interaction): number {

@@ -29,6 +29,7 @@
 import { resolveCameraFrame, canvasTranslateFor } from "@/lib/timeline/camera";
 import { coverFitDims } from "@/lib/timeline/cover";
 import { drawClickHighlight } from "@/lib/timeline/click-highlight";
+import { drawInCameraOverlays, drawOutputOverlays } from "./overlay-draw";
 import type { BackgroundMode } from "@/lib/firebase/schema";
 import type { RenderRecipe } from "./recipe";
 
@@ -45,7 +46,7 @@ export function composeFrame(
   recipe: RenderRecipe,
   sourceTime: number
 ): void {
-  const { canvasW, canvasH, bgActive, bgMode, backgroundColor, sourceRect, effects, applyWatermark, debugBorders } = recipe;
+  const { canvasW, canvasH, bgActive, bgMode, backgroundColor, sourceRect, effects, moments, applyWatermark, debugBorders } = recipe;
 
   ctx.fillStyle = "#000";
   ctx.fillRect(0, 0, canvasW, canvasH);
@@ -75,6 +76,12 @@ export function composeFrame(
   // Vignette + watermark sit OUTSIDE the camera transform so they stay anchored
   // to the output frame (not zooming with the video).
   if (effects.vignette) drawVignette(ctx, canvasW, canvasH);
+
+  // Phase-3 output-anchored overlays (captions / hook text / text overlays /
+  // branding CTA / transition). Drawn AFTER the vignette so text stays crisp,
+  // BEFORE the watermark so the brand mark stays topmost.
+  drawOutputOverlays(ctx, moments, sourceTime, { canvasW, canvasH });
+
   if (applyWatermark) drawWatermark(ctx, canvasW, canvasH);
 }
 
@@ -148,6 +155,11 @@ function applyCameraFrame(
       canvasW
     );
   }
+
+  // Phase-3 in-camera overlays (callout / blur-redaction) — drawn INSIDE the
+  // camera transform (origin = placement centre, same convention as the click
+  // highlight) so they track the video content as it zooms/pans.
+  drawInCameraOverlays(ctx, moments, t, base.drawW, base.drawH);
 
   ctx.restore();
 }

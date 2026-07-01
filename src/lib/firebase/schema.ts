@@ -2,6 +2,9 @@
 
 import type { CaptureDimensions } from "@/lib/recording/scope-detect";
 import type { SourceCrop } from "@/lib/recording/types";
+// Type-only (erased at runtime → no import cycle): the edit-recipe plan the
+// analysis pipeline records for a project.
+import type { EditRecipePlan } from "@/lib/analysis/edit-recipe";
 
 export type { SourceCrop };
 
@@ -52,7 +55,59 @@ export type EffectType =
   | "cursor-focus"
   | "speed-up"
   | "cut"
-  | "crop";
+  | "crop"
+  // ── Phase 3: Core AI Edit Pack (visible overlay + framing edits) ──
+  // Additive: older docs never carry these, and every consumer switches on
+  // `effectType` + reads an OPTIONAL settings bag, so unknown/absent types
+  // decode + ignore safely. See OVERLAY_EFFECT_TYPES for the overlay subset.
+  | "captions"
+  | "hook-text"
+  | "text-overlay"
+  | "smart-crop"
+  | "callout"
+  | "blur-redaction"
+  | "transition"
+  | "branding-cta";
+
+/**
+ * The Phase-3 edit types that render as OVERLAYS / framing on top of the video
+ * (as opposed to camera moments or timing edits). They never participate in
+ * camera selection (`pickActiveMoment` skips them) or the cut/speed timeline
+ * map — they layer additively at draw time, so several can be active at once.
+ * `smart-crop` is listed for classification but is applied via the output
+ * canvas (aspect/framing), not a per-frame overlay draw.
+ */
+export const OVERLAY_EFFECT_TYPES = [
+  "captions",
+  "hook-text",
+  "text-overlay",
+  "callout",
+  "blur-redaction",
+  "transition",
+  "branding-cta",
+] as const;
+
+/** Overlay types drawn OUTSIDE the camera transform (anchored to the output frame). */
+export const OUTPUT_ANCHORED_OVERLAY_TYPES = [
+  "captions",
+  "hook-text",
+  "text-overlay",
+  "branding-cta",
+  "transition",
+] as const;
+
+/** Overlay types drawn INSIDE the camera transform (track the video content). */
+export const IN_CAMERA_OVERLAY_TYPES = ["callout", "blur-redaction"] as const;
+
+const OVERLAY_EFFECT_TYPE_SET: ReadonlySet<string> = new Set([
+  ...OVERLAY_EFFECT_TYPES,
+  "smart-crop",
+]);
+
+/** True when the effectType is a Phase-3 overlay/framing edit (not camera/timing). */
+export function isOverlayEffectType(t: EffectType | undefined): boolean {
+  return t !== undefined && OVERLAY_EFFECT_TYPE_SET.has(t);
+}
 
 // ── Manual Crop/Reframe + Speed settings (additive) ─────────────────────────
 // Crop/Reframe and Speed are manual timeline effects. They extend
@@ -100,6 +155,112 @@ export interface SpeedSettings {
 export interface CutSettings {
   /** True = the range is cut (removed). False = restored (kept). */
   active: boolean;
+}
+
+// ── Phase 3: Core AI Edit Pack settings (additive, one bag per effectType) ──
+// Every bag is OPTIONAL on `DetectedMoment` and present only for its matching
+// `effectType`, mirroring the crop/speed/cut pattern — old docs decode unchanged.
+
+export type OverlayTextPreset = "clean" | "bold_social" | "minimal" | "podcast" | "tutorial";
+export type CaptionPosition = "bottom" | "center" | "top" | "custom";
+/** 9-grid anchor for free text overlays (+ custom via focusRegion). */
+export type TextOverlayPosition =
+  | "top-left" | "top-center" | "top-right"
+  | "middle-left" | "center" | "middle-right"
+  | "bottom-left" | "bottom-center" | "bottom-right"
+  | "custom";
+export type TextAlignment = "left" | "center" | "right";
+export type TextBackgroundStyle = "none" | "pill" | "box" | "shadow";
+export type OverlayAnimation = "none" | "fade" | "pop" | "slide";
+export type OverlaySize = "small" | "medium" | "large";
+export type HookTextPreset = "bold" | "minimal" | "neon" | "shadow";
+export type HookPosition = "top" | "center" | "bottom";
+export type CalloutStyle = "arrow" | "box" | "spotlight" | "underline" | "circle";
+export type BlurReasonType = "sensitive_info" | "face" | "manual" | "ai_detected";
+export type TransitionStyle = "fade" | "zoom" | "swipe" | "flash" | "smooth_cut";
+export type SmartCropAspect = "original" | "16:9" | "9:16" | "1:1";
+export type SmartCropFocus = "center" | "face" | "motion" | "screen_action" | "manual";
+export type BrandingPosition = "bottom-left" | "bottom-right" | "bottom-center" | "custom";
+export type BrandingPreset = "minimal" | "creator" | "business" | "social";
+
+/** One word of a caption line, with SOURCE-time bounds (seconds). */
+export interface CaptionWord {
+  text: string;
+  start: number;
+  end: number;
+}
+
+/** effectType "captions" — a burned-in caption line over [startTime, endTime]. */
+export interface CaptionSettings {
+  text: string;
+  /** Word-level timing for karaoke highlight (only when a real transcript exists). */
+  words?: CaptionWord[];
+  stylePreset: OverlayTextPreset;
+  position: CaptionPosition;
+  /** Indices into `words` to emphasize (highlight). */
+  highlightedWords?: number[];
+}
+
+/** effectType "hook-text" — a bold attention line, usually in the first seconds. */
+export interface HookTextSettings {
+  text: string;
+  stylePreset: HookTextPreset;
+  position: HookPosition;
+  animation: OverlayAnimation;
+}
+
+/** effectType "text-overlay" — a positioned text label / lower-third. */
+export interface TextOverlaySettings {
+  text: string;
+  position: TextOverlayPosition;
+  size: OverlaySize;
+  alignment: TextAlignment;
+  backgroundStyle: TextBackgroundStyle;
+  animation: OverlayAnimation;
+}
+
+/** effectType "callout" — an annotation pointing at `focusRegion` (the target). */
+export interface CalloutSettings {
+  text: string;
+  style: CalloutStyle;
+}
+
+/** Default blur strength for a new redaction (shared by manual-add + inspector). */
+export const DEFAULT_BLUR_STRENGTH = 0.85;
+
+/** effectType "blur-redaction" — a blur/pixelate over `focusRegion`. */
+export interface BlurRedactionSettings {
+  /** 0..1 — mapped to a blur radius at draw time. */
+  blurStrength: number;
+  reasonType: BlurReasonType;
+}
+
+/**
+ * effectType "transition" — a punctuation transition over [startTime, endTime]
+ * (its `atTime` is the window centre). Rendered as a luminance dip (fade/flash)
+ * — a per-frame-safe, export-parity approximation of geometric wipes.
+ */
+export interface TransitionSettings {
+  style: TransitionStyle;
+}
+
+/**
+ * effectType "smart-crop" — a reframe to a target aspect + focus. Applied via
+ * the project's output canvas (aspect/fit), NOT a per-frame overlay; the moment
+ * is the timeline record of that decision. `focusTarget: "manual"` uses
+ * `focusRegion`; `keyframes` can animate the reframe (future).
+ */
+export interface SmartCropSettings {
+  aspectRatio: SmartCropAspect;
+  focusTarget: SmartCropFocus;
+}
+
+/** effectType "branding-cta" — an end-card CTA (+ optional logo asset). */
+export interface BrandingCtaSettings {
+  ctaText: string;
+  logoAssetId?: string;
+  position: BrandingPosition;
+  stylePreset: BrandingPreset;
 }
 
 export type UIContext =
@@ -314,6 +475,25 @@ export interface DetectedMoment {
    */
   cut?: CutSettings;
 
+  // ── Phase 3: Core AI Edit Pack — one optional bag per new effectType ──
+  // Additive: present only for the matching effectType; absent on all older docs.
+  /** Present when `effectType === "captions"`. */
+  captions?: CaptionSettings;
+  /** Present when `effectType === "hook-text"`. */
+  hookText?: HookTextSettings;
+  /** Present when `effectType === "text-overlay"`. */
+  textOverlay?: TextOverlaySettings;
+  /** Present when `effectType === "smart-crop"`. Reframe box lives in `focusRegion`. */
+  smartCrop?: SmartCropSettings;
+  /** Present when `effectType === "callout"`. Target lives in `focusRegion`. */
+  callout?: CalloutSettings;
+  /** Present when `effectType === "blur-redaction"`. Region lives in `focusRegion`. */
+  blurRedaction?: BlurRedactionSettings;
+  /** Present when `effectType === "transition"`. */
+  transition?: TransitionSettings;
+  /** Present when `effectType === "branding-cta"`. */
+  brandingCta?: BrandingCtaSettings;
+
   // ── Attention-aware fields (Gemini-supplied, post-processed by balancer) ──
   /** Composite priority (0..1) — replaces importance going forward. */
   attentionScore?: number;
@@ -335,6 +515,22 @@ export interface DetectedMoment {
    * readers should fall back to `source` and treat as "ai".
    */
   provenance?: MomentProvenance;
+  /**
+   * Edit-recipe provenance — set (additively; never replaces `source`/`provenance`)
+   * when the AI Edit Recipe Engine drove this edit's generation. Explains which
+   * recipe + category caused it and why. See src/lib/analysis/edit-recipe.ts.
+   */
+  recipe?: {
+    source: "recipe";
+    /** The effective recipe (video type) that produced this edit. */
+    recipeType: string;
+    /** The edit-operation category (cut | zoom | speed). */
+    category: string;
+    /** Why this edit fits the recipe. */
+    reason: string;
+    /** Recipe intensity applied to this category (0..1). */
+    intensity?: number;
+  };
   /** Back-pointer to raw `Interaction.id`(s) that fed this moment. */
   eventIds?: string[];
   /** Composite confidence in this moment (0..1). Events ~0.9+, CV ~0.5-0.8, AI ~0.3-0.6. */
@@ -574,6 +770,13 @@ export interface Analysis {
   recommendedPresetIds?: string[];
   /** AI-classified video type — drives default pacing / effect biasing. */
   videoType?: VideoType;
+  /**
+   * The structured edit-recipe plan chosen for this analysis (which edit
+   * operations are enabled/disabled for the video type + available signals, and
+   * why). Recorded for observability + future edit executors; does NOT change
+   * the current zoom/cut/speed timeline. See src/lib/analysis/edit-recipe.ts.
+   */
+  editRecipe?: EditRecipePlan;
   /** AI-segmented narrative structure (intro / action / result / etc). */
   narrativeStructure?: NarrativeSegment[];
   /**

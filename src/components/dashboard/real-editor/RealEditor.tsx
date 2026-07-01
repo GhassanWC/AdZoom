@@ -26,6 +26,7 @@ import { ExportModal } from "./ExportModal";
 import { CanvasModal } from "./CanvasModal";
 import { AnalysisOptionsModal } from "./AnalysisOptionsModal";
 import { VideoTypePicker } from "./VideoTypePicker";
+import { RecipeSummary } from "./RecipeSummary";
 import { DEFAULT_ANALYSIS_OPTIONS } from "@/lib/analysis/engine-layers";
 import type { SelectedVideoType } from "@/lib/firebase/schema";
 import { useWorkspaceSettings } from "@/lib/firebase/workspace-settings";
@@ -242,6 +243,13 @@ function Body() {
                 </span>
               )}
             </div>
+          )}
+
+          {project.analysis?.editRecipe && (
+            <RecipeSummary
+              recipe={project.analysis.editRecipe}
+              moments={project.analysis.detectedMoments ?? []}
+            />
           )}
         </div>
       </header>

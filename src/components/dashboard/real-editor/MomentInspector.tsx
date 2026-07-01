@@ -17,6 +17,13 @@ import {
   MoreHorizontal,
   Copy,
   Scissors,
+  Captions as CaptionsIcon,
+  Type as TypeIcon,
+  Frame as FrameIcon,
+  Megaphone,
+  EyeOff,
+  Shuffle,
+  BadgeCheck,
 } from "lucide-react";
 import { useEditorReal } from "./context";
 import { DirectionalPresetRow } from "./DirectionalPresetRow";
@@ -42,7 +49,24 @@ import type {
   MomentProvenance,
   SpeedAudioMode,
   SpeedSettings,
+  CaptionPosition,
+  OverlayTextPreset,
+  HookTextPreset,
+  HookPosition,
+  TextOverlayPosition,
+  OverlaySize,
+  TextAlignment,
+  TextBackgroundStyle,
+  OverlayAnimation,
+  CalloutStyle,
+  BlurReasonType,
+  TransitionStyle,
+  SmartCropAspect,
+  SmartCropFocus,
+  BrandingPosition,
+  BrandingPreset,
 } from "@/lib/firebase/schema";
+import { isOverlayEffectType, DEFAULT_BLUR_STRENGTH } from "@/lib/firebase/schema";
 
 /**
  * Moment inspector — premium creative-tool layout.
@@ -127,6 +151,15 @@ const EFFECTS: EffectSpec[] = [
   { id: "cut", label: "Cut", Icon: Scissors, accent: "text-rose-300" },
   { id: "crop", label: "Crop", Icon: Crop, accent: "text-teal-300" },
   { id: "speed-up", label: "Speed", Icon: FastForward, accent: "text-amber-300" },
+  // Phase 3 — Core AI Edit Pack.
+  { id: "captions", label: "Captions", Icon: CaptionsIcon, accent: "text-sky-300" },
+  { id: "hook-text", label: "Hook", Icon: Sparkles, accent: "text-pink-300" },
+  { id: "text-overlay", label: "Text", Icon: TypeIcon, accent: "text-blue-300" },
+  { id: "smart-crop", label: "Smart Crop", Icon: FrameIcon, accent: "text-emerald-300" },
+  { id: "callout", label: "Callout", Icon: Megaphone, accent: "text-orange-300" },
+  { id: "blur-redaction", label: "Blur", Icon: EyeOff, accent: "text-slate-300" },
+  { id: "transition", label: "Transition", Icon: Shuffle, accent: "text-purple-300" },
+  { id: "branding-cta", label: "CTA", Icon: BadgeCheck, accent: "text-lime-300" },
 ];
 
 const EFFECT_BY_ID: Record<EffectType, EffectSpec> = Object.fromEntries(
@@ -146,6 +179,14 @@ const EFFECT_FULL_NAME: Record<EffectType, string> = {
   cut: "Cut",
   crop: "Crop / Reframe",
   "speed-up": "Speed",
+  captions: "Captions",
+  "hook-text": "Hook Text",
+  "text-overlay": "Text Overlay",
+  "smart-crop": "Smart Crop",
+  callout: "Callout",
+  "blur-redaction": "Blur / Redaction",
+  transition: "Transition",
+  "branding-cta": "Branding / CTA",
 };
 
 /**
@@ -165,6 +206,15 @@ const ADVANCED_RELEVANCE: Record<
   "speed-up": { keyframes: false, cursor: false },
   cut: { keyframes: false, cursor: false },
   crop: { keyframes: false, cursor: false },
+  // Overlays with a spatial target expose the region editor (cursor:true).
+  captions: { keyframes: false, cursor: false },
+  "hook-text": { keyframes: false, cursor: false },
+  "text-overlay": { keyframes: false, cursor: false },
+  "smart-crop": { keyframes: false, cursor: true },
+  callout: { keyframes: false, cursor: true },
+  "blur-redaction": { keyframes: false, cursor: true },
+  transition: { keyframes: false, cursor: false },
+  "branding-cta": { keyframes: false, cursor: false },
 };
 
 export function MomentInspector() {
@@ -209,9 +259,10 @@ export function MomentInspector() {
   const isCrop = moment.effectType === "crop";
   const isSpeed = moment.effectType === "speed-up";
   const isCut = moment.effectType === "cut";
-  // Crop frames a box; speed only retimes; cut removes a range — none use the
-  // zoom-intensity slider (they have their own controls below).
-  const showIntensity = !isCrop && !isSpeed && !isCut;
+  const isOverlay = isOverlayEffectType(moment.effectType);
+  // Crop frames a box; speed only retimes; cut removes a range; overlays have
+  // their own controls — none use the zoom-intensity slider.
+  const showIntensity = !isCrop && !isSpeed && !isCut && !isOverlay;
   const momentDuration = moment.endTime - moment.startTime;
 
   // Switching effect type seeds the matching settings so the new controls have
@@ -252,7 +303,7 @@ export function MomentInspector() {
             click). Crop + Speed have their own tracks/tools, so the dialog
             shows their settings directly instead of a 5-tab row that overflows. */}
         <section className="space-y-3">
-          {!isCrop && !isSpeed && !isCut && (
+          {!isCrop && !isSpeed && !isCut && !isOverlay && (
             <SegmentedEffect value={moment.effectType} onChange={onEffectChange} />
           )}
           {showCameraPresets && (
@@ -296,6 +347,15 @@ export function MomentInspector() {
         {/* Cut controls — only for cut moments. */}
         {isCut && (
           <CutControls
+            moment={moment}
+            onUpdate={(patch) => updateMoment(moment.id, patch)}
+          />
+        )}
+
+        {/* Phase-3 overlay controls — captions / hook / text / callout / blur /
+            transition / branding / smart-crop. */}
+        {isOverlay && (
+          <OverlayControls
             moment={moment}
             onUpdate={(patch) => updateMoment(moment.id, patch)}
           />
@@ -1101,6 +1161,298 @@ function CutControls({
       </p>
     </section>
   );
+}
+
+// ─── Phase-3 overlay controls ──────────────────────────────────────────────
+
+const CAPTION_STYLE_OPTS: { id: OverlayTextPreset; label: string }[] = [
+  { id: "clean", label: "Clean" },
+  { id: "bold_social", label: "Bold" },
+  { id: "minimal", label: "Minimal" },
+  { id: "podcast", label: "Podcast" },
+  { id: "tutorial", label: "Tutorial" },
+];
+const CAPTION_POS_OPTS: { id: CaptionPosition; label: string }[] = [
+  { id: "bottom", label: "Bottom" },
+  { id: "center", label: "Center" },
+  { id: "top", label: "Top" },
+];
+const HOOK_STYLE_OPTS: { id: HookTextPreset; label: string }[] = [
+  { id: "bold", label: "Bold" },
+  { id: "minimal", label: "Minimal" },
+  { id: "neon", label: "Neon" },
+  { id: "shadow", label: "Shadow" },
+];
+const HOOK_POS_OPTS: { id: HookPosition; label: string }[] = [
+  { id: "top", label: "Top" },
+  { id: "center", label: "Center" },
+  { id: "bottom", label: "Bottom" },
+];
+const ANIM_OPTS: { id: OverlayAnimation; label: string }[] = [
+  { id: "none", label: "None" },
+  { id: "fade", label: "Fade" },
+  { id: "pop", label: "Pop" },
+  { id: "slide", label: "Slide" },
+];
+const TEXT_POS_OPTS: { id: TextOverlayPosition; label: string }[] = [
+  { id: "top-left", label: "↖" },
+  { id: "top-center", label: "↑" },
+  { id: "top-right", label: "↗" },
+  { id: "middle-left", label: "←" },
+  { id: "center", label: "•" },
+  { id: "middle-right", label: "→" },
+  { id: "bottom-left", label: "↙" },
+  { id: "bottom-center", label: "↓" },
+  { id: "bottom-right", label: "↘" },
+];
+const SIZE_OPTS: { id: OverlaySize; label: string }[] = [
+  { id: "small", label: "S" },
+  { id: "medium", label: "M" },
+  { id: "large", label: "L" },
+];
+const ALIGN_OPTS: { id: TextAlignment; label: string }[] = [
+  { id: "left", label: "Left" },
+  { id: "center", label: "Center" },
+  { id: "right", label: "Right" },
+];
+const BG_OPTS: { id: TextBackgroundStyle; label: string }[] = [
+  { id: "none", label: "None" },
+  { id: "pill", label: "Pill" },
+  { id: "box", label: "Box" },
+  { id: "shadow", label: "Shadow" },
+];
+const CALLOUT_STYLE_OPTS: { id: CalloutStyle; label: string }[] = [
+  { id: "box", label: "Box" },
+  { id: "circle", label: "Circle" },
+  { id: "arrow", label: "Arrow" },
+  { id: "spotlight", label: "Spotlight" },
+  { id: "underline", label: "Underline" },
+];
+const BLUR_REASON_OPTS: { id: BlurReasonType; label: string }[] = [
+  { id: "sensitive_info", label: "Sensitive" },
+  { id: "face", label: "Face" },
+  { id: "manual", label: "Manual" },
+  { id: "ai_detected", label: "AI" },
+];
+const TRANSITION_STYLE_OPTS: { id: TransitionStyle; label: string }[] = [
+  { id: "fade", label: "Fade" },
+  { id: "flash", label: "Flash" },
+  { id: "smooth_cut", label: "Smooth" },
+  { id: "zoom", label: "Zoom" },
+  { id: "swipe", label: "Swipe" },
+];
+const SMARTCROP_ASPECT_OPTS: { id: SmartCropAspect; label: string }[] = [
+  { id: "original", label: "Original" },
+  { id: "16:9", label: "16:9" },
+  { id: "9:16", label: "9:16" },
+  { id: "1:1", label: "1:1" },
+];
+const SMARTCROP_FOCUS_OPTS: { id: SmartCropFocus; label: string }[] = [
+  { id: "center", label: "Center" },
+  { id: "face", label: "Face" },
+  { id: "motion", label: "Motion" },
+  { id: "screen_action", label: "Action" },
+  { id: "manual", label: "Manual" },
+];
+const CTA_POS_OPTS: { id: BrandingPosition; label: string }[] = [
+  { id: "bottom-right", label: "Right" },
+  { id: "bottom-center", label: "Center" },
+  { id: "bottom-left", label: "Left" },
+];
+const CTA_STYLE_OPTS: { id: BrandingPreset; label: string }[] = [
+  { id: "minimal", label: "Minimal" },
+  { id: "creator", label: "Creator" },
+  { id: "business", label: "Business" },
+  { id: "social", label: "Social" },
+];
+
+function TextField({
+  label,
+  value,
+  placeholder,
+  multiline,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  placeholder?: string;
+  multiline?: boolean;
+  onChange: (v: string) => void;
+}) {
+  const cls =
+    "w-full rounded-lg border border-white/[0.1] bg-white/[0.03] px-2.5 py-1.5 text-[12.5px] text-white outline-none transition-colors placeholder:text-fog/50 focus:border-violet-400/50";
+  return (
+    <div className="space-y-1.5">
+      <span className="text-[10px] font-medium uppercase tracking-[0.12em] text-fog">{label}</span>
+      {multiline ? (
+        <textarea
+          rows={2}
+          value={value}
+          placeholder={placeholder}
+          onChange={(e) => onChange(e.target.value)}
+          className={cn(cls, "resize-none")}
+        />
+      ) : (
+        <input value={value} placeholder={placeholder} onChange={(e) => onChange(e.target.value)} className={cls} />
+      )}
+    </div>
+  );
+}
+
+const OVERLAY_ACCENT: Partial<Record<EffectType, string>> = {
+  captions: "border-sky-400/15 bg-sky-500/[0.04] text-sky-200",
+  "hook-text": "border-pink-400/15 bg-pink-500/[0.04] text-pink-200",
+  "text-overlay": "border-blue-400/15 bg-blue-500/[0.04] text-blue-200",
+  "smart-crop": "border-emerald-400/15 bg-emerald-500/[0.04] text-emerald-200",
+  callout: "border-orange-400/15 bg-orange-500/[0.04] text-orange-200",
+  "blur-redaction": "border-slate-400/15 bg-slate-500/[0.06] text-slate-200",
+  transition: "border-purple-400/15 bg-purple-500/[0.04] text-purple-200",
+  "branding-cta": "border-lime-400/15 bg-lime-500/[0.04] text-lime-200",
+};
+
+/**
+ * Editing controls for every Phase-3 overlay effect. Each reads its optional
+ * settings bag (with safe defaults) and patches it through `onUpdate`. Spatial
+ * types (callout / blur / smart-crop) additionally use the shared
+ * `FocusRegionEditor` (surfaced via ADVANCED_RELEVANCE.cursor).
+ */
+function OverlayControls({
+  moment,
+  onUpdate,
+}: {
+  moment: DetectedMoment;
+  onUpdate: (patch: Partial<DetectedMoment>) => void;
+}) {
+  const accent = OVERLAY_ACCENT[moment.effectType] ?? "border-white/10 bg-white/[0.03] text-white";
+  const shell = cn("space-y-3 rounded-xl border p-3", accent);
+  const heading = (
+    <span className="text-[11px] font-semibold uppercase tracking-[0.14em]">
+      {EFFECT_FULL_NAME[moment.effectType]}
+    </span>
+  );
+
+  if (moment.effectType === "captions") {
+    const c = moment.captions ?? { text: "", stylePreset: "clean" as OverlayTextPreset, position: "bottom" as CaptionPosition };
+    const set = (patch: Partial<typeof c>) => onUpdate({ captions: { ...c, ...patch } });
+    return (
+      <section className={shell}>
+        {heading}
+        <TextField label="Caption text" value={c.text} multiline placeholder="Caption line…" onChange={(text) => set({ text })} />
+        <Segmented label="Style" value={c.stylePreset} options={CAPTION_STYLE_OPTS} onChange={(stylePreset) => set({ stylePreset })} />
+        <Segmented label="Position" value={c.position} options={CAPTION_POS_OPTS} onChange={(position) => set({ position })} />
+        {!(c.words && c.words.length) && (
+          <p className="text-[10.5px] leading-relaxed text-fog/70">
+            No transcript is available, so captions aren&apos;t auto-generated. Type a line here — it renders in the preview + export.
+          </p>
+        )}
+      </section>
+    );
+  }
+
+  if (moment.effectType === "hook-text") {
+    const h = moment.hookText ?? { text: "", stylePreset: "bold" as HookTextPreset, position: "center" as HookPosition, animation: "pop" as OverlayAnimation };
+    const set = (patch: Partial<typeof h>) => onUpdate({ hookText: { ...h, ...patch } });
+    return (
+      <section className={shell}>
+        {heading}
+        <TextField label="Hook text" value={h.text} placeholder="Watch this…" onChange={(text) => set({ text })} />
+        <Segmented label="Style" value={h.stylePreset} options={HOOK_STYLE_OPTS} onChange={(stylePreset) => set({ stylePreset })} />
+        <Segmented label="Position" value={h.position} options={HOOK_POS_OPTS} onChange={(position) => set({ position })} />
+        <Segmented label="Animation" value={h.animation} options={ANIM_OPTS} onChange={(animation) => set({ animation })} />
+      </section>
+    );
+  }
+
+  if (moment.effectType === "text-overlay") {
+    const tOv = moment.textOverlay ?? {
+      text: "",
+      position: "bottom-center" as TextOverlayPosition,
+      size: "medium" as OverlaySize,
+      alignment: "center" as TextAlignment,
+      backgroundStyle: "pill" as TextBackgroundStyle,
+      animation: "fade" as OverlayAnimation,
+    };
+    const set = (patch: Partial<typeof tOv>) => onUpdate({ textOverlay: { ...tOv, ...patch } });
+    return (
+      <section className={shell}>
+        {heading}
+        <TextField label="Text" value={tOv.text} multiline placeholder="Overlay text…" onChange={(text) => set({ text })} />
+        <Segmented label="Position" value={tOv.position === "custom" ? "center" : tOv.position} options={TEXT_POS_OPTS} onChange={(position) => set({ position })} />
+        <Segmented label="Size" value={tOv.size} options={SIZE_OPTS} onChange={(size) => set({ size })} />
+        <Segmented label="Align" value={tOv.alignment} options={ALIGN_OPTS} onChange={(alignment) => set({ alignment })} />
+        <Segmented label="Background" value={tOv.backgroundStyle} options={BG_OPTS} onChange={(backgroundStyle) => set({ backgroundStyle })} />
+        <Segmented label="Animation" value={tOv.animation} options={ANIM_OPTS} onChange={(animation) => set({ animation })} />
+      </section>
+    );
+  }
+
+  if (moment.effectType === "callout") {
+    const co = moment.callout ?? { text: "", style: "box" as CalloutStyle };
+    const set = (patch: Partial<typeof co>) => onUpdate({ callout: { ...co, ...patch } });
+    return (
+      <section className={shell}>
+        {heading}
+        <TextField label="Label" value={co.text} placeholder="Click here" onChange={(text) => set({ text })} />
+        <Segmented label="Style" value={co.style} options={CALLOUT_STYLE_OPTS} onChange={(style) => set({ style })} />
+        <p className="text-[10.5px] leading-relaxed text-fog/70">Points at the region below — drag it to aim the callout.</p>
+      </section>
+    );
+  }
+
+  if (moment.effectType === "blur-redaction") {
+    const b = moment.blurRedaction ?? { blurStrength: DEFAULT_BLUR_STRENGTH, reasonType: "manual" as BlurReasonType };
+    const set = (patch: Partial<typeof b>) => onUpdate({ blurRedaction: { ...b, ...patch } });
+    return (
+      <section className={shell}>
+        {heading}
+        <Slider label="Strength" value={Math.round(b.blurStrength * 100)} min={20} max={100} onChange={(v) => set({ blurStrength: v / 100 })} />
+        <Segmented label="Reason" value={b.reasonType} options={BLUR_REASON_OPTS} onChange={(reasonType) => set({ reasonType })} />
+        <p className="text-[10.5px] leading-relaxed text-fog/70">Hides the region below in preview + export. Drag it to cover the sensitive area.</p>
+      </section>
+    );
+  }
+
+  if (moment.effectType === "transition") {
+    const tr = moment.transition ?? { style: "fade" as TransitionStyle };
+    const set = (patch: Partial<typeof tr>) => onUpdate({ transition: { ...tr, ...patch } });
+    return (
+      <section className={shell}>
+        {heading}
+        <Segmented label="Style" value={tr.style} options={TRANSITION_STYLE_OPTS} onChange={(style) => set({ style })} />
+        <p className="text-[10.5px] leading-relaxed text-fog/70">A short punctuation dip over this range. Adjust its length in Timing below.</p>
+      </section>
+    );
+  }
+
+  if (moment.effectType === "branding-cta") {
+    const cta = moment.brandingCta ?? { ctaText: "", position: "bottom-right" as BrandingPosition, stylePreset: "creator" as BrandingPreset };
+    const set = (patch: Partial<typeof cta>) => onUpdate({ brandingCta: { ...cta, ...patch } });
+    return (
+      <section className={shell}>
+        {heading}
+        <TextField label="CTA text" value={cta.ctaText} placeholder="Follow for more" onChange={(ctaText) => set({ ctaText })} />
+        <Segmented label="Position" value={cta.position === "custom" ? "bottom-right" : cta.position} options={CTA_POS_OPTS} onChange={(position) => set({ position })} />
+        <Segmented label="Style" value={cta.stylePreset} options={CTA_STYLE_OPTS} onChange={(stylePreset) => set({ stylePreset })} />
+      </section>
+    );
+  }
+
+  if (moment.effectType === "smart-crop") {
+    const sc = moment.smartCrop ?? { aspectRatio: "9:16" as SmartCropAspect, focusTarget: "center" as SmartCropFocus };
+    const set = (patch: Partial<typeof sc>) => onUpdate({ smartCrop: { ...sc, ...patch } });
+    return (
+      <section className={shell}>
+        {heading}
+        <Segmented label="Aspect ratio" value={sc.aspectRatio} options={SMARTCROP_ASPECT_OPTS} onChange={(aspectRatio) => set({ aspectRatio })} />
+        <Segmented label="Focus" value={sc.focusTarget} options={SMARTCROP_FOCUS_OPTS} onChange={(focusTarget) => set({ focusTarget })} />
+        <p className="text-[10.5px] leading-relaxed text-fog/70">
+          Output framing is applied via the Canvas tool (this records the recipe&apos;s choice). Open Canvas to fine-tune the reframe.
+        </p>
+      </section>
+    );
+  }
+
+  return null;
 }
 
 function EmptyInspector({

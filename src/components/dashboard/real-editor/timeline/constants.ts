@@ -12,6 +12,13 @@ import {
   RefreshCcw,
   Crop,
   Scissors,
+  Captions,
+  Type,
+  Frame,
+  Megaphone,
+  EyeOff,
+  Shuffle,
+  BadgeCheck,
   type LucideIcon,
 } from "lucide-react";
 import type {
@@ -27,6 +34,15 @@ export const EFFECT_ICONS: Record<EffectType, LucideIcon> = {
   "speed-up": FastForward,
   cut: Scissors,
   crop: Crop,
+  // Phase 3 — Core AI Edit Pack.
+  captions: Captions,
+  "hook-text": Sparkles,
+  "text-overlay": Type,
+  "smart-crop": Frame,
+  callout: Megaphone,
+  "blur-redaction": EyeOff,
+  transition: Shuffle,
+  "branding-cta": BadgeCheck,
 };
 
 /**
@@ -137,6 +153,72 @@ export const EFFECT_TONES: Record<
     label: "Crop / Reframe",
     glow: "shadow-[0_8px_36px_-12px_rgba(45,212,191,0.9)]",
     hoverGlow: "hover:shadow-[0_8px_36px_-12px_rgba(45,212,191,0.9)]",
+  },
+  // ── Phase 3 — Core AI Edit Pack overlays. Distinct colour families so the
+  // overlay lane reads clearly against the camera/cut/speed lanes. ──
+  captions: {
+    ai: "from-sky-400/85 via-sky-500/55 to-blue-600/40 border-sky-200/40",
+    user: "from-sky-400/85 via-sky-500/55 to-blue-600/40 border-sky-200/50",
+    dot: "bg-sky-300",
+    label: "Captions",
+    glow: "shadow-[0_8px_36px_-12px_rgba(56,189,248,0.9)]",
+    hoverGlow: "hover:shadow-[0_8px_36px_-12px_rgba(56,189,248,0.9)]",
+  },
+  "hook-text": {
+    ai: "from-pink-500/85 via-pink-500/55 to-rose-600/40 border-pink-300/40",
+    user: "from-pink-500/85 via-pink-500/55 to-rose-600/40 border-pink-300/50",
+    dot: "bg-pink-300",
+    label: "Hook Text",
+    glow: "shadow-[0_8px_36px_-12px_rgba(236,72,153,0.9)]",
+    hoverGlow: "hover:shadow-[0_8px_36px_-12px_rgba(236,72,153,0.9)]",
+  },
+  "text-overlay": {
+    ai: "from-blue-400/85 via-blue-500/55 to-indigo-600/40 border-blue-200/40",
+    user: "from-blue-400/85 via-blue-500/55 to-indigo-600/40 border-blue-200/50",
+    dot: "bg-blue-300",
+    label: "Text",
+    glow: "shadow-[0_8px_36px_-12px_rgba(96,165,250,0.9)]",
+    hoverGlow: "hover:shadow-[0_8px_36px_-12px_rgba(96,165,250,0.9)]",
+  },
+  "smart-crop": {
+    ai: "from-emerald-400/85 via-emerald-500/55 to-green-600/40 border-emerald-200/40",
+    user: "from-emerald-400/85 via-emerald-500/55 to-green-600/40 border-emerald-200/50",
+    dot: "bg-emerald-300",
+    label: "Smart Crop",
+    glow: "shadow-[0_8px_36px_-12px_rgba(52,211,153,0.9)]",
+    hoverGlow: "hover:shadow-[0_8px_36px_-12px_rgba(52,211,153,0.9)]",
+  },
+  callout: {
+    ai: "from-orange-400/85 via-orange-500/55 to-amber-600/40 border-orange-200/40",
+    user: "from-orange-400/85 via-orange-500/55 to-amber-600/40 border-orange-200/50",
+    dot: "bg-orange-300",
+    label: "Callout",
+    glow: "shadow-[0_8px_36px_-12px_rgba(251,146,60,0.9)]",
+    hoverGlow: "hover:shadow-[0_8px_36px_-12px_rgba(251,146,60,0.9)]",
+  },
+  "blur-redaction": {
+    ai: "from-slate-400/85 via-slate-500/55 to-slate-700/40 border-slate-200/40",
+    user: "from-slate-400/85 via-slate-500/55 to-slate-700/40 border-slate-200/50",
+    dot: "bg-slate-300",
+    label: "Blur",
+    glow: "shadow-[0_8px_36px_-12px_rgba(148,163,184,0.9)]",
+    hoverGlow: "hover:shadow-[0_8px_36px_-12px_rgba(148,163,184,0.9)]",
+  },
+  transition: {
+    ai: "from-purple-400/85 via-purple-500/55 to-violet-700/40 border-purple-200/40",
+    user: "from-purple-400/85 via-purple-500/55 to-violet-700/40 border-purple-200/50",
+    dot: "bg-purple-300",
+    label: "Transition",
+    glow: "shadow-[0_8px_36px_-12px_rgba(192,132,252,0.9)]",
+    hoverGlow: "hover:shadow-[0_8px_36px_-12px_rgba(192,132,252,0.9)]",
+  },
+  "branding-cta": {
+    ai: "from-lime-400/85 via-lime-500/55 to-green-600/40 border-lime-200/40",
+    user: "from-lime-400/85 via-lime-500/55 to-green-600/40 border-lime-200/50",
+    dot: "bg-lime-300",
+    label: "CTA",
+    glow: "shadow-[0_8px_36px_-12px_rgba(163,230,53,0.9)]",
+    hoverGlow: "hover:shadow-[0_8px_36px_-12px_rgba(163,230,53,0.9)]",
   },
 };
 

@@ -17,6 +17,8 @@ export type TimelineTrackKind =
   | "interactions"
   | "speed"
   | "cut"
+  // Phase-3 — one shared lane for the Core AI Edit Pack overlays.
+  | "overlays"
   // ── Prepared-but-not-implemented (placeholder lanes / future descriptors) ──
   | "crop"
   | "captions"

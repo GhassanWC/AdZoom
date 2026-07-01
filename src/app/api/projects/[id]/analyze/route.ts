@@ -31,6 +31,8 @@ import {
   normalizeSelectedVideoType,
   mapSelectedToDetectedVideoType,
 } from "@/lib/analysis/video-type";
+import { resolveEditRecipe, logEditRecipePlan } from "@/lib/analysis/edit-recipe";
+import { generateOverlayEdits } from "@/lib/analysis/overlay-generators";
 import { buildEditDiagnostics } from "@/lib/diagnostics/edit-diagnostics";
 import { momentsFromEvents } from "@/lib/attention/events";
 import { attentionCurve } from "@/lib/attention/score";
@@ -764,6 +766,27 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     const pacing: Pacing = existingPacing ?? "moderate";
     const visualAnalysis = project.visualAnalysis as VisualAnalysis | undefined;
 
+    // ── Edit Recipe Engine ────────────────────────────────────────────────
+    // Request the structured edit PLAN for this run (which operations fit the
+    // video type + the signals we actually have). It does NOT mutate the
+    // zoom/cut/speed timeline built below — it's recorded on the analysis for
+    // observability + future edit executors (captions, crop, overlays, music…).
+    const isTabScope = interactionScope === "tab";
+    const editRecipePlan = resolveEditRecipe({
+      selectedVideoType,
+      detectedVideoType: sections.videoType,
+      signals: {
+        hasTranscript: false, // no transcript pipeline yet → captions planned, not run
+        hasAudioAnalysis: false, // no dedicated audio/silence analysis yet
+        hasSceneData: (visualAnalysis?.sceneChanges?.length ?? 0) > 0,
+        hasVisualMoments: (visualAnalysis?.sampleCount ?? 0) > 0,
+        hasInteractionData: isTabScope,
+        isScreenRecording: selectedVideoType === "screen-recording" || isTabScope,
+        durationSeconds: duration ?? undefined,
+      },
+    });
+    logEditRecipePlan(editRecipePlan, { projectId, mode: isFinalize ? "finalize" : "direct" });
+
     // Cursor intent (hesitation / velocity per bucket) feeds the click
     // classifier's "deliberate approach" signal — small bump per click
     // when the user slowed before pressing. Cheap; skip when there's
@@ -1380,6 +1403,41 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       });
     }
 
+    // ── Phase-3 overlay generation (deterministic, whole-video) ─────────────
+    // Turn the recipe's enabled overlay categories into real edits (hook text,
+    // CTA, text labels, callouts, transitions) + a smart-crop output canvas.
+    // Runs AFTER the layer guard so these additive edits are never dropped.
+    // Idempotent: skips any category that already has a moment (manual or a
+    // prior run), so re-analysis never duplicates or clobbers user overlays.
+    const existingOutputCanvas =
+      (project.effectsSettings as { outputCanvas?: unknown } | undefined)?.outputCanvas != null;
+    const overlayGen = generateOverlayEdits({
+      plan: editRecipePlan,
+      moments: finalMoments,
+      duration: dur,
+      projectTitle: (project.title as string | undefined) ?? null,
+      hasOutputCanvas: existingOutputCanvas,
+    });
+    if (overlayGen.moments.length > 0) {
+      finalMoments = [...finalMoments, ...overlayGen.moments].sort(
+        (a, b) => a.startTime - b.startTime
+      );
+    }
+    console.info("[edit-recipe:overlays]", {
+      projectId,
+      generated: overlayGen.log.generated,
+      skipped: overlayGen.log.skipped,
+      smartCropAspect: overlayGen.log.smartCropAspect,
+      appliedOutputCanvas: !!overlayGen.outputCanvas,
+    });
+    if (overlayGen.moments.length > 0) {
+      await emitActivity(
+        ref,
+        "ok",
+        `Added ${overlayGen.moments.length} overlay edit${overlayGen.moments.length === 1 ? "" : "s"} from the ${editRecipePlan.recipeName} recipe`
+      );
+    }
+
     const cleanMoments = stripUndefined(finalMoments);
     const cleanRawPool = stripUndefined(rawPool);
     const cleanRejectedPool = stripUndefined(balanced.rejectedPool);
@@ -1457,6 +1515,12 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
         // Persist the resolved user selection (top-level project field) so it
         // survives + stays the source of truth for a re-analysis.
         selectedVideoType,
+        // smart_crop applies the vertical/social reframe via the output canvas.
+        // Merge-write only the canvas so the user's other effects are untouched;
+        // only set when the recipe generated one (user had no canvas of their own).
+        ...(overlayGen.outputCanvas
+          ? { effectsSettings: { outputCanvas: overlayGen.outputCanvas } }
+          : {}),
         analysis: {
           status: "complete",
           stage: "Complete",
@@ -1467,6 +1531,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
           boringSections: sections.boringSections,
           recommendedPresetIds: sections.recommendedPresetIds,
           videoType: effectiveVideoType,
+          editRecipe: editRecipePlan,
           narrativeStructure: sections.narrativeStructure,
           attentionCurve: attention.curveQ8,
           attentionSampleRate: attention.sampleRate,

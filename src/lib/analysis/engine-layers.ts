@@ -9,6 +9,7 @@
  * pulling a `"use client"` bundle onto the server.
  */
 import type { DetectedMoment, EffectType, SelectedVideoType } from "../firebase/schema";
+import { isOverlayEffectType } from "../firebase/schema";
 import { CHUNK_SIZE_S, type ChunkMode } from "./chunk-config";
 
 /**
@@ -108,10 +109,20 @@ export function disabledLayers(opts: AnalysisOptions): EngineLayer[] {
   return PRIMARY_LAYERS.filter((l) => !enabled.has(l));
 }
 
-/** Layers that currently hold ≥1 AI-generated moment. */
+/**
+ * Layers that currently hold ≥1 AI-generated moment. Phase-3 overlays
+ * (captions/hook/text/callout/blur/transition/branding + smart-crop) are
+ * ORTHOGONAL to the camera/cut/speed engines — they're generated separately at
+ * finalize — so they must NOT count as a layer being "present" here, or an
+ * AI hook/CTA (which classifies as `camera`) would suppress zoom regeneration
+ * in "keep" mode.
+ */
 export function aiLayersPresent(moments: DetectedMoment[]): Set<EngineLayer> {
   const s = new Set<EngineLayer>();
-  for (const m of moments) if (isAiMoment(m)) s.add(layerForMoment(m));
+  for (const m of moments) {
+    if (!isAiMoment(m) || isOverlayEffectType(m.effectType)) continue;
+    s.add(layerForMoment(m));
+  }
   return s;
 }
 
