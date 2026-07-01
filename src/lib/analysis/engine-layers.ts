@@ -8,7 +8,7 @@
  * client (dialog, timeline, editor context) AND the Node analyze route without
  * pulling a `"use client"` bundle onto the server.
  */
-import type { DetectedMoment, EffectType } from "../firebase/schema";
+import type { DetectedMoment, EffectType, SelectedVideoType } from "../firebase/schema";
 import { CHUNK_SIZE_S, type ChunkMode } from "./chunk-config";
 
 /**
@@ -43,6 +43,12 @@ export interface AnalysisOptions {
   chunkSizeSeconds: number;
   /** Target chunk count — set only in custom "by count" mode (informational). */
   chunkCount?: number;
+  /**
+   * The user-selected video type for this run (Auto Detect by default). Threaded
+   * to the finalize route so the AI applies the matching edit recipe. Injected by
+   * `startAnalyze` from the project's `selectedVideoType`.
+   */
+  selectedVideoType?: SelectedVideoType;
 }
 
 /** The persisted subset (the 3 toggles only — the mode is never remembered). */
@@ -59,6 +65,7 @@ export const DEFAULT_ANALYSIS_OPTIONS: AnalysisOptions = {
   existingEditMode: "replace-selected",
   chunkMode: "balanced",
   chunkSizeSeconds: CHUNK_SIZE_S,
+  selectedVideoType: "auto",
 };
 
 /** Map an effectType to its engine layer (mirrors the timeline track split). */

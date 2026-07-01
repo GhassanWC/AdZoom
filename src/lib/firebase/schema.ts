@@ -134,6 +134,24 @@ export type VideoType =
   | "onboarding-flow"
   | "mixed";
 
+/**
+ * USER-SELECTED video type (chosen before analysis) — distinct from the
+ * AI-DETECTED `VideoType` above (the model's internal classification). Drives
+ * which edit recipe the analysis pipeline applies. "auto" lets the AI detect it.
+ * Screen recording is now ONE type among many (not the whole product). See
+ * src/lib/analysis/video-type.ts for labels + the map onto the detected type.
+ */
+export type SelectedVideoType =
+  | "auto"
+  | "reels-shorts"
+  | "talking-head"
+  | "podcast-clip"
+  | "product-demo"
+  | "tutorial"
+  | "vlog"
+  | "ad-promo"
+  | "screen-recording";
+
 export interface AttentionFactors {
   /** How much the visible frame changed (0..1). Modal opening = high, hover = low. */
   changeMagnitude: number;
@@ -1082,6 +1100,12 @@ export interface ProjectDoc {
   fileSize?: number;
   mimeType?: string;
   status: ProjectStatus;
+  /**
+   * The video type the user picked BEFORE analysis (Auto Detect by default).
+   * Passed into the AI analysis/edit-generation pipeline to select the edit
+   * recipe. Absent on projects created before this shipped → treated as "auto".
+   */
+  selectedVideoType?: SelectedVideoType;
   analysis?: Analysis;
   /**
    * Client-side computer-vision pass output. Written by the browser before the

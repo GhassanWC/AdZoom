@@ -83,6 +83,17 @@ export const CV_CHUNK_CONCURRENCY = 3;
 /** Per-chunk retry budget before a chunk is left `failed`. */
 export const CHUNK_MAX_ATTEMPTS = 3;
 
+/**
+ * No-progress watchdog for a chunk's CV pass. If the engine produces NO progress
+ * within this window, the orchestrator aborts it + throws so the retry /
+ * probe-fallback / mark-failed path runs — instead of hanging the whole analysis
+ * forever on a video the on-device decoder can't handle (unsupported codec,
+ * metadata that never loads, a silent WebCodecs worker). Generous enough that a
+ * healthy chunk (≤60s of video, decoded in seconds by the worker, or streamed
+ * frame-by-frame by the hidden-video engine) always finishes first.
+ */
+export const CHUNK_CV_NO_PROGRESS_MS = 60_000;
+
 /** Debounce (ms) for per-chunk progress writes so we don't hammer Firestore. */
 export const CHUNK_PROGRESS_WRITE_MS = 500;
 

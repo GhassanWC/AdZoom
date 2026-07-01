@@ -22,8 +22,9 @@ import { visualMomentsFromCv } from "../cv/visual-moments";
 import { mergeVisualAnalysis, type VaChunk } from "../cv/merge";
 import { selectCvEngine, cvConcurrencyFor } from "../cv/engine/select";
 import { HiddenVideoCvEngine } from "../cv/engine/hidden-video";
-import type { CvChunkEngine, CvSource } from "../cv/engine/types";
+import type { CvChunkEngine, CvChunkRequest, CvSource } from "../cv/engine/types";
 import {
+  CHUNK_CV_NO_PROGRESS_MS,
   CHUNK_MAX_ATTEMPTS,
   CHUNK_PROGRESS_WRITE_MS,
   CHUNK_SIZE_S,
@@ -337,23 +338,31 @@ export async function runChunkedAnalysis(args: ChunkedRunArgs): Promise<void> {
     for (let attempt = 1; attempt <= CHUNK_MAX_ATTEMPTS; attempt++) {
       if (ac.signal.aborted) throw new DOMException("Aborted", "AbortError");
       try {
-        const va = await engineRef.current.analyzeChunk({
-          startTime: w.startTime,
-          endTime: w.endTime,
-          duration,
-          signal: ac.signal,
-          onProgress: (p) => {
-            const now = Date.now();
-            if (now - lastProgressWrite < CHUNK_PROGRESS_WRITE_MS) return;
-            lastProgressWrite = now;
-            // Coalesced: a newer progress for this chunk supersedes a queued one.
-            void qWrite(
-              "chunk-progress",
-              () => updateChunk(uid, jobId, chunkId, { progress: p }),
-              `chunk-${w.index}-progress`
-            );
+        // Bounded by a no-progress watchdog so an undecodable video (unsupported
+        // codec, metadata that never loads, a silent WebCodecs worker) can't hang
+        // the whole analysis at chunk 1 / 0% forever — it throws, and the retry /
+        // probe-fallback / mark-failed path below takes over.
+        const va = await analyzeChunkBounded(
+          engineRef.current,
+          {
+            startTime: w.startTime,
+            endTime: w.endTime,
+            duration,
+            onProgress: (p) => {
+              const now = Date.now();
+              if (now - lastProgressWrite < CHUNK_PROGRESS_WRITE_MS) return;
+              lastProgressWrite = now;
+              // Coalesced: a newer progress for this chunk supersedes a queued one.
+              void qWrite(
+                "chunk-progress",
+                () => updateChunk(uid, jobId, chunkId, { progress: p }),
+                `chunk-${w.index}-progress`
+              );
+            },
           },
-        });
+          ac.signal,
+          CHUNK_CV_NO_PROGRESS_MS
+        );
 
         // Three engines per chunk: zoom/focus (camera) + cut + speed. Each is
         // gated on the user's selection (`runCamera/runCut/runSpeed`); a
@@ -539,11 +548,25 @@ export async function runChunkedAnalysis(args: ChunkedRunArgs): Promise<void> {
     await flushProjectWrites(pid);
 
     await writeJob({ status: "running", progress: 1 });
-    await finalizeWithAi(project.id, idTokenGetter, {
-      chunkCount: windows.length,
-      progressiveCount: counters.momentsSoFar,
-      options,
-    });
+    // Finalize (the server-side Gemini refinement: classification, labels,
+    // gap-fill) is BEST-EFFORT — the progressive CV timeline is already the
+    // source of truth. If it fails but we already have edits, complete with them
+    // instead of nuking the whole analysis; only a zero-edit run treats a
+    // finalize failure as fatal (surfaced with the real reason).
+    try {
+      await finalizeWithAi(project.id, idTokenGetter, {
+        chunkCount: windows.length,
+        progressiveCount: counters.momentsSoFar,
+        options,
+      });
+    } catch (finalizeErr) {
+      if (counters.momentsSoFar <= 0) throw finalizeErr;
+      console.warn("[chunk-finalize] refinement failed — completing with progressive edits", {
+        projectId: project.id,
+        momentsSoFar: counters.momentsSoFar,
+        error: finalizeErr instanceof Error ? finalizeErr.message : String(finalizeErr),
+      });
+    }
 
     // Authoritative terminal write. The finalize route already writes
     // "analyzed"/"complete", but we re-assert it here (idempotent) so the
@@ -734,8 +757,19 @@ async function finalizeWithAi(
     }),
   });
   if (!res.ok) {
-    const j = await res.json().catch(() => ({ error: "Finalize failed" }));
-    throw new Error(j.error || `HTTP ${res.status}`);
+    // Surface the REAL server error. The route returns `{ error }` JSON on a
+    // handled failure; on an unhandled 500 / timeout the body may be HTML, so
+    // read it as text and include a snippet instead of a useless "Finalize failed".
+    const bodyText = await res.text().catch(() => "");
+    let serverMsg = "";
+    try {
+      serverMsg = (JSON.parse(bodyText) as { error?: string }).error ?? "";
+    } catch {
+      /* non-JSON (HTML error page) — fall back to the raw snippet */
+    }
+    const detail = serverMsg || bodyText.replace(/\s+/g, " ").trim().slice(0, 300) || `HTTP ${res.status}`;
+    console.error("[finalize] failed", { projectId, status: res.status, detail });
+    throw new Error(`Finalize failed (${res.status}): ${detail}`);
   }
 }
 
@@ -760,4 +794,56 @@ async function runPool<T>(
     }
   });
   await Promise.all(runners);
+}
+
+/**
+ * Run one chunk's CV pass with a sliding NO-PROGRESS watchdog. If the engine
+ * makes no progress within `noProgressMs` — a decode/demux/metadata hang on a
+ * video the on-device decoder can't handle (unsupported codec, HEVC, metadata
+ * that never loads, a silent WebCodecs worker) — abort it (which terminates the
+ * worker / cancels the seek) and REJECT, so `processChunk`'s retry /
+ * probe-fallback / mark-failed logic runs instead of hanging the whole analysis
+ * forever. The per-run `runSignal` (cancel) still aborts too. Any engine
+ * `onProgress` re-arms the watchdog, so a slow-but-progressing chunk isn't killed.
+ */
+async function analyzeChunkBounded(
+  engine: CvChunkEngine,
+  req: Omit<CvChunkRequest, "signal">,
+  runSignal: AbortSignal,
+  noProgressMs: number
+): Promise<VisualAnalysis> {
+  const chunkAc = new AbortController();
+  const onRunAbort = () => chunkAc.abort();
+  if (runSignal.aborted) chunkAc.abort();
+  else runSignal.addEventListener("abort", onRunAbort, { once: true });
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let rejectWatchdog: ((e: Error) => void) | undefined;
+  const arm = () => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      chunkAc.abort();
+      rejectWatchdog?.(new Error("chunk_cv_no_progress_timeout"));
+    }, noProgressMs);
+  };
+  const watchdog = new Promise<never>((_, rej) => {
+    rejectWatchdog = rej;
+  });
+  arm();
+  try {
+    return await Promise.race([
+      engine.analyzeChunk({
+        ...req,
+        signal: chunkAc.signal,
+        onProgress: (p: number) => {
+          arm();
+          req.onProgress?.(p);
+        },
+      }),
+      watchdog,
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+    runSignal.removeEventListener("abort", onRunAbort);
+  }
 }

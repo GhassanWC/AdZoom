@@ -20,7 +20,11 @@ import type {
   EffectType,
   Preset,
   ProjectDoc,
+  SelectedVideoType,
 } from "@/lib/firebase/schema";
+import {
+  normalizeSelectedVideoType,
+} from "@/lib/analysis/video-type";
 import { applyPresetToSettings } from "@/lib/presets";
 import { useInteractions } from "./useInteractions";
 import type { Interaction } from "@/lib/recording/types";
@@ -204,6 +208,10 @@ interface EditorRealContextValue {
   ) => Promise<void>;
   /** Reset the output canvas to "Source / full frame" (removes outputCanvas). */
   clearOutputCanvas: () => Promise<void>;
+  /** The video type the user picked before analysis (Auto Detect by default). */
+  selectedVideoType: SelectedVideoType;
+  /** Persist a new video type on the project (used before Generate AI Edit). */
+  setSelectedVideoType: (t: SelectedVideoType) => Promise<void>;
   /**
    * Set (or update) the global source-frame crop. Instant + non-destructive —
    * the source bytes are untouched. If `visualAnalysis` exists and the crop
@@ -406,6 +414,14 @@ export function EditorRealProvider({
   const [playing, setPlaying] = React.useState(false);
   const [exporting, setExporting] = React.useState(false);
   const [duration, setDuration] = React.useState(project.duration ?? 0);
+  // User-selected video type (chosen before analysis). Seeds from the project
+  // (default "auto") and stays in sync as the live doc updates.
+  const [selectedVideoType, setSelectedVideoTypeState] = React.useState<SelectedVideoType>(
+    () => normalizeSelectedVideoType(project.selectedVideoType)
+  );
+  React.useEffect(() => {
+    setSelectedVideoTypeState(normalizeSelectedVideoType(project.selectedVideoType));
+  }, [project.selectedVideoType]);
   const [selectedMomentId, setSelectedMomentId] = React.useState<string | null>(null);
   const [multiSelectIds, setMultiSelectIds] = React.useState<string[]>([]);
   const [inspectorOpen, setInspectorOpen] = React.useState(false);
@@ -992,7 +1008,26 @@ export function EditorRealProvider({
       );
     }, [projectRef]);
 
-  const startAnalyze = React.useCallback(async (options: AnalysisOptions) => {
+  // Persist the pre-analysis video-type choice. Optimistic local update so the
+  // picker highlights instantly; the doc write makes it survive reloads + feeds
+  // the analysis pipeline.
+  const setSelectedVideoType: EditorRealContextValue["setSelectedVideoType"] =
+    React.useCallback(
+      async (t) => {
+        setSelectedVideoTypeState(t);
+        await setDoc(
+          projectRef,
+          { selectedVideoType: t, updatedAt: serverTimestamp() },
+          { merge: true }
+        );
+      },
+      [projectRef]
+    );
+
+  const startAnalyze = React.useCallback(async (rawOptions: AnalysisOptions) => {
+    // Attach the user's video type so the whole pipeline (orchestrator →
+    // finalize route → balancer/prompt) applies the matching edit recipe.
+    const options: AnalysisOptions = { ...rawOptions, selectedVideoType };
     // Free-plan duration gate — block (re)analysis of >3-min videos before any
     // state change or on-device CV work. `resolveReliableDuration` probes the
     // real <video>, so a stale/missing `project.duration` on an old project
@@ -1288,7 +1323,7 @@ export function EditorRealProvider({
       setCvProgress(null);
       setAnalyzing(false);
     }
-  }, [idTokenGetter, uid, project, projectRef, videoRef, interactions, planTier]);
+  }, [idTokenGetter, uid, project, projectRef, videoRef, interactions, planTier, selectedVideoType]);
 
   // ── Resume an in-flight chunked job after a refresh ─────────────────────
   // Completed chunks already wrote their moments to the project doc, so the
@@ -1530,6 +1565,8 @@ export function EditorRealProvider({
     dismissSuggestion,
     updateEffects,
     clearOutputCanvas,
+    selectedVideoType,
+    setSelectedVideoType,
     setSourceCrop,
     clearSourceCrop,
     setRemoveSharingBar,

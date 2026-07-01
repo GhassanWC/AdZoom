@@ -23,13 +23,20 @@ export class WebCodecsCvEngine implements CvChunkEngine {
 
   constructor(private source: CvSource) {}
 
-  private ensureDemuxed(): Promise<DemuxResult> {
+  private ensureDemuxed(signal?: AbortSignal): Promise<DemuxResult> {
     if (!this.demuxed) {
       this.demuxed = (async () => {
-        const res = await fetch(this.source.url);
-        if (!res.ok) throw new Error(`Fetch video failed: HTTP ${res.status}`);
-        const bytes = await res.arrayBuffer();
-        return demuxMp4(bytes);
+        try {
+          // Signal-aware so the orchestrator's per-chunk watchdog (or a cancel)
+          // can abort a stalled download instead of hanging chunk 1 forever.
+          const res = await fetch(this.source.url, signal ? { signal } : undefined);
+          if (!res.ok) throw new Error(`Fetch video failed: HTTP ${res.status}`);
+          const bytes = await res.arrayBuffer();
+          return demuxMp4(bytes);
+        } catch (err) {
+          this.demuxed = null; // don't cache the failure — allow a retry to re-fetch
+          throw err;
+        }
       })();
     }
     return this.demuxed;
@@ -57,7 +64,7 @@ export class WebCodecsCvEngine implements CvChunkEngine {
   }
 
   async analyzeChunk(req: CvChunkRequest): Promise<VisualAnalysis> {
-    const { config, samples } = await this.ensureDemuxed();
+    const { config, samples } = await this.ensureDemuxed(req.signal);
 
     // Select the window's samples, extended back to the keyframe at/before the
     // window start so the decoder has a random-access point.

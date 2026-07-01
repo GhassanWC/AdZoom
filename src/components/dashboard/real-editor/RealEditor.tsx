@@ -25,6 +25,9 @@ import { EffectsModal } from "./EffectsModal";
 import { ExportModal } from "./ExportModal";
 import { CanvasModal } from "./CanvasModal";
 import { AnalysisOptionsModal } from "./AnalysisOptionsModal";
+import { VideoTypePicker } from "./VideoTypePicker";
+import { DEFAULT_ANALYSIS_OPTIONS } from "@/lib/analysis/engine-layers";
+import type { SelectedVideoType } from "@/lib/firebase/schema";
 import { useWorkspaceSettings } from "@/lib/firebase/workspace-settings";
 import { RealProcessingOverlay } from "./RealProcessingOverlay";
 import { PresetsRail } from "./PresetsRail";
@@ -132,6 +135,8 @@ function Body() {
     cropEditing,
     openCropEditor,
     closeCropEditor,
+    selectedVideoType,
+    setSelectedVideoType,
   } = useEditorReal();
   const hasAnalysis = (project.analysis?.detectedMoments?.length ?? 0) > 0;
   const isFailed = project.analysis?.status === "failed";
@@ -159,6 +164,19 @@ function Body() {
     : !hasAnalysis && project.analysis?.status === "complete"
       ? "No moments were produced — re-run to try again."
       : undefined;
+
+  // One-click "Generate AI Edit": run analysis with the user's remembered engine
+  // + detail prefs (all engines on by default). `startAnalyze` attaches the
+  // selected video type. Advanced options remain a click away (the modal).
+  const onGenerate = React.useCallback(() => {
+    if (!canAnalyze) return;
+    void startAnalyze({
+      ...DEFAULT_ANALYSIS_OPTIONS,
+      ...(settings.analysisEngines ?? {}),
+      ...(settings.analysisDetail ?? {}),
+      existingEditMode: "replace-selected",
+    });
+  }, [canAnalyze, startAnalyze, settings.analysisEngines, settings.analysisDetail]);
 
   return (
     <div className="space-y-6 pb-12">
@@ -254,7 +272,10 @@ function Body() {
           analyzing={isAnalyzingNow}
           canAnalyze={canAnalyze}
           title={analyzeTitle}
-          onAnalyze={() => setAnalysisOptionsOpen(true)}
+          selectedVideoType={selectedVideoType}
+          onSelectType={(t) => void setSelectedVideoType(t)}
+          onGenerate={onGenerate}
+          onAdvanced={() => setAnalysisOptionsOpen(true)}
         />
       )}
 
@@ -327,12 +348,18 @@ function PreAnalysisHero({
   analyzing,
   canAnalyze,
   title,
-  onAnalyze,
+  selectedVideoType,
+  onSelectType,
+  onGenerate,
+  onAdvanced,
 }: {
   analyzing: boolean;
   canAnalyze: boolean;
   title?: string;
-  onAnalyze: () => void;
+  selectedVideoType: SelectedVideoType;
+  onSelectType: (t: SelectedVideoType) => void;
+  onGenerate: () => void;
+  onAdvanced: () => void;
 }) {
   return (
     <div className="glass relative overflow-hidden rounded-2xl p-6 sm:p-7">
@@ -340,25 +367,34 @@ function PreAnalysisHero({
         aria-hidden
         className="pointer-events-none absolute -right-10 -top-14 h-48 w-72 bg-[radial-gradient(ellipse_at_top_right,rgba(139,92,246,0.18),transparent_65%)] blur-2xl"
       />
-      <div className="relative flex flex-col gap-5 sm:flex-row sm:items-center sm:justify-between">
+      <div className="relative">
         <div className="flex items-start gap-4">
           <span className="inline-flex size-11 shrink-0 items-center justify-center rounded-2xl bg-violet-500/15 text-violet-200 ring-1 ring-violet-400/25 shadow-[0_8px_24px_-12px_rgba(139,92,246,0.6)]">
             <Sparkles size={20} />
           </span>
           <div className="min-w-0">
             <h2 className="font-display text-lg font-semibold tracking-tight text-white">
-              Generate your first-draft edit
+              What kind of video is this?
             </h2>
             <p className="mt-1 max-w-xl text-[13px] leading-relaxed text-fog">
-              Framevo&apos;s AI finds the moments that matter — clicks, reveals,
-              and focus shifts — and builds cinematic zooms you can refine on the
-              timeline.
+              Pick a type so Framevo applies the best edit recipe — or let it Auto
+              Detect. You can refine every zoom, cut, and speed change on the
+              timeline afterward.
             </p>
           </div>
         </div>
-        <div className="shrink-0">
+
+        <div className="mt-5">
+          <VideoTypePicker
+            value={selectedVideoType}
+            onChange={onSelectType}
+            disabled={analyzing}
+          />
+        </div>
+
+        <div className="mt-5 flex flex-wrap items-center gap-2.5">
           <Button
-            onClick={onAnalyze}
+            onClick={onGenerate}
             variant="primary"
             size="md"
             disabled={!canAnalyze}
@@ -371,7 +407,10 @@ function PreAnalysisHero({
               )
             }
           >
-            {analyzing ? "Analyzing…" : "Analyze with AI"}
+            {analyzing ? "Analyzing…" : "Generate AI Edit"}
+          </Button>
+          <Button onClick={onAdvanced} variant="ghost" size="md" disabled={analyzing}>
+            Advanced options
           </Button>
         </div>
       </div>

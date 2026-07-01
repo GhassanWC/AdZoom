@@ -27,6 +27,10 @@ import {
   estimateAnalysisSeconds,
 } from "@/lib/analysis-stages";
 import { balanceTimeline, distributionScore } from "@/lib/timeline-balancer";
+import {
+  normalizeSelectedVideoType,
+  mapSelectedToDetectedVideoType,
+} from "@/lib/analysis/video-type";
 import { buildEditDiagnostics } from "@/lib/diagnostics/edit-diagnostics";
 import { momentsFromEvents } from "@/lib/attention/events";
 import { attentionCurve } from "@/lib/attention/score";
@@ -62,6 +66,30 @@ export const dynamic = "force-dynamic";
 export const maxDuration = 300;
 
 const INLINE_BYTE_LIMIT = 18 * 1024 * 1024;
+
+/**
+ * Internal finalize budget — kept safely under `maxDuration` (Cloud Run /
+ * App Hosting kills the request at 300s and returns a non-JSON 504, which the
+ * client can only show as the opaque "Finalize failed"). The serial Gemini
+ * sequence (file-active wait + classify + gap-fill + label) on a long/arbitrary
+ * video can exceed 300s, so each Gemini step is bounded by the REMAINING budget:
+ * when it's spent, the step rejects fast → the outer catch returns clean JSON
+ * (and the client's non-fatal finalize keeps the progressive edits).
+ */
+const FINALIZE_BUDGET_MS = 260_000;
+
+/** Reject `p` after `ms` so a wall-clock overrun surfaces as a catchable error
+ *  instead of a platform 504. The underlying Gemini call can't be cancelled, but
+ *  the response is sent (clean JSON) instead of hanging into the platform kill. */
+function withDeadline<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(label)), Math.max(1, ms));
+  });
+  return Promise.race([p, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  }) as Promise<T>;
+}
 
 interface RouteContext {
   params: Promise<{ id: string }>;
@@ -365,6 +393,10 @@ function mergeCropSpeedSections(moments: DetectedMoment[]): {
 export async function POST(req: NextRequest, { params }: RouteContext) {
   const { id: projectId } = await params;
   let ref: DocumentReference | null = null;
+  // Wall-clock start — Gemini steps below are bounded by the remaining budget so
+  // the route returns clean JSON before the platform's 300s hard kill.
+  const reqStart = Date.now();
+  const budgetRemainingMs = () => Math.max(0, FINALIZE_BUDGET_MS - (Date.now() - reqStart));
 
   try {
     // 1. Auth
@@ -433,6 +465,13 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     // Engine selection. A legacy no-body call → all-on default + empty
     // carry-over, i.e. exactly today's "clear and regenerate everything".
     const analysisOptions = reqBody?.analysisOptions ?? DEFAULT_ANALYSIS_OPTIONS;
+    // User-selected video type (from the run options, falling back to the saved
+    // project field). When it's not "auto" it OVERRIDES the model's detected type
+    // so the balancer + edit recipe follow the user's declaration.
+    const selectedVideoType = normalizeSelectedVideoType(
+      analysisOptions.selectedVideoType ?? project.selectedVideoType
+    );
+    const videoTypeOverride = mapSelectedToDetectedVideoType(selectedVideoType);
     const finalizeChunkCount =
       typeof reqBody?.chunkCount === "number" ? reqBody.chunkCount : undefined;
     const progressiveMoments =
@@ -672,7 +711,9 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       await ensureNotCancelled(ref);
       await setStage(ref, "extracting_frames", "Extracting frames");
       await waitForGeminiFileActive(uploaded.name, {
-        timeoutMs: 180_000,
+        // Never let the file-active wait eat the whole budget — leave room for
+        // the classify/gap-fill/label generations before the 300s wall.
+        timeoutMs: Math.min(120_000, Math.max(1000, budgetRemainingMs())),
         shouldCancel: () => isCancelled(ref!),
         onProgress: async (state, attempt) => {
           if (attempt > 0 && attempt % 3 === 0) {
@@ -690,10 +731,14 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     // preset recommendations). NO moments proposed here.
     await setStage(ref, "analyzing", "Classifying recording");
     await emitActivity(ref, "info", "Asking Gemini for structure (sections + classification)");
-    const sections = await classifyVideoSections({
-      video: geminiVideo,
-      hintedDuration: duration,
-    });
+    const sections = await withDeadline(
+      classifyVideoSections({
+        video: geminiVideo,
+        hintedDuration: duration,
+      }),
+      budgetRemainingMs(),
+      "Analysis timed out while classifying the video. Try a shorter clip or run it again."
+    );
     await emitActivity(
       ref,
       "ok",
@@ -703,6 +748,10 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
           : ""
       }`
     );
+
+    // The type the edit recipe actually uses: the user's selection (mapped onto
+    // the internal type) when set, else the model's detection.
+    const effectiveVideoType = videoTypeOverride ?? sections.videoType;
 
     await ensureNotCancelled(ref);
 
@@ -820,7 +869,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       raw: [],
       duration: duration ?? 0,
       pacing,
-      videoType: sections.videoType,
+      videoType: effectiveVideoType,
       visualAnalysis,
       eventMoments,
       // Finalize: the progressive moments ARE the CV result — don't regenerate
@@ -895,12 +944,16 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
         } (budget ${aiBudget})`
       );
       try {
-        const proposals = await proposeGapFills({
-          video: geminiVideo,
-          gaps,
-          maxMoments: aiBudget,
-          boringSections: sections.boringSections,
-        });
+        const proposals = await withDeadline(
+          proposeGapFills({
+            video: geminiVideo,
+            gaps,
+            maxMoments: aiBudget,
+            boringSections: sections.boringSections,
+          }),
+          budgetRemainingMs(),
+          "gap-fill timed out"
+        );
         aiGapMoments = proposals.map((p, i) => ({
           id: `mom_ai_${i + 1}`,
           startTime: p.startTime,
@@ -1009,7 +1062,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       raw: [...aiGapMoments, ...aiVisualMoments],
       duration: dur,
       pacing,
-      videoType: sections.videoType,
+      videoType: effectiveVideoType,
       visualAnalysis,
       eventMoments,
       // Finalize keeps progressive moments as `preserved`; don't regenerate CV.
@@ -1048,7 +1101,11 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     } else if (needsLabeling.length > 0) {
       await emitActivity(ref, "info", `Asking Gemini to label ${needsLabeling.length} moment${needsLabeling.length === 1 ? "" : "s"}`);
       try {
-        const labels = await labelMoments({ video: geminiVideo, moments: needsLabeling });
+        const labels = await withDeadline(
+          labelMoments({ video: geminiVideo, moments: needsLabeling }),
+          budgetRemainingMs(),
+          "labeling timed out"
+        );
         const byId = new Map(labels.map((l) => [l.id, l]));
         for (const m of balanced.moments) {
           const l = byId.get(m.id);
@@ -1397,6 +1454,9 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     await ref.set(
       {
         status: "analyzed" as ProjectStatus,
+        // Persist the resolved user selection (top-level project field) so it
+        // survives + stays the source of truth for a re-analysis.
+        selectedVideoType,
         analysis: {
           status: "complete",
           stage: "Complete",
@@ -1406,7 +1466,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
           rejectedPool: cleanRejectedPool,
           boringSections: sections.boringSections,
           recommendedPresetIds: sections.recommendedPresetIds,
-          videoType: sections.videoType,
+          videoType: effectiveVideoType,
           narrativeStructure: sections.narrativeStructure,
           attentionCurve: attention.curveQ8,
           attentionSampleRate: attention.sampleRate,
@@ -1472,8 +1532,16 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     console.error("[analyze] failed", { kind, msg, err });
 
     if (ref) {
-      await bail(ref, kind, msg);
-      await emitActivity(ref, "error", `Failed: ${msg.slice(0, 200)}`);
+      // Never let the failure-state write throw out of the catch — that would
+      // turn a clean JSON error into an unhandled non-JSON 500 (the opaque
+      // "Finalize failed" the client then shows). The JSON response below must
+      // always run so the real reason reaches the client.
+      try {
+        await bail(ref, kind, msg);
+        await emitActivity(ref, "error", `Failed: ${msg.slice(0, 200)}`);
+      } catch (writeErr) {
+        console.error("[analyze] failure-state write threw (returning error anyway)", writeErr);
+      }
     }
     void recordEvent(EVENTS.ANALYSIS_FAILED, {
       userId: errUid,

@@ -33,18 +33,32 @@ export class HiddenVideoCvEngine implements CvChunkEngine {
       video.style.pointerEvents = "none";
       video.style.width = "1px";
       video.style.height = "1px";
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const cleanup = () => {
+        if (timer) clearTimeout(timer);
+        video.removeEventListener("loadedmetadata", onMeta);
+        video.removeEventListener("error", onErr);
+      };
+      const fail = (message: string) => {
+        cleanup();
+        // Clear the cached promise so a retry can re-attempt the load rather than
+        // resolving to this same rejection instantly.
+        this.ready = null;
+        reject(new Error(message));
+      };
       const onMeta = () => {
         cleanup();
         resolve(video);
       };
-      const onErr = () => {
-        cleanup();
-        reject(new Error(`CV video failed to load: ${this.source.url}`));
-      };
-      const cleanup = () => {
-        video.removeEventListener("loadedmetadata", onMeta);
-        video.removeEventListener("error", onErr);
-      };
+      const onErr = () => fail(`CV video failed to load: ${this.source.url}`);
+      // Some arbitrary uploads (unsupported codec, HEVC, a stalled URL) never fire
+      // `loadedmetadata` OR `error`. Without this the CV pass would hang at 0%
+      // forever; instead we fail fast so the orchestrator falls back / marks the
+      // chunk failed and still finalizes via the server pass.
+      timer = setTimeout(
+        () => fail(`CV video metadata load timed out: ${this.source.url}`),
+        30_000
+      );
       video.addEventListener("loadedmetadata", onMeta);
       video.addEventListener("error", onErr);
       video.src = this.source.url;
