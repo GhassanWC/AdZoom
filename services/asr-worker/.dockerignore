@@ -1,0 +1,9 @@
+# NOTE: the real build uses the REPO ROOT as context (see Dockerfile header +
+# cloudbuild.yaml), where the root .dockerignore applies. This file exists so
+# an accidental service-dir-context build still excludes local artifacts.
+node_modules
+dist
+*.log
+.env
+.env.*
+!.env*.example

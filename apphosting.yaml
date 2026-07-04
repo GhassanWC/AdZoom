@@ -78,3 +78,28 @@ env:
     secret: LEMONSQUEEZY_CREATOR_VARIANT_ID
     availability:
       - RUNTIME
+
+  - variable: TRANSCRIPT_PROVIDER
+    value: google_speech
+    availability:
+      - RUNTIME
+
+  - variable: TRANSCRIPT_EXECUTION
+    value: worker
+    availability:
+      - RUNTIME
+
+  - variable: TRANSCRIPT_WORKER_URL
+    value: YOUR_CLOUD_RUN_URL
+    availability:
+      - RUNTIME
+
+  - variable: TRANSCRIPT_WORKER_SECRET
+    secret: framevo-transcript-worker-secret
+    availability:
+      - RUNTIME
+
+  - variable: GOOGLE_CLOUD_PROJECT_ID
+    value: adzoom-prod
+    availability:
+      - RUNTIME

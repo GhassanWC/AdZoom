@@ -1,0 +1,22 @@
+{
+  "name": "framevo-asr-worker",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Framevo ASR/transcription worker (Cloud Run). Runs ffmpeg + Google Speech-to-Text via the SHARED transcript pipeline (src/lib/transcript) — caption quota verification, caption generation, and Firestore updates included.",
+  "type": "module",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/server.js"
+  },
+  "dependencies": {
+    "firebase-admin": "^13.9.0",
+    "google-auth-library": "^9.15.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "esbuild": "^0.24.2",
+    "typescript": "^5.7.2"
+  }
+}

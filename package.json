@@ -31,7 +31,11 @@
     "deploy:cors:dev": "node scripts/deploy-cors.mjs --project=dev",
     "deploy:cors:prod": "node scripts/deploy-cors.mjs --project=prod",
     "deploy:dev": "npm run deploy:rules:dev && npm run deploy:indexes:dev",
-    "deploy:prod": "npm run deploy:rules:prod && npm run deploy:indexes:prod"
+    "deploy:prod": "npm run deploy:rules:prod && npm run deploy:indexes:prod",
+    "asr:install": "npm --prefix services/asr-worker install",
+    "asr:build": "npm --prefix services/asr-worker run build",
+    "asr:typecheck": "npm --prefix services/asr-worker run typecheck",
+    "asr:deploy": "node scripts/deploy-asr-worker.mjs"
   },
   "dependencies": {
     "@google-cloud/batch": "^2.3.1",

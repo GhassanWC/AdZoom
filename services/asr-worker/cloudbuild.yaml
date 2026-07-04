@@ -1,0 +1,20 @@
+# Cloud Build config for the Framevo ASR worker.
+#
+# The build context MUST be the REPO ROOT — the Dockerfile bundles shared code
+# from src/ via the "@" alias. Submit from the repo root:
+#
+#   gcloud builds submit ^
+#     --config services\asr-worker\cloudbuild.yaml ^
+#     --substitutions _IMAGE=gcr.io/PROJECT_ID/framevo-asr-worker:latest ^
+#     .
+#
+# (`.gcloudignore` at the repo root keeps node_modules + secrets out of the
+# uploaded context; the Dockerfile copies ONLY services/asr-worker + src, so
+# the .NET export API and other services are never built.)
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ["build", "-f", "services/asr-worker/Dockerfile", "-t", "${_IMAGE}", "."]
+images: ["${_IMAGE}"]
+options:
+  machineType: E2_HIGHCPU_8
+timeout: 1800s

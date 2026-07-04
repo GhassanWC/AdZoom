@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "noEmit": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "target": "es2022",
+    // "dom" is types-only here: the shared import graph reaches modules that
+    // mention browser types (e.g. MediaRecorder in recording/types); nothing
+    // browser-only executes in the worker.
+    "lib": ["es2022", "dom"],
+    "types": ["node"],
+    "esModuleInterop": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "paths": {
+      "@/*": ["../../src/*"],
+      "server-only": ["./src/server-only-stub.ts"]
+    }
+  },
+  "include": ["src/**/*.ts"]
+}

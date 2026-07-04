@@ -1,14 +1,19 @@
-# Build context for services/export-worker/Dockerfile is the REPO ROOT. Keep
-# host node_modules (wrong-platform binaries that would clobber the Linux
-# install) and any secrets out of the image.
+# Build context for services/export-worker/Dockerfile AND
+# services/asr-worker/Dockerfile is the REPO ROOT. Keep host node_modules
+# (wrong-platform binaries that would clobber the Linux install) and any
+# secrets out of the image.
 **/node_modules
 **/.next
+**/.next-verify
 .git
 **/*.log
 **/.env
 **/.env.*
 !**/.env*.example
 services/export-worker/dist
+services/asr-worker/dist
+# Repo test suites — never needed inside a service image.
+tests
 # .NET build artifacts (services/export-api-dotnet) — rebuilt inside the image.
 **/bin
 **/obj
