@@ -90,7 +90,7 @@ env:
       - RUNTIME
 
   - variable: TRANSCRIPT_WORKER_URL
-    value: YOUR_CLOUD_RUN_URL
+    value: https://framevo-asr-worker-eibhkxwhea-uc.a.run.app
     availability:
       - RUNTIME
 
