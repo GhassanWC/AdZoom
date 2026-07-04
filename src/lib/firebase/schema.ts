@@ -199,6 +199,14 @@ export interface CaptionSettings {
   position: CaptionPosition;
   /** Indices into `words` to emphasize (highlight). */
   highlightedWords?: number[];
+  /**
+   * Text direction for rendering. "rtl" for Arabic / Hebrew / Urdu / Persian so
+   * preview AND export shape + order the script correctly. Absent = "ltr" (old
+   * captions decode safely). Set from the transcript language at generation.
+   */
+  direction?: "ltr" | "rtl";
+  /** BCP-47 of the caption text (for font/shaping + status). */
+  lang?: string;
 }
 
 /** effectType "hook-text" — a bold attention line, usually in the first seconds. */
@@ -444,6 +452,14 @@ export interface DetectedMoment {
   effectType: EffectType;
   /** User-tuned override of intensity (0..1). Falls back to project effectsSettings. */
   intensity?: number;
+  /**
+   * Non-destructive on/off for OVERLAY edits (captions / hook / text / callout /
+   * blur / transition / branding). `false` hides the overlay in preview + export
+   * while keeping it on the timeline (re-enableable). ABSENT is treated as
+   * enabled, so older overlays + all cut/zoom/speed moments are unaffected — only
+   * `enabled === false` hides, and only overlay rendering consults it.
+   */
+  enabled?: boolean;
   /** True if the user added/edited this moment (vs raw AI output). */
   edited?: boolean;
   /**
@@ -755,6 +771,167 @@ export interface VisualAnalysis {
   uiRegions?: UIRegion[];
 }
 
+// ── Phase 4: Transcript + Audio Intelligence ────────────────────────────────
+// All additive + optional on `Analysis` — projects analyzed before Phase 4
+// decode with `transcript`/`audioAnalysis` absent (treated as not-run).
+
+/** Lifecycle of a transcript. `unavailable` = no provider/key configured (NOT an error). */
+export type TranscriptStatus =
+  | "not_started"
+  | "processing"
+  | "complete"
+  | "failed"
+  | "unavailable";
+
+/**
+ * WHY an `unavailable` transcript was skipped — structured (never parsed from
+ * the human-readable `error` text). Quota reasons drive the distinct
+ * "blocked by quota" caption state in the UI; absent = generic unavailable
+ * (e.g. no ASR provider configured).
+ */
+export type TranscriptSkipReason =
+  | "quota_exhausted"
+  | "per_video_limit"
+  | "unknown_duration"
+  | "quota_check_failed"
+  | "reservation_invalid";
+
+export interface TranscriptSegment {
+  id: string;
+  startTime: number;
+  endTime: number;
+  text: string;
+  confidence?: number;
+}
+
+export interface TranscriptWord {
+  word: string;
+  startTime: number;
+  endTime: number;
+  confidence?: number;
+}
+
+/** Which engine produced the transcript (so it's replaceable + auditable). */
+export interface TranscriptProviderMeta {
+  provider: string;
+  model?: string;
+  createdAt: number;
+  /** Seconds of media actually transcribed. */
+  durationAnalyzed?: number;
+  /** The primary BCP-47 sent to the ASR provider for this transcript. */
+  languageCode?: string;
+  /** How the language was chosen ("auto" | "selected"). */
+  languageMode?: "auto" | "selected";
+}
+
+/**
+ * A real transcript. NEVER fabricated — `status: "unavailable"` (with no
+ * segments) is the honest state when no ASR provider is configured. Captions
+ * only auto-generate when `status === "complete"` AND `segments` exist.
+ */
+export interface Transcript {
+  status: TranscriptStatus;
+  /** Full transcript text (`transcriptText`). */
+  text?: string;
+  /** BCP-47 language code when detected (e.g. "en"). */
+  language?: string;
+  segments?: TranscriptSegment[];
+  /** Word-level timing when the provider supplies it (for karaoke caption highlight). */
+  words?: TranscriptWord[];
+  provider?: TranscriptProviderMeta;
+  /** User-facing failure reason when `status === "failed"`. */
+  error?: string;
+  /**
+   * Fingerprint of the SOURCE this transcript was made from (storage path + size
+   * + duration). Used to REUSE a `complete` transcript when the video hasn't
+   * changed, and to re-transcribe when it has. See src/lib/transcript/transcription-job.ts.
+   */
+  sourceFingerprint?: string;
+  /** Wall-clock when transcription was requested (dedup: a stale `processing` job can be retried). */
+  requestedAt?: number;
+  /** How the spoken language was chosen for this run ("auto" | "selected"). */
+  languageMode?: "auto" | "selected";
+  /** The primary BCP-47 the resolver requested (the language SENT to ASR). */
+  requestedLanguageCode?: string;
+  /** Auto-Detect candidate codes sent alongside (v1 `alternativeLanguageCodes`). */
+  requestedAlternativeLanguageCodes?: string[];
+  /**
+   * True when the returned transcript's SCRIPT looks inconsistent with the
+   * selected language (e.g. Latin text for an Arabic selection). Surfaces the
+   * "wrong language?" warning — we never silently translate or fix it.
+   */
+  languageMismatch?: boolean;
+  /**
+   * Caption-quota accounting for THIS ASR request (see
+   * src/lib/usage/caption-quota.ts). `usageKey` is the reservation/idempotency
+   * key the analyze route reserved before dispatch; the worker verifies it
+   * before calling the provider and finalizes it (commit/release) after.
+   * `usagePeriodId` names the ledger doc holding the reservation;
+   * `usageSeconds` is the reserved amount (fallback for a late commit).
+   */
+  usageKey?: string;
+  usagePeriodId?: string;
+  usageSeconds?: number;
+  /** Structured reason an `unavailable` transcript was skipped (quota, etc.). */
+  skipReason?: TranscriptSkipReason;
+}
+
+export type AudioAnalysisStatus = TranscriptStatus;
+
+export interface SpeechSegment {
+  startTime: number;
+  endTime: number;
+}
+
+export interface SilenceSegment {
+  startTime: number;
+  endTime: number;
+  duration: number;
+}
+
+/** A silence long enough to be a silence-removal candidate. */
+export interface LongPause {
+  startTime: number;
+  endTime: number;
+  duration: number;
+}
+
+/** A likely filler word ("um", "uh", …) — only when transcript words exist. */
+export interface FillerWord {
+  word: string;
+  startTime: number;
+  endTime: number;
+}
+
+/** Speech coverage in a fixed time window (0..1 = fraction of the window that is speech). */
+export interface SpeakingDensityBucket {
+  startTime: number;
+  endTime: number;
+  density: number;
+}
+
+/**
+ * Deterministic audio intelligence — produced client-side from the media's audio
+ * (Web Audio RMS), so it needs no API key and is REAL. `hasUsableSpeech` gates
+ * whether captions / silence-removal make sense.
+ */
+export interface AudioAnalysis {
+  status: AudioAnalysisStatus;
+  speechSegments?: SpeechSegment[];
+  silenceSegments?: SilenceSegment[];
+  /** Silences long enough to remove — the silence-removal candidates. */
+  longPauses?: LongPause[];
+  speakingDensity?: SpeakingDensityBucket[];
+  fillerWords?: FillerWord[];
+  hasUsableSpeech: boolean;
+  /** Convenience totals for the UI. */
+  totalSilenceSeconds?: number;
+  /** 8-bit quantized loudness timeline (divide by 255) — for debug/UI only. */
+  loudness?: number[];
+  loudnessSampleRate?: number;
+  error?: string;
+}
+
 export interface Analysis {
   status: AnalysisStatus;
   stage?: string;
@@ -777,6 +954,18 @@ export interface Analysis {
    * the current zoom/cut/speed timeline. See src/lib/analysis/edit-recipe.ts.
    */
   editRecipe?: EditRecipePlan;
+  /**
+   * Phase 4 — real transcript (or an honest `unavailable`/`failed` status when
+   * no ASR provider is configured). Drives auto-captions + hook text. Absent on
+   * pre-Phase-4 projects.
+   */
+  transcript?: Transcript;
+  /**
+   * Phase 4 — deterministic audio intelligence (speech / silence / density),
+   * produced from the media audio. Drives silence-removal feasibility. Absent on
+   * pre-Phase-4 projects.
+   */
+  audioAnalysis?: AudioAnalysis;
   /** AI-segmented narrative structure (intro / action / result / etc). */
   narrativeStructure?: NarrativeSegment[];
   /**

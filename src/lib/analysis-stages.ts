@@ -10,14 +10,18 @@ export interface StageDef {
  * Ordered list of analysis stages shown in the processing UI.
  * The server walks these in order; the client renders them as a checklist.
  */
+// NOTE: these coarse server stages drive the progress FRACTION (indexing), not
+// the user-facing step list — the modern, video-type-aware, option-filtered
+// steps live in `src/lib/analysis-progress.ts`. Labels here are generic (no
+// screen-recording-only language) so any surface that still reads them is clean.
 export const ANALYSIS_STAGES: StageDef[] = [
-  { id: "scanning_frames", label: "Scanning frames", description: "Reading the video on-device — motion, scene changes, and visual density." },
-  { id: "preparing", label: "Preparing analysis", description: "Loading project metadata and downloading the source video." },
-  { id: "uploading_to_gemini", label: "Uploading to Gemini", description: "Streaming your video to Google's Files API." },
-  { id: "extracting_frames", label: "Extracting frames", description: "Gemini is decoding the video and indexing frames." },
-  { id: "analyzing", label: "Analyzing UI interactions", description: "Detecting cursor focus, clicks, and important moments." },
-  { id: "generating_timeline", label: "Building zoom timeline", description: "Composing the cinematic plan from detected moments." },
-  { id: "generating_presets", label: "Generating presets", description: "Picking the presets that fit this recording." },
+  { id: "scanning_frames", label: "Preparing video", description: "Reading the video on-device — motion, scenes, and visual density." },
+  { id: "preparing", label: "Preparing analysis", description: "Loading the project and the source video." },
+  { id: "uploading_to_gemini", label: "Preparing AI analysis", description: "Getting the video ready for the AI model." },
+  { id: "extracting_frames", label: "Reading the video", description: "The AI model is decoding + indexing the video." },
+  { id: "analyzing", label: "Analyzing the video", description: "Finding the scenes and moments that matter." },
+  { id: "generating_timeline", label: "Building your edit", description: "Adding the selected edits to the timeline." },
+  { id: "generating_presets", label: "Finishing up", description: "Choosing presets that fit this video." },
 ];
 
 /**
@@ -116,9 +120,9 @@ export const ERROR_RECOVERY: Record<
     suggestion: "Compress or trim the recording, then re-upload.",
   },
   network_interruption: {
-    title: "Network interrupted",
-    reason: "The connection between Framevo and Gemini dropped mid-analysis.",
-    suggestion: "Retry. If this keeps happening, check your network and try a different browser.",
+    title: "Analysis connection failed",
+    reason: "Framevo couldn't reach the AI service. This is usually a temporary network or connectivity issue.",
+    suggestion: "Please retry — or run it in the background and try again in a moment. If it keeps happening, check your network/VPN and try a different browser.",
   },
   unknown: {
     title: "Something went wrong",
@@ -129,7 +133,7 @@ export const ERROR_RECOVERY: Record<
 
 export function classifyError(message: string): AnalysisErrorKind {
   const m = message.toLowerCase();
-  if (m.includes("timeout") || m.includes("deadline_exceeded") || m.includes("deadline exceeded"))
+  if (m.includes("timeout") || m.includes("timed out") || m.includes("deadline_exceeded") || m.includes("deadline exceeded"))
     return "gemini_timeout";
   if (m.includes("quota") || m.includes("rate") || m.includes("resource_exhausted"))
     return "gemini_quota";
@@ -141,7 +145,20 @@ export function classifyError(message: string): AnalysisErrorKind {
     return "upload_failed";
   if (m.includes("too large") || m.includes("payload size") || m.includes("exceeded"))
     return "video_too_large";
-  if (m.includes("network") || m.includes("econn") || m.includes("etimedout") || m.includes("fetch failed"))
+  if (
+    m.includes("network") ||
+    m.includes("econn") ||
+    m.includes("etimedout") ||
+    m.includes("fetch failed") ||
+    // gRPC UNAVAILABLE / transport failures (e.g. "14 UNAVAILABLE: No connection
+    // established. Last error: Failed to connect").
+    m.includes("unavailable") ||
+    m.includes("no connection") ||
+    m.includes("failed to connect") ||
+    m.includes("couldn't reach") ||
+    m.includes("connectivity") ||
+    m.includes("connection failed")
+  )
     return "network_interruption";
   return "unknown";
 }

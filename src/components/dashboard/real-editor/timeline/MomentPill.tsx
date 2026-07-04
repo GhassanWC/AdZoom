@@ -133,6 +133,9 @@ export function MomentPill({
   const provInfo = PROVENANCE_PRESENTATION[prov];
   // A restored cut is inactive (range kept) — render it dimmed.
   const cutRestored = m.effectType === "cut" && m.cut?.active === false;
+  // A disabled overlay is hidden from preview/export (kept on the timeline) —
+  // render it dimmed like a restored cut so its off-state reads at a glance.
+  const overlayDisabled = m.enabled === false;
   // Crop shows its target aspect (9:16); speed shows its multiplier (2×); a cut
   // shows how much it removes (or "Restored" when inactive).
   const badge =
@@ -213,7 +216,7 @@ export function MomentPill({
         minWidth: `${MIN_PILL_PX}px`,
         top: insetY,
         bottom: insetY,
-        opacity: cutRestored ? bodyOpacity * 0.5 : bodyOpacity,
+        opacity: cutRestored || overlayDisabled ? bodyOpacity * 0.5 : bodyOpacity,
       }}
     >
       {/* ── Floating action toolbar ─────────────────────────────────── */}

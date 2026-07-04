@@ -42,6 +42,7 @@ import {
 } from "@/lib/timeline/canvas-layout";
 import { probeVideoBottomBand } from "@/lib/recording/health-check";
 import { resolveSourceRect } from "@/lib/timeline/source-crop";
+import { applyCompareBypass } from "./editor-shell-behavior";
 import { CropEditorOverlay } from "./CropEditorOverlay";
 import { FocalPathOverlay } from "./FocalPathOverlay";
 import { PreviewInCameraOverlays, PreviewOutputOverlays } from "./PreviewOverlays";
@@ -52,6 +53,31 @@ import type {
   FocusRegion,
   VisualAnalysis,
 } from "@/lib/firebase/schema";
+
+/**
+ * Measured size of the preview's parent box (fullscreen-editor `fill` mode).
+ * The frame is then sized in explicit px to FIT this box at the exact frame
+ * aspect — CSS alone (aspect-ratio + max-w/max-h) can over-constrain and
+ * silently break the ratio, which would corrupt every %-based overlay drag.
+ */
+function useContainerSize(
+  ref: React.RefObject<HTMLDivElement | null>,
+  enabled: boolean
+): { w: number; h: number } | null {
+  const [size, setSize] = React.useState<{ w: number; h: number } | null>(null);
+  React.useEffect(() => {
+    if (!enabled) return;
+    const el = ref.current;
+    if (!el) return;
+    const ro = new ResizeObserver((entries) => {
+      const r = entries[0]?.contentRect;
+      if (r) setSize({ w: r.width, h: r.height });
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [ref, enabled]);
+  return enabled ? size : null;
+}
 
 /**
  * Calls video.play() and swallows the AbortError that browsers throw when the
@@ -307,7 +333,17 @@ function useCinematicCamera(
   }, [wrapRef, videoRef]);
 }
 
-export function RealVideoPlayer() {
+export function RealVideoPlayer({
+  fill = false,
+}: {
+  /**
+   * Fullscreen-editor mode: size the frame to FIT the parent (measured via
+   * ResizeObserver) instead of the legacy viewport-unit caps, preserving the
+   * exact frame aspect so every %-based overlay (focus box, crop editor,
+   * click highlights) keeps its coordinate space.
+   */
+  fill?: boolean;
+} = {}) {
   const {
     project,
     videoRef,
@@ -328,6 +364,7 @@ export function RealVideoPlayer() {
     closeCropEditor,
     setSourceCrop,
     clearSourceCrop,
+    compareBypassId,
   } = useEditorReal();
 
   // Dev-only CV debug overlay gate (?debug=1 / Ctrl+Shift+D).
@@ -536,7 +573,13 @@ export function RealVideoPlayer() {
   // exporter uses. Passing the full moments array (not just
   // `activeMoment`) means moment selection happens in one place and
   // preview never drifts from export on overlap edge cases.
-  const allMoments = project.analysis?.detectedMoments ?? [];
+  // Before/After hold-to-compare removes ONLY the compared moment from the
+  // PREVIEW's list (camera + overlays) — persisted data and export are
+  // untouched, and with no active compare this is the same array reference.
+  const allMoments = applyCompareBypass(
+    project.analysis?.detectedMoments ?? [],
+    compareBypassId
+  );
   useCinematicCamera(
     transformWrapRef,
     videoRef,
@@ -748,6 +791,23 @@ export function RealVideoPlayer() {
     ? "h-[72vh] w-auto max-w-full"
     : "w-full max-h-[56vh] max-w-[100vh]";
 
+  // Fullscreen-editor `fill` mode: fit the frame into the measured parent at
+  // the exact frame aspect (explicit px keep the ratio true for BOTH tall and
+  // wide frames — no viewport units, no over-constrained CSS).
+  const fillActive = fill && !isFullscreen;
+  const containerSize = useContainerSize(containerRef, fillActive);
+  const frameAspect =
+    canvasActive && previewPlacement
+      ? previewPlacement.canvasW / previewPlacement.canvasH
+      : previewAspect;
+  const fittedStyle: React.CSSProperties | null =
+    fillActive && containerSize && containerSize.w > 8 && containerSize.h > 8
+      ? (() => {
+          const w = Math.min(containerSize.w, containerSize.h * frameAspect);
+          return { width: Math.floor(w), height: Math.floor(w / frameAspect) };
+        })()
+      : null;
+
   const place = canvasActive ? previewPlacement?.place : undefined;
   const stageStyle: React.CSSProperties | undefined =
     place && previewPlacement
@@ -849,17 +909,24 @@ export function RealVideoPlayer() {
         // fill it and let the inner card stretch to match. The video element
         // already uses `object-contain`, so any letterboxing happens cleanly
         // inside the frame instead of as page chrome around it.
-        isFullscreen && "h-screen w-screen bg-black"
+        isFullscreen && "h-screen w-screen bg-black",
+        // `fill` mode centers the fitted frame inside the flexible workspace.
+        fillActive && "flex h-full w-full min-h-0 items-center justify-center"
       )}
     >
       <div
         ref={aspectRef}
-        style={frameStyle}
+        style={fittedStyle ? { ...frameStyle, ...fittedStyle } : frameStyle}
         className={cn(
           "relative overflow-hidden bg-black shadow-cinematic",
           isFullscreen
             ? "h-full w-full rounded-none border-0"
-            : cn("rounded-xl border border-white/[0.06] mx-auto", frameSizeClass)
+            : cn(
+                "rounded-xl border border-white/[0.06] mx-auto",
+                // Until the first measurement lands, fall back to the legacy
+                // viewport caps so there's no zero-size flash.
+                fittedStyle ? "max-h-full max-w-full" : frameSizeClass
+              )
         )}
       >
         {/* ── Canvas Fit background — fills the empty space behind the (crisp)
@@ -999,7 +1066,7 @@ export function RealVideoPlayer() {
                     these track the content with no math here (WYSIWYG). */}
                 <PreviewInCameraOverlays
                   videoRef={videoRef}
-                  moments={project.analysis?.detectedMoments ?? []}
+                  moments={allMoments}
                   enabled={previewMode && !cropEditing}
                 />
               </div>
@@ -1008,7 +1075,11 @@ export function RealVideoPlayer() {
                   guides, editable focus box. Nested in the source frame so
                   their coords track the placed source under any fit mode.
                   Hidden while editing the global crop. */}
-              {!cropEditing && activeMoment && (
+              {/* Suppressed while THIS moment is hold-to-compared — the click
+                  highlight is a real exported effect, so the "before" view
+                  must drop it too (the editing guides below stay: they're
+                  editor affordances, not exported output). */}
+              {!cropEditing && activeMoment && activeMoment.id !== compareBypassId && (
                 <OverlayLayer
                   moment={activeMoment}
                   currentTime={currentTime}
@@ -1060,7 +1131,7 @@ export function RealVideoPlayer() {
             the export's post-camera draw. Same pure functions the export runs. */}
         <PreviewOutputOverlays
           videoRef={videoRef}
-          moments={project.analysis?.detectedMoments ?? []}
+          moments={allMoments}
           enabled={previewMode && !cropEditing}
         />
 

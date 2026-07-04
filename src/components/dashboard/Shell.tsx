@@ -9,22 +9,35 @@ import { RecordingChrome } from "@/components/recording/RecordingChrome";
 import { ExportProvider } from "@/components/export/ExportProvider";
 import { ExportPill } from "@/components/export/ExportPill";
 import { NotificationProvider } from "@/lib/notifications/store";
+import { isEditorRoute } from "@/components/dashboard/real-editor/editor-shell-behavior";
 
 export function Shell({ children }: { children: React.ReactNode }) {
   const [open, setOpen] = React.useState(false);
+  const pathname = usePathname();
   useRecordHotkey();
+
+  // The project editor is a dedicated fullscreen workspace: no persistent
+  // sidebar, no dashboard topbar, no content padding. It brings its own
+  // chrome (EditorTopBar + overlay nav drawer). Providers + the recording /
+  // export overlays still wrap it so those flows keep working inside the
+  // editor.
+  const fullBleed = isEditorRoute(pathname);
 
   return (
     <NotificationProvider>
       <RecordingProvider>
         <ExportProvider>
-          <div className="min-h-screen bg-ink">
-            <Sidebar open={open} onClose={() => setOpen(false)} />
-            <div className="lg:pl-64">
-              <Topbar onOpenSidebar={() => setOpen(true)} />
-              <main className="px-4 py-6 lg:px-8 lg:py-8">{children}</main>
+          {fullBleed ? (
+            <div className="min-h-screen bg-ink">{children}</div>
+          ) : (
+            <div className="min-h-screen bg-ink">
+              <Sidebar open={open} onClose={() => setOpen(false)} />
+              <div className="lg:pl-64">
+                <Topbar onOpenSidebar={() => setOpen(true)} />
+                <main className="px-4 py-6 lg:px-8 lg:py-8">{children}</main>
+              </div>
             </div>
-          </div>
+          )}
           <RecordingChrome />
           <ExportPill />
         </ExportProvider>

@@ -143,6 +143,7 @@ export const pricingTiers: PricingTier[] = [
     features: [
       "2 cloud exports per month",
       "720p cloud exports",
+      "10 auto-caption minutes/month",
       "Browser export available",
       "Watermark included",
       "Basic AI edits",
@@ -158,6 +159,7 @@ export const pricingTiers: PricingTier[] = [
     priceUnit: "month",
     features: [
       "150 cloud export minutes/month",
+      "150 auto-caption minutes/month",
       "1080p MP4 exports",
       "No watermark",
       "All AI effects",
@@ -174,6 +176,7 @@ export const pricingTiers: PricingTier[] = [
     priceUnit: "month",
     features: [
       "250 cloud export minutes/month",
+      "300 auto-caption minutes/month",
       "1080p MP4 exports",
       "No watermark",
       "All AI effects + presets",

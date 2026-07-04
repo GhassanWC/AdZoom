@@ -1,0 +1,173 @@
+/**
+ * Timeline LANE model — the single source of truth for which `effectType` lives
+ * in which timeline lane, how lanes are grouped, and which lanes are visible for
+ * a given moment set.
+ *
+ * Replaces the old single "Overlays" lane: every edit type now has its OWN lane
+ * (Captions, Hook text, Text overlays, Callouts, CTA, Transitions, Smart crop,
+ * Blur) grouped under collapsible sections. This module is framework-neutral
+ * (type-only imports) so it's unit-testable and shared by the timeline renderer.
+ *
+ * Backward compatibility: routing is purely by `effectType`, so old projects
+ * whose overlays were stored in the unified model load straight into the correct
+ * new lanes — no migration, no schema change.
+ */
+import type { DetectedMoment, EffectType } from "@/lib/firebase/schema";
+import type { TimelineTrackTone } from "./trackModel";
+
+/** Collapsible lane groups (product spec §4). */
+export type LaneGroupId = "camera" | "pacing" | "overlays" | "canvas";
+
+export interface LaneGroupDef {
+  id: LaneGroupId;
+  label: string;
+}
+
+/** Ordered groups — top-to-bottom on the timeline. */
+export const LANE_GROUPS: readonly LaneGroupDef[] = [
+  { id: "camera", label: "Camera" },
+  { id: "pacing", label: "Pacing" },
+  { id: "overlays", label: "Visual overlays" },
+  { id: "canvas", label: "Canvas" },
+] as const;
+
+/** One lane per user-facing edit type. */
+export type LaneId =
+  | "camera"
+  | "cut"
+  | "speed"
+  | "transition"
+  | "captions"
+  | "hook-text"
+  | "text-overlay"
+  | "callout"
+  | "branding-cta"
+  | "blur-redaction"
+  | "smart-crop";
+
+export interface LaneDef {
+  id: LaneId;
+  group: LaneGroupId;
+  /** Left-gutter label. */
+  label: string;
+  /** Gutter tint. */
+  tone: TimelineTrackTone;
+  /** The effect type whose icon represents this lane. */
+  primaryEffect: EffectType;
+  /** effectTypes routed into this lane. */
+  effectTypes: readonly EffectType[];
+  /**
+   * Core lanes (camera / cut / speed) ALWAYS show — even empty — with a
+   * "Run this layer" affordance. Overlay lanes appear only when they have ≥1
+   * moment (empty overlay types are reachable from the toolbar's Add menu).
+   */
+  core?: boolean;
+  /** The analysis engine layer this lane maps to (for the Run affordance + note). */
+  engineLayer?: "camera" | "cut" | "speed";
+  /** Overlay lanes support bulk enable / disable / delete in the gutter. */
+  overlay?: boolean;
+}
+
+/**
+ * Every EffectType → its lane. STATIC + exhaustive (compile error if a new
+ * EffectType is added without a lane), which is what guarantees old docs route
+ * correctly. `crop` (legacy source-crop / reframe) rides the Canvas lane with
+ * smart-crop since both are framing edits.
+ */
+export const EFFECT_TO_LANE: Record<EffectType, LaneId> = {
+  zoom: "camera",
+  "click-highlight": "camera",
+  "cursor-focus": "camera",
+  cut: "cut",
+  "speed-up": "speed",
+  crop: "smart-crop",
+  captions: "captions",
+  "hook-text": "hook-text",
+  "text-overlay": "text-overlay",
+  "smart-crop": "smart-crop",
+  callout: "callout",
+  "blur-redaction": "blur-redaction",
+  transition: "transition",
+  "branding-cta": "branding-cta",
+};
+
+/** The lane a moment belongs to (by effectType). Unknown/legacy → camera. */
+export function laneForEffectType(t: EffectType | undefined): LaneId {
+  return (t && EFFECT_TO_LANE[t]) || "camera";
+}
+
+/** Ordered lane definitions. Order within a group is top-to-bottom. */
+export const LANE_DEFS: readonly LaneDef[] = [
+  {
+    id: "camera",
+    group: "camera",
+    label: "Zooms & focus",
+    tone: "violet",
+    primaryEffect: "zoom",
+    effectTypes: ["zoom", "click-highlight", "cursor-focus"],
+    core: true,
+    engineLayer: "camera",
+  },
+  { id: "cut", group: "pacing", label: "Cuts", tone: "rose", primaryEffect: "cut", effectTypes: ["cut"], core: true, engineLayer: "cut" },
+  { id: "speed", group: "pacing", label: "Speed", tone: "amber", primaryEffect: "speed-up", effectTypes: ["speed-up"], core: true, engineLayer: "speed" },
+  { id: "transition", group: "pacing", label: "Transitions", tone: "purple", primaryEffect: "transition", effectTypes: ["transition"], overlay: true },
+  { id: "captions", group: "overlays", label: "Captions", tone: "sky", primaryEffect: "captions", effectTypes: ["captions"], overlay: true },
+  { id: "hook-text", group: "overlays", label: "Hook text", tone: "pink", primaryEffect: "hook-text", effectTypes: ["hook-text"], overlay: true },
+  { id: "text-overlay", group: "overlays", label: "Text overlays", tone: "blue", primaryEffect: "text-overlay", effectTypes: ["text-overlay"], overlay: true },
+  { id: "callout", group: "overlays", label: "Callouts", tone: "orange", primaryEffect: "callout", effectTypes: ["callout"], overlay: true },
+  { id: "branding-cta", group: "overlays", label: "CTA / End card", tone: "lime", primaryEffect: "branding-cta", effectTypes: ["branding-cta"], overlay: true },
+  { id: "blur-redaction", group: "overlays", label: "Blur / Redaction", tone: "slate", primaryEffect: "blur-redaction", effectTypes: ["blur-redaction"], overlay: true },
+  { id: "smart-crop", group: "canvas", label: "Smart crop / Canvas", tone: "emerald", primaryEffect: "smart-crop", effectTypes: ["smart-crop", "crop"], overlay: true },
+] as const;
+
+/** Lane def by id (for quick lookup). */
+export const LANE_BY_ID: Record<LaneId, LaneDef> = Object.fromEntries(
+  LANE_DEFS.map((l) => [l.id, l])
+) as Record<LaneId, LaneDef>;
+
+export interface PlannedLane {
+  def: LaneDef;
+  moments: DetectedMoment[];
+  count: number;
+}
+
+export interface PlannedGroup {
+  def: LaneGroupDef;
+  lanes: PlannedLane[];
+  /** Total moments across the group's lanes. */
+  count: number;
+}
+
+/**
+ * Plan the visible, grouped lanes for a moment set.
+ *   • Core lanes (camera / cut / speed) always appear (even empty).
+ *   • Overlay lanes appear only when they hold ≥1 moment — so the timeline
+ *     never shows a wall of empty rows; empty overlay types live in the Add menu.
+ *   • A group with no visible lanes is dropped entirely.
+ * Pure → unit-testable and the single input the renderer maps over.
+ */
+export function planTimelineLanes(moments: DetectedMoment[]): PlannedGroup[] {
+  const byLane = new Map<LaneId, DetectedMoment[]>();
+  for (const m of moments) {
+    const id = laneForEffectType(m.effectType);
+    const arr = byLane.get(id);
+    if (arr) arr.push(m);
+    else byLane.set(id, [m]);
+  }
+
+  const out: PlannedGroup[] = [];
+  for (const g of LANE_GROUPS) {
+    const lanes: PlannedLane[] = [];
+    for (const def of LANE_DEFS) {
+      if (def.group !== g.id) continue;
+      const ms = byLane.get(def.id) ?? [];
+      if (def.core || ms.length > 0) {
+        lanes.push({ def, moments: ms, count: ms.length });
+      }
+    }
+    if (lanes.length > 0) {
+      out.push({ def: g, lanes, count: lanes.reduce((n, l) => n + l.count, 0) });
+    }
+  }
+  return out;
+}

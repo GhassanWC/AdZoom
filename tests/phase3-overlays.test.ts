@@ -65,6 +65,38 @@ test("Reels generates hook text + a 9:16 smart crop when the recipe enables them
   assert.ok(res.moments.some((m) => m.effectType === "smart-crop"), "smart-crop record on timeline");
 });
 
+test("Reels/ad-promo still get an (editable) default hook with no transcript AND no title", () => {
+  // Regression: a bare upload (no transcript, empty/short title) used to skip the
+  // hook entirely ("hook_text:no-source"), leaving only zooms. A hook-first format
+  // now falls back to a type-based editable default.
+  for (const t of ["reels-shorts", "ad-promo"]) {
+    const res = generateOverlayEdits({
+      plan: planFor(t),
+      moments: [],
+      duration: 30,
+      projectTitle: "", // no usable title
+      hasOutputCanvas: false,
+    });
+    const hook = res.moments.find((m) => m.effectType === "hook-text");
+    assert.ok(hook, `${t} generates a fallback hook`);
+    assert.ok((hook?.hookText?.text?.length ?? 0) >= 2, `${t} hook has real text`);
+    assert.match(hook?.reason ?? "", /editable/i, `${t} hook is flagged as an editable default`);
+  }
+
+  // Types where an invented hook would feel forced still skip when there's no source.
+  const talking = generateOverlayEdits({
+    plan: planFor("talking-head"),
+    moments: [],
+    duration: 30,
+    projectTitle: "",
+    hasOutputCanvas: false,
+  });
+  assert.ok(
+    !talking.moments.some((m) => m.effectType === "hook-text"),
+    "talking-head does NOT fabricate a hook with no transcript/title"
+  );
+});
+
 test("captions are NEVER auto-generated (no transcript = no fake words)", () => {
   for (const t of ["reels-shorts", "talking-head", "podcast-clip", "tutorial"]) {
     const res = generateOverlayEdits({
@@ -221,4 +253,42 @@ test("hasOverlayMoments ignores plain camera/timing timelines (old projects)", (
     { id: "c", startTime: 3, endTime: 5, effectType: "cut", label: "", reason: "", focusRegion: { x: 0, y: 0, width: 1, height: 1 }, cut: { active: true } },
   ];
   assert.equal(hasOverlayMoments(old), false, "no overlays on a legacy timeline");
+});
+
+// ── Non-destructive enable/disable for overlays (preview == export gate) ─────
+
+const cap = (id, extra = {}) => ({
+  id, startTime: 0, endTime: 5, effectType: "captions", label: "", reason: "",
+  focusRegion: { x: 0, y: 0, width: 1, height: 1 },
+  captions: { text: "hi", stylePreset: "clean", position: "bottom" },
+  ...extra,
+});
+
+test("a disabled caption is hidden in BOTH preview and export (single activeOverlays gate)", () => {
+  // activeOverlays is the one selector composeFrame (export/worker), the Remotion
+  // layers, AND the live preview all use — so filtering here hides it everywhere.
+  const disabled = activeOverlays([cap("c", { enabled: false })], 2);
+  assert.equal(disabled.output.length, 0, "enabled:false → not drawn");
+  assert.equal(hasOverlayMoments([cap("c", { enabled: false })]), false, "all-disabled → no overlay canvas");
+});
+
+test("an enabled caption renders/exports; absent `enabled` (old overlays) still renders", () => {
+  assert.equal(activeOverlays([cap("c", { enabled: true })], 2).output.length, 1, "enabled:true → drawn");
+  assert.equal(activeOverlays([cap("c")], 2).output.length, 1, "no enabled field → treated as enabled");
+  assert.equal(hasOverlayMoments([cap("c")]), true, "legacy overlay counts as present");
+});
+
+test("a disabled caption can be re-enabled (flip the flag → it renders again)", () => {
+  let m = cap("c", { enabled: false });
+  assert.equal(activeOverlays([m], 2).output.length, 0);
+  m = { ...m, enabled: true };
+  assert.equal(activeOverlays([m], 2).output.length, 1, "re-enabled caption renders");
+});
+
+test("disabling overlays never affects cut/zoom/speed selection", () => {
+  // enabled:false on a zoom is ignored by activeOverlays (it only handles overlays),
+  // and camera/timing resolvers don't consult `enabled` at all → unchanged behavior.
+  const zoom = { id: "z", startTime: 0, endTime: 5, effectType: "zoom", label: "", reason: "", focusRegion: { x: 0, y: 0, width: 1, height: 1 }, enabled: false };
+  const r = activeOverlays([zoom], 2);
+  assert.equal(r.output.length + r.inCamera.length, 0, "zoom is never an overlay regardless of enabled");
 });

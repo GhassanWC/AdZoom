@@ -35,7 +35,22 @@ export interface TimelineLaneContext {
   zoom: number;
 }
 
-export type TimelineTrackTone = "violet" | "cyan" | "fog" | "amber" | "teal" | "rose";
+export type TimelineTrackTone =
+  | "violet"
+  | "cyan"
+  | "fog"
+  | "amber"
+  | "teal"
+  | "rose"
+  // Per-overlay-lane tones (match the effect colours in EFFECT_TONES).
+  | "sky"
+  | "pink"
+  | "blue"
+  | "emerald"
+  | "orange"
+  | "purple"
+  | "lime"
+  | "slate";
 
 export interface TimelineTrackDescriptor {
   id: string;

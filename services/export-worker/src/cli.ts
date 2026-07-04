@@ -55,6 +55,7 @@ console.warn = toStderr as typeof console.warn;
 console.error = toStderr as typeof console.error;
 
 import { renderToMp4 } from "./render.js";
+import { registerAndDiagnoseFonts } from "./fonts.js";
 import { computePreflight, AUDIO_UNSUPPORTED_WARNING } from "./preflight.js";
 import { normalizeSource, probeSource, ffmpegBin, type SourceInfo } from "./ffmpeg.js";
 import { buildAudioFilterComplex } from "./audio.js";
@@ -507,6 +508,8 @@ async function main(): Promise<void> {
   const build = process.env.BUILD_VERSION ?? "unknown";
   emit({ type: "version", cliVersion: RENDER_CLI_VERSION, build, node: process.version });
   toStderr(`[worker:cli] start version=${RENDER_CLI_VERSION} build=${build} node=${process.version}`);
+  // Load + verify multilingual fonts before any render (logs to stderr).
+  registerAndDiagnoseFonts();
 
   const specPath = process.argv[2];
   if (!specPath) {

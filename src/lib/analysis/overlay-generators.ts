@@ -21,6 +21,7 @@ import type {
   FocusRegion,
   OutputCanvas,
   SelectedVideoType,
+  Transcript,
 } from "@/lib/firebase/schema";
 import type {
   EditOperationCategory,
@@ -33,10 +34,17 @@ export interface OverlayGenInput {
   moments: DetectedMoment[];
   /** Source duration in seconds. */
   duration: number;
-  /** Real project title — the only honest source for hook text. */
+  /** Real project title — the honest fallback source for hook text. */
   projectTitle?: string | null;
   /** True when the project already has a user/explicit output canvas (don't override). */
   hasOutputCanvas: boolean;
+  /** Phase 4 — REAL transcript. Drives auto-captions + strengthens the hook. */
+  transcript?: Transcript | null;
+  /**
+   * Per-category generation gates from the Analyze modal. `false` SUPPRESSES that
+   * category even if the recipe enables it; absent = allow (recipe decides).
+   */
+  allow?: Partial<Record<EditOperationCategory, boolean>>;
 }
 
 export interface OverlayGenResult {
@@ -50,6 +58,19 @@ export interface OverlayGenResult {
   };
 }
 
+/**
+ * A punchy hook from the transcript's opening line — the first sentence, capped.
+ * Returns null when there's no usable transcript (caller falls back to the title).
+ */
+function transcriptHook(transcript: Transcript | null | undefined): string | null {
+  if (!transcript || transcript.status !== "complete") return null;
+  const first = transcript.segments?.[0]?.text ?? transcript.text ?? "";
+  const sentence = first.trim().split(/(?<=[.!?])\s+/)[0]?.trim() ?? "";
+  if (sentence.length < 3) return null;
+  const capped = sentence.length > 58 ? `${sentence.slice(0, 57).trimEnd()}…` : sentence;
+  return capped.replace(/[.]+$/, "");
+}
+
 const GENERIC_LABELS = new Set([
   "cut", "zoom", "speed", "focus", "click", "crop", "moment", "edit",
   "speed up", "click emphasis", "crop / reframe",
@@ -59,6 +80,29 @@ function isDescriptive(label: string | undefined): label is string {
   if (!label) return false;
   const l = label.trim().toLowerCase();
   return l.length >= 5 && !GENERIC_LABELS.has(l);
+}
+
+/**
+ * A generic-but-editable opening hook per video type — the LAST-resort fallback
+ * used only when there's neither a transcript line nor a usable project title.
+ * A hook-first format (reels / ad-promo / demo / tutorial) should never ship
+ * with no hook at all; this is an editable placeholder (same philosophy as the
+ * CTA default), NOT fabricated transcript data. `null` for types where an
+ * invented hook would feel out of place (e.g. talking-head, podcast, vlog).
+ */
+function defaultHookFor(v: SelectedVideoType): string | null {
+  switch (v) {
+    case "reels-shorts":
+      return "Wait for it…";
+    case "ad-promo":
+      return "You'll want to see this";
+    case "product-demo":
+      return "Here's how it works";
+    case "tutorial":
+      return "Here's how";
+    default:
+      return null;
+  }
 }
 
 /** CTA copy per video type — a sensible, editable default (never fabricated data). */
@@ -115,7 +159,7 @@ function canvasForAspect(aspect: "9:16" | "1:1" | "16:9"): OutputCanvas {
 const FULL_REGION: FocusRegion = { x: 0, y: 0, width: 1, height: 1 };
 
 export function generateOverlayEdits(input: OverlayGenInput): OverlayGenResult {
-  const { plan, moments, duration, projectTitle, hasOutputCanvas } = input;
+  const { plan, moments, duration, projectTitle, hasOutputCanvas, transcript } = input;
   const out: DetectedMoment[] = [];
   const generated: Partial<Record<string, number>> = {};
   const skipped: string[] = [];
@@ -127,7 +171,11 @@ export function generateOverlayEdits(input: OverlayGenInput): OverlayGenResult {
   }
 
   const videoType = plan.effectiveVideoType;
-  const enabled = (c: EditOperationCategory) => plan.enabledCategories.includes(c);
+  const allow = input.allow;
+  /** A category generates only if the recipe enables it AND the user allows it. */
+  const allowed = (c: EditOperationCategory) => allow?.[c] !== false;
+  const enabled = (c: EditOperationCategory) =>
+    plan.enabledCategories.includes(c) && allowed(c);
   const opParams = (c: EditOperationCategory): Record<string, unknown> | undefined =>
     plan.operations.find((o) => o.category === c && o.enabled)?.params;
   const hasType = (t: EffectType) => moments.some((m) => m.effectType === t);
@@ -146,15 +194,30 @@ export function generateOverlayEdits(input: OverlayGenInput): OverlayGenResult {
     reason: string
   ): DetectedMoment => ({
     ...m,
+    // Overlays default ON; the user can non-destructively disable them later.
+    enabled: true,
     source: "ai",
     provenance: "ai",
     recipe: { source: "recipe", recipeType: videoType, category, reason },
   });
 
-  // 1. Hook text — first ~1–3s, from the real project title.
+  // 1. Hook text — first ~1–3s. Prefer the transcript's opening line (the real
+  // strongest first sentence); fall back to the project title when there's no
+  // transcript. Never fabricated.
   if (enabled("hook_text") && !hasType("hook-text") && !userTouchedOverlays) {
+    const fromTranscript = transcriptHook(transcript);
     const title = (projectTitle ?? "").trim();
-    if (title.length >= 2 && duration > 1.2) {
+    const fromTitle = title.length >= 2 ? title.slice(0, 60) : null;
+    // Transcript line → project title → a type-based editable default (so a bare
+    // upload with no transcript/title still gets an opening hook for hook-first
+    // formats). `defaultHookFor` returns null for types where that'd feel forced.
+    const hook = fromTranscript ?? fromTitle ?? defaultHookFor(videoType);
+    const hookSource: "transcript" | "title" | "default" = fromTranscript
+      ? "transcript"
+      : fromTitle
+        ? "title"
+        : "default";
+    if (hook && duration > 1.2) {
       const end = Math.min(duration - 0.05, Math.max(1.4, Math.min(3, duration * 0.3)));
       out.push(
         stamp(
@@ -163,11 +226,16 @@ export function generateOverlayEdits(input: OverlayGenInput): OverlayGenResult {
             startTime: 0.15,
             endTime: end,
             label: "Hook",
-            reason: "Opening hook from the project title.",
+            reason:
+              hookSource === "transcript"
+                ? "Opening hook from the transcript."
+                : hookSource === "title"
+                  ? "Opening hook from the project title."
+                  : "Opening hook — an editable starting point; make it yours.",
             focusRegion: FULL_REGION,
             effectType: "hook-text",
             hookText: {
-              text: title.slice(0, 60),
+              text: hook,
               stylePreset: hookStyleFor(videoType),
               position: videoType === "reels-shorts" ? "center" : "top",
               animation: "pop",
@@ -179,16 +247,22 @@ export function generateOverlayEdits(input: OverlayGenInput): OverlayGenResult {
       );
       generated["hook-text"] = 1;
     } else {
-      skipped.push("hook_text:no-title");
+      skipped.push("hook_text:no-source");
     }
   }
 
+  // NOTE: captions are transcript-driven + potentially large, so they're
+  // generated by the route (via `generateCaptionMoments`) rather than here —
+  // keeping this module free of cross-file VALUE imports (node --test loadable).
+
   // 2. Branding / CTA end-card — enabled via "branding" OR a cta text_overlay op.
+  // Gated by the CTA toggle (mapped to the "branding" allow key).
   const wantsCta =
-    enabled("branding") ||
-    plan.operations.some(
-      (o) => o.category === "text_overlay" && o.enabled && o.params?.kind === "cta"
-    );
+    allowed("branding") &&
+    (plan.enabledCategories.includes("branding") ||
+      plan.operations.some(
+        (o) => o.category === "text_overlay" && o.enabled && o.params?.kind === "cta"
+      ));
   if (wantsCta && !hasType("branding-cta") && !userTouchedOverlays && duration > 5) {
     const start = Math.max(0, duration - 4);
     out.push(
@@ -220,7 +294,11 @@ export function generateOverlayEdits(input: OverlayGenInput): OverlayGenResult {
     enabled("text_overlay") &&
     !hasType("text-overlay") &&
     !userTouchedOverlays &&
-    (videoType === "tutorial" || videoType === "product-demo")
+    (videoType === "tutorial" ||
+      videoType === "product-demo" ||
+      videoType === "screen-recording" ||
+      videoType === "reels-shorts" ||
+      videoType === "ad-promo")
   ) {
     const candidates = moments
       .filter(
@@ -369,5 +447,9 @@ export function generateOverlayEdits(input: OverlayGenInput): OverlayGenResult {
     }
   }
 
-  return { moments: out, outputCanvas, log: { generated, skipped, smartCropAspect } };
+  return {
+    moments: out,
+    outputCanvas,
+    log: { generated, skipped, smartCropAspect },
+  };
 }

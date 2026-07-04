@@ -4,8 +4,6 @@ import * as React from "react";
 import {
   Sparkles,
   MousePointer2,
-  FastForward,
-  Scissors,
   AlertTriangle,
   Trash2,
   Check,
@@ -14,18 +12,23 @@ import {
   Diamond,
   Bug,
   Activity,
-  Layers,
+  ChevronDown,
+  ChevronRight,
+  MoreHorizontal,
+  Eye,
+  EyeOff,
+  type LucideIcon,
 } from "lucide-react";
 import { useEditorReal } from "../context";
 import { cn } from "@/lib/cn";
 import { distributionScore } from "@/lib/timeline-balancer";
 import { buildTimelineMap } from "@/lib/timeline/crop-speed";
 import { CvSignalTracks } from "../CvSignalTracks";
-import type { DetectedMoment } from "@/lib/firebase/schema";
-import { isOverlayEffectType } from "@/lib/firebase/schema";
+import type { DetectedMoment, EffectType } from "@/lib/firebase/schema";
 import type { AnalysisOptions, EngineLayer } from "@/lib/analysis/engine-layers";
 import {
   EFFECT_TONES,
+  EFFECT_ICONS,
   GUTTER_WIDTH,
   MIN_MOMENT_LEN,
   MIN_PILL_PX,
@@ -47,7 +50,8 @@ import { AttentionWaveform } from "./AttentionWaveform";
 import { useTimelineMetrics } from "./useTimelineMetrics";
 import { MomentLane } from "./MomentLane";
 import { InteractionsLane } from "./InteractionsLane";
-import type { TimelineTrackDescriptor } from "./trackModel";
+import type { TimelineLaneContext, TimelineTrackTone } from "./trackModel";
+import { planTimelineLanes, type LaneGroupId } from "./laneModel";
 
 /**
  * Track-based timeline orchestrator. Owns drag math, snap math, multi-select
@@ -78,6 +82,8 @@ export function RealTimeline() {
     deleteMoment,
     duplicateMoment,
     addMomentAtPlayhead,
+    setLaneEnabled,
+    deleteLane,
     undo,
     redo,
     canUndo,
@@ -94,39 +100,17 @@ export function RealTimeline() {
   const narrativeSegments = project.analysis?.narrativeStructure ?? [];
   const attentionCurve = project.analysis?.attentionCurve;
 
-  // Cut and Speed each live on their OWN track (any source). The unified
-  // "Edits" track holds ALL camera/click effects — AI-generated AND manual —
-  // so there's no redundant empty "Your edits" row (manual zoom/focus edits
-  // appear here alongside AI ones, distinguished by their provenance colour).
-  // Crop is demoted: any legacy crop moments are excluded from Edits but have
-  // no dedicated track.
-  const isOwnTrack = (m: DetectedMoment) =>
-    m.effectType === "crop" ||
-    m.effectType === "speed-up" ||
-    m.effectType === "cut" ||
-    isOverlayEffectType(m.effectType);
-  const cutMoments = React.useMemo(
-    () => moments.filter((m) => m.effectType === "cut"),
-    [moments]
-  );
-  // Phase-3 overlays (captions/hook/text/callout/blur/transition/branding +
-  // smart-crop) share ONE "Overlays" lane so they never crowd the Edits lane.
-  const overlayMoments = React.useMemo(
-    () => moments.filter((m) => isOverlayEffectType(m.effectType)),
-    [moments]
-  );
+  // ── Lane model ──────────────────────────────────────────────────────────
+  // Every edit type has its OWN lane now (no single "Overlays" lane). The plan
+  // groups the visible lanes (core camera/cut/speed always; overlay lanes only
+  // when populated) into collapsible groups, with each lane carrying its own
+  // moments. Routing is purely by effectType, so old projects load straight
+  // into the right new lanes (no migration).
+  const lanePlan = React.useMemo(() => planTimelineLanes(moments), [moments]);
   // Cut summary for the track header — "{active} active · {removed}s removed".
   const cutMap = React.useMemo(
     () => buildTimelineMap(moments, total),
     [moments, total]
-  );
-  const speedMoments = React.useMemo(
-    () => moments.filter((m) => m.effectType === "speed-up"),
-    [moments]
-  );
-  const editMoments = React.useMemo(
-    () => moments.filter((m) => !isOwnTrack(m)),
-    [moments]
   );
 
   // Engine selection from the most recent analysis — drives the "Disabled for
@@ -232,7 +216,6 @@ export function RealTimeline() {
   const emptyQuartiles = emptyRanges.length;
   const densityPerMin = total > 0 ? moments.length / (total / 60) : 0;
   const isClustered = moments.length >= 3 && distScore < 0.55;
-  const editCount = editMoments.length;
 
   const snapTime = React.useCallback(
     (
@@ -476,6 +459,26 @@ export function RealTimeline() {
     writePersistedBool("adzoom.timeline.insights.open", next);
   };
 
+  // ── Lane-group collapse state (persisted per group) ──────────────────────
+  const [collapsedGroups, setCollapsedGroups] = React.useState<
+    Partial<Record<LaneGroupId, boolean>>
+  >({});
+  React.useEffect(() => {
+    const ids: LaneGroupId[] = ["camera", "pacing", "overlays", "canvas"];
+    setCollapsedGroups(
+      Object.fromEntries(
+        ids.map((id) => [id, readPersistedBool(`adzoom.timeline.group.${id}.collapsed`, false)])
+      )
+    );
+  }, []);
+  const toggleGroup = React.useCallback((id: LaneGroupId) => {
+    setCollapsedGroups((cur) => {
+      const next = !cur[id];
+      writePersistedBool(`adzoom.timeline.group.${id}.collapsed`, next);
+      return { ...cur, [id]: next };
+    });
+  }, []);
+
   const hasMoments = moments.length > 0;
   const showNarrative = narrativeSegments.length > 0;
 
@@ -546,166 +549,143 @@ export function RealTimeline() {
   const showInteractionsTrack =
     hasCursorData || (interactionsLoading && !!project.interactionsPath);
 
-  // ── Ordered DAW track stack ─────────────────────────────────────────────
-  // The orchestrator maps this twice: gutter labels + lanes. Future track
-  // kinds (captions, audio, transitions, real speed/crop) slot in as more
-  // descriptors — no render-tree surgery.
-  const tracks: TimelineTrackDescriptor[] = [
-    {
-      id: "ai",
-      kind: "ai",
-      // Unified camera-edits track — AI + manual zoom/focus/click together.
-      label: "Edits",
-      Icon: Sparkles,
-      height: TRACK_HEIGHTS.ai,
-      tone: "violet",
-      interactive: true,
-      count: editCount,
-      note: layerDisabled("camera") ? "Disabled for this analysis" : undefined,
-      emptyAction: { label: "Run Camera edits", onRun: () => runLayer("camera") },
-      renderLane: () => (
-        <>
-          {insightsOpen && attentionCurve && attentionCurve.length > 0 && (
-            <div className="pointer-events-none absolute inset-x-0 inset-y-0 z-0">
-              <AttentionWaveform
-                curve={attentionCurve}
-                duration={total}
-                height={TRACK_HEIGHTS.ai}
-                variant="full"
-                className="opacity-70"
-              />
-            </div>
-          )}
-          <MomentLane
-            moments={editMoments}
-            total={total}
-            selectedMomentId={selectedMomentId}
-            multiSelectIds={multiSelectIds}
-            draftId={draft?.id ?? null}
-            withDraft={withDraft}
-            onBeginDrag={beginDrag}
-            onDuplicate={(id) => void duplicateMoment(id)}
-            onDelete={(id) => void deleteMoment(id)}
-            onEdit={onEditMoment}
-          />
-        </>
-      ),
-    },
-    {
-      id: "cut",
-      kind: "cut",
-      label: "Cuts",
-      Icon: Scissors,
-      height: TRACK_HEIGHTS.user,
-      tone: "rose",
-      interactive: true,
-      count: cutMoments.length,
-      note: layerDisabled("cut")
-        ? "Disabled for this analysis"
-        : cutMap.activeCuts > 0
-          ? `${cutMap.activeCuts} active · ${Math.round(cutMap.totalRemoved)}s removed`
+  // ── Grouped lane rows ───────────────────────────────────────────────────
+  // Every edit type gets its OWN lane, organised into collapsible groups
+  // (Camera / Pacing / Visual overlays / Canvas). `rows` interleaves group
+  // headers with lane rows so the gutter + lane columns map ONE ordered list
+  // and stay perfectly aligned. Core lanes (camera/cut/speed) always show with a
+  // "Run this layer" affordance; overlay lanes appear only when populated.
+  const momentLane = (laneMoments: DetectedMoment[]) => (
+    <MomentLane
+      moments={laneMoments}
+      total={total}
+      selectedMomentId={selectedMomentId}
+      multiSelectIds={multiSelectIds}
+      draftId={draft?.id ?? null}
+      withDraft={withDraft}
+      onBeginDrag={beginDrag}
+      onDuplicate={(id) => void duplicateMoment(id)}
+      onDelete={(id) => void deleteMoment(id)}
+      onEdit={onEditMoment}
+    />
+  );
+  const RUN_LABEL: Record<"camera" | "cut" | "speed", string> = {
+    camera: "Run Camera edits",
+    cut: "Run Cuts",
+    speed: "Run Speed",
+  };
+
+  type LaneRow = {
+    kind: "lane";
+    id: string;
+    height: number;
+    tone: TimelineTrackTone;
+    label: string;
+    Icon: LucideIcon;
+    count: number;
+    note?: string;
+    interactive: boolean;
+    emptyAction?: { label: string; onRun: () => void };
+    /** Overlay lanes: bulk enable/disable/delete over these effect types. */
+    laneControls?: {
+      effectTypes: EffectType[];
+      anyEnabled: boolean;
+      anyDisabled: boolean;
+    };
+    renderLane: (ctx: TimelineLaneContext) => React.ReactNode;
+  };
+  type GroupRow = {
+    kind: "group";
+    id: LaneGroupId;
+    label: string;
+    count: number;
+    collapsed: boolean;
+  };
+  type Row = LaneRow | GroupRow;
+
+  const rows: Row[] = [];
+  for (const g of lanePlan) {
+    const collapsed = !!collapsedGroups[g.def.id];
+    rows.push({ kind: "group", id: g.def.id, label: g.def.label, count: g.count, collapsed });
+    if (collapsed) continue;
+    for (const lane of g.lanes) {
+      const def = lane.def;
+      const isCamera = def.id === "camera";
+      const engine = def.engineLayer;
+      rows.push({
+        kind: "lane",
+        id: def.id,
+        height: isCamera ? TRACK_HEIGHTS.ai : TRACK_HEIGHTS.overlay,
+        tone: def.tone,
+        label: def.label,
+        Icon: EFFECT_ICONS[def.primaryEffect],
+        count: lane.count,
+        note:
+          engine && layerDisabled(engine)
+            ? "Disabled for this analysis"
+            : def.id === "cut" && cutMap.activeCuts > 0
+              ? `${cutMap.activeCuts} active · ${Math.round(cutMap.totalRemoved)}s removed`
+              : undefined,
+        interactive: true,
+        emptyAction: engine ? { label: RUN_LABEL[engine], onRun: () => runLayer(engine) } : undefined,
+        laneControls: def.overlay
+          ? {
+              effectTypes: def.effectTypes as EffectType[],
+              anyEnabled: lane.moments.some((m) => m.enabled !== false),
+              anyDisabled: lane.moments.some((m) => m.enabled === false),
+            }
           : undefined,
-      emptyAction: { label: "Run Cuts", onRun: () => runLayer("cut") },
+        renderLane: () =>
+          isCamera ? (
+            <>
+              {insightsOpen && attentionCurve && attentionCurve.length > 0 && (
+                <div className="pointer-events-none absolute inset-x-0 inset-y-0 z-0">
+                  <AttentionWaveform
+                    curve={attentionCurve}
+                    duration={total}
+                    height={TRACK_HEIGHTS.ai}
+                    variant="full"
+                    className="opacity-70"
+                  />
+                </div>
+              )}
+              {momentLane(lane.moments)}
+            </>
+          ) : (
+            momentLane(lane.moments)
+          ),
+      });
+    }
+  }
+  // Cursor / Focus — read-only cursor data, appended (ungrouped) at the bottom
+  // and only when real cursor data exists.
+  if (showInteractionsTrack) {
+    rows.push({
+      kind: "lane",
+      id: "interactions",
+      height: TRACK_HEIGHTS.interactions,
+      tone: "fog",
+      label: "Cursor / Focus",
+      Icon: MousePointer2,
+      count: interactionClickCount,
+      interactive: false,
       renderLane: () => (
-        <MomentLane
-          moments={cutMoments}
+        <InteractionsLane
+          interactions={interactions}
+          loading={interactionsLoading}
           total={total}
-          selectedMomentId={selectedMomentId}
-          multiSelectIds={multiSelectIds}
-          draftId={draft?.id ?? null}
-          withDraft={withDraft}
-          onBeginDrag={beginDrag}
-          onDuplicate={(id) => void duplicateMoment(id)}
-          onDelete={(id) => void deleteMoment(id)}
-          onEdit={onEditMoment}
+          totalClicks={clickPipeline?.totalClicks}
+          onSeek={seek}
         />
       ),
-    },
-    {
-      id: "speed",
-      kind: "speed",
-      label: "Speed",
-      Icon: FastForward,
-      height: TRACK_HEIGHTS.user,
-      tone: "amber",
-      interactive: true,
-      count: speedMoments.length,
-      note: layerDisabled("speed") ? "Disabled for this analysis" : undefined,
-      emptyAction: { label: "Run Speed", onRun: () => runLayer("speed") },
-      renderLane: () => (
-        <MomentLane
-          moments={speedMoments}
-          total={total}
-          selectedMomentId={selectedMomentId}
-          multiSelectIds={multiSelectIds}
-          draftId={draft?.id ?? null}
-          withDraft={withDraft}
-          onBeginDrag={beginDrag}
-          onDuplicate={(id) => void duplicateMoment(id)}
-          onDelete={(id) => void deleteMoment(id)}
-          onEdit={onEditMoment}
-        />
-      ),
-    },
-    // Overlays — one shared lane for the Phase-3 Core AI Edit Pack. Only shown
-    // once at least one overlay exists (added via the toolbar or generated), so
-    // it never sits empty.
-    ...(overlayMoments.length > 0
-      ? ([
-          {
-            id: "overlays",
-            kind: "overlays",
-            label: "Overlays",
-            Icon: Layers,
-            height: TRACK_HEIGHTS.user,
-            tone: "cyan",
-            interactive: true,
-            count: overlayMoments.length,
-            renderLane: () => (
-              <MomentLane
-                moments={overlayMoments}
-                total={total}
-                selectedMomentId={selectedMomentId}
-                multiSelectIds={multiSelectIds}
-                draftId={draft?.id ?? null}
-                withDraft={withDraft}
-                onBeginDrag={beginDrag}
-                onDuplicate={(id) => void duplicateMoment(id)}
-                onDelete={(id) => void deleteMoment(id)}
-                onEdit={onEditMoment}
-              />
-            ),
-          },
-        ] as TimelineTrackDescriptor[])
-      : []),
-    // Cursor / Focus — last, and only present when there's real cursor data.
-    ...(showInteractionsTrack
-      ? ([
-          {
-            id: "interactions",
-            kind: "interactions",
-            label: "Cursor / Focus",
-            Icon: MousePointer2,
-            height: TRACK_HEIGHTS.interactions,
-            tone: "fog",
-            interactive: false,
-            count: interactionClickCount,
-            renderLane: () => (
-              <InteractionsLane
-                interactions={interactions}
-                loading={interactionsLoading}
-                total={total}
-                totalClicks={clickPipeline?.totalClicks}
-                onSeek={seek}
-              />
-            ),
-          },
-        ] as TimelineTrackDescriptor[])
-      : []),
-  ];
+    });
+  }
 
   return (
-    <div className="glass relative overflow-hidden rounded-3xl">
+    // Bottom section of the fullscreen editor shell: full-width flat panel at
+    // its NATURAL height — no inner vertical scroll; the page scrolls to
+    // reach every lane.
+    <div className="relative border-t border-white/[0.06] bg-surface/50 backdrop-blur-xl">
       <TimelineToolbar
         health={health}
         zoom={zoom}
@@ -818,22 +798,43 @@ export function RealTimeline() {
             gridTemplateColumns: `clamp(44px, 13vw, ${GUTTER_WIDTH}px) minmax(0, 1fr)`,
           }}
         >
-          {/* Left gutter — one always-visible label per track. */}
+          {/* Left gutter — group headers + one label per lane. */}
           <div className="flex flex-col pr-3">
             <div style={{ height: TRACK_HEIGHTS.ruler }} />
             {insightsOpen && <div style={{ height: TRACK_HEIGHTS.gap }} />}
-            {tracks.map((t) => (
-              <TrackLabel
-                key={t.id}
-                Icon={t.Icon}
-                label={t.label}
-                count={t.count}
-                height={t.height}
-                tone={t.tone}
-                comingSoon={t.comingSoon}
-                note={t.note}
-              />
-            ))}
+            {rows.map((r) =>
+              r.kind === "group" ? (
+                <GroupGutterHeader
+                  key={`g-${r.id}`}
+                  label={r.label}
+                  count={r.count}
+                  collapsed={r.collapsed}
+                  onToggle={() => toggleGroup(r.id)}
+                />
+              ) : (
+                <TrackLabel
+                  key={r.id}
+                  Icon={r.Icon}
+                  label={r.label}
+                  count={r.count}
+                  height={r.height}
+                  tone={r.tone}
+                  note={r.note}
+                  trailing={
+                    r.laneControls ? (
+                      <OverlayLaneMenu
+                        label={r.label}
+                        anyEnabled={r.laneControls.anyEnabled}
+                        anyDisabled={r.laneControls.anyDisabled}
+                        onEnableAll={() => void setLaneEnabled(r.laneControls!.effectTypes, true)}
+                        onDisableAll={() => void setLaneEnabled(r.laneControls!.effectTypes, false)}
+                        onDeleteAll={() => void deleteLane(r.laneControls!.effectTypes)}
+                      />
+                    ) : undefined
+                  }
+                />
+              )
+            )}
           </div>
 
           {/* Right side — scrollable, zoom-scaled lane viewport */}
@@ -855,26 +856,38 @@ export function RealTimeline() {
                     panel is closed we keep the surface clean. */}
                 {insightsOpen && <GapIndicator ranges={emptyRanges} />}
 
-                {tracks.map((t) => {
+                {rows.map((r) => {
+                  if (r.kind === "group") {
+                    // A thin spacer row in the lane column keeps it aligned with
+                    // the gutter's group header (same height, subtle divider).
+                    return (
+                      <div
+                        key={`g-${r.id}`}
+                        aria-hidden
+                        style={{ height: TRACK_HEIGHTS.group }}
+                        className="border-b border-white/[0.05] bg-white/[0.012]"
+                      />
+                    );
+                  }
                   // Show the one-click "Run this layer" affordance on an empty
                   // lane when other tracks already have content (this layer is
                   // conspicuously empty) or it was explicitly disabled last run.
                   const showEmptyAction =
-                    (t.count ?? 0) === 0 &&
-                    !!t.emptyAction &&
-                    (hasMoments || !!t.note);
+                    r.count === 0 &&
+                    !!r.emptyAction &&
+                    (hasMoments || !!r.note);
                   return (
                     <TimelineTrack
-                      key={t.id}
-                      ariaLabel={`${t.label} track`}
-                      height={t.height}
-                      dimmed={!t.interactive}
+                      key={r.id}
+                      ariaLabel={`${r.label} track`}
+                      height={r.height}
+                      dimmed={!r.interactive}
                     >
-                      {t.renderLane({ total, pxPerSec, zoom })}
+                      {r.renderLane({ total, pxPerSec, zoom })}
                       {showEmptyAction && (
                         <TrackEmptyAction
-                          label={t.emptyAction!.label}
-                          onRun={t.emptyAction!.onRun}
+                          label={r.emptyAction!.label}
+                          onRun={r.emptyAction!.onRun}
                           disabled={analyzing}
                         />
                       )}
@@ -1174,6 +1187,147 @@ function TrackEmptyAction({
         {label}
       </button>
     </div>
+  );
+}
+
+/** Collapsible lane-group header shown in the left gutter. */
+function GroupGutterHeader({
+  label,
+  count,
+  collapsed,
+  onToggle,
+}: {
+  label: string;
+  count: number;
+  collapsed: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      aria-expanded={!collapsed}
+      style={{ height: TRACK_HEIGHTS.group }}
+      className="group/gh flex w-full items-center gap-1 border-b border-white/[0.05] pr-1 text-left"
+    >
+      <span className="text-fog/60 transition-colors duration-150 group-hover/gh:text-white">
+        {collapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
+      </span>
+      <span className="hidden truncate text-[10px] font-semibold uppercase tracking-[0.14em] text-fog/70 transition-colors duration-150 group-hover/gh:text-white md:inline">
+        {label}
+      </span>
+      <span className="ml-auto hidden font-mono text-[10px] tabular-nums text-fog/45 md:inline">
+        {count}
+      </span>
+    </button>
+  );
+}
+
+/**
+ * Per-overlay-lane ⋯ menu — bulk enable / disable / delete for every moment of
+ * that lane's type. Non-destructive enable/disable (one undo step); delete
+ * clears the lane. Closes on outside click.
+ */
+function OverlayLaneMenu({
+  label,
+  anyEnabled,
+  anyDisabled,
+  onEnableAll,
+  onDisableAll,
+  onDeleteAll,
+}: {
+  label: string;
+  anyEnabled: boolean;
+  anyDisabled: boolean;
+  onEnableAll: () => void;
+  onDisableAll: () => void;
+  onDeleteAll: () => void;
+}) {
+  const [open, setOpen] = React.useState(false);
+  const ref = React.useRef<HTMLDivElement | null>(null);
+  React.useEffect(() => {
+    if (!open) return;
+    const onDown = (e: PointerEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    window.addEventListener("pointerdown", onDown);
+    return () => window.removeEventListener("pointerdown", onDown);
+  }, [open]);
+  return (
+    <div ref={ref} className="relative">
+      <button
+        type="button"
+        aria-label={`${label} lane options`}
+        onClick={() => setOpen((o) => !o)}
+        className="inline-flex size-6 items-center justify-center rounded-md text-fog/55 transition-colors duration-150 hover:bg-white/[0.06] hover:text-white"
+      >
+        <MoreHorizontal size={13} />
+      </button>
+      {open && (
+        // Opens rightward (into the wide lane area) — the gutter is the leftmost
+        // column inside the card's overflow-hidden, so a leftward menu would clip.
+        <div className="absolute left-0 top-7 z-40 w-40 overflow-hidden rounded-lg border border-white/10 bg-ink/95 p-1 shadow-cinematic backdrop-blur-xl">
+          <LaneMenuItem
+            Icon={Eye}
+            label="Enable all"
+            disabled={!anyDisabled}
+            onClick={() => {
+              onEnableAll();
+              setOpen(false);
+            }}
+          />
+          <LaneMenuItem
+            Icon={EyeOff}
+            label="Disable all"
+            disabled={!anyEnabled}
+            onClick={() => {
+              onDisableAll();
+              setOpen(false);
+            }}
+          />
+          <LaneMenuItem
+            Icon={Trash2}
+            label="Delete all"
+            danger
+            onClick={() => {
+              onDeleteAll();
+              setOpen(false);
+            }}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function LaneMenuItem({
+  Icon,
+  label,
+  onClick,
+  disabled,
+  danger,
+}: {
+  Icon: LucideIcon;
+  label: string;
+  onClick: () => void;
+  disabled?: boolean;
+  danger?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      disabled={disabled}
+      onClick={onClick}
+      className={cn(
+        "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[12px] font-medium transition-colors duration-150 disabled:cursor-not-allowed disabled:opacity-40",
+        danger
+          ? "text-rose-200 hover:bg-rose-500/15"
+          : "text-fog hover:bg-white/[0.06] hover:text-white"
+      )}
+    >
+      <Icon size={12} />
+      {label}
+    </button>
   );
 }
 

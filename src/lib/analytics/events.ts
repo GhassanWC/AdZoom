@@ -44,6 +44,16 @@ export const EVENTS = {
   SPEED_ENABLED: "speed_enabled",
   CHUNK_SIZE_SELECTED: "chunk_size_selected",
 
+  // ── Captions / transcription ─────────────────────────────────────────
+  // SEPARATE lifecycle from AI edits (the ANALYSIS_* events above are the
+  // AI-edit started/completed/failed) — captions succeed/fail/block on
+  // their own without affecting those.
+  CAPTION_TRANSCRIPTION_STARTED: "caption_transcription_started",
+  CAPTION_TRANSCRIPTION_COMPLETED: "caption_transcription_completed",
+  CAPTION_TRANSCRIPTION_FAILED: "caption_transcription_failed",
+  CAPTION_QUOTA_BLOCKED: "caption_quota_blocked",
+  CAPTION_DISABLED: "caption_disabled",
+
   // ── Export ───────────────────────────────────────────────────────────
   EXPORT_STARTED: "export_started",
   EXPORT_COMPLETED: "export_completed",

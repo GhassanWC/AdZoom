@@ -106,6 +106,8 @@ export const IMPLEMENTED_CATEGORIES: ReadonlySet<EditOperationCategory> = new Se
   "branding",
   "smart_crop",
   "transition",
+  // Phase 4 — real transcript-driven captions (only fire when a transcript exists).
+  "captions",
 ]);
 
 /**
@@ -186,10 +188,16 @@ export interface EditRecipePlan {
 
 /** Signals the recipe engine consults to decide what's actually feasible. */
 export interface RecipeSignals {
-  /** A transcript is available (captions / spoken-text overlays need it). */
+  /** A REAL transcript is available (captions / spoken-text overlays need it). */
   hasTranscript: boolean;
-  /** Audio/silence analysis is available (silence removal / audio cleanup). */
+  /** Audio/silence analysis ran (silence removal / audio cleanup feasibility). */
   hasAudioAnalysis: boolean;
+  /** The audio analysis found usable speech (gates captions relevance + silence removal). */
+  hasUsableSpeech: boolean;
+  /** How many silence segments the audio analysis found (silence-removal candidates). */
+  silenceSegmentCount: number;
+  /** Detected transcript language (BCP-47), when known. */
+  transcriptLanguage?: string;
   /** Scene-change data is available (beat cuts / transitions land better). */
   hasSceneData: boolean;
   /** Visual moments / CV data is available (zoom + callout targets). */
@@ -272,6 +280,7 @@ export const DEFAULT_RECIPES: Record<SelectedVideoType, EditRecipe> = {
       op("silence_removal", 0.9),
       op("cut", 0.8, { style: "jump", intensity: 0.55 }, "Clean jump cuts tighten the delivery."),
       op("captions", 0.85),
+      op("hook_text", 0.6, {}, "A short title/hook for the opening line."),
       op("smart_crop", 0.85, { focus: "face" }),
       op("zoom", 0.5, { style: "subtle", intensity: 0.3 }, "Subtle zooms keep the speaker centered without distraction."),
       op("speed", 0.3, { intensity: 0.25 }, "Minimal speed changes — avoid distracting the viewer."),
@@ -302,6 +311,7 @@ export const DEFAULT_RECIPES: Record<SelectedVideoType, EditRecipe> = {
       op("zoom", 0.85, { target: "actions", intensity: 0.85 }, "Zooms are the star — emphasize each important action."),
       op("callout", 0.8, { kind: "cursor-highlight" }),
       op("text_overlay", 0.7, { kind: "labels" }),
+      op("captions", 0.6),
       op("cut", 0.7, { style: "clean", intensity: 0.55 }, "Clean cuts remove waiting / loading."),
       op("speed", 0.6, { target: "waiting", intensity: 0.6 }, "Compress slow / loading stretches."),
       op("text_overlay", 0.6, { kind: "cta" }),
@@ -346,6 +356,7 @@ export const DEFAULT_RECIPES: Record<SelectedVideoType, EditRecipe> = {
       op("smart_crop", 0.8, { aspect: "9:16" }, "Vertical 9:16 crop for social feeds."),
       op("captions", 0.8),
       op("speed", 0.6, { intensity: 0.6 }, "Tight pacing over slower moments."),
+      op("transition", 0.7, { style: "quick" }, "Snappy transitions between beats."),
       op("text_overlay", 0.85, { kind: "cta" }),
       op("branding", 0.7, { kind: "logo" }),
     ],
@@ -357,12 +368,128 @@ export const DEFAULT_RECIPES: Record<SelectedVideoType, EditRecipe> = {
     operations: [
       op("zoom", 0.85, { intensity: 0.85 }, "Strong cinematic zooms on the important interactions."),
       op("callout", 0.8, { kind: "cursor-click" }),
+      op("text_overlay", 0.6, { kind: "labels" }),
+      op("captions", 0.5),
       op("blur_redaction", 0.7),
       op("cut", 0.7, { style: "clean", intensity: 0.5 }, "Clean cuts on dead sections."),
       op("speed", 0.7, { target: "idle", intensity: 0.6 }, "Speed up waiting / loading."),
     ],
   },
 };
+
+// ── Per-type generation defaults (drives the Analyze modal) ──────────────────
+
+/**
+ * The auto-generation toggles shown in the "What should Framevo generate?"
+ * modal — ONLY the IMPLEMENTED automatic edit types (blur/audio are excluded:
+ * blur is manual-only, audio has no executor). Keys match `AnalysisOptions`.
+ */
+export interface GenerationToggles {
+  /** Zooms & focus (zoom / click-highlight / cursor-focus). */
+  generateCameraEdits: boolean;
+  generateCut: boolean;
+  generateSpeed: boolean;
+  generateCaptions: boolean;
+  generateHookText: boolean;
+  generateTextOverlays: boolean;
+  generateSmartCrop: boolean;
+  generateCallouts: boolean;
+  generateTransitions: boolean;
+  generateCta: boolean;
+}
+
+/** Ordered toggle keys — the single list the modal + tests iterate over. */
+export const GENERATION_TOGGLE_KEYS: (keyof GenerationToggles)[] = [
+  "generateCameraEdits",
+  "generateCut",
+  "generateSpeed",
+  "generateCaptions",
+  "generateHookText",
+  "generateTextOverlays",
+  "generateSmartCrop",
+  "generateCallouts",
+  "generateTransitions",
+  "generateCta",
+];
+
+/**
+ * Smart defaults for a video type: ON for every implemented category the type's
+ * recipe includes. `captions` defaults ON where the recipe wants speech text —
+ * it's still skipped at runtime when no transcript exists (honest, never faked).
+ */
+export function recipeGenerationDefaults(videoType: SelectedVideoType): GenerationToggles {
+  // Auto Detect: be PERMISSIVE. The concrete type isn't known until analysis
+  // resolves the DETECTED recipe, so pre-suppressing overlays here would wrongly
+  // hide edits the detected recipe wants (e.g. Auto → Reels losing hook/CTA/
+  // transitions). All-on lets the resolved recipe decide — it still gates by type
+  // (an enabled toggle can't force a category the recipe doesn't include).
+  if (videoType === "auto") {
+    return {
+      generateCameraEdits: true,
+      generateCut: true,
+      generateSpeed: true,
+      generateCaptions: true,
+      generateHookText: true,
+      generateTextOverlays: true,
+      generateSmartCrop: true,
+      generateCallouts: true,
+      generateTransitions: true,
+      generateCta: true,
+    };
+  }
+  const recipe = DEFAULT_RECIPES[videoType] ?? DEFAULT_RECIPES.auto;
+  const has = (c: EditOperationCategory) => recipe.operations.some((o) => o.category === c);
+  const hasCta =
+    has("branding") ||
+    recipe.operations.some((o) => o.category === "text_overlay" && o.params?.kind === "cta");
+  return {
+    generateCameraEdits: has("zoom"),
+    generateCut: has("cut"),
+    generateSpeed: has("speed"),
+    generateCaptions: has("captions"),
+    generateHookText: has("hook_text"),
+    generateTextOverlays: has("text_overlay"),
+    generateSmartCrop: has("smart_crop"),
+    generateCallouts: has("callout"),
+    generateTransitions: has("transition"),
+    generateCta: hasCta,
+  };
+}
+
+/** The 3 core-engine toggle keys (persisted per-user); overlays default per type. */
+export type CoreGenerationPrefs = Pick<
+  GenerationToggles,
+  "generateCameraEdits" | "generateCut" | "generateSpeed"
+>;
+
+/**
+ * The Analyze modal's STARTING toggle state. Core engines: last run → remembered
+ * user prefs → recipe default. Overlays: last run → recipe default (they're
+ * type-driven, not globally remembered). This is what makes Re-analyze respect
+ * what the user turned off, while a fresh run follows the video-type recipe.
+ */
+export function resolveInitialGenerationToggles(input: {
+  recipeDefaults: GenerationToggles;
+  lastRun?: Partial<GenerationToggles> | null;
+  corePrefs?: Partial<CoreGenerationPrefs> | null;
+}): GenerationToggles {
+  const { recipeDefaults, lastRun, corePrefs } = input;
+  const core = (k: keyof CoreGenerationPrefs): boolean =>
+    lastRun?.[k] ?? corePrefs?.[k] ?? recipeDefaults[k];
+  const overlay = (k: keyof GenerationToggles): boolean => lastRun?.[k] ?? recipeDefaults[k];
+  return {
+    generateCameraEdits: core("generateCameraEdits"),
+    generateCut: core("generateCut"),
+    generateSpeed: core("generateSpeed"),
+    generateCaptions: overlay("generateCaptions"),
+    generateHookText: overlay("generateHookText"),
+    generateTextOverlays: overlay("generateTextOverlays"),
+    generateSmartCrop: overlay("generateSmartCrop"),
+    generateCallouts: overlay("generateCallouts"),
+    generateTransitions: overlay("generateTransitions"),
+    generateCta: overlay("generateCta"),
+  };
+}
 
 // ── Resolution ──────────────────────────────────────────────────────────────
 
@@ -378,8 +505,13 @@ function unmetRequirement(
     case "captions":
       return s.hasTranscript ? null : "no transcript available yet";
     case "silence_removal":
+      // Needs REAL usable speech + detected silence to remove.
+      return s.hasUsableSpeech && s.silenceSegmentCount > 0
+        ? null
+        : "no removable silence detected yet";
     case "audio_cleanup":
-      return s.hasAudioAnalysis ? null : "no audio/silence analysis available yet";
+      // Planned category — no executor yet; only "feasible" once audio ran.
+      return s.hasAudioAnalysis ? null : "no audio analysis available yet";
     case "blur_redaction":
       return s.isScreenRecording ? null : "only for screen recordings";
     case "callout":

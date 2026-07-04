@@ -24,6 +24,10 @@ const nextConfig: NextConfig = {
     "google-gax",
     "@grpc/grpc-js",
     "@grpc/proto-loader",
+    // Speech-to-Text ASR (src/lib/transcript/*) uses ADC via google-auth-library,
+    // which does dynamic requires (gcp-metadata / json-bigint) the webpack bundle
+    // can't statically resolve — keep it external so it loads from node_modules.
+    "google-auth-library",
   ],
   // This repo has a second lockfile (services/export-worker), which can make
   // Next infer the wrong workspace root for output-file tracing. Pin it to THIS

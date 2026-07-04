@@ -2,20 +2,13 @@
 
 import * as React from "react";
 import Link from "next/link";
-import {
-  ArrowLeft,
-  Sparkles,
-  Loader2,
-  AlertCircle,
-  Pencil,
-} from "lucide-react";
-import { useToast } from "@/components/ui/Toast";
+import { ArrowLeft, Sparkles, Loader2, AlertCircle } from "lucide-react";
 import { useAuth } from "@/lib/firebase/AuthProvider";
-import { subscribeProject, updateProject } from "@/lib/firebase/projects";
-import { cn } from "@/lib/cn";
+import { subscribeProject } from "@/lib/firebase/projects";
 import type { ProjectDoc } from "@/lib/firebase/schema";
 import { FREE_VIDEO_DURATION_LIMIT_MESSAGE } from "@/lib/usage/plan";
 import { Button } from "@/components/ui/Button";
+import { SidebarNav } from "@/components/dashboard/Sidebar";
 import { EditorRealProvider, useEditorReal } from "./context";
 import { RealVideoPlayer } from "./RealVideoPlayer";
 import { RemotionPreviewPanel } from "./RemotionPreviewPanel";
@@ -25,23 +18,22 @@ import { EffectsModal } from "./EffectsModal";
 import { ExportModal } from "./ExportModal";
 import { CanvasModal } from "./CanvasModal";
 import { AnalysisOptionsModal } from "./AnalysisOptionsModal";
-import { VideoTypePicker } from "./VideoTypePicker";
 import { RecipeSummary } from "./RecipeSummary";
-import { DEFAULT_ANALYSIS_OPTIONS } from "@/lib/analysis/engine-layers";
-import type { SelectedVideoType } from "@/lib/firebase/schema";
+import type { AnalysisOptions } from "@/lib/analysis/engine-layers";
 import { useWorkspaceSettings } from "@/lib/firebase/workspace-settings";
 import { RealProcessingOverlay } from "./RealProcessingOverlay";
 import { PresetsRail } from "./PresetsRail";
 import { RecommendedPresets } from "./RecommendedPresets";
 import { ProcessingMiniPill } from "./ProcessingMiniPill";
-import { EditorActions } from "./EditorActions";
 import { AIConfidencePanel } from "./AIConfidencePanel";
 import { SuggestionsPanel } from "./SuggestionsPanel";
-import { WorkflowStepper, type WorkflowStep } from "./WorkflowStepper";
 import { DebugOverlay } from "./DebugOverlay";
 import { ClickPipelinePanel } from "./ClickPipelinePanel";
 import { EditDiagnosticsPanel } from "./EditDiagnosticsPanel";
 import { CvDebugPanel } from "./CvDebugPanel";
+import { EditorTopBar } from "./EditorTopBar";
+import { EditorToolbar } from "./EditorToolbar";
+import { EditorDrawer } from "./EditorDrawer";
 import { disposeThumbnails } from "./timeline/thumbnails";
 import { restoreEditorScrollLock } from "./scroll-lock";
 
@@ -78,25 +70,27 @@ export function RealEditorPage({ projectId }: { projectId: string }) {
 
   if (notFound) {
     return (
-      <div className="glass mx-auto max-w-lg rounded-2xl p-8 text-center">
-        <div className="mx-auto inline-flex size-12 items-center justify-center rounded-xl border border-rose-400/30 bg-rose-500/10 text-rose-300">
-          <AlertCircle size={20} />
-        </div>
-        <h2 className="mt-4 font-display text-xl font-semibold text-white">
-          Project not found
-        </h2>
-        <p className="mt-2 text-sm text-fog">
-          This project doesn&apos;t exist or you don&apos;t have access to it.
-        </p>
-        <div className="mt-5 flex justify-center">
-          <Button
-            href="/dashboard"
-            variant="ghost"
-            size="sm"
-            leftIcon={<ArrowLeft size={13} />}
-          >
-            Back to dashboard
-          </Button>
+      <div className="grid min-h-dvh place-items-center px-4">
+        <div className="glass w-full max-w-lg rounded-2xl p-8 text-center">
+          <div className="mx-auto inline-flex size-12 items-center justify-center rounded-xl border border-rose-400/30 bg-rose-500/10 text-rose-300">
+            <AlertCircle size={20} />
+          </div>
+          <h2 className="mt-4 font-display text-xl font-semibold text-white">
+            Project not found
+          </h2>
+          <p className="mt-2 text-sm text-fog">
+            This project doesn&apos;t exist or you don&apos;t have access to it.
+          </p>
+          <div className="mt-5 flex justify-center">
+            <Button
+              href="/dashboard"
+              variant="ghost"
+              size="sm"
+              leftIcon={<ArrowLeft size={13} />}
+            >
+              Back to dashboard
+            </Button>
+          </div>
         </div>
       </div>
     );
@@ -104,7 +98,7 @@ export function RealEditorPage({ projectId }: { projectId: string }) {
 
   if (!project) {
     return (
-      <div className="grid min-h-[60vh] place-items-center">
+      <div className="grid min-h-dvh place-items-center">
         <div className="flex items-center gap-2 text-sm text-fog">
           <Loader2 size={14} className="animate-spin text-violet-300" />
           Loading project…
@@ -123,10 +117,22 @@ export function RealEditorPage({ projectId }: { projectId: string }) {
   );
 }
 
+/**
+ * The fullscreen editing workspace. One column, PAGE-scrolled:
+ *
+ *   EditorTopBar   — sticky: menu (nav drawer) · back · title · undo/redo · Export
+ *   workspace      — the video preview at a stable viewport-relative height
+ *   EditorToolbar  — compact tools row + Previous/Next edit review
+ *   timeline       — natural height, NO internal scroll; the page scrolls
+ *                    vertically to reach every lane
+ *
+ * Nothing permanent flanks the preview: Framevo navigation, presets, and the
+ * AI insights/suggestions all open as temporary overlay drawers, and every
+ * edit's controls open in the shared moment editor dialog.
+ */
 function Body() {
   const {
     project,
-    uid,
     startAnalyze,
     analyzing,
     analyzeError,
@@ -142,23 +148,17 @@ function Body() {
   const hasAnalysis = (project.analysis?.detectedMoments?.length ?? 0) > 0;
   const isFailed = project.analysis?.status === "failed";
   // A draft is "missing" whenever there's nothing to edit — fresh upload,
-  // failed run, or a completed run that produced zero moments (e.g. a quiet
-  // recording or a preset rebalance that dropped everything below the floor).
-  // In every such case the primary "Analyze with AI" CTA must be reachable;
-  // before the fix this button vanished after `project.status` moved off
-  // "uploaded" yet `detectedMoments` stayed empty.
+  // failed run, or a completed run that produced zero moments. In every such
+  // case the primary "Generate AI edit" CTA must be reachable.
   const isAnalyzingNow = analyzing || project.status === "analyzing";
   const canAnalyze = !isAnalyzingNow && !!project.originalVideoUrl;
   const [effectsOpen, setEffectsOpen] = React.useState(false);
   const [exportOpen, setExportOpen] = React.useState(false);
   const [analysisOptionsOpen, setAnalysisOptionsOpen] = React.useState(false);
+  const [navOpen, setNavOpen] = React.useState(false);
+  const [presetsOpen, setPresetsOpen] = React.useState(false);
+  const [insightsOpen, setInsightsOpen] = React.useState(false);
   const { settings, save } = useWorkspaceSettings();
-
-  const currentStep: WorkflowStep = !hasAnalysis
-    ? "analyze"
-    : project.status === "exported"
-    ? "export"
-    : "refine";
 
   const analyzeTitle = isFailed
     ? "The previous analysis failed — try again."
@@ -166,105 +166,29 @@ function Body() {
       ? "No moments were produced — re-run to try again."
       : undefined;
 
-  // One-click "Generate AI Edit": run analysis with the user's remembered engine
-  // + detail prefs (all engines on by default). `startAnalyze` attaches the
-  // selected video type. Advanced options remain a click away (the modal).
-  const onGenerate = React.useCallback(() => {
-    if (!canAnalyze) return;
-    void startAnalyze({
-      ...DEFAULT_ANALYSIS_OPTIONS,
-      ...(settings.analysisEngines ?? {}),
-      ...(settings.analysisDetail ?? {}),
-      existingEditMode: "replace-selected",
-    });
-  }, [canAnalyze, startAnalyze, settings.analysisEngines, settings.analysisDetail]);
+  // The project's LAST RUN toggles — passed to the dialog so Re-analyze respects
+  // what the user turned off. The dialog owns the video type + recipe defaults now.
+  const lastRun = project.analysis?.lastRunOptions as Partial<AnalysisOptions> | undefined;
 
   return (
-    <div className="space-y-6 pb-12">
-      {/* ── 1. Top bar ───────────────────────────────────────────────────────
-          A real editor top bar: back link + actions on one utility row, then
-          the editable title, status, summary, and metadata chips. Export is
-          the single primary action; all project tools live in one grouped,
-          visually-secondary cluster (`EditorActions`). */}
-      <header className="space-y-4">
-        {/* Utility row — back link (left) + actions (right). */}
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <Link
-            href="/dashboard/projects"
-            className="inline-flex items-center gap-1.5 text-[12.5px] font-medium text-fog transition-colors duration-200 hover:text-white"
-          >
-            <ArrowLeft size={13} />
-            All projects
-          </Link>
+    <div className="flex min-h-dvh flex-col">
+      {/* ── 1. Editor top bar ─────────────────────────────────────────────── */}
+      <EditorTopBar
+        onOpenNav={() => setNavOpen(true)}
+        onExport={() => setExportOpen(true)}
+      />
 
-          <EditorActions
-            hasAnalysis={hasAnalysis}
-            isAnalyzingNow={isAnalyzingNow}
-            canAnalyze={canAnalyze}
-            analyzeTitle={analyzeTitle}
-            cropEditing={cropEditing}
-            onAnalyze={() => setAnalysisOptionsOpen(true)}
-            onToggleCrop={cropEditing ? closeCropEditor : openCropEditor}
-            onCanvas={openCanvas}
-            onEffects={() => setEffectsOpen(true)}
-            onExport={() => setExportOpen(true)}
-          />
-        </div>
-
-        {/* Title + lightweight status, then summary + chips. */}
-        <div className="min-w-0">
-          <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
-            <EditableProjectTitle
-              uid={uid}
-              projectId={project.id}
-              title={project.title}
-            />
-            <StatusBadge status={headerStatus(project, hasAnalysis)} />
-          </div>
-
-          <p className="mt-2 max-w-2xl text-[14px] leading-relaxed text-fog">
-            {summaryLine(project)}
-          </p>
-
-          {project.analysis?.videoType && (
-            <div className="mt-3.5 flex flex-wrap items-center gap-2">
-              <span className="inline-flex items-center gap-1.5 rounded-md border border-violet-400/25 bg-violet-500/[0.08] px-2.5 py-1 text-[11.5px] font-medium tracking-tight text-violet-200">
-                <Sparkles size={11} className="text-violet-300" />
-                {prettyVideoType(project.analysis.videoType)}
-              </span>
-              {(project.analysis.narrativeStructure?.length ?? 0) > 0 && (
-                <span className="inline-flex items-center rounded-md border border-white/[0.07] bg-white/[0.02] px-2.5 py-1 text-[11.5px] font-medium tracking-tight text-fog">
-                  {project.analysis.narrativeStructure!.length}-act narrative
-                </span>
-              )}
-              {(project.analysis.detectedMoments?.length ?? 0) > 0 && (
-                <span className="inline-flex items-center rounded-md border border-white/[0.07] bg-white/[0.02] px-2.5 py-1 text-[11.5px] font-medium tracking-tight text-fog">
-                  {project.analysis.detectedMoments!.length} cinematic moments
-                </span>
-              )}
-            </div>
-          )}
-
-          {project.analysis?.editRecipe && (
-            <RecipeSummary
-              recipe={project.analysis.editRecipe}
-              moments={project.analysis.detectedMoments ?? []}
-            />
-          )}
-        </div>
-      </header>
-
-      {/* ── 2. Workflow stepper ──────────────────────────────────────────── */}
-      <WorkflowStepper current={currentStep} />
-
+      {/* ── 2. Transient strips (error / first-run CTA) — compact, shrink-0 ── */}
       {analyzeError && (
-        <div className="flex items-center gap-2 rounded-xl border border-rose-400/30 bg-rose-500/[0.06] px-4 py-3 text-sm text-rose-200">
-          <AlertCircle size={14} className="shrink-0" />
-          <span className="flex-1">{analyzeError}</span>
+        <div className="flex shrink-0 items-center gap-2 border-b border-rose-400/25 bg-rose-500/[0.06] px-4 py-2 text-[12.5px] text-rose-200">
+          <AlertCircle size={13} className="shrink-0" />
+          <span className="min-w-0 flex-1 truncate" title={analyzeError}>
+            {analyzeError}
+          </span>
           {analyzeError === FREE_VIDEO_DURATION_LIMIT_MESSAGE && (
             <Link
               href="/pricing"
-              className="shrink-0 rounded-md border border-rose-300/40 bg-rose-400/15 px-2.5 py-1 text-[12px] font-semibold text-rose-50 transition-colors hover:bg-rose-400/25"
+              className="shrink-0 rounded-md border border-rose-300/40 bg-rose-400/15 px-2.5 py-1 text-[11.5px] font-semibold text-rose-50 transition-colors hover:bg-rose-400/25"
             >
               Upgrade
             </Link>
@@ -272,63 +196,101 @@ function Body() {
         </div>
       )}
 
-      {/* ── 3. Pre-analysis hero — the first-run call to action. Export is the
-              header's primary, so Analyze gets a prominent home in the work
-              area until a first-draft edit exists. */}
       {!hasAnalysis && (
-        <PreAnalysisHero
+        <PreAnalysisBanner
           analyzing={isAnalyzingNow}
           canAnalyze={canAnalyze}
           title={analyzeTitle}
-          selectedVideoType={selectedVideoType}
-          onSelectType={(t) => void setSelectedVideoType(t)}
-          onGenerate={onGenerate}
-          onAdvanced={() => setAnalysisOptionsOpen(true)}
+          onGenerate={() => setAnalysisOptionsOpen(true)}
         />
       )}
 
-      {/* ── 4. Preview — full width, centered, owns the row. Moment editing
-              opens in the centered floating inspector (no backdrop), so the
-              player stays large and visible while you edit. */}
-      <div className="space-y-4">
-        <RealVideoPlayer />
-        {/* Flag-gated Remotion preview, alongside (never replacing) the canvas
-            preview above — visible only when NEXT_PUBLIC_REMOTION_PREVIEW is on. */}
-        <RemotionPreviewPanel />
+      {/* ── 3. Workspace — the preview at a stable viewport-relative height
+             (the bounded box the fill-mode player fits into). Marked as a
+             dialog "hold" region so crop-box drags / scrubbing never dismiss
+             the floating moment editor. ─────────────────────────────────── */}
+      <div data-editor-dialog-hold className="h-[56vh] shrink-0 px-3 py-3 sm:px-4">
+        <RealVideoPlayer fill />
       </div>
 
-      {/* ── 5. Full-width timeline ───────────────────────────────────────── */}
+      {/* ── 4. Compact toolbar ────────────────────────────────────────────── */}
+      <EditorToolbar
+        hasAnalysis={hasAnalysis}
+        isAnalyzingNow={isAnalyzingNow}
+        canAnalyze={canAnalyze}
+        analyzeTitle={analyzeTitle}
+        cropEditing={cropEditing}
+        onAnalyze={() => setAnalysisOptionsOpen(true)}
+        onToggleCrop={cropEditing ? closeCropEditor : openCropEditor}
+        onCanvas={openCanvas}
+        onEffects={() => setEffectsOpen(true)}
+        onPresets={() => setPresetsOpen(true)}
+        onInsights={() => setInsightsOpen(true)}
+      />
+
+      {/* ── 5. Timeline — natural height in the page flow (no inner scroll);
+             lane count grows the page and the PAGE scrolls. ─────────────── */}
       <RealTimeline />
 
-      {/* ── 5b. AI analysis — directly under the timeline, full width: the
-              engagement summary + the accept/dismiss suggestions, on every
-              screen. */}
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-        <AIConfidencePanel />
-        <SuggestionsPanel />
-      </div>
+      {/* ── Overlay drawers — temporary, never resize the preview. ────────── */}
+      <EditorDrawer
+        open={navOpen}
+        onClose={() => setNavOpen(false)}
+        side="left"
+        ariaLabel="Framevo navigation"
+        widthClass="w-72"
+      >
+        <SidebarNav onNavigate={() => setNavOpen(false)} />
+      </EditorDrawer>
 
-      {/* ── 6. Click pipeline diagnostics — dev-visible; in production
-              hidden unless ?debug=1 / Ctrl+Shift+D. ─────────────────────── */}
-      <ClickPipelinePanel />
+      <EditorDrawer
+        open={presetsOpen}
+        onClose={() => setPresetsOpen(false)}
+        title="Presets"
+        widthClass="w-full max-w-xl"
+      >
+        <div className="space-y-5 p-5">
+          <RecommendedPresets />
+          <PresetsRail />
+        </div>
+      </EditorDrawer>
 
-      {/* ── 6b. Edit-coverage funnel — internal/dev-only (?debug=1). ────── */}
-      <EditDiagnosticsPanel />
+      <EditorDrawer
+        open={insightsOpen}
+        onClose={() => setInsightsOpen(false)}
+        title="AI insights"
+        widthClass="w-full max-w-xl"
+      >
+        <div className="space-y-4 p-5">
+          {project.analysis?.editRecipe && (
+            <RecipeSummary
+              recipe={project.analysis.editRecipe}
+              moments={project.analysis.detectedMoments ?? []}
+              transcript={project.analysis.transcript}
+              audioAnalysis={project.analysis.audioAnalysis}
+            />
+          )}
+          <AIConfidencePanel />
+          <SuggestionsPanel />
+          {/* Flag-gated Remotion preview + dev diagnostics (?debug=1) live
+              here so they stay reachable without crowding the workspace. */}
+          <RemotionPreviewPanel />
+          <ClickPipelinePanel />
+          <EditDiagnosticsPanel />
+          <CvDebugPanel />
+        </div>
+      </EditorDrawer>
 
-      {/* ── 6c. CV tuning panel — internal/dev-only (?debug=1). ─────────── */}
-      <CvDebugPanel />
-
-      {/* ── 7. Presets — recommended hero + full rail ─────────────────────── */}
-      <RecommendedPresets />
-      <PresetsRail />
-
-      {/* ── 6. Sheets: Effects + Export are now modal dialogs ──────────────── */}
+      {/* ── Editing dialogs (shared shell) ────────────────────────────────── */}
       <AnalysisOptionsModal
         open={analysisOptionsOpen}
         onClose={() => setAnalysisOptionsOpen(false)}
         hasExistingEdits={hasAnalysis}
-        initialEnginePrefs={settings.analysisEngines}
-        onPersistEnginePrefs={(prefs) => void save({ analysisEngines: prefs })}
+        initialVideoType={selectedVideoType}
+        onSelectVideoType={(t) => void setSelectedVideoType(t)}
+        lastRunOptions={lastRun}
+        corePrefs={settings.analysisEngines}
+        onPersistCorePrefs={(core) => void save({ analysisEngines: core })}
         videoDuration={project.duration ?? 0}
         initialDetail={settings.analysisDetail}
         onPersistDetail={(detail) => void save({ analysisDetail: detail })}
@@ -348,265 +310,51 @@ function Body() {
 }
 
 /**
- * First-run hero. Export owns the header's single primary slot, so the
- * Analyze call-to-action gets a prominent, self-explanatory home in the work
- * area until a first-draft edit exists.
+ * First-run call to action — a compact strip under the top bar (the old
+ * full-size hero card would push the preview off-balance in the fullscreen
+ * shell). Disappears as soon as a first draft exists.
  */
-function PreAnalysisHero({
+function PreAnalysisBanner({
   analyzing,
   canAnalyze,
   title,
-  selectedVideoType,
-  onSelectType,
   onGenerate,
-  onAdvanced,
 }: {
   analyzing: boolean;
   canAnalyze: boolean;
   title?: string;
-  selectedVideoType: SelectedVideoType;
-  onSelectType: (t: SelectedVideoType) => void;
   onGenerate: () => void;
-  onAdvanced: () => void;
 }) {
   return (
-    <div className="glass relative overflow-hidden rounded-2xl p-6 sm:p-7">
-      <div
-        aria-hidden
-        className="pointer-events-none absolute -right-10 -top-14 h-48 w-72 bg-[radial-gradient(ellipse_at_top_right,rgba(139,92,246,0.18),transparent_65%)] blur-2xl"
-      />
-      <div className="relative">
-        <div className="flex items-start gap-4">
-          <span className="inline-flex size-11 shrink-0 items-center justify-center rounded-2xl bg-violet-500/15 text-violet-200 ring-1 ring-violet-400/25 shadow-[0_8px_24px_-12px_rgba(139,92,246,0.6)]">
-            <Sparkles size={20} />
-          </span>
-          <div className="min-w-0">
-            <h2 className="font-display text-lg font-semibold tracking-tight text-white">
-              What kind of video is this?
-            </h2>
-            <p className="mt-1 max-w-xl text-[13px] leading-relaxed text-fog">
-              Pick a type so Framevo applies the best edit recipe — or let it Auto
-              Detect. You can refine every zoom, cut, and speed change on the
-              timeline afterward.
-            </p>
-          </div>
-        </div>
-
-        <div className="mt-5">
-          <VideoTypePicker
-            value={selectedVideoType}
-            onChange={onSelectType}
-            disabled={analyzing}
-          />
-        </div>
-
-        <div className="mt-5 flex flex-wrap items-center gap-2.5">
-          <Button
-            onClick={onGenerate}
-            variant="primary"
-            size="md"
-            disabled={!canAnalyze}
-            title={title}
-            leftIcon={
-              analyzing ? (
-                <Loader2 size={16} className="animate-spin" />
-              ) : (
-                <Sparkles size={16} />
-              )
-            }
-          >
-            {analyzing ? "Analyzing…" : "Generate AI Edit"}
-          </Button>
-          <Button onClick={onAdvanced} variant="ghost" size="md" disabled={analyzing}>
-            Advanced options
-          </Button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function prettyVideoType(t: string): string {
-  switch (t) {
-    case "coding-tutorial":
-      return "Coding tutorial";
-    case "saas-demo":
-      return "SaaS demo";
-    case "talking-tutorial":
-      return "Talking tutorial";
-    case "presentation":
-      return "Presentation";
-    case "vertical-short":
-      return "Vertical short";
-    case "onboarding-flow":
-      return "Onboarding flow";
-    default:
-      return t;
-  }
-}
-
-function summaryLine(p: ProjectDoc): string {
-  if (p.status === "analyzing") return "AI is analyzing this recording…";
-  if (p.status === "uploading") return "Uploading…";
-  if (p.status === "failed")
-    return p.analysis?.errorMessage || "Something went wrong. Try re-analyzing.";
-  const a = p.analysis;
-  if (a && a.status === "complete") {
-    return "Your first-draft edit is ready — drag, retime, and reframe any moment.";
-  }
-  return "Ready for AI analysis — it'll give you a first-draft edit to refine.";
-}
-
-/* ── Header building blocks ────────────────────────────────────────────────
-   Small, self-contained pieces for the redesigned header: a lightweight
-   status pill and an inline-editable project title. */
-
-type HeaderStatus = {
-  label: string;
-  dotClass: string;
-  textClass: string;
-  /** Animate the dot while work is in flight. */
-  pulse?: boolean;
-};
-
-function headerStatus(p: ProjectDoc, hasAnalysis: boolean): HeaderStatus {
-  switch (p.status) {
-    case "analyzing":
-      return { label: "Analyzing", dotClass: "bg-amber-400", textClass: "text-amber-200/90", pulse: true };
-    case "uploading":
-      return { label: "Uploading", dotClass: "bg-sky-400", textClass: "text-sky-200/90", pulse: true };
-    case "failed":
-      return { label: "Needs attention", dotClass: "bg-rose-400", textClass: "text-rose-200/90" };
-    case "exported":
-      return { label: "Exported", dotClass: "bg-emerald-400", textClass: "text-emerald-200/90" };
-    default:
-      return hasAnalysis
-        ? { label: "Draft", dotClass: "bg-violet-400", textClass: "text-violet-200/90" }
-        : { label: "New", dotClass: "bg-white/40", textClass: "text-fog" };
-  }
-}
-
-function StatusBadge({ status }: { status: HeaderStatus }) {
-  return (
-    <span className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-white/[0.07] bg-white/[0.02] px-2 py-0.5 text-[11px] font-medium">
-      <span className="relative flex size-1.5">
-        {status.pulse && (
-          <span
-            className={cn(
-              "absolute inline-flex h-full w-full animate-ping rounded-full opacity-60",
-              status.dotClass
-            )}
-          />
-        )}
-        <span className={cn("relative inline-flex size-1.5 rounded-full", status.dotClass)} />
+    <div className="flex shrink-0 flex-wrap items-center gap-x-4 gap-y-2 border-b border-white/[0.06] bg-violet-500/[0.04] px-4 py-2.5">
+      <span className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg bg-violet-500/15 text-violet-200 ring-1 ring-violet-400/25">
+        <Sparkles size={15} />
       </span>
-      <span className={status.textClass}>{status.label}</span>
-    </span>
-  );
-}
-
-/**
- * Inline-editable project title. Renders as a heading-styled button; clicking
- * it (or its pencil affordance) swaps in an input that visually matches the
- * heading, so renaming happens in place. Enter / blur commits via
- * `updateProject`; Escape reverts. The realtime `subscribeProject` listener
- * pushes the saved title back down as `project.title`.
- */
-function EditableProjectTitle({
-  uid,
-  projectId,
-  title,
-}: {
-  uid: string;
-  projectId: string;
-  title: string;
-}) {
-  const toast = useToast();
-  const [editing, setEditing] = React.useState(false);
-  const [value, setValue] = React.useState(title);
-  const [saving, setSaving] = React.useState(false);
-  const inputRef = React.useRef<HTMLInputElement>(null);
-
-  // Keep the field in sync when the title changes elsewhere (other tab,
-  // realtime update) and we're not mid-edit.
-  React.useEffect(() => {
-    if (!editing) setValue(title);
-  }, [title, editing]);
-
-  React.useEffect(() => {
-    if (editing) {
-      inputRef.current?.focus();
-      inputRef.current?.select();
-    }
-  }, [editing]);
-
-  const commit = React.useCallback(async () => {
-    const trimmed = value.trim();
-    if (!trimmed || trimmed === title) {
-      setValue(title);
-      setEditing(false);
-      return;
-    }
-    setSaving(true);
-    try {
-      await updateProject(uid, projectId, { title: trimmed });
-      setEditing(false);
-    } catch (err) {
-      toast.error(
-        "Couldn't rename project",
-        err instanceof Error ? err.message : undefined
-      );
-      setValue(title);
-      setEditing(false);
-    } finally {
-      setSaving(false);
-    }
-  }, [value, title, uid, projectId, toast]);
-
-  // Shared type scale so the input reads as the heading it replaces.
-  const titleType =
-    "font-display text-2xl font-semibold leading-tight tracking-tight text-white sm:text-[28px]";
-
-  if (editing) {
-    return (
-      <input
-        ref={inputRef}
-        value={value}
-        disabled={saving}
-        maxLength={120}
-        onChange={(e) => setValue(e.target.value)}
-        onBlur={() => void commit()}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") {
-            e.preventDefault();
-            void commit();
-          } else if (e.key === "Escape") {
-            e.preventDefault();
-            setValue(title);
-            setEditing(false);
-          }
-        }}
-        aria-label="Project title"
-        className={cn(
-          titleType,
-          "-mx-2.5 w-full max-w-xl rounded-lg border border-violet-400/40 bg-white/[0.03] px-2.5 py-0.5 outline-none transition-colors duration-150 focus:border-violet-400/70 disabled:opacity-60"
-        )}
-      />
-    );
-  }
-
-  return (
-    <button
-      type="button"
-      onClick={() => setEditing(true)}
-      title="Rename project"
-      className="group/title -mx-2.5 inline-flex min-w-0 max-w-full items-center gap-2 rounded-lg px-2.5 py-0.5 text-left transition-colors duration-150 hover:bg-white/[0.03] focus:outline-none focus-visible:ring-1 focus-visible:ring-violet-400/40"
-    >
-      <span className={cn(titleType, "truncate")}>{title}</span>
-      <Pencil
-        size={14}
-        className="shrink-0 text-fog opacity-0 transition-opacity duration-150 group-hover/title:opacity-100"
-      />
-    </button>
+      <div className="min-w-0 flex-1">
+        <p className="truncate text-[13px] font-medium text-white">
+          Generate your AI edit
+        </p>
+        <p className="hidden truncate text-[11.5px] text-fog sm:block">
+          Framevo builds a first-draft edit — cuts, zooms, speed changes, captions —
+          that you refine on the timeline.
+        </p>
+      </div>
+      <Button
+        onClick={onGenerate}
+        variant="primary"
+        size="sm"
+        disabled={!canAnalyze}
+        title={title}
+        leftIcon={
+          analyzing ? (
+            <Loader2 size={14} className="animate-spin" />
+          ) : (
+            <Sparkles size={14} />
+          )
+        }
+      >
+        {analyzing ? "Analyzing…" : "Generate AI Edit"}
+      </Button>
+    </div>
   );
 }

@@ -22,7 +22,7 @@ export function EffectsModal({
       title="Effects"
       subtitle="Global defaults for this project — applied to every detected moment."
       icon={<SlidersHorizontal size={17} />}
-      maxWidth="max-w-2xl"
+      size="wide"
     >
       <RealEffectsPanel />
     </EditorSheet>

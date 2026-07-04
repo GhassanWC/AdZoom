@@ -45,13 +45,13 @@ const navItems =
     ? sidebarItems.filter((i) => !DEV_ONLY_HREFS.has(i.href))
     : sidebarItems;
 
-export function Sidebar({
-  open,
-  onClose,
-}: {
-  open: boolean;
-  onClose: () => void;
-}) {
+/**
+ * The Framevo navigation content (logo, nav items, storage/plan footer) —
+ * shared by the persistent dashboard sidebar, its mobile drawer, AND the
+ * fullscreen editor's overlay navigation drawer. `onNavigate` fires when a
+ * link is chosen so drawers can close themselves.
+ */
+export function SidebarNav({ onNavigate }: { onNavigate?: () => void }) {
   const pathname = usePathname();
   const storage = useStoragePlan();
   const band = storageBand(storage.usedBytes, storage.limitBytes);
@@ -63,7 +63,7 @@ export function Sidebar({
         : "bg-gradient-to-r from-violet-500 to-cyan-400";
   const usagePct = Math.max(1, Math.round(storage.fraction * 100));
 
-  const nav = (
+  return (
     <nav className="flex h-full flex-col">
       <div className="flex h-16 items-center px-5">
         <Link href="/" aria-label="Framevo home">
@@ -81,7 +81,7 @@ export function Sidebar({
             <li key={item.href}>
               <Link
                 href={item.href}
-                onClick={onClose}
+                onClick={onNavigate}
                 className={cn(
                   "group relative flex items-center gap-3 rounded-lg px-3 py-2 text-sm transition-colors duration-200",
                   active
@@ -141,12 +141,20 @@ export function Sidebar({
       </div>
     </nav>
   );
+}
 
+export function Sidebar({
+  open,
+  onClose,
+}: {
+  open: boolean;
+  onClose: () => void;
+}) {
   return (
     <>
       {/* Desktop */}
       <aside className="hidden border-r border-white/[0.06] bg-surface/40 backdrop-blur-xl lg:fixed lg:inset-y-0 lg:left-0 lg:z-40 lg:flex lg:w-64 lg:flex-col">
-        {nav}
+        <SidebarNav />
       </aside>
 
       {/* Mobile drawer */}
@@ -177,7 +185,7 @@ export function Sidebar({
               >
                 <X size={16} />
               </button>
-              {nav}
+              <SidebarNav onNavigate={onClose} />
             </motion.aside>
           </>
         )}

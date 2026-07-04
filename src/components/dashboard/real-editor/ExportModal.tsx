@@ -22,7 +22,7 @@ export function ExportModal({
       title="Export video"
       subtitle="Choose your export settings. Framevo will prepare your MP4 automatically."
       icon={<Download size={17} />}
-      maxWidth="max-w-xl"
+      size="default"
     >
       <RealExportPanel onClose={onClose} />
     </EditorSheet>

@@ -140,6 +140,16 @@ service cloud.firestore {
         allow write: if false;
       }
 
+      // ── Auto-caption usage ledger (SEPARATE from export minutes) ──────
+      // Read-only to the owner so the Analyze dialog can show "X of Y caption
+      // minutes used". All writes happen server-side in atomic transactions
+      // (see src/lib/usage/caption-ledger.ts) — the client is never trusted
+      // with usage values.
+      match /captionUsage/{periodId} {
+        allow read: if isOwner(uid);
+        allow write: if false;
+      }
+
       // ── Workspace settings (client-owned) ─────────────────────────────
       // Single-doc parent for the user's preferences: workspace defaults
       // (default preset id + default export format) + notification

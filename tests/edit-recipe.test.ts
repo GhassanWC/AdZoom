@@ -18,6 +18,9 @@ import {
   editGenerationControls,
   disablesAllImplementedEdits,
   resolveEditRecipe,
+  recipeGenerationDefaults,
+  resolveInitialGenerationToggles,
+  GENERATION_TOGGLE_KEYS,
   type EditGenerationControls,
   type EditOperationCategory,
   type EditRecipePlan,
@@ -36,6 +39,8 @@ function controlsFor(
 const FULL_SIGNALS = {
   hasTranscript: true,
   hasAudioAnalysis: true,
+  hasUsableSpeech: true,
+  silenceSegmentCount: 5,
   hasSceneData: true,
   hasVisualMoments: true,
   hasInteractionData: true,
@@ -45,6 +50,8 @@ const FULL_SIGNALS = {
 const NO_SIGNALS = {
   hasTranscript: false,
   hasAudioAnalysis: false,
+  hasUsableSpeech: false,
+  silenceSegmentCount: 0,
   hasSceneData: false,
   hasVisualMoments: false,
   hasInteractionData: false,
@@ -91,14 +98,15 @@ test("Phase-3 promoted the Core AI Edit Pack to implemented; audio/captions stay
   assert.ok(IMPLEMENTED_CATEGORIES.has("cut"));
   assert.ok(IMPLEMENTED_CATEGORIES.has("zoom"));
   assert.ok(IMPLEMENTED_CATEGORIES.has("speed"));
-  // Phase 3 — now implemented (render + export + generate).
+  // Phase 3 + 4 — now implemented (render + export + generate). Phase 4 added
+  // captions (transcript-driven).
   const nowImplemented: EditOperationCategory[] = [
-    "hook_text", "text_overlay", "callout", "branding", "smart_crop", "transition",
+    "hook_text", "text_overlay", "callout", "branding", "smart_crop", "transition", "captions",
   ];
   for (const c of nowImplemented) assert.ok(IMPLEMENTED_CATEGORIES.has(c), `${c} should be implemented`);
-  // Still planned: captions (no transcript), blur (no auto-detector), audio/broll.
+  // Still planned: blur (no auto-detector), silence removal + audio/broll (no executor).
   const planned: EditOperationCategory[] = [
-    "captions", "blur_redaction", "music", "silence_removal", "audio_cleanup", "freeze_frame", "broll_overlay",
+    "blur_redaction", "music", "silence_removal", "audio_cleanup", "freeze_frame", "broll_overlay",
   ];
   for (const c of planned) assert.ok(!IMPLEMENTED_CATEGORIES.has(c), `${c} should be planned`);
 });
@@ -196,9 +204,9 @@ test("missing plan → baseline controls (old behavior preserved)", () => {
 
 test("planned categories never become generation controls", () => {
   const plan = resolveEditRecipe({ selectedVideoType: "reels-shorts", signals: FULL_SIGNALS });
-  // Reels plans captions (no transcript executor) — still flagged planned…
+  // Reels plans silence_removal (no executor yet) — still flagged planned…
   const planned = plan.operations.filter((o) => o.planned).map((o) => o.category);
-  assert.ok(planned.includes("captions"), "captions is a planned category");
+  assert.ok(planned.includes("silence_removal"), "silence_removal is a planned category");
   // …and the controls object only exposes the implemented engines, so a planned
   // category has no channel to affect preview/export.
   const c = editGenerationControls(plan);
@@ -241,4 +249,116 @@ test("all-disabled implemented plan triggers the empty-timeline fallback", () =>
     disablesAllImplementedEdits(c),
     "orchestrator must detect this and keep safe cuts (no empty timeline)"
   );
+});
+
+// ── Phase 4 — transcript / audio recipe gating ──────────────────────────────
+
+test("recipe enables captions ONLY when a transcript exists", () => {
+  const withT = resolveEditRecipe({ selectedVideoType: "talking-head", signals: FULL_SIGNALS });
+  assert.ok(withT.enabledCategories.includes("captions"), "captions enabled with a transcript");
+
+  const noT = resolveEditRecipe({
+    selectedVideoType: "talking-head",
+    signals: { ...FULL_SIGNALS, hasTranscript: false },
+  });
+  assert.ok(noT.disabledCategories.includes("captions"), "captions disabled without a transcript");
+  assert.match(noT.reasons.captions, /transcript/i);
+});
+
+test("recipe enables silence_removal ONLY with usable speech + detected silence", () => {
+  const withAudio = resolveEditRecipe({ selectedVideoType: "reels-shorts", signals: FULL_SIGNALS });
+  assert.ok(withAudio.enabledCategories.includes("silence_removal"), "enabled with audio + silence");
+
+  const noSpeech = resolveEditRecipe({
+    selectedVideoType: "reels-shorts",
+    signals: { ...FULL_SIGNALS, hasUsableSpeech: false },
+  });
+  assert.ok(noSpeech.disabledCategories.includes("silence_removal"), "disabled without usable speech");
+
+  const noSilence = resolveEditRecipe({
+    selectedVideoType: "reels-shorts",
+    signals: { ...FULL_SIGNALS, silenceSegmentCount: 0 },
+  });
+  assert.ok(noSilence.disabledCategories.includes("silence_removal"), "disabled without silence");
+});
+
+test("audio_cleanup stays PLANNED even when audio analysis is available", () => {
+  const plan = resolveEditRecipe({ selectedVideoType: "talking-head", signals: FULL_SIGNALS });
+  const op = plan.operations.find((o) => o.category === "audio_cleanup");
+  if (op) assert.equal(op.planned, true, "audio_cleanup has no executor yet → planned");
+});
+
+// ── Analyze modal — generation toggles + per-type defaults ──────────────────
+
+test("generation toggles cover ONLY implemented auto types — no blur / audio", () => {
+  assert.equal(GENERATION_TOGGLE_KEYS.length, 10);
+  const expected = [
+    "generateCameraEdits", "generateCut", "generateSpeed",
+    "generateCaptions", "generateHookText", "generateTextOverlays",
+    "generateSmartCrop", "generateCallouts", "generateTransitions", "generateCta",
+  ];
+  assert.deepEqual([...GENERATION_TOGGLE_KEYS].sort(), [...expected].sort());
+  // Blur is manual-only; audio/silence/music have no executor → never a toggle.
+  assert.ok(!GENERATION_TOGGLE_KEYS.some((k) => /blur|audio|silence|music|broll/i.test(k)));
+});
+
+test("recipeGenerationDefaults differ by video type (recipe-driven smart defaults)", () => {
+  const reels = recipeGenerationDefaults("reels-shorts");
+  assert.ok(
+    reels.generateCaptions && reels.generateHookText && reels.generateSmartCrop &&
+      reels.generateCta && reels.generateCut && reels.generateSpeed && reels.generateCameraEdits,
+    "reels turns on captions/hook/smart-crop/cta/cuts/speed/camera"
+  );
+
+  const talking = recipeGenerationDefaults("talking-head");
+  assert.ok(talking.generateCaptions && talking.generateHookText && talking.generateSmartCrop);
+  assert.equal(talking.generateTransitions, false, "talking-head has no transitions default");
+
+  const demo = recipeGenerationDefaults("product-demo");
+  assert.ok(demo.generateCallouts && demo.generateTextOverlays && demo.generateCta && demo.generateCameraEdits);
+
+  const screen = recipeGenerationDefaults("screen-recording");
+  assert.ok(
+    screen.generateCameraEdits && screen.generateCallouts && screen.generateTextOverlays &&
+      screen.generateCut && screen.generateSpeed
+  );
+
+  const promo = recipeGenerationDefaults("ad-promo");
+  assert.equal(promo.generateTransitions, true, "ad-promo turns transitions on");
+  assert.equal(promo.generateHookText, true);
+
+  // Different types → different toggle sets.
+  assert.notDeepEqual(reels, talking);
+  assert.notDeepEqual(demo, reels);
+});
+
+test("Auto Detect defaults are all-on (regression: Auto must not pre-suppress overlays)", () => {
+  // Bug: Auto Detect used to seed only a few overlay categories, so the modal's
+  // `allow` map suppressed hook/cta/text/callout/transition even when analysis
+  // detected e.g. Reels — leaving only cuts/zooms/speeds. Auto must be permissive
+  // and let the DETECTED recipe gate categories at generation time.
+  const auto = recipeGenerationDefaults("auto");
+  for (const k of GENERATION_TOGGLE_KEYS) {
+    assert.equal(auto[k], true, `Auto Detect must default ${k} on`);
+  }
+});
+
+test("resolveInitialGenerationToggles: fresh run = recipe defaults; re-analyze respects saved-off", () => {
+  const recipeDefaults = recipeGenerationDefaults("reels-shorts");
+  // Fresh run → the recipe defaults verbatim.
+  assert.deepEqual(
+    resolveInitialGenerationToggles({ recipeDefaults, lastRun: null, corePrefs: null }),
+    recipeDefaults
+  );
+  // Re-analyze: what the user turned off last run stays off.
+  const re = resolveInitialGenerationToggles({
+    recipeDefaults,
+    lastRun: { generateCaptions: false, generateCta: false },
+  });
+  assert.equal(re.generateCaptions, false, "saved captions-off respected");
+  assert.equal(re.generateCta, false, "saved cta-off respected");
+  assert.equal(re.generateHookText, recipeDefaults.generateHookText, "untouched key keeps recipe default");
+  // Remembered core prefs override the recipe default when there's no last run.
+  const core = resolveInitialGenerationToggles({ recipeDefaults, corePrefs: { generateCut: false } });
+  assert.equal(core.generateCut, false);
 });

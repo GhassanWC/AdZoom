@@ -316,6 +316,11 @@ export const MIN_RENDER_DURATION = 0.5;
 export const TRACK_HEIGHTS = {
   ai: 96,
   user: 84,
+  /** Compact height for the cut/speed + per-type overlay lanes (keeps the taller
+   *  stack of lanes readable without a huge vertical footprint). */
+  overlay: 56,
+  /** Collapsible lane-group header row. */
+  group: 30,
   ruler: 36,
   gap: 22,
   /** Narrative chapter strip — the cinematic "act" band above the lane. */

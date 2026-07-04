@@ -44,6 +44,14 @@ ARG BUILD_VERSION=dev
 ENV BUILD_VERSION=${BUILD_VERSION}
 ENV DOTNET_System_Globalization_Invariant=true
 WORKDIR /app
+# Multilingual fonts for the Node render CLI (@napi-rs/canvas / Skia burns overlay
+# text via fontconfig). Noto covers the officially-supported scripts (Latin/
+# Cyrillic/Greek/Arabic/Hebrew/Devanagari/Thai + CJK + emoji); without them
+# non-Latin captions/labels render as missing-glyph boxes in VM/Cloud-Run export.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    fonts-noto-core fonts-noto-cjk fonts-noto-color-emoji fontconfig \
+    && fc-cache -f \
+    && rm -rf /var/lib/apt/lists/*
 # Node runtime (dynamically linked against libstdc++6/libgcc-s1/libc6, present
 # on the Debian-based aspnet image) for the render CLI.
 COPY --from=cli-build /usr/local/bin/node /usr/local/bin/node

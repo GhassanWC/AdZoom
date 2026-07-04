@@ -195,6 +195,11 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
   const [container, setContainer] = React.useState<"mp4" | "webm">("mp4");
   const [advancedOpen, setAdvancedOpen] = React.useState(false);
   const [blockedWarning, setBlockedWarning] = React.useState<string | null>(null);
+  // Captions are still transcribing in the background. Warn ONCE before export
+  // (rule: "Export now without captions or wait?") — an ack lets it through.
+  const captionsProcessing = project.analysis?.transcript?.status === "processing";
+  const [captionsPrompt, setCaptionsPrompt] = React.useState(false);
+  const captionsAckRef = React.useRef(false);
 
   const engine: "server" | "browser" =
     container === "mp4" && canServerMp4 ? "server" : "browser";
@@ -289,6 +294,13 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
     // Client-side lock: a create request is already in flight — ignore extra
     // clicks so a double-click can't spawn two jobs (the server dedups too).
     if (cloud.starting) return;
+    // Captions still transcribing → confirm once. Export NEVER creates captions;
+    // it only renders caption ops that already exist, so exporting now simply
+    // ships without them (they can be re-exported once transcription finishes).
+    if (captionsProcessing && !captionsAckRef.current) {
+      setCaptionsPrompt(true);
+      return;
+    }
     setBlockedWarning(null);
     cloud.clearError();
     console.log("[export-ui:path]", { path: exportPath });
@@ -595,6 +607,37 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
             <Notice tone="amber">{cloud.alreadyRunningMessage}</Notice>
           )}
           {blockedWarning && <Notice tone="rose">{blockedWarning}</Notice>}
+
+          {/* Captions still transcribing — confirm before exporting without them. */}
+          {captionsPrompt && (
+            <div className="rounded-xl border border-amber-300/35 bg-amber-400/[0.07] px-3.5 py-3 text-[12.5px] text-amber-100">
+              <p className="font-medium text-white">Captions are still processing.</p>
+              <p className="mt-0.5 leading-relaxed text-amber-100/85">
+                Export now without captions, or wait for transcription to finish? You can
+                re-export with captions once they appear on the timeline.
+              </p>
+              <div className="mt-2.5 flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    captionsAckRef.current = true;
+                    setCaptionsPrompt(false);
+                    start();
+                  }}
+                  className="inline-flex items-center rounded-lg border border-amber-300/50 bg-amber-400/20 px-3 py-1.5 text-[12px] font-semibold text-amber-50 transition-colors hover:bg-amber-400/30"
+                >
+                  Export without captions
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setCaptionsPrompt(false)}
+                  className="inline-flex items-center rounded-lg border border-white/10 bg-white/[0.02] px-3 py-1.5 text-[12px] font-medium text-fog transition-colors hover:border-white/25 hover:text-white"
+                >
+                  Wait for captions
+                </button>
+              </div>
+            </div>
+          )}
 
           {/* Cloud export expectation-setting — it runs server-side and the user
               is free to leave the page while it renders. */}

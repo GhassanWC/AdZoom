@@ -11,11 +11,13 @@ import { stripUndefined } from "../firebase/sanitize";
 import type {
   AnalysisChunk,
   AnalysisJob,
+  AudioAnalysis,
   DetectedMoment,
   ProjectDoc,
   SelectedVideoType,
   VisualAnalysis,
 } from "../firebase/schema";
+import { analyzeAudio } from "../audio/analyze-audio";
 import {
   resolveEditRecipe,
   editGenerationControls,
@@ -129,8 +131,14 @@ export async function runChunkedAnalysis(args: ChunkedRunArgs): Promise<void> {
   const recipePlan = resolveEditRecipe({
     selectedVideoType,
     signals: {
-      hasTranscript: false, // no transcript pipeline yet → captions stay planned
+      // The orchestrator resolves the recipe BEFORE audio/transcript run — it
+      // only gates the audio-independent cut/zoom/speed engines. The finalize
+      // route re-resolves with the REAL transcript + audio signals (that plan is
+      // the stored one that drives captions / silence).
+      hasTranscript: false,
       hasAudioAnalysis: false,
+      hasUsableSpeech: false,
+      silenceSegmentCount: 0,
       hasSceneData: true, // CV produces scene changes
       hasVisualMoments: true, // CV produces zoom/callout targets
       hasInteractionData:
@@ -185,6 +193,13 @@ export async function runChunkedAnalysis(args: ChunkedRunArgs): Promise<void> {
 
   const windows = chunkWindows(duration, chunkSize);
   const jobId = `job_${project.id}`;
+
+  // ── Phase 4: audio intelligence (silence / loudness) ──────────────────────
+  // Kicked off concurrently with the CV chunks (Web Audio, no API key). Result
+  // is handed to the finalize pass, which stores it + uses it for the caption /
+  // silence-removal recipe signals. Best-effort: `analyzeAudio` NEVER throws, so
+  // this can't break the analysis pipeline.
+  const audioAnalysisPromise = analyzeAudio(project.originalVideoUrl, duration, signal);
 
   // Production-safe diagnostics (console.* ships to prod). The resolved chunk
   // config makes a mis-routed run obvious end-to-end without devtools setup.
@@ -623,6 +638,17 @@ export async function runChunkedAnalysis(args: ChunkedRunArgs): Promise<void> {
     await flushProjectWrites(pid);
 
     await writeJob({ status: "running", progress: 1 });
+    // Await the audio pass (already running); pass it to finalize so the server
+    // stores it + gates captions / silence removal. Never throws.
+    const audioAnalysis = await audioAnalysisPromise;
+    console.info("[audio:analysis]", {
+      projectId: project.id,
+      status: audioAnalysis.status,
+      hasUsableSpeech: audioAnalysis.hasUsableSpeech,
+      silenceSegments: audioAnalysis.silenceSegments?.length ?? 0,
+      longPauses: audioAnalysis.longPauses?.length ?? 0,
+      totalSilenceSeconds: audioAnalysis.totalSilenceSeconds ?? 0,
+    });
     // Finalize (the server-side Gemini refinement: classification, labels,
     // gap-fill) is BEST-EFFORT — the progressive CV timeline is already the
     // source of truth. If it fails but we already have edits, complete with them
@@ -634,6 +660,7 @@ export async function runChunkedAnalysis(args: ChunkedRunArgs): Promise<void> {
         progressiveCount: counters.momentsSoFar,
         // Recipe-gated so the server's gap-fill can't re-add a recipe-disabled layer.
         options: recipeOptions,
+        audioAnalysis,
       });
     } catch (finalizeErr) {
       if (counters.momentsSoFar <= 0) throw finalizeErr;
@@ -840,7 +867,12 @@ async function markCancelled(
 async function finalizeWithAi(
   projectId: string,
   idTokenGetter: () => Promise<string | null>,
-  diag: { chunkCount: number; progressiveCount: number; options: AnalysisOptions }
+  diag: {
+    chunkCount: number;
+    progressiveCount: number;
+    options: AnalysisOptions;
+    audioAnalysis?: AudioAnalysis;
+  }
 ): Promise<void> {
   const token = await idTokenGetter();
   if (!token) throw new Error("Not signed in.");
@@ -856,6 +888,9 @@ async function finalizeWithAi(
       progressiveCount: diag.progressiveCount,
       // So the finalize pass can't re-introduce a disabled layer via gap-fill.
       analysisOptions: diag.options,
+      // Phase 4 — client-computed audio intelligence for the finalize recipe +
+      // caption/silence gates (the server has no Web Audio).
+      audioAnalysis: diag.audioAnalysis ?? null,
     }),
   });
   if (!res.ok) {
@@ -870,7 +905,10 @@ async function finalizeWithAi(
       /* non-JSON (HTML error page) — fall back to the raw snippet */
     }
     const detail = serverMsg || bodyText.replace(/\s+/g, " ").trim().slice(0, 300) || `HTTP ${res.status}`;
-    console.error("[finalize] failed", { projectId, status: res.status, detail });
+    // WARN, not error: the caller (runChunkedAnalysis) catches this and completes
+    // with the progressive edits, so it's a handled, non-fatal degrade — a
+    // console.error here would trip Next.js's dev error overlay for a recovered case.
+    console.warn("[finalize] failed", { projectId, status: res.status, detail });
     throw new Error(`Finalize failed (${res.status}): ${detail}`);
   }
 }

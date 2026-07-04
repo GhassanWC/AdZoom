@@ -49,6 +49,14 @@ const TONE_TINT: Record<TimelineTrackTone, string> = {
   teal: "text-teal-200",
   rose: "text-rose-200",
   fog: "text-fog",
+  sky: "text-sky-200",
+  pink: "text-pink-200",
+  blue: "text-blue-200",
+  emerald: "text-emerald-200",
+  orange: "text-orange-200",
+  purple: "text-purple-200",
+  lime: "text-lime-200",
+  slate: "text-slate-200",
 };
 
 /**
@@ -65,6 +73,7 @@ export function TrackLabel({
   tone = "violet",
   comingSoon,
   note,
+  trailing,
 }: {
   Icon: LucideIcon;
   label: string;
@@ -74,13 +83,15 @@ export function TrackLabel({
   comingSoon?: boolean;
   /** Subtle line shown in place of the count (e.g. "Disabled for this analysis"). */
   note?: string;
+  /** Optional trailing control (e.g. an overlay lane's ⋯ menu). Shown on md+. */
+  trailing?: React.ReactNode;
 }) {
   const tint = comingSoon ? "text-fog/55" : TONE_TINT[tone];
   return (
     <div
       title={label}
       style={{ height }}
-      className="flex items-center gap-2 border-b border-white/[0.04] pr-3 last:border-b-0"
+      className="flex items-center gap-2 border-b border-white/[0.04] pr-1 last:border-b-0"
     >
       <span
         className={cn(
@@ -118,6 +129,7 @@ export function TrackLabel({
           )
         )}
       </div>
+      {trailing && <div className="ml-auto hidden shrink-0 md:flex">{trailing}</div>}
     </div>
   );
 }

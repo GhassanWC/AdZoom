@@ -11,6 +11,8 @@ import {
   Crosshair,
   X,
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   Brain,
   Crop,
   Zap,
@@ -217,7 +219,21 @@ const ADVANCED_RELEVANCE: Record<
   "branding-cta": { keyframes: false, cursor: false },
 };
 
-export function MomentInspector() {
+/**
+ * Previous/Next review navigation rendered in the header — supplied by the
+ * moment editor dialog (which owns the review flow) so the inspector itself
+ * stays a pure content component.
+ */
+export interface MomentReviewNav {
+  /** 1-based "12 of 42" position, or null when the moment isn't in the list. */
+  position: { index: number; total: number } | null;
+  hasPrev: boolean;
+  hasNext: boolean;
+  onPrev: () => void;
+  onNext: () => void;
+}
+
+export function MomentInspector({ nav }: { nav?: MomentReviewNav } = {}) {
   const {
     project,
     selectedMomentId,
@@ -225,6 +241,7 @@ export function MomentInspector() {
     updateMoment,
     deleteMoment,
     duplicateMoment,
+    setCaptionsEnabled,
     currentTime,
     duration,
     seek,
@@ -233,6 +250,10 @@ export function MomentInspector() {
   } = useEditorReal();
 
   const moments = project.analysis?.detectedMoments ?? [];
+  const captionCount = moments.filter((m) => m.effectType === "captions").length;
+  const allCaptionsEnabled =
+    captionCount > 0 &&
+    moments.every((m) => m.effectType !== "captions" || m.enabled !== false);
   const sourceAspect =
     project.width && project.height ? project.width / project.height : 16 / 9;
   const sourceDuration = duration || project.duration || 0;
@@ -284,46 +305,52 @@ export function MomentInspector() {
   };
 
   return (
-    // No own surface — the floating dialog provides the solid `bg-panel`
-    // background, border + shadow. Keeping this transparent avoids a
-    // translucent card-on-panel "washed out" look.
+    // No own surface — the floating dialog provides the solid background,
+    // border + shadow. Keeping this transparent avoids a translucent
+    // card-on-panel "washed out" look.
     <div>
       {/* ── Compact header ─────────────────────────────────────────────── */}
       <Header
         moment={moment}
         effectSpec={effectSpec}
+        nav={nav}
         onTitleChange={(label) => updateMoment(moment.id, { label })}
         onDuplicate={() => duplicateMoment(moment.id)}
         onDelete={() => deleteMoment(moment.id)}
       />
 
-      {/* ── Body ───────────────────────────────────────────────────────── */}
-      <div className="space-y-4 px-4 pb-4 pt-3">
+      {/* ── Body — two columns on desktop (effect controls | status/timing/AI),
+             one column when narrow. ─────────────────────────────────────── */}
+      <div className="grid grid-cols-1 gap-x-7 gap-y-4 px-4 pb-4 pt-3 sm:px-5 lg:grid-cols-[1.55fr_1fr]">
+        {/* ══ LEFT — primary effect settings ══ */}
+        <div className="min-w-0 space-y-4">
         {/* Effect type switcher — only for the camera effects (zoom/focus/
             click). Crop + Speed have their own tracks/tools, so the dialog
-            shows their settings directly instead of a 5-tab row that overflows. */}
-        <section className="space-y-3">
-          {!isCrop && !isSpeed && !isCut && !isOverlay && (
+            shows their settings directly instead of a 5-tab row that overflows.
+            The whole section only exists for camera effects — an empty section
+            would add stray spacing for crop/speed/cut/overlay moments. */}
+        {!isCrop && !isSpeed && !isCut && !isOverlay && (
+          <section className="space-y-3">
             <SegmentedEffect value={moment.effectType} onChange={onEffectChange} />
-          )}
-          {showCameraPresets && (
-            <DirectionalPresetRow
-              moment={moment}
-              interactions={interactions}
-              interactionsLoading={interactionsLoading}
-              onUpdate={(patch) => updateMoment(moment.id, patch)}
-            />
-          )}
-          {showIntensity && (
-            <Slider
-              label={`${effectSpec.label} intensity`}
-              value={Math.round((moment.intensity ?? 1) * 100)}
-              min={20}
-              max={150}
-              onChange={(v) => updateMoment(moment.id, { intensity: v / 100 })}
-            />
-          )}
-        </section>
+            {showCameraPresets && (
+              <DirectionalPresetRow
+                moment={moment}
+                interactions={interactions}
+                interactionsLoading={interactionsLoading}
+                onUpdate={(patch) => updateMoment(moment.id, patch)}
+              />
+            )}
+            {showIntensity && (
+              <Slider
+                label={`${effectSpec.label} intensity`}
+                value={Math.round((moment.intensity ?? 1) * 100)}
+                min={20}
+                max={150}
+                onChange={(v) => updateMoment(moment.id, { intensity: v / 100 })}
+              />
+            )}
+          </section>
+        )}
 
         {/* Crop / Reframe controls — only for crop moments. */}
         {isCrop && (
@@ -353,12 +380,42 @@ export function MomentInspector() {
         )}
 
         {/* Phase-3 overlay controls — captions / hook / text / callout / blur /
-            transition / branding / smart-crop. */}
+            transition / branding / smart-crop. (Enabled toggles live in the
+            right column with the rest of the status controls.) */}
         {isOverlay && (
           <OverlayControls
             moment={moment}
             onUpdate={(patch) => updateMoment(moment.id, patch)}
           />
+        )}
+        </div>
+
+        {/* ══ RIGHT — status, timing, advanced, AI reasoning ══ */}
+        <div className="min-w-0 space-y-4">
+
+        {/* Non-destructive enable/disable — hidden overlays stay on the
+            timeline (re-enableable) but never render in preview or export. */}
+        {isOverlay && (
+          <section className="space-y-3">
+            <Toggle
+              label="Enabled"
+              description={
+                moment.enabled === false
+                  ? "Hidden from preview & export — still on the timeline."
+                  : "Shown in preview & export."
+              }
+              checked={moment.enabled !== false}
+              onChange={(v) => updateMoment(moment.id, { enabled: v })}
+            />
+            {moment.effectType === "captions" && captionCount > 1 && (
+              <Toggle
+                label={`All captions (${captionCount})`}
+                description="Enable or disable the whole caption layer at once."
+                checked={allCaptionsEnabled}
+                onChange={(v) => void setCaptionsEnabled(v)}
+              />
+            )}
+          </section>
         )}
 
         {/* Timing — single row, no boxes, click-to-seek chips. */}
@@ -414,28 +471,6 @@ export function MomentInspector() {
             </CompactSection>
           )}
 
-          <CompactSection
-            title="AI reasoning"
-            meta={
-              <span className="inline-flex items-center gap-1.5">
-                <span
-                  className={cn(
-                    "size-1.5 rounded-full",
-                    PROVENANCE_PRESENTATION[provenanceOf(moment)].dot
-                  )}
-                />
-                {PROVENANCE_PRESENTATION[provenanceOf(moment)].label}
-                <span className="font-mono tabular-nums text-fog/70">
-                  {Math.round(
-                    (moment.confidenceScore ?? moment.attentionScore ?? 0.5) * 100
-                  )}
-                </span>
-              </span>
-            }
-          >
-            <AiReasoningSection moment={moment} />
-          </CompactSection>
-
           {/* Power-user escape hatch — show all advanced sections regardless
               of effect relevance. Tiny footer link, intentionally quiet. */}
           {!(showKeyframes && showCursor) && (
@@ -448,6 +483,20 @@ export function MomentInspector() {
             </button>
           )}
         </div>
+
+        {/* AI reasoning — always visible for the review workflow, but ONLY for
+            AI/CV/event-derived moments: user-created edits have no analysis
+            reasoning, and the fallback confidence (0.5) would read as a
+            fabricated "50/100" score. */}
+        {provenanceOf(moment) !== "user" && (
+          <section className="space-y-2 pt-1">
+            <h3 className="text-[11px] font-semibold uppercase tracking-[0.14em] text-fog">
+              AI reasoning
+            </h3>
+            <AiReasoningSection moment={moment} />
+          </section>
+        )}
+        </div>
       </div>
     </div>
   );
@@ -458,12 +507,14 @@ export function MomentInspector() {
 function Header({
   moment,
   effectSpec,
+  nav,
   onTitleChange,
   onDuplicate,
   onDelete,
 }: {
   moment: DetectedMoment;
   effectSpec: EffectSpec;
+  nav?: MomentReviewNav;
   onTitleChange: (s: string) => void;
   onDuplicate: () => void;
   onDelete: () => void;
@@ -473,7 +524,7 @@ function Header({
     // `pr-12` reserves space for the settings-dialog ✕ button (absolute,
     // top-right). Bottom border separates the header from the body now that
     // the dialog (not a glass card) owns the surface.
-    <div className="flex items-center gap-2.5 border-b border-white/[0.06] py-3 pl-4 pr-12">
+    <div className="flex items-center gap-2.5 border-b border-white/[0.06] py-3 pl-4 pr-12 sm:pl-5">
       <span
         className={cn(
           "inline-flex size-8 shrink-0 items-center justify-center rounded-lg bg-white/[0.03] ring-1 ring-white/10",
@@ -496,6 +547,35 @@ function Header({
           className="-mx-1 mt-0.5 block w-full truncate rounded px-1 py-0.5 text-[11.5px] leading-tight text-fog outline-none transition-colors duration-150 placeholder:text-fog/50 focus:bg-white/[0.05] focus:text-white"
         />
       </div>
+      {/* Previous / Next edit review — walk every timeline edit without
+          closing the dialog; content swaps in place. */}
+      {nav && nav.position && (
+        <span className="hidden shrink-0 items-center gap-1 sm:inline-flex">
+          <button
+            type="button"
+            onClick={nav.onPrev}
+            disabled={!nav.hasPrev}
+            aria-label="Previous edit"
+            title="Previous edit"
+            className={HEADER_NAV_BTN}
+          >
+            <ChevronLeft size={14} />
+          </button>
+          <span className="min-w-14 px-0.5 text-center font-mono text-[11px] tabular-nums text-fog">
+            {nav.position.index} of {nav.position.total}
+          </span>
+          <button
+            type="button"
+            onClick={nav.onNext}
+            disabled={!nav.hasNext}
+            aria-label="Next edit"
+            title="Next edit"
+            className={HEADER_NAV_BTN}
+          >
+            <ChevronRight size={14} />
+          </button>
+        </span>
+      )}
       <span
         title={prov.text}
         className="inline-flex shrink-0 items-center gap-1.5 text-[10.5px] text-fog"
@@ -507,6 +587,9 @@ function Header({
     </div>
   );
 }
+
+const HEADER_NAV_BTN =
+  "inline-flex size-8 items-center justify-center rounded-lg border border-white/10 bg-white/[0.03] text-fog transition-colors duration-150 hover:border-white/25 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/60 disabled:pointer-events-none disabled:opacity-35";
 
 function OverflowMenu({
   onDuplicate,

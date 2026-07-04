@@ -32,8 +32,32 @@ import type {
   TextOverlaySettings,
   TransitionSettings,
 } from "@/lib/firebase/schema";
+import { resolveTextStyle, type ResolvedTextStyle, type TextScript } from "./text-shaping";
 
-const FONT_STACK = `-apple-system, "Segoe UI", system-ui, sans-serif`;
+/**
+ * Set ctx.font (script-appropriate family) + ctx.direction (text-derived) via the
+ * SHARED script-aware resolver. Every text draw (caption / hook / text-overlay /
+ * callout / CTA) calls this, so font + direction logic lives in ONE place, used
+ * identically by preview and every export path. The canvas text engine then
+ * shapes + bidi-reorders under ctx.direction — we NEVER reverse strings manually.
+ */
+function applyTextStyle(
+  ctx: CanvasRenderingContext2D,
+  text: string,
+  opts: { weight: number; fontSize: number }
+): ResolvedTextStyle {
+  const style = resolveTextStyle(text);
+  ctx.font = `${opts.weight} ${opts.fontSize}px ${style.fontFamily}`;
+  ctx.direction = style.direction;
+  return style;
+}
+
+/** Only cased scripts support an uppercase transform (Arabic/CJK/Thai/etc. don't). */
+function isCasedScript(s: TextScript): boolean {
+  return s === "latin" || s === "cyrillic" || s === "greek";
+}
+
+
 
 /** Output-frame geometry the output-anchored pass needs. */
 export interface OverlayLayout {
@@ -90,23 +114,48 @@ function roundRectPath(
   ctx.closePath();
 }
 
-/** Greedy word-wrap to `maxWidth` px (ctx.font must already be set). */
-function wrapText(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string[] {
-  const words = text.split(/\s+/).filter(Boolean);
-  if (!words.length) return [];
+/**
+ * Script-aware greedy wrap to `maxWidth` px (ctx.font must already be set).
+ * Wraps on whitespace like normal; a single token wider than the line (a CJK/Thai
+ * run with no spaces, or a long URL) is broken BY CHARACTER so it never overflows.
+ * Iterates by code point (Array.from) so surrogate pairs — CJK astral + emoji —
+ * are never split mid-character.
+ */
+export function wrapText(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string[] {
+  const raw = (text ?? "").trim();
+  if (!raw) return [];
+  const fits = (str: string) => ctx.measureText(str).width <= maxWidth;
   const lines: string[] = [];
-  let line = words[0];
-  for (let i = 1; i < words.length; i++) {
-    const next = `${line} ${words[i]}`;
-    if (ctx.measureText(next).width > maxWidth && line) {
-      lines.push(line);
-      line = words[i];
-    } else {
-      line = next;
+  let line = "";
+  for (const token of raw.split(/\s+/)) {
+    if (!token) continue;
+    const candidate = line ? `${line} ${token}` : token;
+    if (fits(candidate)) {
+      line = candidate;
+      continue;
     }
+    if (line) {
+      lines.push(line);
+      line = "";
+    }
+    if (fits(token)) {
+      line = token;
+      continue;
+    }
+    // Token alone is wider than the line — break it by character.
+    let chunk = "";
+    for (const ch of Array.from(token)) {
+      if (!chunk || fits(chunk + ch)) {
+        chunk += ch;
+      } else {
+        lines.push(chunk);
+        chunk = ch;
+      }
+    }
+    line = chunk;
   }
-  lines.push(line);
-  return lines;
+  if (line) lines.push(line);
+  return lines.length ? lines : [raw];
 }
 
 // ── selection ────────────────────────────────────────────────────────────────
@@ -120,6 +169,9 @@ export function activeOverlays(
   const inCamera: DetectedMoment[] = [];
   for (const m of moments) {
     if (t < m.startTime || t >= m.endTime) continue;
+    // Non-destructive disable — `enabled === false` hides the overlay in preview
+    // AND export (this is the single gate both paths share). Absent = enabled.
+    if (m.enabled === false) continue;
     switch (m.effectType) {
       case "captions":
       case "hook-text":
@@ -139,17 +191,18 @@ export function activeOverlays(
   return { output, inCamera };
 }
 
-/** True if any overlay moment exists (cheap gate to skip the passes entirely). */
+/** True if any ENABLED overlay moment exists (cheap gate to skip the passes entirely). */
 export function hasOverlayMoments(moments: DetectedMoment[]): boolean {
   return moments.some(
     (m) =>
-      m.effectType === "captions" ||
+      m.enabled !== false &&
+      (m.effectType === "captions" ||
       m.effectType === "hook-text" ||
       m.effectType === "text-overlay" ||
       m.effectType === "branding-cta" ||
       m.effectType === "transition" ||
       m.effectType === "callout" ||
-      m.effectType === "blur-redaction"
+      m.effectType === "blur-redaction")
   );
 }
 
@@ -215,12 +268,15 @@ function drawCaption(
   if (alpha <= 0 || !s.text.trim()) return;
   const style = CAPTION_PRESETS[s.stylePreset] ?? CAPTION_PRESETS.clean;
   const fontSize = Math.max(14, Math.round(canvasH * style.fontScale));
-  const text = style.uppercase ? s.text.toUpperCase() : s.text;
   ctx.save();
   ctx.globalAlpha = alpha;
-  ctx.font = `${style.fontWeight} ${fontSize}px ${FONT_STACK}`;
+  // Shared resolver: script-appropriate font + text-derived direction (drives
+  // canvas bidi/shaping — no manual reversal). Same result in preview + export.
+  const textStyle = applyTextStyle(ctx, s.text, { weight: style.fontWeight, fontSize });
   ctx.textBaseline = "middle";
   ctx.textAlign = "center";
+  // Uppercase only for cased scripts (Arabic/CJK/Thai have no case).
+  const text = style.uppercase && isCasedScript(textStyle.script) ? s.text.toUpperCase() : s.text;
   const maxWidth = canvasW * 0.82;
   const lines = wrapText(ctx, text, maxWidth);
   const lineH = fontSize * 1.25;
@@ -268,13 +324,13 @@ function drawHookText(
   if (alpha <= 0 || !s.text.trim()) return;
   const style = HOOK_PRESETS[s.stylePreset] ?? HOOK_PRESETS.bold;
   const fontSize = Math.max(18, Math.round(canvasH * style.fontScale));
-  const text = style.uppercase ? s.text.toUpperCase() : s.text;
   const p = easeOut(inProgress(t, m.startTime, m.endTime));
   ctx.save();
   ctx.globalAlpha = alpha;
-  ctx.font = `${style.fontWeight} ${fontSize}px ${FONT_STACK}`;
+  const textStyle = applyTextStyle(ctx, s.text, { weight: style.fontWeight, fontSize });
   ctx.textBaseline = "middle";
   ctx.textAlign = "center";
+  const text = style.uppercase && isCasedScript(textStyle.script) ? s.text.toUpperCase() : s.text;
   const maxWidth = canvasW * 0.86;
   const lines = wrapText(ctx, text, maxWidth);
   const lineH = fontSize * 1.16;
@@ -361,7 +417,7 @@ function drawTextOverlay(
   const p = easeOut(inProgress(t, m.startTime, m.endTime));
   ctx.save();
   ctx.globalAlpha = baseAlpha;
-  ctx.font = `700 ${fontSize}px ${FONT_STACK}`;
+  applyTextStyle(ctx, s.text, { weight: 700, fontSize });
   ctx.textBaseline = "top";
   ctx.textAlign = anchor.align;
   const maxWidth = canvasW * 0.6;
@@ -426,7 +482,7 @@ function drawBrandingCta(
   const fontSize = Math.max(14, Math.round(canvasH * 0.036));
   ctx.save();
   ctx.globalAlpha = alpha;
-  ctx.font = `800 ${fontSize}px ${FONT_STACK}`;
+  applyTextStyle(ctx, s.ctaText, { weight: 800, fontSize });
   ctx.textBaseline = "middle";
   const textW = ctx.measureText(s.ctaText).width;
   const padX = fontSize * 0.9;
@@ -615,9 +671,11 @@ function drawCallout(
     ctx.stroke();
   }
 
-  // Optional label pill above the region.
+  // Optional label pill above the region. Uses the shared resolver too, so an
+  // Arabic/Hebrew callout label gets the right font + RTL direction (previously
+  // this was the one text draw that never set ctx.direction).
   if (s.text && s.text.trim()) {
-    ctx.font = `700 ${fontSize}px ${FONT_STACK}`;
+    applyTextStyle(ctx, s.text, { weight: 700, fontSize });
     ctx.textBaseline = "middle";
     ctx.textAlign = "center";
     const tw = ctx.measureText(s.text).width;

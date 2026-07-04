@@ -26,11 +26,17 @@ ARG BUILD_VERSION=dev
 ENV BUILD_VERSION=${BUILD_VERSION}
 WORKDIR /app/services/remotion-renderer
 
-# Chromium runtime dependencies for @remotion/renderer (headless Chrome).
+# Chromium runtime dependencies for @remotion/renderer (headless Chrome) + the
+# multilingual fonts Chromium's canvas needs for burned-in overlay text. Noto
+# covers the officially-supported scripts (Latin/Cyrillic/Greek/Arabic/Hebrew/
+# Devanagari/Thai + CJK + emoji); fonts-liberation stays for Latin metrics.
+# Without the Noto packages, non-Latin overlay text renders as tofu boxes.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libnss3 libdbus-1-3 libatk1.0-0 libgbm-dev libasound2 libxrandr2 \
     libxkbcommon-dev libxfixes3 libxcomposite1 libxdamage1 libatk-bridge2.0-0 \
     libpango-1.0-0 libcairo2 libcups2 fonts-liberation \
+    fonts-noto-core fonts-noto-cjk fonts-noto-color-emoji fontconfig \
+    && fc-cache -f \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /app/services/remotion-renderer/package.json ./

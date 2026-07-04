@@ -24,7 +24,7 @@ export function CanvasModal({
       title="Canvas"
       subtitle="How your whole video fits the export frame. Preview matches the export."
       icon={<Frame size={17} />}
-      maxWidth="max-w-2xl"
+      size="default"
     >
       <RealCanvasPanel />
     </EditorSheet>

@@ -21,6 +21,7 @@ import express, { type Request, type Response } from "express";
 import { loadConfig, type WorkerConfig } from "./config.js";
 import { verifyRequestAuth } from "./oidc.js";
 import { processJob } from "./handler.js";
+import { registerAndDiagnoseFonts } from "./fonts.js";
 
 /** Best-effort container memory limit (MB) from cgroup v2/v1; "unknown" otherwise. */
 function detectMemoryLimitMB(): number | "unknown" {
@@ -46,6 +47,8 @@ function detectMemoryLimitMB(): number | "unknown" {
  * is to make a misconfigured revision obvious in the logs.
  */
 function logStartup(cfg: WorkerConfig): void {
+  // Load + verify multilingual fonts once, so a fontless image is obvious at boot.
+  registerAndDiagnoseFonts();
   const availableCpus =
     typeof os.availableParallelism === "function" ? os.availableParallelism() : os.cpus().length;
 

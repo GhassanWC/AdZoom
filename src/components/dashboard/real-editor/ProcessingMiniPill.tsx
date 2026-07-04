@@ -10,6 +10,7 @@ import {
   fmtElapsed,
   isProcessing,
 } from "@/lib/analysis-stages";
+import { countGeneratedEdits } from "@/lib/analysis-progress";
 
 /**
  * Tiny pill that appears in the bottom-right when the user minimizes the
@@ -82,10 +83,13 @@ export function ProcessingMiniPill() {
       : "";
   const stageText = job
     ? `Chunk ${Math.min(job.completedCount + 1, job.chunkCount)} of ${job.chunkCount}${chunkSizeSuffix}`
-    : project.analysis?.stage ?? "Analyzing";
+    : "Generating your AI edit";
   const pctFinal = job ? Math.max(0.02, job.progress) : pct;
+  const editCount = countGeneratedEdits(analysis?.detectedMoments);
   const subtitle = job
-    ? `${job.momentsSoFar} edit${job.momentsSoFar === 1 ? "" : "s"} so far · editable now`
+    ? editCount > 0
+      ? `${editCount} edit${editCount === 1 ? "" : "s"} so far · editable now`
+      : "Preparing your selected AI edits…"
     : project.title;
 
   return createPortal(

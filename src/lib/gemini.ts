@@ -322,20 +322,85 @@ export interface UploadedGeminiFile {
   mimeType: string;
 }
 
-/** Upload a video buffer to the Gemini Files API. The returned file may not be ACTIVE yet. */
+/** A transient (retryable) Gemini/network error — connection resets, gRPC UNAVAILABLE, timeouts. */
+function isTransientGeminiError(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return (
+    msg.includes("unavailable") ||
+    msg.includes("failed to connect") ||
+    msg.includes("no connection") ||
+    msg.includes("econnreset") ||
+    msg.includes("etimedout") ||
+    msg.includes("enotfound") ||
+    msg.includes("socket hang up") ||
+    msg.includes("network") ||
+    msg.includes("timed out") ||
+    msg.includes("deadline") ||
+    /\b14\b/.test(msg) // gRPC UNAVAILABLE
+  );
+}
+
+function raceTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(label)), Math.max(1, ms));
+  });
+  return Promise.race([p, timeout]).finally(() => timer && clearTimeout(timer)) as Promise<T>;
+}
+
+/**
+ * Upload a video buffer to the Gemini Files API. The returned file may not be
+ * ACTIVE yet.
+ *
+ * Resilient by design: the Files API upload can flake with transient gRPC
+ * `14 UNAVAILABLE: No connection established` / `Failed to connect` errors, and
+ * a single un-bounded attempt can hang for many minutes retrying inside the SDK.
+ * So each attempt is bounded by `perAttemptTimeoutMs` and transient failures are
+ * retried a few times with backoff — a blip no longer sinks the whole analysis,
+ * and a genuinely-unreachable API fails FAST with an actionable message.
+ */
 export async function uploadVideoToGemini(
   buffer: Buffer,
-  mimeType: string
+  mimeType: string,
+  opts: { retries?: number; perAttemptTimeoutMs?: number } = {}
 ): Promise<UploadedGeminiFile> {
   const ai = getGemini();
-  const file = await ai.files.upload({
-    file: new Blob([new Uint8Array(buffer)], { type: mimeType }),
-    config: { mimeType },
-  });
-  if (!file.uri || !file.mimeType || !file.name) {
-    throw new Error("Gemini file upload returned no URI");
+  const retries = opts.retries ?? 2;
+  const perAttemptTimeoutMs = opts.perAttemptTimeoutMs ?? 60_000;
+  let lastErr: unknown;
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const file = await raceTimeout(
+        ai.files.upload({
+          file: new Blob([new Uint8Array(buffer)], { type: mimeType }),
+          config: { mimeType },
+        }),
+        perAttemptTimeoutMs,
+        "Gemini upload attempt timed out"
+      );
+      if (!file.uri || !file.mimeType || !file.name) {
+        throw new Error("Gemini file upload returned no URI");
+      }
+      return { name: file.name, uri: file.uri, mimeType: file.mimeType };
+    } catch (err) {
+      lastErr = err;
+      if (attempt >= retries || !isTransientGeminiError(err)) break;
+      const backoffMs = 1500 * (attempt + 1);
+      console.warn("[gemini-upload] transient error — retrying", {
+        attempt: attempt + 1,
+        of: retries + 1,
+        backoffMs,
+        error: err instanceof Error ? err.message.slice(0, 160) : String(err),
+      });
+      await new Promise((r) => setTimeout(r, backoffMs));
+    }
   }
-  return { name: file.name, uri: file.uri, mimeType: file.mimeType };
+
+  const detail = lastErr instanceof Error ? lastErr.message : String(lastErr);
+  throw new Error(
+    `Couldn't reach the Gemini API to upload the video. This is usually a temporary network/connectivity issue — check your connection (and GEMINI_API_KEY) and try again. (${detail.slice(0, 200)})`
+  );
 }
 
 /**

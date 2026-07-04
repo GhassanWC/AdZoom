@@ -48,7 +48,10 @@ import {
   computeCarryOver,
   DEFAULT_ANALYSIS_OPTIONS,
 } from "@/lib/analysis/engine-layers";
+import type { TranscriptLanguageMode } from "@/lib/transcript/language";
 import { getActiveJobForProject } from "@/lib/firebase/analysis-jobs";
+import { logFramevoEvent } from "@/lib/firebase/analytics";
+import { EVENTS } from "@/lib/analytics/events";
 import {
   enqueueProjectWrite,
   isAnalysisActive,
@@ -172,6 +175,13 @@ interface EditorRealContextValue {
   inspectorOpen: boolean;
   openInspector: () => void;
   closeInspector: () => void;
+  /**
+   * Before/After compare: while set, the LIVE PREVIEW renders as if this
+   * moment didn't exist (hold-to-compare in the moment editor). Strictly a
+   * preview-side override — never persisted, never seen by export.
+   */
+  compareBypassId: string | null;
+  setCompareBypassId: (id: string | null) => void;
   /** Global "Canvas / Format" panel — opens from the header or the export summary. */
   canvasOpen: boolean;
   openCanvas: () => void;
@@ -193,6 +203,12 @@ interface EditorRealContextValue {
   updateMoment: (id: string, patch: Partial<DetectedMoment>) => Promise<void>;
   deleteMoment: (id: string) => Promise<void>;
   addMoment: (m: DetectedMoment) => Promise<void>;
+  /** Non-destructively enable/disable ALL caption moments at once (whole layer). */
+  setCaptionsEnabled: (enabled: boolean) => Promise<void>;
+  /** Non-destructively enable/disable EVERY moment of these effect types (lane-level). */
+  setLaneEnabled: (effectTypes: EffectType[], enabled: boolean) => Promise<void>;
+  /** Delete every moment of these effect types (lane-level "clear"). */
+  deleteLane: (effectTypes: EffectType[]) => Promise<void>;
   /** Duplicate a moment just after itself, as a fresh user-owned edit. */
   duplicateMoment: (id: string) => Promise<void>;
   /** Manually insert an edit of the given effect at the current playhead. */
@@ -231,6 +247,8 @@ interface EditorRealContextValue {
   applyPreset: (preset: Preset) => Promise<void>;
   clearSelectedPreset: () => Promise<void>;
   startAnalyze: (options: AnalysisOptions) => Promise<void>;
+  /** "Wrong language?" — re-transcribe the same video in a chosen spoken language. */
+  retranscribe: (opts: { mode: TranscriptLanguageMode; code?: string }) => Promise<void>;
   cancelAnalyze: () => Promise<void>;
   /**
    * Re-derive `focusRegion` for every non-user-positioned moment from the
@@ -436,6 +454,35 @@ export function EditorRealProvider({
   const [inspectorOpen, setInspectorOpen] = React.useState(false);
   const openInspector = React.useCallback(() => setInspectorOpen(true), []);
   const closeInspector = React.useCallback(() => setInspectorOpen(false), []);
+  // Before/After hold-to-compare — preview-only, cleared by the moment editor
+  // on release/close. Never persisted.
+  const [compareBypassId, setCompareBypassId] = React.useState<string | null>(null);
+
+  // ── Caption analytics — the transcription lifecycle is SEPARATE from the
+  // AI-edit lifecycle (ANALYSIS_*). Watch the transcript's status transitions
+  // (background ASR lands via the realtime subscription) and log the caption
+  // events distinctly: completed / failed / quota-blocked.
+  const prevTranscriptStatusRef = React.useRef<string | null>(null);
+  React.useEffect(() => {
+    const t = project.analysis?.transcript;
+    const status = t?.status ?? null;
+    const prev = prevTranscriptStatusRef.current;
+    prevTranscriptStatusRef.current = status;
+    if (!status || prev === status || prev === null) return;
+    if (status === "complete") {
+      logFramevoEvent(EVENTS.CAPTION_TRANSCRIPTION_COMPLETED, {
+        language: t?.language ?? t?.requestedLanguageCode ?? "unknown",
+        segments: t?.segments?.length ?? 0,
+      });
+    } else if (status === "failed") {
+      logFramevoEvent(EVENTS.CAPTION_TRANSCRIPTION_FAILED);
+    } else if (
+      status === "unavailable" &&
+      (t?.skipReason === "quota_exhausted" || t?.skipReason === "per_video_limit")
+    ) {
+      logFramevoEvent(EVENTS.CAPTION_QUOTA_BLOCKED, { reason: t.skipReason });
+    }
+  }, [project.analysis?.transcript]);
   const [canvasOpen, setCanvasOpen] = React.useState(false);
   const openCanvas = React.useCallback(() => setCanvasOpen(true), []);
   const closeCanvas = React.useCallback(() => setCanvasOpen(false), []);
@@ -655,6 +702,55 @@ export function EditorRealProvider({
     [commitMoments, selectedMomentId]
   );
 
+  const setCaptionsEnabled: EditorRealContextValue["setCaptionsEnabled"] =
+    React.useCallback(
+      async (enabled) => {
+        let changed = false;
+        const next = momentsRef.current.map((m) => {
+          if (m.effectType !== "captions") return m;
+          if ((m.enabled !== false) === enabled) return m; // already in state
+          changed = true;
+          return { ...m, enabled };
+        });
+        if (changed) await commitMoments(next);
+      },
+      [commitMoments]
+    );
+
+  // Lane-level enable/disable — non-destructive, whole layer, single undo step.
+  // Generalizes `setCaptionsEnabled` to any set of effect types (used by the
+  // per-type overlay lanes' gutter menu).
+  const setLaneEnabled: EditorRealContextValue["setLaneEnabled"] =
+    React.useCallback(
+      async (effectTypes, enabled) => {
+        const types = new Set<EffectType>(effectTypes);
+        let changed = false;
+        const next = momentsRef.current.map((m) => {
+          if (!types.has(m.effectType)) return m;
+          if ((m.enabled !== false) === enabled) return m; // already in state
+          changed = true;
+          return { ...m, enabled };
+        });
+        if (changed) await commitMoments(next);
+      },
+      [commitMoments]
+    );
+
+  // Lane-level clear — deletes every moment of these effect types in ONE step.
+  const deleteLane: EditorRealContextValue["deleteLane"] = React.useCallback(
+    async (effectTypes) => {
+      const types = new Set<EffectType>(effectTypes);
+      const cur = momentsRef.current;
+      const next = cur.filter((m) => !types.has(m.effectType));
+      if (next.length === cur.length) return;
+      await commitMoments(next);
+      const survives = new Set(next.map((m) => m.id));
+      if (selectedMomentId && !survives.has(selectedMomentId)) setSelectedMomentId(null);
+      setMultiSelectIds((ids) => ids.filter((x) => survives.has(x)));
+    },
+    [commitMoments, selectedMomentId]
+  );
+
   const toggleMultiSelect = React.useCallback((id: string) => {
     setMultiSelectIds((ids) =>
       ids.includes(id) ? ids.filter((x) => x !== id) : [...ids, id]
@@ -784,6 +880,8 @@ export function EditorRealProvider({
           ...(isCrop ? { crop: { ...DEFAULT_CROP } } : {}),
           ...(isSpeed ? { speed: { ...DEFAULT_SPEED } } : {}),
           ...(isCut ? { cut: { ...DEFAULT_CUT } } : {}),
+          // Overlays default ON (non-destructively disable-able later).
+          ...(isOverlay ? { enabled: true } : {}),
           // Phase-3 overlay settings (only the matching one is attached).
           ...(effectType === "captions"
             ? { captions: { text: "Caption", stylePreset: "clean" as const, position: "bottom" as const } }
@@ -1075,8 +1173,14 @@ export function EditorRealProvider({
 
   const startAnalyze = React.useCallback(async (rawOptions: AnalysisOptions) => {
     // Attach the user's video type so the whole pipeline (orchestrator →
-    // finalize route → balancer/prompt) applies the matching edit recipe.
-    const options: AnalysisOptions = { ...rawOptions, selectedVideoType };
+    // finalize route → balancer/prompt) applies the matching edit recipe. The
+    // dialog now owns the type picker and passes its choice in `rawOptions` —
+    // honor that first (the context state may not have re-rendered yet), falling
+    // back to the persisted project type when a caller doesn't specify one.
+    const options: AnalysisOptions = {
+      ...rawOptions,
+      selectedVideoType: rawOptions.selectedVideoType ?? selectedVideoType,
+    };
     // Free-plan duration gate — block (re)analysis of >3-min videos before any
     // state change or on-device CV work. `resolveReliableDuration` probes the
     // real <video>, so a stale/missing `project.duration` on an old project
@@ -1374,6 +1478,32 @@ export function EditorRealProvider({
     }
   }, [idTokenGetter, uid, project, projectRef, videoRef, interactions, planTier, selectedVideoType]);
 
+  // "Wrong language?" — re-transcribe the SAME video in a chosen spoken language
+  // (or Auto) without re-uploading. Deletes only AI transcript-derived captions
+  // (manual captions survive), then forces a fresh transcription; the new-language
+  // captions regenerate + appear live via the subscription. `keep` mode preserves
+  // the existing timeline; the language change forces a new transcript (fingerprint).
+  const retranscribe: EditorRealContextValue["retranscribe"] = React.useCallback(
+    async (opts) => {
+      const cur = momentsRef.current;
+      const kept = cur.filter((m) => !(m.effectType === "captions" && m.source !== "user"));
+      if (kept.length !== cur.length) await commitMoments(kept);
+      const last = (project.analysis?.lastRunOptions as Partial<AnalysisOptions> | undefined) ?? {};
+      await startAnalyze({
+        ...DEFAULT_ANALYSIS_OPTIONS,
+        ...last,
+        transcriptLanguageMode: opts.mode,
+        transcriptLanguageCode: opts.mode === "selected" ? opts.code : undefined,
+        transcriptLocaleHint:
+          typeof navigator !== "undefined" ? navigator.language : undefined,
+        forceRetranscribe: true,
+        generateCaptions: true,
+        existingEditMode: "keep",
+      });
+    },
+    [commitMoments, project.analysis?.lastRunOptions, startAnalyze]
+  );
+
   // ── Resume an in-flight chunked job after a refresh ─────────────────────
   // Completed chunks already wrote their moments to the project doc, so the
   // timeline shows them instantly; we just re-attach the orchestrator to drive
@@ -1593,6 +1723,8 @@ export function EditorRealProvider({
     inspectorOpen,
     openInspector,
     closeInspector,
+    compareBypassId,
+    setCompareBypassId,
     canvasOpen,
     openCanvas,
     closeCanvas,
@@ -1607,6 +1739,9 @@ export function EditorRealProvider({
     updateMoment,
     deleteMoment,
     addMoment,
+    setCaptionsEnabled,
+    setLaneEnabled,
+    deleteLane,
     duplicateMoment,
     addMomentAtPlayhead,
     newMomentId,
@@ -1622,6 +1757,7 @@ export function EditorRealProvider({
     applyPreset,
     clearSelectedPreset,
     startAnalyze,
+    retranscribe,
     cancelAnalyze,
     refineFraming,
     refiningFraming,

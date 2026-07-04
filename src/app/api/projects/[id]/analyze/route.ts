@@ -21,6 +21,7 @@ import {
   waitForGeminiFileActive,
   GeminiCancelled,
   type GeminiVideoRef,
+  type SectionClassification,
 } from "@/lib/gemini";
 import {
   classifyError,
@@ -33,6 +34,21 @@ import {
 } from "@/lib/analysis/video-type";
 import { resolveEditRecipe, logEditRecipePlan } from "@/lib/analysis/edit-recipe";
 import { generateOverlayEdits } from "@/lib/analysis/overlay-generators";
+import { generateCaptionMoments } from "@/lib/analysis/caption-generator";
+import { transcribeVideo, hasUsableTranscript } from "@/lib/transcript/transcribe";
+import {
+  decideTranscription,
+  transcriptionFingerprint,
+  isAsrRunnable,
+  asrExecutionMode,
+  resolveAsrDispatch,
+  hasBackgroundAsrTarget,
+} from "@/lib/transcript/transcription-job";
+import {
+  resolveTranscriptLanguage,
+  transcriptScriptMatchesLanguage,
+} from "@/lib/transcript/language";
+import { dispatchTranscription } from "@/lib/transcript/run-transcription";
 import { buildEditDiagnostics } from "@/lib/diagnostics/edit-diagnostics";
 import { momentsFromEvents } from "@/lib/attention/events";
 import { attentionCurve } from "@/lib/attention/score";
@@ -40,6 +56,21 @@ import { cursorIntent } from "@/lib/attention/cursor-intent";
 import { classifyClick, type ClickTier } from "@/lib/attention/click-classifier";
 import { canUseAiFeature } from "@/lib/usage/ai-features";
 import { canUsePreset, getUserPlan } from "@/lib/usage/gating";
+import {
+  CAPTION_PLAN_LIMITS,
+  CAPTION_ALLOWANCE_EXHAUSTED_MESSAGE,
+  CaptionQuotaExhaustedError,
+  exceedsCaptionVideoLimit,
+  perVideoCaptionLimitMessage,
+  requiredCaptionSeconds,
+  shouldCommitCaptionUsage,
+} from "@/lib/usage/caption-quota";
+import {
+  commitCaptionUsage,
+  logCaptionQuota,
+  releaseCaptionReservation,
+  reserveCaptionSeconds,
+} from "@/lib/usage/caption-ledger";
 import {
   exceedsUploadDuration,
   FREE_UPLOAD_MAX_DURATION_SECONDS,
@@ -55,11 +86,14 @@ import {
   AI_MOMENT_QUOTA,
   type AnalysisActivityEvent,
   type AnalysisErrorKind,
+  type AudioAnalysis,
   type ClickPipelineDiagnostics,
   type DetectedMoment,
   type MomentProvenance,
   type Pacing,
   type ProjectStatus,
+  type Transcript,
+  type TranscriptSkipReason,
   type VisualAnalysis,
 } from "@/lib/firebase/schema";
 
@@ -462,8 +496,17 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       progressiveCount?: number;
       analysisOptions?: AnalysisOptions;
       carryOver?: DetectedMoment[];
+      /** Phase 4 — client-computed audio intelligence (Web Audio). */
+      audioAnalysis?: AudioAnalysis | null;
+      /** Force re-transcription even if a transcript already exists. */
+      forceRetranscribe?: boolean;
     } | null;
     const isFinalize = reqBody?.mode === "finalize";
+    // Phase 4 audio intelligence: prefer the client's fresh result, else fall
+    // back to any previously-stored one (e.g. a re-run) so signals stay stable.
+    const audioAnalysis: AudioAnalysis | null =
+      reqBody?.audioAnalysis ??
+      ((project.analysis as { audioAnalysis?: AudioAnalysis } | undefined)?.audioAnalysis ?? null);
     // Engine selection. A legacy no-body call → all-on default + empty
     // carry-over, i.e. exactly today's "clear and regenerate everything".
     const analysisOptions = reqBody?.analysisOptions ?? DEFAULT_ANALYSIS_OPTIONS;
@@ -697,62 +740,107 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
 
     await ensureNotCancelled(ref);
 
-    // 5. Prepare a Gemini video reference. The new refinement-only pipeline
-    // calls Gemini up to three times (sections → gap-fill → labels), so we
-    // upload once via the Files API for non-inline videos and reuse the URI.
+    // 5–6. Gemini refinement (upload → classify) — BEST-EFFORT, never fatal.
+    // Gemini adds structure (videoType / narrative / presets) and, later,
+    // gap-fill + labels. But it is NOT required to produce an edit: the
+    // progressive/CV timeline, the deterministic overlays (hook / CTA /
+    // smart-crop / text), and background ASR are all Gemini-INDEPENDENT. So a
+    // Gemini upload/classify failure (a timeout, a flaky connection) must NOT
+    // 500 the whole finalize — that would wipe the overlays + the transcript
+    // dispatch too. On failure we log, fall back to the prior/neutral structure,
+    // null the video ref (which skips gap-fill/labels), and carry on so the user
+    // keeps every edit we can make without Gemini.
     const useInline = buffer.length <= INLINE_BYTE_LIMIT;
-    let geminiVideo: GeminiVideoRef;
-    if (useInline) {
-      geminiVideo = { kind: "inline", buffer, mimeType };
-      await emitActivity(ref, "info", `Using inline video (${sizeMB} MB)`);
-    } else {
-      await setStage(ref, "uploading_to_gemini", "Uploading to Gemini");
-      await emitActivity(ref, "info", "Uploading video to Gemini Files API");
-      const uploaded = await uploadVideoToGemini(buffer, mimeType);
-      await emitActivity(ref, "ok", `Uploaded — file id ${uploaded.name.split("/").pop()}`);
+    const priorAnalysis = project.analysis as
+      | {
+          summary?: string;
+          videoType?: SectionClassification["videoType"];
+          narrativeStructure?: SectionClassification["narrativeStructure"];
+          recommendedPresetIds?: string[];
+        }
+      | undefined;
+    let geminiVideo: GeminiVideoRef | null = null;
+    let sections: SectionClassification;
+    try {
+      if (useInline) {
+        geminiVideo = { kind: "inline", buffer, mimeType };
+        await emitActivity(ref, "info", `Using inline video (${sizeMB} MB)`);
+      } else {
+        await setStage(ref, "uploading_to_gemini", "Uploading to Gemini");
+        await emitActivity(ref, "info", "Uploading video to Gemini Files API");
+        // Hard ceiling so a flaky Gemini connection can't hang the whole run —
+        // `uploadVideoToGemini` already bounds + retries each attempt internally.
+        const uploaded = await withDeadline(
+          uploadVideoToGemini(buffer, mimeType, {
+            retries: 2,
+            perAttemptTimeoutMs: Math.min(60_000, Math.max(5_000, budgetRemainingMs() - 30_000)),
+          }),
+          Math.min(150_000, Math.max(10_000, budgetRemainingMs())),
+          "Uploading the video to Gemini timed out — please retry (temporary connectivity issue)."
+        );
+        await emitActivity(ref, "ok", `Uploaded — file id ${uploaded.name.split("/").pop()}`);
+        await ensureNotCancelled(ref);
+        await setStage(ref, "extracting_frames", "Extracting frames");
+        await waitForGeminiFileActive(uploaded.name, {
+          // Never let the file-active wait eat the whole budget — leave room for
+          // the classify/gap-fill/label generations before the 300s wall.
+          timeoutMs: Math.min(120_000, Math.max(1000, budgetRemainingMs())),
+          shouldCancel: () => isCancelled(ref!),
+          onProgress: async (state, attempt) => {
+            if (attempt > 0 && attempt % 3 === 0) {
+              await emitActivity(ref!, "info", `Gemini state: ${state}`);
+            }
+          },
+        });
+        await emitActivity(ref, "ok", "Gemini finished extracting frames");
+        geminiVideo = { kind: "file", uri: uploaded.uri, mimeType: uploaded.mimeType };
+      }
+
       await ensureNotCancelled(ref);
-      await setStage(ref, "extracting_frames", "Extracting frames");
-      await waitForGeminiFileActive(uploaded.name, {
-        // Never let the file-active wait eat the whole budget — leave room for
-        // the classify/gap-fill/label generations before the 300s wall.
-        timeoutMs: Math.min(120_000, Math.max(1000, budgetRemainingMs())),
-        shouldCancel: () => isCancelled(ref!),
-        onProgress: async (state, attempt) => {
-          if (attempt > 0 && attempt % 3 === 0) {
-            await emitActivity(ref!, "info", `Gemini state: ${state}`);
-          }
-        },
+
+      // Phase A — Section classification (videoType, narrative, summary, presets).
+      await setStage(ref, "analyzing", "Analyzing the video");
+      await emitActivity(ref, "info", "Asking Gemini for structure (sections + classification)");
+      sections = await withDeadline(
+        classifyVideoSections({ video: geminiVideo, hintedDuration: duration }),
+        budgetRemainingMs(),
+        "Analysis timed out while classifying the video. Try a shorter clip or run it again."
+      );
+      await emitActivity(
+        ref,
+        "ok",
+        `Classified as ${sections.videoType.replace(/-/g, " ")}${
+          sections.narrativeStructure.length > 0
+            ? ` · ${sections.narrativeStructure.length} narrative segments`
+            : ""
+        }`
+      );
+    } catch (gErr) {
+      // Preserve REAL cancellation; only degrade on Gemini / connectivity errors.
+      if (gErr instanceof CancelledError || gErr instanceof GeminiCancelled) throw gErr;
+      geminiVideo = null; // skips gap-fill / visual / label below
+      sections = {
+        summary: priorAnalysis?.summary ?? "",
+        videoType: priorAnalysis?.videoType ?? "mixed",
+        narrativeStructure: priorAnalysis?.narrativeStructure ?? [],
+        boringSections: [],
+        recommendedPresetIds: priorAnalysis?.recommendedPresetIds ?? [],
+      };
+      console.warn("[analyze] Gemini refinement unavailable — continuing with deterministic edits + overlays", {
+        projectId,
+        error: gErr instanceof Error ? gErr.message : String(gErr),
       });
-      await emitActivity(ref, "ok", "Gemini finished extracting frames");
-      geminiVideo = { kind: "file", uri: uploaded.uri, mimeType: uploaded.mimeType };
+      await emitActivity(
+        ref,
+        "warn",
+        "AI refinement unavailable (couldn't reach Gemini) — keeping your edits and adding overlays."
+      );
     }
 
     await ensureNotCancelled(ref);
 
-    // 6. Phase A — Section classification (videoType, narrative, summary,
-    // preset recommendations). NO moments proposed here.
-    await setStage(ref, "analyzing", "Classifying recording");
-    await emitActivity(ref, "info", "Asking Gemini for structure (sections + classification)");
-    const sections = await withDeadline(
-      classifyVideoSections({
-        video: geminiVideo,
-        hintedDuration: duration,
-      }),
-      budgetRemainingMs(),
-      "Analysis timed out while classifying the video. Try a shorter clip or run it again."
-    );
-    await emitActivity(
-      ref,
-      "ok",
-      `Classified as ${sections.videoType.replace(/-/g, " ")}${
-        sections.narrativeStructure.length > 0
-          ? ` · ${sections.narrativeStructure.length} narrative segments`
-          : ""
-      }`
-    );
-
     // The type the edit recipe actually uses: the user's selection (mapped onto
-    // the internal type) when set, else the model's detection.
+    // the internal type) when set, else the model's detection (or the fallback).
     const effectiveVideoType = videoTypeOverride ?? sections.videoType;
 
     await ensureNotCancelled(ref);
@@ -760,11 +848,280 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     // 7. Phase B — Build the deterministic candidate pool. Real events first,
     // CV candidates as a backstop. Gemini contributes ZERO moments at this
     // stage (invariant 1).
-    await setStage(ref, "generating_timeline", "Building zoom timeline");
+    await setStage(ref, "generating_timeline", "Building your edit");
 
     const existingPacing = (project.effectsSettings as { pacing?: Pacing } | undefined)?.pacing;
     const pacing: Pacing = existingPacing ?? "moderate";
     const visualAnalysis = project.visualAnalysis as VisualAnalysis | undefined;
+
+    // ── Phase 4: transcript lifecycle (triggered by analysis, NEVER export) ──
+    // Decide REUSE / SKIP / TRANSCRIBE / UNAVAILABLE (dedup: reuse a fresh
+    // transcript, don't double-queue an in-flight one, re-transcribe on a changed
+    // video or explicit request). The heavy ASR (ffmpeg + Speech) runs in an
+    // ffmpeg-equipped runtime: `worker` mode dispatches there (this Next.js route
+    // NEVER runs ffmpeg); `inline` mode (dev / ffmpeg-in-process) transcribes
+    // here. `disabled`/unconfigured → unavailable (never fabricated, never blocks).
+    const priorTranscript = (project.analysis as { transcript?: Transcript } | undefined)?.transcript;
+    // Resolve the SPOKEN language (precedence §3): user selection → prior confirmed
+    // language for the unchanged source → Auto-Detect candidates from locale →
+    // TRANSCRIPT_LANGUAGE env → en-US. TRANSCRIPT_LANGUAGE NEVER overrides the
+    // user's pick. Captions stay in the spoken language — we never translate.
+    const asrModel = process.env.TRANSCRIPT_MODEL || "latest_long";
+    const asrProvider = process.env.TRANSCRIPT_PROVIDER?.trim().toLowerCase() || "";
+    const langConfig = resolveTranscriptLanguage({
+      mode: analysisOptions.transcriptLanguageMode,
+      selectedCode: analysisOptions.transcriptLanguageCode,
+      priorLanguage: priorTranscript?.status === "complete" ? priorTranscript.language : null,
+      locale: analysisOptions.transcriptLocaleHint,
+      envFallback: process.env.TRANSCRIPT_LANGUAGE,
+    });
+    // Transcript IDENTITY (video + language + model/provider): changing the
+    // language forces a fresh transcript; same language + unchanged video reuses.
+    const fingerprint = transcriptionFingerprint({
+      source: {
+        storagePath: project.storagePath as string | undefined,
+        originalVideoUrl: project.originalVideoUrl as string | undefined,
+        fileSize: project.fileSize as number | undefined,
+        duration: duration ?? undefined,
+      },
+      languageMode: langConfig.mode,
+      languageCode: langConfig.languageCode,
+      model: asrModel,
+      provider: asrProvider,
+    });
+    const execMode = asrExecutionMode();
+    // Captions toggle also gates transcription: with captions off we don't start
+    // a new (costly) transcription — an existing transcript is preserved for hook
+    // text (decideTranscription reuses it when not runnable).
+    const captionsAllowed = analysisOptions.generateCaptions !== false;
+    const decision = decideTranscription({
+      existing: priorTranscript,
+      fingerprint,
+      runnable: isAsrRunnable() && captionsAllowed,
+      // The "Wrong language?" action sets forceRetranscribe on the run options.
+      forceRetranscribe:
+        reqBody?.forceRetranscribe === true || analysisOptions.forceRetranscribe === true,
+      now: Date.now(),
+    });
+    // Language identity stamped on every transcript we (re)write, so the worker +
+    // UI know what was requested and the fingerprint stays language-aware.
+    const langStamp = {
+      languageMode: langConfig.mode,
+      requestedLanguageCode: langConfig.languageCode,
+      ...(langConfig.alternativeLanguageCodes.length
+        ? { requestedAlternativeLanguageCodes: langConfig.alternativeLanguageCodes }
+        : {}),
+    };
+    let transcript: Transcript;
+    let dispatchWorker = false;
+    if (decision.action === "reuse" || decision.action === "skip") {
+      transcript = priorTranscript ?? { status: "unavailable" };
+    } else if (decision.action === "unavailable") {
+      transcript = { status: "unavailable" };
+    } else {
+      // transcribe — a NEW ASR run, which is the ONLY thing that consumes
+      // caption minutes (reuse/skip above are free by construction). Gate +
+      // RESERVE the source duration atomically BEFORE any dispatch; a blocked
+      // quota only skips captions — the rest of the analysis continues.
+      const requiredSeconds =
+        typeof duration === "number" && Number.isFinite(duration) && duration > 0
+          ? requiredCaptionSeconds(duration)
+          : null;
+      const captionPlanLimits = CAPTION_PLAN_LIMITS[plan];
+      let quotaBlockedReason: string | null = null;
+      let quotaSkipReason: TranscriptSkipReason | null = null;
+      let usageKey: string | null = null;
+      let usagePeriodId: string | null = null;
+
+      if (requiredSeconds === null) {
+        // Fail-closed for billing: without a real duration we can't meter the
+        // audio, so we don't start a metered ASR run.
+        quotaBlockedReason =
+          "The video duration is unknown, so auto-caption minutes can't be metered for this run.";
+        quotaSkipReason = "unknown_duration";
+        logCaptionQuota("blocked", { uid, projectId, plan, reason: "unknown_duration" });
+      } else if (exceedsCaptionVideoLimit(plan, duration)) {
+        quotaBlockedReason = perVideoCaptionLimitMessage(plan);
+        quotaSkipReason = "per_video_limit";
+        logCaptionQuota("blocked", {
+          uid,
+          projectId,
+          plan,
+          requestedSeconds: requiredSeconds,
+          reason: "per_video_limit",
+        });
+      } else {
+        usageKey = `cap_${projectId}_${Date.now().toString(36)}`;
+        try {
+          const reserved = await reserveCaptionSeconds(db, {
+            uid,
+            projectId,
+            key: usageKey,
+            seconds: requiredSeconds,
+          });
+          usagePeriodId = reserved.periodId;
+        } catch (quotaErr) {
+          usageKey = null;
+          if (quotaErr instanceof CaptionQuotaExhaustedError) {
+            quotaBlockedReason = CAPTION_ALLOWANCE_EXHAUSTED_MESSAGE;
+            quotaSkipReason = "quota_exhausted";
+          } else {
+            // Ledger infrastructure failure must never take analysis down —
+            // captions skip honestly and everything else proceeds.
+            console.warn("[caption-quota] reserve failed", quotaErr);
+            quotaBlockedReason = "The caption usage check failed for this run. Try analyzing again.";
+            quotaSkipReason = "quota_check_failed";
+          }
+        }
+      }
+
+      if (quotaBlockedReason || !usageKey || !usagePeriodId) {
+        transcript = {
+          status: "unavailable",
+          error: quotaBlockedReason ?? "Caption quota reservation failed.",
+          ...(quotaSkipReason ? { skipReason: quotaSkipReason } : {}),
+          ...langStamp,
+          sourceFingerprint: fingerprint,
+          requestedAt: Date.now(),
+        };
+      } else {
+        // Reserved. ASYNC BY DEFAULT for real videos: analysis (and every other
+        // edit) is NEVER blocked on ASR — only SHORT videos in `inline` mode run
+        // synchronously (dev tests); everything else is dispatched to the
+        // background and the transcript lands `processing` — captions then appear
+        // live via the editor's Firestore subscription when the worker completes.
+        const usageStamp = { usageKey, usagePeriodId, usageSeconds: requiredSeconds ?? undefined };
+        const dispatch = resolveAsrDispatch({ execMode, durationSeconds: duration });
+        if (dispatch === "inline") {
+          // Short video, inline mode: run in-process, bounded by the budget so even
+          // here a slow provider can't push finalize past the platform's hard kill
+          // (it degrades to "failed" and the pass still generates every overlay).
+          const asrBudgetMs = Math.max(15_000, budgetRemainingMs() - 40_000);
+          try {
+            const raw = await withDeadline(
+              transcribeVideo({
+                videoUrl: (project.originalVideoUrl as string) ?? "",
+                mimeType: project.mimeType as string | undefined,
+                durationSeconds: duration ?? undefined,
+                languageCode: langConfig.languageCode,
+                alternativeLanguageCodes: langConfig.alternativeLanguageCodes,
+                maxDurationSeconds: captionPlanLimits.maxCaptionVideoSeconds,
+              }),
+              asrBudgetMs,
+              "inline transcription exceeded the analysis time budget"
+            );
+            transcript = {
+              ...raw,
+              ...langStamp,
+              ...usageStamp,
+              sourceFingerprint: fingerprint,
+              requestedAt: Date.now(),
+            };
+          } catch (asrErr) {
+            console.warn("[transcript:analysis] inline ASR budget exceeded — skipping captions this pass", asrErr);
+            transcript = {
+              status: "failed",
+              // Short, specific REASON only — the UI frames it ("Captions were
+              // skipped — …"), so this must NOT repeat that or it reads doubled.
+              error:
+                "Transcription took too long to finish in one pass. Try a shorter clip, or run ASR in worker mode.",
+              ...langStamp,
+              ...usageStamp,
+              sourceFingerprint: fingerprint,
+              requestedAt: Date.now(),
+            };
+          }
+          // Finalize the reservation for the inline run: any `complete`
+          // transcript (even an empty one — the provider processed the audio)
+          // COMMITS; failure/unavailable RELEASES. Both are idempotent.
+          try {
+            if (shouldCommitCaptionUsage(transcript.status)) {
+              await commitCaptionUsage(db, {
+                uid,
+                projectId,
+                key: usageKey,
+                periodId: usagePeriodId,
+                fallbackSeconds: requiredSeconds ?? undefined,
+              });
+            } else {
+              await releaseCaptionReservation(db, {
+                uid,
+                projectId,
+                key: usageKey,
+                periodId: usagePeriodId,
+              });
+            }
+          } catch (settleErr) {
+            // Non-fatal: the stale-reservation sweep reconciles from the
+            // recorded transcript state.
+            console.warn("[caption-quota] inline settle failed (sweep will reconcile)", settleErr);
+          }
+        } else if (dispatch === "background" && hasBackgroundAsrTarget()) {
+          // Mark processing now with the resolved language + the reservation
+          // stamp so the background worker (a) transcribes in the RIGHT language
+          // and (b) can VERIFY the reservation before calling the provider.
+          transcript = {
+            status: "processing",
+            ...langStamp,
+            ...usageStamp,
+            sourceFingerprint: fingerprint,
+            requestedAt: Date.now(),
+          };
+          dispatchWorker = true;
+        } else {
+          // Wanted background but there's nowhere to dispatch to → honest, not
+          // stuck — and the reservation is returned immediately.
+          transcript = { status: "unavailable" };
+          await releaseCaptionReservation(db, {
+            uid,
+            projectId,
+            key: usageKey,
+            periodId: usagePeriodId,
+          }).catch(() => {});
+        }
+      }
+    }
+    const transcriptUsable = hasUsableTranscript(transcript);
+    const silenceSegmentCount = audioAnalysis?.silenceSegments?.length ?? 0;
+    console.info("[transcript:analysis]", {
+      projectId,
+      action: decision.action,
+      reason: decision.reason,
+      execMode,
+      status: transcript.status,
+      languageMode: langConfig.mode,
+      requestedLanguage: langConfig.languageCode,
+      altLanguages: langConfig.alternativeLanguageCodes,
+      detectedLanguage: transcript.language ?? null,
+    });
+    // Failure protection (§10): if a COMPLETE transcript's script looks
+    // inconsistent with the selected language (e.g. Arabic requested but Latin
+    // text came back), flag it so the UI can offer "Wrong language?" — we NEVER
+    // silently translate. `null` = no opinion (too little signal / unchecked script).
+    if (
+      transcript.status === "complete" &&
+      langConfig.mode === "selected" &&
+      transcriptScriptMatchesLanguage(transcript.text, langConfig.languageCode) === false
+    ) {
+      transcript = { ...transcript, languageMismatch: true };
+      console.warn("[transcript:analysis] language mismatch — transcript script != selected language", {
+        projectId,
+        requested: langConfig.languageCode,
+      });
+      await emitActivity(
+        ref,
+        "warn",
+        "The transcript may be in the wrong language. Use “Wrong language?” to re-transcribe."
+      );
+    }
+    console.info("[audio:analysis]", {
+      projectId,
+      audioStatus: audioAnalysis?.status ?? "not_run",
+      hasUsableSpeech: audioAnalysis?.hasUsableSpeech ?? false,
+      silenceSegments: silenceSegmentCount,
+      transcriptStatus: transcript.status,
+      transcriptSegments: transcript.segments?.length ?? 0,
+    });
 
     // ── Edit Recipe Engine ────────────────────────────────────────────────
     // Request the structured edit PLAN for this run (which operations fit the
@@ -776,8 +1133,12 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       selectedVideoType,
       detectedVideoType: sections.videoType,
       signals: {
-        hasTranscript: false, // no transcript pipeline yet → captions planned, not run
-        hasAudioAnalysis: false, // no dedicated audio/silence analysis yet
+        // Phase 4 — real transcript/audio signals gate captions + silence removal.
+        hasTranscript: transcriptUsable,
+        hasAudioAnalysis: audioAnalysis?.status === "complete",
+        hasUsableSpeech: audioAnalysis?.hasUsableSpeech ?? false,
+        silenceSegmentCount,
+        transcriptLanguage: transcript.language,
         hasSceneData: (visualAnalysis?.sceneChanges?.length ?? 0) > 0,
         hasVisualMoments: (visualAnalysis?.sampleCount ?? 0) > 0,
         hasInteractionData: isTabScope,
@@ -958,7 +1319,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
         "info",
         "AI gap-fill skipped — Creator plan required for advanced AI balancing"
       );
-    } else if (gaps.length > 0 && aiBudget > 0) {
+    } else if (geminiVideo && gaps.length > 0 && aiBudget > 0) {
       await emitActivity(
         ref,
         "info",
@@ -1023,7 +1384,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     // Skipped in finalize: this IS the whole-video CV generator whose output the
     // balancer pruned down to 6–7. The progressive chunk pass already produced
     // the CV timeline, so finalize must not regenerate it.
-    if (!isFinalize && eventMoments.length === 0 && allowVisualMoments && dur > 0) {
+    if (geminiVideo && !isFinalize && eventMoments.length === 0 && allowVisualMoments && dur > 0) {
       const visualBudget = Math.max(4, Math.min(12, Math.ceil(dur / 20)));
       await emitActivity(
         ref,
@@ -1121,7 +1482,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
         "info",
         "AI labeling skipped — Creator plan required for cinematic AI labels"
       );
-    } else if (needsLabeling.length > 0) {
+    } else if (geminiVideo && needsLabeling.length > 0) {
       await emitActivity(ref, "info", `Asking Gemini to label ${needsLabeling.length} moment${needsLabeling.length === 1 ? "" : "s"}`);
       try {
         const labels = await withDeadline(
@@ -1417,6 +1778,18 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       duration: dur,
       projectTitle: (project.title as string | undefined) ?? null,
       hasOutputCanvas: existingOutputCanvas,
+      // Phase 4 — real transcript drives auto-captions + strengthens the hook.
+      transcript,
+      // Analyze-modal toggles — `false` SUPPRESSES that category (maps the UI
+      // toggle names onto recipe categories; branding = CTA).
+      allow: {
+        hook_text: analysisOptions.generateHookText,
+        text_overlay: analysisOptions.generateTextOverlays,
+        smart_crop: analysisOptions.generateSmartCrop,
+        callout: analysisOptions.generateCallouts,
+        transition: analysisOptions.generateTransitions,
+        branding: analysisOptions.generateCta,
+      },
     });
     if (overlayGen.moments.length > 0) {
       finalMoments = [...finalMoments, ...overlayGen.moments].sort(
@@ -1430,6 +1803,51 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       smartCropAspect: overlayGen.log.smartCropAspect,
       appliedOutputCanvas: !!overlayGen.outputCanvas,
     });
+
+    // ── Phase 4: caption generation (transcript-driven) ─────────────────────
+    // Generated here (not in generateOverlayEdits) so that module stays free of
+    // cross-file value imports. Only when the recipe enabled captions (→ a real
+    // transcript exists) AND the user has no captions already. NEVER faked.
+    const captionsEnabled =
+      editRecipePlan.enabledCategories.includes("captions") && captionsAllowed;
+    // Only AI captions block regeneration — so "Wrong language?" (which deletes
+    // AI captions) regenerates in the new language, while MANUAL captions survive.
+    const hasExistingCaptions = finalMoments.some(
+      (m) => m.effectType === "captions" && m.source !== "user"
+    );
+    let captionCount = 0;
+    let captionsTruncated = false;
+    if (captionsEnabled && !hasExistingCaptions) {
+      const capRes = generateCaptionMoments(transcript, editRecipePlan.effectiveVideoType);
+      if (capRes.moments.length > 0) {
+        captionCount = capRes.moments.length;
+        captionsTruncated = capRes.truncated;
+        finalMoments = [...finalMoments, ...capRes.moments].sort(
+          (a, b) => a.startTime - b.startTime
+        );
+      }
+    }
+    console.info("[captions:generation]", {
+      projectId,
+      transcriptStatus: transcript.status,
+      captionsEnabled,
+      generatedCaptions: captionCount,
+      truncated: captionsTruncated,
+      skippedReason: captionCount
+        ? undefined
+        : hasExistingCaptions
+          ? "captions already present (manual)"
+          : !captionsEnabled
+            ? `captions disabled (transcript ${transcript.status})`
+            : "no caption lines produced",
+    });
+    if (captionCount > 0) {
+      await emitActivity(
+        ref,
+        "ok",
+        `Generated ${captionCount} caption${captionCount === 1 ? "" : "s"} from the transcript`
+      );
+    }
     if (overlayGen.moments.length > 0) {
       await emitActivity(
         ref,
@@ -1532,6 +1950,10 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
           recommendedPresetIds: sections.recommendedPresetIds,
           videoType: effectiveVideoType,
           editRecipe: editRecipePlan,
+          // Phase 4 — persist the transcript + audio intelligence (stripUndefined
+          // so optional fields never write literal `undefined` to Firestore).
+          transcript: stripUndefined(transcript),
+          ...(audioAnalysis ? { audioAnalysis: stripUndefined(audioAnalysis) } : {}),
           narrativeStructure: sections.narrativeStructure,
           attentionCurve: attention.curveQ8,
           attentionSampleRate: attention.sampleRate,
@@ -1548,6 +1970,18 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       },
       { merge: true }
     );
+
+    // ── Phase 4: dispatch async transcription (worker mode) ─────────────────
+    // AFTER the timeline is persisted, so the worker reads the complete timeline
+    // before appending captions. Fast + best-effort — the Next.js request never
+    // runs ffmpeg; the editor shows "processing" and captions arrive live when
+    // the worker finishes. A dispatch failure just retries on the next analysis.
+    if (dispatchWorker) {
+      await dispatchTranscription(uid, projectId, {
+        forceRetranscribe: reqBody?.forceRetranscribe === true,
+      });
+      await emitActivity(ref, "info", "Transcribing audio for captions…");
+    }
 
     // User-facing provenance summary — invariant 6 (trust).
     const pc = balanced.stats.provenanceCounts;

@@ -28,10 +28,23 @@ import {
   fmtElapsed,
   isProcessing,
 } from "@/lib/analysis-stages";
+import {
+  buildProgressSteps,
+  progressHeadline,
+  countGeneratedEdits,
+  editsProgressLine,
+  friendlyActivityFeed,
+  type ProgressStep,
+  type FriendlyActivity,
+} from "@/lib/analysis-progress";
 import type {
   AnalysisActivityEvent,
   AnalysisErrorKind,
+  SelectedVideoType,
+  Transcript,
 } from "@/lib/firebase/schema";
+import { CAPTION_STATE_LABEL, resolveCaptionState } from "@/lib/analysis/caption-state";
+import { Captions as CaptionsIcon } from "lucide-react";
 import { cn } from "@/lib/cn";
 
 const LONG_PROCESS_WARN_MS = 90_000;
@@ -45,10 +58,14 @@ export function RealProcessingOverlay() {
     processingMinimized,
     setProcessingMinimized,
     chunkedJob,
+    selectedVideoType,
   } = useEditorReal();
 
   const status = project.status;
   const analysis = project.analysis;
+  // The CURRENT run's generation options (written to lastRunOptions at chunk
+  // reset) — drives which generation steps the progress UI shows.
+  const runOptions = (analysis?.lastRunOptions as AnalysisOptions | undefined) ?? undefined;
   const failed = analysis?.status === "failed" || status === "failed";
   const cancelled = analysis?.status === "cancelled" || status === "cancelled";
   const currentlyProcessing = isProcessing(status);
@@ -72,7 +89,8 @@ export function RealProcessingOverlay() {
     (analysis?.status === "complete" ||
       chunkedJob?.status === "complete" ||
       (allChunksDone && momentsPresent && lastActivityComplete));
-  const editsCount = analysis?.detectedMoments?.length ?? 0;
+  // Count ALL edit types (cuts, zooms, speeds, captions, overlays…) — not just zooms.
+  const editsCount = countGeneratedEdits(analysis?.detectedMoments);
 
   // When `done`, the run is no longer processing regardless of a lagging status.
   const effectivelyProcessing = currentlyProcessing && !done;
@@ -205,6 +223,9 @@ export function RealProcessingOverlay() {
               <CompleteBody editsCount={editsCount} onClose={onCloseTerminal} />
             ) : (
               <ActiveBody
+                videoType={selectedVideoType}
+                options={runOptions}
+                editsCount={editsCount}
                 stage={stage}
                 status={status}
                 elapsedMs={elapsedMs}
@@ -212,6 +233,7 @@ export function RealProcessingOverlay() {
                 activity={analysis?.activity ?? []}
                 longRunning={longRunning}
                 cvProgress={cvProgress}
+                transcript={analysis?.transcript ?? null}
                 onCancel={onCancel}
                 onMinimize={onMinimize}
               />
@@ -259,6 +281,9 @@ function CompleteBody({
 // ─── ACTIVE BODY ─────────────────────────────────────────────────────────────
 
 function ActiveBody({
+  videoType,
+  options,
+  editsCount,
   stage,
   status,
   elapsedMs,
@@ -266,9 +291,13 @@ function ActiveBody({
   activity,
   longRunning,
   cvProgress,
+  transcript,
   onCancel,
   onMinimize,
 }: {
+  videoType: SelectedVideoType;
+  options: AnalysisOptions | undefined;
+  editsCount: number;
   stage: string;
   status: string | undefined;
   elapsedMs: number;
@@ -276,6 +305,7 @@ function ActiveBody({
   activity: AnalysisActivityEvent[];
   longRunning: boolean;
   cvProgress: number | null;
+  transcript: Transcript | null;
   onCancel: () => Promise<void>;
   onMinimize: () => void;
 }) {
@@ -299,28 +329,40 @@ function ActiveBody({
   const estLow = Math.max(15, Math.round((estimateSeconds ?? 60) * 0.7));
   const estHigh = Math.round((estimateSeconds ?? 90) * 1.4);
 
+  // Dynamic, video-type-aware, option-filtered step list. Progress maps onto it
+  // so the checklist advances even without per-step server signals.
+  const { headline, subtitle } = progressHeadline(videoType);
+  const steps: ProgressStep[] = React.useMemo(
+    () => buildProgressSteps({ videoType, options }),
+    [videoType, options]
+  );
+  const activeStepIdx = Math.min(steps.length - 1, Math.max(0, Math.floor(pct * steps.length)));
+  const activeStep = steps[activeStepIdx];
+  const friendly = React.useMemo(() => friendlyActivityFeed(activity), [activity]);
+
   return (
     <div className="p-6">
       <div className="grid grid-cols-1 gap-6 md:grid-cols-[1.05fr_1fr]">
-        {/* Left: stage list */}
+        {/* Left: headline + dynamic step list */}
         <div>
-          <AnimatePresence mode="wait">
-            <motion.div
-              key={stage}
-              initial={{ opacity: 0, y: 6 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -6 }}
-              transition={{ duration: 0.25 }}
-            >
-              <h3 className="font-display text-2xl font-semibold tracking-tight text-white">
-                {stage}…
-              </h3>
-            </motion.div>
-          </AnimatePresence>
-          <p className="mt-1.5 text-sm text-fog">
-            {ANALYSIS_STAGES.find((s) => s.id === status)?.description ||
-              "Framevo is processing your recording."}
-          </p>
+          <h3 className="font-display text-2xl font-semibold tracking-tight text-white">
+            {headline}
+          </h3>
+          <p className="mt-1.5 text-sm text-fog">{subtitle}</p>
+          {activeStep && (
+            <AnimatePresence mode="wait">
+              <motion.p
+                key={activeStep.id}
+                initial={{ opacity: 0, y: 4 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -4 }}
+                transition={{ duration: 0.22 }}
+                className="mt-2 text-[13px] font-medium text-violet-200"
+              >
+                {activeStep.label}…
+              </motion.p>
+            </AnimatePresence>
+          )}
 
           {job && (
             <div className="mt-4 rounded-xl border border-violet-400/25 bg-violet-500/[0.08] px-4 py-3">
@@ -347,26 +389,25 @@ function ActiveBody({
                 />
               </div>
               <p className="mt-2 text-[11.5px] text-violet-100/80">
-                {job.momentsSoFar} edit{job.momentsSoFar === 1 ? "" : "s"} generated
-                so far — you can start editing the completed sections now.
+                {editsProgressLine(editsCount)}
               </p>
             </div>
           )}
 
           <ul className="mt-5 space-y-2.5">
-            {ANALYSIS_STAGES.map((s, i) => {
-              const done = i < stageIdx;
-              const active = i === stageIdx;
+            {steps.map((s, i) => {
+              const stepDone = i < activeStepIdx;
+              const active = i === activeStepIdx;
               return (
                 <li key={s.id} className="flex items-start gap-2.5 text-sm">
-                  <StageDot done={done} active={active} />
+                  <StageDot done={stepDone} active={active} />
                   <div className="min-w-0">
                     <div
                       className={cn(
                         "text-sm",
-                        done && "text-white/85",
+                        stepDone && "text-white/85",
                         active && "text-white",
-                        !done && !active && "text-fog/70"
+                        !stepDone && !active && "text-fog/70"
                       )}
                     >
                       {s.label}
@@ -376,17 +417,26 @@ function ActiveBody({
               );
             })}
           </ul>
+
+          {/* ── Captions — a SEPARATE track from the main analysis steps.
+              Transcription runs (and can keep running) independently: the
+              analysis above finishes either way. Driven by the transcript's
+              own lifecycle, never the analysis status. */}
+          <CaptionProgressRow
+            captionsRequested={options?.generateCaptions !== false}
+            transcript={transcript}
+          />
         </div>
 
-        {/* Right: activity feed */}
+        {/* Right: activity feed (friendly labels; technical lives under details) */}
         <div className="flex min-h-0 flex-col">
           <div className="mb-2 flex items-center justify-between">
             <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-fog">
               Activity
             </div>
-            <span className="font-mono text-[10px] text-fog">{activity.length} events</span>
+            <span className="font-mono text-[10px] text-fog">{friendly.length} events</span>
           </div>
-          <ActivityFeed activity={activity} />
+          <ActivityFeed activity={friendly} />
         </div>
       </div>
 
@@ -483,6 +533,64 @@ function ActiveBody({
   );
 }
 
+/**
+ * The captions/transcription track of the progress view — SEPARATE from the
+ * main analysis steps because captions are an independent feature: they can
+ * be off, quota-blocked, still transcribing after analysis completes, or
+ * failed without the AI edit failing. States come from the transcript's own
+ * lifecycle (`resolveCaptionState`), never the analysis status.
+ */
+function CaptionProgressRow({
+  captionsRequested,
+  transcript,
+}: {
+  captionsRequested: boolean;
+  transcript: Transcript | null;
+}) {
+  const state = resolveCaptionState({ captionsRequested, transcript });
+  const detail =
+    state === "disabled"
+      ? "Off for this run — every other edit still generates."
+      : state === "not_started"
+        ? "Waiting…"
+        : state === "processing"
+          ? "Transcribing — the rest of your edit doesn't wait for this."
+          : state === "complete"
+            ? "Captions ready."
+            : state === "blocked_by_quota"
+              ? (transcript?.error ?? "Caption limit reached — other edits continue.")
+              : state === "failed"
+                ? "Transcription failed — every other edit still generated."
+                : "Transcription unavailable — every other edit still generated.";
+  return (
+    <div className="mt-4 rounded-xl border border-white/[0.06] bg-white/[0.015] px-3.5 py-2.5">
+      <div className="flex items-center gap-2 text-[12px]">
+        {state === "processing" ? (
+          <Loader2 size={12} className="animate-spin text-sky-300" />
+        ) : (
+          <CaptionsIcon size={12} className="text-sky-300/80" />
+        )}
+        <span className="font-semibold text-white/90">Captions</span>
+        <span
+          className={cn(
+            "text-[11px] font-medium",
+            state === "complete"
+              ? "text-emerald-200/90"
+              : state === "failed"
+                ? "text-rose-200/90"
+                : state === "blocked_by_quota"
+                  ? "text-amber-200/90"
+                  : "text-fog"
+          )}
+        >
+          {CAPTION_STATE_LABEL[state]}
+        </span>
+      </div>
+      <p className="mt-1 text-[11px] leading-relaxed text-fog/75">{detail}</p>
+    </div>
+  );
+}
+
 function StageDot({ done, active }: { done: boolean; active: boolean }) {
   if (done) {
     return (
@@ -503,7 +611,7 @@ function StageDot({ done, active }: { done: boolean; active: boolean }) {
   );
 }
 
-function ActivityFeed({ activity }: { activity: AnalysisActivityEvent[] }) {
+function ActivityFeed({ activity }: { activity: FriendlyActivity[] }) {
   const ref = React.useRef<HTMLDivElement | null>(null);
   React.useEffect(() => {
     ref.current?.scrollTo({ top: ref.current.scrollHeight, behavior: "smooth" });
@@ -516,7 +624,7 @@ function ActivityFeed({ activity }: { activity: AnalysisActivityEvent[] }) {
     >
       {activity.length === 0 ? (
         <div className="grid h-full place-items-center text-xs text-fog/70">
-          Waiting for first signal…
+          Getting started…
         </div>
       ) : (
         <ul className="space-y-1.5">
@@ -531,7 +639,7 @@ function ActivityFeed({ activity }: { activity: AnalysisActivityEvent[] }) {
                 })}
               </span>
               <span className="min-w-0 flex-1 break-words text-white/85">
-                {e.text}
+                {e.label}
               </span>
             </li>
           ))}
@@ -571,7 +679,7 @@ function ProcessingDetails({
   const errors = activity.filter((a) => a.kind === "error").length;
 
   return (
-    <div className="mt-3 rounded-lg border border-white/[0.06] bg-white/[0.015] p-3">
+    <div className="mt-3 space-y-3 rounded-lg border border-white/[0.06] bg-white/[0.015] p-3">
       <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
         <Stat label="Status" value={status ?? "—"} />
         <Stat label="Stage" value={stage} />
@@ -585,6 +693,21 @@ function ProcessingDetails({
         <Stat label="Success" value={String(ok)} mono />
         <Stat label="Errors" value={String(errors)} mono />
       </div>
+      {/* Raw technical log — the full server activity incl. Gemini/infra lines. */}
+      {activity.length > 0 && (
+        <div className="max-h-40 overflow-y-auto rounded-md border border-white/[0.05] bg-black/20 p-2">
+          <ul className="space-y-1">
+            {activity.map((e, i) => (
+              <li key={`${e.ts}-${i}`} className="flex items-start gap-2 font-mono text-[10px] text-fog/80">
+                <span className="shrink-0 text-fog/50">
+                  {new Date(e.ts).toLocaleTimeString([], { hour12: false, minute: "2-digit", second: "2-digit" })}
+                </span>
+                <span className="min-w-0 flex-1 break-words">{e.text}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
     </div>
   );
 }

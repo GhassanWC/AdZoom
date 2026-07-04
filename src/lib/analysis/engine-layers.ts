@@ -31,12 +31,28 @@ export type ExistingEditMode = "keep" | "replace-selected" | "clear-all";
  * `startAnalyze` → orchestrator → per-chunk engines → finalize route.
  */
 export interface AnalysisOptions {
-  /** Zoom / click-highlight / cursor-focus moments. */
+  /** Zooms & focus — zoom / click-highlight / cursor-focus moments. */
   generateCameraEdits: boolean;
   /** Cut sections — removed dead / idle / loading / pause ranges. */
   generateCut: boolean;
   /** Speed-up sections. */
   generateSpeed: boolean;
+  // ── Phase 3/4 AI edit types (absent = allow; gated further by the recipe +
+  // feasibility, e.g. captions still need a transcript). `false` SUPPRESSES. ──
+  /** Transcript-driven captions (skipped if no transcript — never faked). */
+  generateCaptions?: boolean;
+  /** Opening hook text. */
+  generateHookText?: boolean;
+  /** Text overlays / labels on key moments. */
+  generateTextOverlays?: boolean;
+  /** Smart crop / social output framing. */
+  generateSmartCrop?: boolean;
+  /** Callouts / highlights on grounded targets. */
+  generateCallouts?: boolean;
+  /** Transitions around strong cuts. */
+  generateTransitions?: boolean;
+  /** CTA / end card. */
+  generateCta?: boolean;
   existingEditMode: ExistingEditMode;
   /** Analysis-granularity preset (or "custom"). */
   chunkMode: ChunkMode;
@@ -50,6 +66,15 @@ export interface AnalysisOptions {
    * `startAnalyze` from the project's `selectedVideoType`.
    */
   selectedVideoType?: SelectedVideoType;
+  // ── Spoken language (transcription) — see src/lib/transcript/language.ts ──
+  /** "auto" = detect from a small candidate list; "selected" = the user's choice. */
+  transcriptLanguageMode?: "auto" | "selected";
+  /** BCP-47 the user picked (selected mode) — sent to ASR verbatim, never overridden by env. */
+  transcriptLanguageCode?: string;
+  /** Browser/app locale hint for Auto-Detect candidates (set client-side from navigator.language). */
+  transcriptLocaleHint?: string;
+  /** Force a fresh transcription (the "Wrong language?" action) even if one exists. */
+  forceRetranscribe?: boolean;
 }
 
 /** The persisted subset (the 3 toggles only — the mode is never remembered). */
@@ -67,6 +92,7 @@ export const DEFAULT_ANALYSIS_OPTIONS: AnalysisOptions = {
   chunkMode: "balanced",
   chunkSizeSeconds: CHUNK_SIZE_S,
   selectedVideoType: "auto",
+  transcriptLanguageMode: "auto",
 };
 
 /** Map an effectType to its engine layer (mirrors the timeline track split). */

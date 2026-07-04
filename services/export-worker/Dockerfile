@@ -21,6 +21,15 @@ RUN npm run build
 # ── Runtime stage ───────────────────────────────────────────────────────────
 FROM node:20-slim
 ENV NODE_ENV=production
+# Multilingual fonts for burned-in overlay text (captions / hook / labels / CTA /
+# callouts). @napi-rs/canvas (Skia) resolves these via fontconfig. Noto covers the
+# officially-supported scripts: Latin/Cyrillic/Greek/Arabic/Hebrew/Devanagari/Thai
+# (fonts-noto-core), CJK (fonts-noto-cjk), and emoji (fonts-noto-color-emoji).
+# Without these, non-Latin scripts render as missing-glyph boxes in server export.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    fonts-noto-core fonts-noto-cjk fonts-noto-color-emoji fontconfig \
+    && fc-cache -f \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /app/services/export-worker
 COPY --from=build /app/services/export-worker/package.json ./
 COPY --from=build /app/services/export-worker/node_modules ./node_modules

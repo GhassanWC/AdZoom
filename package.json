@@ -8,7 +8,7 @@
     "start": "next start",
     "typecheck": "tsc --noEmit",
     "gen:icons": "node scripts/gen-icons.mjs",
-    "test": "node --test \"tests/**/*.test.ts\"",
+    "test": "node --import ./tests/register-resolver.mjs --test \"tests/**/*.test.ts\"",
     "test:smoke": "node scripts/admin-smoke.mjs",
     "worker:install": "npm --prefix services/export-worker install",
     "worker:dev": "npm --prefix services/export-worker run dev",
