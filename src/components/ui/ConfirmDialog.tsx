@@ -104,7 +104,7 @@ export function ConfirmProvider({ children }: { children: React.ReactNode }) {
                 exit={{ opacity: 0 }}
                 transition={{ duration: 0.18 }}
                 onClick={() => close(false)}
-                className="fixed inset-0 z-[130] flex items-center justify-center bg-ink/80 px-4 py-6 backdrop-blur-xl"
+                className="fixed inset-0 z-[141] flex items-center justify-center bg-ink/80 px-4 py-6 backdrop-blur-xl"
               >
                 <motion.div
                   role="alertdialog"

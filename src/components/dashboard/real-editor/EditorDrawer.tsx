@@ -5,6 +5,7 @@ import { createPortal } from "react-dom";
 import { AnimatePresence, motion } from "framer-motion";
 import { X as XIcon } from "lucide-react";
 import { cn } from "@/lib/cn";
+import { lockEditorScroll, unlockEditorScroll } from "./scroll-lock";
 
 const FOCUSABLE_SELECTOR =
   'a[href],button:not([disabled]),textarea:not([disabled]),input:not([disabled]),select:not([disabled]),[tabindex]:not([tabindex="-1"])';
@@ -42,6 +43,15 @@ export function EditorDrawer({
   const panelRef = React.useRef<HTMLDivElement | null>(null);
   const restoreFocusRef = React.useRef<HTMLElement | null>(null);
   const titleId = React.useId();
+
+  // Lock the background PAGE scroll while the drawer is open (the editor page
+  // scrolls vertically). The drawer's own content region scrolls internally
+  // (overflow-y-auto + overscroll-contain), so only the panel scrolls.
+  React.useEffect(() => {
+    if (!open) return;
+    lockEditorScroll("editor-drawer");
+    return () => unlockEditorScroll("editor-drawer");
+  }, [open]);
 
   // Escape closes — capture phase so the timeline's Escape (clear
   // multi-select) doesn't swallow it.

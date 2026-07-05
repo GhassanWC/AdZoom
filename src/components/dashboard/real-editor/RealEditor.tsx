@@ -253,8 +253,8 @@ function Body() {
         widthClass="w-full max-w-xl"
       >
         <div className="space-y-5 p-5">
-          <RecommendedPresets />
-          <PresetsRail />
+          <RecommendedPresets onApplied={() => setPresetsOpen(false)} />
+          <PresetsRail onApplied={() => setPresetsOpen(false)} />
         </div>
       </EditorDrawer>
 

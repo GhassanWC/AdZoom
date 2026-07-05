@@ -26,7 +26,7 @@ import { planMeetsMinimum } from "@/lib/usage/plan";
 import { useRouter } from "next/navigation";
 import { cn } from "@/lib/cn";
 
-export function PresetsRail() {
+export function PresetsRail({ onApplied }: { onApplied?: () => void } = {}) {
   const { user } = useAuth();
   const { project, applyPreset, clearSelectedPreset } = useEditorReal();
   const { plan } = useStoragePlan();
@@ -79,11 +79,13 @@ export function PresetsRail() {
   const onApply = async (preset: Preset) => {
     try {
       await applyPreset(preset);
+      setOpenPreset(null);
+      // Close the presets drawer so the success snackbar is clearly visible.
+      onApplied?.();
       toast.success(
         "Preset applied to your current edit.",
         `${preset.name} — your AI moments and timeline are unchanged.`
       );
-      setOpenPreset(null);
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Failed to apply preset";
       toast.error("Could not apply preset", msg);
@@ -280,7 +282,9 @@ function SaveAsCustomDialog({
   return (
     <div
       onClick={onClose}
-      className="fixed inset-0 z-[100] grid place-items-center bg-ink/80 px-4 backdrop-blur-xl"
+      // z-[140]: launched from inside the presets drawer (z-[131]) — must sit
+      // above it so the Save form stays interactive.
+      className="fixed inset-0 z-[140] grid place-items-center bg-ink/80 px-4 backdrop-blur-xl"
     >
       <div
         onClick={(e) => e.stopPropagation()}

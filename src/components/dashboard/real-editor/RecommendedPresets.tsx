@@ -17,7 +17,7 @@ import { cn } from "@/lib/cn";
  * Premium "Recommended for this recording" hero. Big cinematic thumbnails, the
  * first card promoted as a hero, the rest as supporting picks.
  */
-export function RecommendedPresets() {
+export function RecommendedPresets({ onApplied }: { onApplied?: () => void } = {}) {
   const { project, applyPreset } = useEditorReal();
   const { plan } = useStoragePlan();
   const router = useRouter();
@@ -45,11 +45,14 @@ export function RecommendedPresets() {
     }
     try {
       await applyPreset(preset);
+      setOpenPreset(null);
+      // Close the presets drawer FIRST so the success snackbar (topmost, but
+      // the drawer would otherwise cover the view) is clearly visible.
+      onApplied?.();
       toast.success(
         "Preset applied to your current edit.",
         `${preset.name} — your AI moments and timeline are unchanged.`
       );
-      setOpenPreset(null);
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Failed to apply preset";
       toast.error("Could not apply preset", msg);

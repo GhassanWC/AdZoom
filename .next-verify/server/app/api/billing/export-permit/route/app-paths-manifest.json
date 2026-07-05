@@ -1,0 +1,3 @@
+{
+  "/api/billing/export-permit/route": "app/api/billing/export-permit/route.js"
+}

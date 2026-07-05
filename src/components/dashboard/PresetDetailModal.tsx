@@ -63,6 +63,10 @@ export function PresetDetailModal({
   React.useEffect(() => setMounted(true), []);
   if (!mounted) return null;
 
+  // z-[140]: this dialog can be launched from inside the editor's presets
+  // drawer (z-[131]); a lower z-index would render the dialog BEHIND the
+  // drawer, hiding the Apply button. 140 sits above every editor overlay and
+  // is harmless on the presets page (no drawer there).
   return createPortal(
     <AnimatePresence>
       {open && (
@@ -72,7 +76,7 @@ export function PresetDetailModal({
           exit={{ opacity: 0 }}
           transition={{ duration: 0.2 }}
           onClick={onClose}
-          className="fixed inset-0 z-[100] flex items-center justify-center bg-ink/80 px-4 backdrop-blur-xl"
+          className="fixed inset-0 z-[140] flex items-center justify-center bg-ink/80 px-4 backdrop-blur-xl"
         >
           <motion.div
             onClick={(e) => e.stopPropagation()}
