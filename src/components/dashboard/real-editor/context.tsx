@@ -73,8 +73,11 @@ import {
   FULL_FRAME_CROP,
 } from "@/lib/timeline/source-crop";
 import { quantize, dequantize } from "@/lib/cv/resample";
+import type { CaptionActionResult } from "@/lib/analysis/ai-caption-status";
 import type {
   AnalysisJob,
+  CaptionPosition,
+  OverlayTextPreset,
   SourceCrop,
   VisualAnalysis,
 } from "@/lib/firebase/schema";
@@ -247,8 +250,23 @@ interface EditorRealContextValue {
   applyPreset: (preset: Preset) => Promise<void>;
   clearSelectedPreset: () => Promise<void>;
   startAnalyze: (options: AnalysisOptions) => Promise<void>;
-  /** "Wrong language?" — re-transcribe the same video in a chosen spoken language. */
+  /**
+   * "Generate AI Captions" — the ONE automatic caption entry point (never runs
+   * analysis / Gemini). Reuses a valid transcript when possible, else reserves
+   * quota + dispatches ASR. Server-side duplicate protection guarantees a
+   * repeated call can't charge twice or duplicate caption moments.
+   */
+  generateCaptions: (opts: {
+    mode: TranscriptLanguageMode;
+    code?: string;
+    stylePreset?: OverlayTextPreset;
+    position?: CaptionPosition;
+    force?: boolean;
+  }) => Promise<CaptionActionResult>;
+  /** "Wrong language?" / change language — captions-only FORCED regeneration. */
   retranscribe: (opts: { mode: TranscriptLanguageMode; code?: string }) => Promise<void>;
+  /** Delete AI-generated captions (manual captions survive). */
+  deleteAiCaptions: () => Promise<void>;
   cancelAnalyze: () => Promise<void>;
   /**
    * Re-derive `focusRegion` for every non-user-positioned moment from the
@@ -1478,31 +1496,70 @@ export function EditorRealProvider({
     }
   }, [idTokenGetter, uid, project, projectRef, videoRef, interactions, planTier, selectedVideoType]);
 
-  // "Wrong language?" — re-transcribe the SAME video in a chosen spoken language
-  // (or Auto) without re-uploading. Deletes only AI transcript-derived captions
-  // (manual captions survive), then forces a fresh transcription; the new-language
-  // captions regenerate + appear live via the subscription. `keep` mode preserves
-  // the existing timeline; the language change forces a new transcript (fingerprint).
+  // Client → the DEDICATED captions endpoint. Captions are generated ONLY here
+  // (analysis never touches them). Returns the server's structured outcome so
+  // the dialog can react (exists / processing / blocked / …).
+  const postCaptions = React.useCallback(
+    async (body: Record<string, unknown>): Promise<CaptionActionResult> => {
+      const token = await idTokenGetter();
+      if (!token) return { status: "error", message: "Not signed in." };
+      try {
+        const res = await fetch(`/api/projects/${project.id}/captions`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        const data = (await res.json().catch(() => ({}))) as Partial<CaptionActionResult>;
+        return {
+          status: (data.status as CaptionActionResult["status"]) ?? (res.ok ? "processing" : "error"),
+          message: data.message ?? (res.ok ? "" : "Caption request failed."),
+          captionCount: data.captionCount,
+        };
+      } catch (err) {
+        return { status: "error", message: err instanceof Error ? err.message : "Caption request failed." };
+      }
+    },
+    [idTokenGetter, project.id]
+  );
+
+  // "Generate AI Captions" — the ONE automatic caption entry point. Reuses an
+  // existing valid transcript when possible (no charge), else reserves quota +
+  // dispatches ASR server-side. Duplicate protection lives on the server.
+  const generateCaptions: EditorRealContextValue["generateCaptions"] = React.useCallback(
+    (opts) =>
+      postCaptions({
+        mode: opts.mode,
+        code: opts.mode === "selected" ? opts.code : undefined,
+        locale: typeof navigator !== "undefined" ? navigator.language : undefined,
+        stylePreset: opts.stylePreset,
+        position: opts.position,
+        force: opts.force === true,
+      }),
+    [postCaptions]
+  );
+
+  // "Wrong language?" / change-language / retranscribe — a captions-only FORCED
+  // regeneration through the SAME endpoint (never the analysis pipeline). The
+  // server drops the old AI captions + reserves a fresh transcription.
   const retranscribe: EditorRealContextValue["retranscribe"] = React.useCallback(
     async (opts) => {
-      const cur = momentsRef.current;
-      const kept = cur.filter((m) => !(m.effectType === "captions" && m.source !== "user"));
-      if (kept.length !== cur.length) await commitMoments(kept);
-      const last = (project.analysis?.lastRunOptions as Partial<AnalysisOptions> | undefined) ?? {};
-      await startAnalyze({
-        ...DEFAULT_ANALYSIS_OPTIONS,
-        ...last,
-        transcriptLanguageMode: opts.mode,
-        transcriptLanguageCode: opts.mode === "selected" ? opts.code : undefined,
-        transcriptLocaleHint:
-          typeof navigator !== "undefined" ? navigator.language : undefined,
-        forceRetranscribe: true,
-        generateCaptions: true,
-        existingEditMode: "keep",
+      await postCaptions({
+        mode: opts.mode,
+        code: opts.mode === "selected" ? opts.code : undefined,
+        locale: typeof navigator !== "undefined" ? navigator.language : undefined,
+        force: true,
       });
     },
-    [commitMoments, project.analysis?.lastRunOptions, startAnalyze]
+    [postCaptions]
   );
+
+  // Delete AI-generated captions (manual captions survive) — re-enables the
+  // "Generate AI Captions" action.
+  const deleteAiCaptions: EditorRealContextValue["deleteAiCaptions"] = React.useCallback(async () => {
+    const cur = momentsRef.current;
+    const kept = cur.filter((m) => !(m.effectType === "captions" && m.source !== "user"));
+    if (kept.length !== cur.length) await commitMoments(kept);
+  }, [commitMoments]);
 
   // ── Resume an in-flight chunked job after a refresh ─────────────────────
   // Completed chunks already wrote their moments to the project doc, so the
@@ -1757,7 +1814,9 @@ export function EditorRealProvider({
     applyPreset,
     clearSelectedPreset,
     startAnalyze,
+    generateCaptions,
     retranscribe,
+    deleteAiCaptions,
     cancelAnalyze,
     refineFraming,
     refiningFraming,

@@ -19,8 +19,6 @@ import {
   type GenerationToggles,
 } from "@/lib/analysis/edit-recipe";
 import { VideoTypePicker } from "./VideoTypePicker";
-import { SpokenLanguagePicker } from "./SpokenLanguagePicker";
-import type { TranscriptLanguageMode } from "@/lib/transcript/language";
 import type { SelectedVideoType } from "@/lib/firebase/schema";
 import {
   type ChunkMode,
@@ -33,20 +31,14 @@ import {
 } from "@/lib/analysis/chunk-config";
 import { logFramevoEvent } from "@/lib/firebase/analytics";
 import { EVENTS } from "@/lib/analytics/events";
-import { useCaptionUsage, type CaptionUsageState } from "@/lib/usage/useCaptionUsage";
-import {
-  CAPTION_ALLOWANCE_EXHAUSTED_MESSAGE,
-  captionAllowanceLabel,
-  estimateCaptionMinutes,
-  exceedsCaptionVideoLimit,
-  perVideoCaptionLimitMessage,
-  requiredCaptionSeconds,
-} from "@/lib/usage/caption-quota";
+// Captions are DECOUPLED from analysis — no caption toggle, language picker, or
+// quota lives in this dialog. Caption generation is behind the dedicated
+// "Generate AI Captions" action (CaptionsModal). This dialog controls ONLY the
+// AI video edits.
 import {
   AI_EDIT_GROUPS,
   AI_EDIT_TOGGLE_KEYS,
   AI_EDIT_EXTRA_KEYS,
-  CAPTIONS_TOGGLE,
 } from "@/lib/analysis/analyze-dialog-config";
 
 const EXISTING_EDIT_OPTIONS: SegmentOption<ExistingEditMode>[] = [
@@ -137,13 +129,6 @@ export function AnalysisOptionsModal({
       corePrefs,
     })
   );
-  // Spoken language for transcription — seeds from the last run (default Auto).
-  const [langMode, setLangMode] = React.useState<TranscriptLanguageMode>(
-    lastRunOptions?.transcriptLanguageMode === "selected" ? "selected" : "auto"
-  );
-  const [langCode, setLangCode] = React.useState<string | undefined>(
-    lastRunOptions?.transcriptLanguageCode
-  );
   const [mode, setMode] = React.useState<ExistingEditMode>("replace-selected");
   const [chunkMode, setChunkMode] = React.useState<ChunkMode>(initialDetail.chunkMode);
   const [customBy, setCustomBy] = React.useState<"size" | "count">("size");
@@ -162,8 +147,6 @@ export function AnalysisOptionsModal({
         corePrefs,
       })
     );
-    setLangMode(lastRunOptions?.transcriptLanguageMode === "selected" ? "selected" : "auto");
-    setLangCode(lastRunOptions?.transcriptLanguageCode);
     setMode("replace-selected");
     setChunkMode(initialDetail.chunkMode);
     setCustomBy("size");
@@ -184,18 +167,6 @@ export function AnalysisOptionsModal({
   // additive on top of a real timeline.
   const coreOff = !gen.generateCameraEdits && !gen.generateCut && !gen.generateSpeed;
 
-  // ── Auto-caption quota (display + client guard; the server re-checks and
-  // reserves atomically — client values are never trusted for enforcement).
-  // A blocked caption toggle NEVER blocks the rest of the analysis.
-  const captionUsage = useCaptionUsage();
-  const captionPerVideoBlocked = exceedsCaptionVideoLimit(captionUsage.plan, videoDuration);
-  const captionRequiredSeconds = requiredCaptionSeconds(videoDuration);
-  const captionExhausted =
-    !captionPerVideoBlocked &&
-    !captionUsage.loading &&
-    captionUsage.remainingSeconds < captionRequiredSeconds;
-  const captionBlocked = captionPerVideoBlocked || captionExhausted;
-
   const setToggle = (key: keyof GenerationToggles, value: boolean) =>
     setGen((prev) => ({ ...prev, [key]: value }));
 
@@ -212,17 +183,6 @@ export function AnalysisOptionsModal({
     if (gen.generateCameraEdits) logFramevoEvent(EVENTS.CAMERA_EDITS_ENABLED);
     if (gen.generateCut) logFramevoEvent(EVENTS.CUTS_ENABLED);
     if (gen.generateSpeed) logFramevoEvent(EVENTS.SPEED_ENABLED);
-    // Captions have their OWN event lifecycle (separate from the AI edit):
-    // requested / disabled / blocked all logged distinctly.
-    if (captionBlocked) {
-      logFramevoEvent(EVENTS.CAPTION_QUOTA_BLOCKED, {
-        reason: captionPerVideoBlocked ? "per_video_limit" : "quota_exhausted",
-      });
-    } else if (gen.generateCaptions) {
-      logFramevoEvent(EVENTS.CAPTION_TRANSCRIPTION_STARTED, { requested: true });
-    } else {
-      logFramevoEvent(EVENTS.CAPTION_DISABLED);
-    }
     logFramevoEvent(EVENTS.CHUNK_SIZE_SELECTED, { chunkMode, chunkSizeSeconds: resolvedSize });
     onPersistCorePrefs({
       generateCameraEdits: gen.generateCameraEdits,
@@ -231,19 +191,14 @@ export function AnalysisOptionsModal({
     });
     onPersistDetail({ chunkMode, chunkSizeSeconds: resolvedSize });
     onSelectVideoType(videoType);
+    // Captions are DECOUPLED — never send a caption/transcription instruction
+    // from the analyze dialog. Strip generateCaptions so analysis can't start
+    // ASR or touch captions.
+    const { generateCaptions: _captionsDecoupled, ...editToggles } = gen;
+    void _captionsDecoupled;
     onConfirm({
-      ...gen,
-      // Quota-blocked captions are forced off for this run (defense in depth —
-      // the server enforces the same limits before dispatching ASR).
-      ...(captionBlocked ? { generateCaptions: false } : {}),
+      ...editToggles,
       selectedVideoType: videoType,
-      // Spoken language — sent verbatim to ASR (never overridden by the server
-      // env). Auto mode omits the code; a locale hint aids Auto-Detect candidates.
-      transcriptLanguageMode: langMode,
-      ...(langMode === "selected" && langCode ? { transcriptLanguageCode: langCode } : {}),
-      ...(typeof navigator !== "undefined" && navigator.language
-        ? { transcriptLocaleHint: navigator.language }
-        : {}),
       existingEditMode: hasExistingEdits ? mode : "replace-selected",
       chunkMode,
       chunkSizeSeconds: resolvedSize,
@@ -290,66 +245,8 @@ export function AnalysisOptionsModal({
           <VideoTypePicker value={videoType} onChange={onPickVideoType} />
         </section>
 
-        {/* ── Captions & transcription ──────────────────────────────────────
-            A DEDICATED section — captions are a transcription feature with
-            their own monthly quota, spoken language, and background
-            processing. They are not one of the AI video edits below: turning
-            them off (or hitting a caption limit) never affects those. */}
-        <section className="space-y-3 border-t border-white/[0.06] pt-6">
-          <h3 className="text-[11px] font-semibold uppercase tracking-[0.14em] text-fog">
-            Captions &amp; transcription
-          </h3>
-          <p className="text-[11.5px] leading-relaxed text-fog/80">
-            Auto-captions transcribe the video&apos;s speech (using your monthly caption
-            minutes) and can keep processing in the background — every other AI edit
-            generates either way.
-          </p>
-
-          <div className="space-y-1">
-            <div className={captionBlocked ? "pointer-events-none opacity-55" : undefined}>
-              <Toggle
-                label={CAPTIONS_TOGGLE.label}
-                description={CAPTIONS_TOGGLE.description}
-                checked={captionBlocked ? false : gen.generateCaptions}
-                onChange={(v) => {
-                  if (!captionBlocked) setToggle("generateCaptions", v);
-                }}
-              />
-            </div>
-            {CAPTIONS_TOGGLE.note && gen.generateCaptions && !captionBlocked && (
-              <p className="pl-0.5 text-[11px] leading-relaxed text-fog/70">
-                {CAPTIONS_TOGGLE.note}
-              </p>
-            )}
-            <CaptionQuotaNote
-              usage={captionUsage}
-              videoDuration={videoDuration}
-              enabled={gen.generateCaptions && !captionBlocked}
-              perVideoBlocked={captionPerVideoBlocked}
-              exhausted={captionExhausted}
-            />
-          </div>
-
-          <div className={cn("space-y-2 pt-1", !gen.generateCaptions && "opacity-60")}>
-            <h4 className="text-[10px] font-semibold uppercase tracking-[0.16em] text-fog/60">
-              Spoken language
-            </h4>
-            <p className="text-[11.5px] leading-relaxed text-fog/80">
-              The language spoken in the video. Framevo transcribes + captions in this
-              language — it never translates. Pick it for reliable captions (e.g. Arabic);
-              Auto Detect guesses from a small candidate list.
-            </p>
-            <SpokenLanguagePicker
-              mode={langMode}
-              code={langCode}
-              disabled={!gen.generateCaptions || captionBlocked}
-              onChange={(m, c) => {
-                setLangMode(m);
-                setLangCode(c);
-              }}
-            />
-          </div>
-        </section>
+        {/* Captions are generated separately via "Generate AI Captions" — no
+            caption toggle, spoken-language picker, or quota lives here. */}
 
         {/* ── AI video edits ────────────────────────────────────────────────
             The automatic EDIT types only — captions are a separate
@@ -530,78 +427,5 @@ function MiniAction({ icon, label, onClick }: { icon: React.ReactNode; label: st
       {icon}
       {label}
     </button>
-  );
-}
-
-/**
- * The auto-caption allowance readout under the Captions toggle: the plan's
- * monthly allowance, live usage, the estimated cost of THIS analysis, and the
- * per-video / exhausted limit states with the right upgrade action. Numbers
- * come from the shared caption-quota config + the user's own ledger doc —
- * display only; the server enforces.
- */
-function CaptionQuotaNote({
-  usage,
-  videoDuration,
-  enabled,
-  perVideoBlocked,
-  exhausted,
-}: {
-  usage: CaptionUsageState;
-  videoDuration: number;
-  enabled: boolean;
-  perVideoBlocked: boolean;
-  exhausted: boolean;
-}) {
-  const upgradeTarget =
-    usage.plan === "free" ? "Pro" : usage.plan === "pro" ? "Creator" : null;
-  return (
-    <div className="space-y-1 pl-0.5">
-      <p className="text-[11px] leading-relaxed text-fog/70">
-        {captionAllowanceLabel(usage.plan)}
-        {" · "}up to {Math.round(usage.maxVideoSeconds / 60)} minutes per video
-        {!usage.loading && (
-          <>
-            {" · "}
-            {usage.usedMinutes} of {usage.allowanceMinutes} caption minutes used
-            {" · "}
-            {usage.remainingMinutes} minutes remaining
-          </>
-        )}
-      </p>
-      {perVideoBlocked ? (
-        <p className="text-[11px] leading-relaxed text-amber-200/90">
-          {perVideoCaptionLimitMessage(usage.plan)}{" "}
-          {upgradeTarget && (
-            <a
-              href="/pricing"
-              className="font-medium text-violet-300 transition-colors hover:text-violet-200"
-            >
-              Upgrade to {upgradeTarget}
-            </a>
-          )}
-        </p>
-      ) : exhausted ? (
-        <p className="text-[11px] leading-relaxed text-amber-200/90">
-          {CAPTION_ALLOWANCE_EXHAUSTED_MESSAGE}{" "}
-          {upgradeTarget && (
-            <a
-              href="/pricing"
-              className="font-medium text-violet-300 transition-colors hover:text-violet-200"
-            >
-              Upgrade to {upgradeTarget}
-            </a>
-          )}
-        </p>
-      ) : (
-        enabled &&
-        videoDuration > 0 && (
-          <p className="text-[11px] leading-relaxed text-fog/70">
-            This video will use approximately {estimateCaptionMinutes(videoDuration)} caption
-            minutes.
-          </p>
-        )
-      )}
-    </div>
   );
 }

@@ -2,6 +2,8 @@
 
 import * as React from "react";
 import {
+  Captions as CaptionsIcon,
+  CheckCircle2,
   ChevronLeft,
   ChevronRight,
   Crop,
@@ -14,6 +16,8 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { useMomentReview } from "./useMomentReview";
+import { useEditorReal } from "./context";
+import { resolveAiCaptionStatus, projectSourceFingerprint } from "@/lib/analysis/ai-caption-status";
 
 /**
  * Compact horizontal editor toolbar between the preview and the timeline.
@@ -36,6 +40,7 @@ export function EditorToolbar({
   onEffects,
   onPresets,
   onInsights,
+  onGenerateCaptions,
 }: {
   hasAnalysis: boolean;
   isAnalyzingNow: boolean;
@@ -48,8 +53,18 @@ export function EditorToolbar({
   onEffects: () => void;
   onPresets: () => void;
   onInsights: () => void;
+  onGenerateCaptions: () => void;
 }) {
   const review = useMomentReview();
+  const { project } = useEditorReal();
+  // Caption button state is derived from the real timeline + transcript, never
+  // the analysis status — disabled when valid AI captions already exist (no
+  // duplicate quota spend) or while a caption job is running.
+  const captions = resolveAiCaptionStatus({
+    moments: project.analysis?.detectedMoments,
+    transcript: project.analysis?.transcript,
+    currentSourceFingerprint: projectSourceFingerprint(project),
+  });
 
   return (
     <div
@@ -84,6 +99,34 @@ export function EditorToolbar({
         </ToolButton>
         <ToolButton label="Effects" title="Global effects" onClick={onEffects}>
           <SlidersHorizontal size={15} />
+        </ToolButton>
+        <ToolButton
+          label={
+            captions.state === "generated"
+              ? "Regenerate AI Captions"
+              : captions.state === "processing"
+                ? "Generating AI Captions…"
+                : "Generate AI Captions"
+          }
+          title={
+            captions.state === "generated"
+              ? "AI captions exist — regenerate to replace them (uses caption minutes)."
+              : captions.state === "processing"
+                ? "Captions are being generated."
+                : captions.state === "unavailable"
+                  ? "Captions unavailable — no transcription provider is configured."
+                  : "Transcribe speech and add captions (uses caption minutes)."
+          }
+          onClick={onGenerateCaptions}
+          disabled={!captions.canGenerate}
+        >
+          {captions.state === "processing" ? (
+            <Loader2 size={15} className="animate-spin" />
+          ) : captions.state === "generated" ? (
+            <CheckCircle2 size={15} />
+          ) : (
+            <CaptionsIcon size={15} />
+          )}
         </ToolButton>
 
         <span aria-hidden className="mx-1 h-5 w-px shrink-0 bg-white/[0.08]" />

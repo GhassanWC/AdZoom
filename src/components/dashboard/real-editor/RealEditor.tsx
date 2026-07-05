@@ -18,6 +18,7 @@ import { EffectsModal } from "./EffectsModal";
 import { ExportModal } from "./ExportModal";
 import { CanvasModal } from "./CanvasModal";
 import { AnalysisOptionsModal } from "./AnalysisOptionsModal";
+import { CaptionsModal } from "./CaptionsModal";
 import { RecipeSummary } from "./RecipeSummary";
 import type { AnalysisOptions } from "@/lib/analysis/engine-layers";
 import { useWorkspaceSettings } from "@/lib/firebase/workspace-settings";
@@ -155,6 +156,7 @@ function Body() {
   const [effectsOpen, setEffectsOpen] = React.useState(false);
   const [exportOpen, setExportOpen] = React.useState(false);
   const [analysisOptionsOpen, setAnalysisOptionsOpen] = React.useState(false);
+  const [captionsOpen, setCaptionsOpen] = React.useState(false);
   const [navOpen, setNavOpen] = React.useState(false);
   const [presetsOpen, setPresetsOpen] = React.useState(false);
   const [insightsOpen, setInsightsOpen] = React.useState(false);
@@ -226,6 +228,7 @@ function Body() {
         onEffects={() => setEffectsOpen(true)}
         onPresets={() => setPresetsOpen(true)}
         onInsights={() => setInsightsOpen(true)}
+        onGenerateCaptions={() => setCaptionsOpen(true)}
       />
 
       {/* ── 5. Timeline — natural height in the page flow (no inner scroll);
@@ -268,6 +271,10 @@ function Body() {
               moments={project.analysis.detectedMoments ?? []}
               transcript={project.analysis.transcript}
               audioAnalysis={project.analysis.audioAnalysis}
+              onGenerateCaptions={() => {
+                setInsightsOpen(false);
+                setCaptionsOpen(true);
+              }}
             />
           )}
           <AIConfidencePanel />
@@ -302,6 +309,7 @@ function Body() {
       <EffectsModal open={effectsOpen} onClose={() => setEffectsOpen(false)} />
       <ExportModal open={exportOpen} onClose={() => setExportOpen(false)} />
       <CanvasModal open={canvasOpen} onClose={closeCanvas} />
+      <CaptionsModal open={captionsOpen} onClose={() => setCaptionsOpen(false)} />
 
       {/* Debug overlay — Ctrl+Shift+D in dev / ?debug=1 anywhere. */}
       <DebugOverlay />

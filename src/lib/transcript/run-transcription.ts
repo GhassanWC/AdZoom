@@ -56,15 +56,14 @@ interface ProjectShape {
 }
 
 /**
- * Does this project want auto-captions? The type's recipe must include captions
- * AND the analysis run's captions toggle must not be off (defensive — the route
- * only dispatches when captions are allowed, but re-checking keeps re-runs honest).
+ * Whether a completed transcription should produce caption moments. Captions
+ * are now generated EXCLUSIVELY via the dedicated "Generate AI Captions" flow
+ * (analysis never dispatches transcription), so any job that reaches this
+ * worker IS a caption job by construction. The duplicate guard is the
+ * "AI captions already exist" check at the call site, not this function.
  */
-function wantsCaptions(project: ProjectShape): boolean {
-  if (project.analysis?.lastRunOptions?.generateCaptions === false) return false;
-  const ops = project.analysis?.editRecipe?.operations;
-  if (!ops) return true;
-  return ops.some((o) => o.category === "captions");
+function wantsCaptions(_project: ProjectShape): boolean {
+  return true;
 }
 
 function captionVideoType(project: ProjectShape): SelectedVideoType {
@@ -230,7 +229,13 @@ export async function processTranscriptionJob(
       // Only AI captions block regeneration (manual captions survive a re-transcribe).
       const hasCaptions = current.some((m) => m.effectType === "captions" && m.source !== "user");
       if (!hasCaptions) {
-        captionMoments = generateCaptionMoments(transcript, captionVideoType(project)).moments;
+        // Honor the style/position the user chose in the Generate AI Captions
+        // dialog (stamped on the processing transcript); fall back to the
+        // video-type default when absent.
+        captionMoments = generateCaptionMoments(transcript, captionVideoType(project), {
+          stylePreset: existing?.captionStylePreset,
+          position: existing?.captionPosition,
+        }).moments;
       }
     }
 

@@ -34,21 +34,12 @@ import {
 } from "@/lib/analysis/video-type";
 import { resolveEditRecipe, logEditRecipePlan } from "@/lib/analysis/edit-recipe";
 import { generateOverlayEdits } from "@/lib/analysis/overlay-generators";
-import { generateCaptionMoments } from "@/lib/analysis/caption-generator";
-import { transcribeVideo, hasUsableTranscript } from "@/lib/transcript/transcribe";
-import {
-  decideTranscription,
-  transcriptionFingerprint,
-  isAsrRunnable,
-  asrExecutionMode,
-  resolveAsrDispatch,
-  hasBackgroundAsrTarget,
-} from "@/lib/transcript/transcription-job";
-import {
-  resolveTranscriptLanguage,
-  transcriptScriptMatchesLanguage,
-} from "@/lib/transcript/language";
-import { dispatchTranscription } from "@/lib/transcript/run-transcription";
+// NOTE: transcription/captions are DECOUPLED from analysis — this route never
+// starts ASR, reserves caption quota, or generates captions. All caption
+// generation lives behind the dedicated "Generate AI Captions" action
+// (src/lib/transcript/caption-request.ts + /api/projects/[id]/captions). Only
+// an EXISTING transcript is read here as a signal (e.g. hook text).
+import { hasUsableTranscript } from "@/lib/transcript/transcribe";
 import { buildEditDiagnostics } from "@/lib/diagnostics/edit-diagnostics";
 import { momentsFromEvents } from "@/lib/attention/events";
 import { attentionCurve } from "@/lib/attention/score";
@@ -56,21 +47,6 @@ import { cursorIntent } from "@/lib/attention/cursor-intent";
 import { classifyClick, type ClickTier } from "@/lib/attention/click-classifier";
 import { canUseAiFeature } from "@/lib/usage/ai-features";
 import { canUsePreset, getUserPlan } from "@/lib/usage/gating";
-import {
-  CAPTION_PLAN_LIMITS,
-  CAPTION_ALLOWANCE_EXHAUSTED_MESSAGE,
-  CaptionQuotaExhaustedError,
-  exceedsCaptionVideoLimit,
-  perVideoCaptionLimitMessage,
-  requiredCaptionSeconds,
-  shouldCommitCaptionUsage,
-} from "@/lib/usage/caption-quota";
-import {
-  commitCaptionUsage,
-  logCaptionQuota,
-  releaseCaptionReservation,
-  reserveCaptionSeconds,
-} from "@/lib/usage/caption-ledger";
 import {
   exceedsUploadDuration,
   FREE_UPLOAD_MAX_DURATION_SECONDS,
@@ -93,7 +69,6 @@ import {
   type Pacing,
   type ProjectStatus,
   type Transcript,
-  type TranscriptSkipReason,
   type VisualAnalysis,
 } from "@/lib/firebase/schema";
 
@@ -854,266 +829,22 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     const pacing: Pacing = existingPacing ?? "moderate";
     const visualAnalysis = project.visualAnalysis as VisualAnalysis | undefined;
 
-    // ── Phase 4: transcript lifecycle (triggered by analysis, NEVER export) ──
-    // Decide REUSE / SKIP / TRANSCRIBE / UNAVAILABLE (dedup: reuse a fresh
-    // transcript, don't double-queue an in-flight one, re-transcribe on a changed
-    // video or explicit request). The heavy ASR (ffmpeg + Speech) runs in an
-    // ffmpeg-equipped runtime: `worker` mode dispatches there (this Next.js route
-    // NEVER runs ffmpeg); `inline` mode (dev / ffmpeg-in-process) transcribes
-    // here. `disabled`/unconfigured → unavailable (never fabricated, never blocks).
+    // ── Transcript (READ-ONLY during analysis; captions are DECOUPLED) ──────
+    // Analysis NEVER starts ASR, reserves caption quota, or generates/replaces
+    // captions. It only REUSES an existing complete transcript as a signal
+    // (e.g. hook text). All caption generation flows through the dedicated
+    // "Generate AI Captions" action. Existing caption moments are preserved
+    // verbatim (see caption preservation at the merge below).
     const priorTranscript = (project.analysis as { transcript?: Transcript } | undefined)?.transcript;
-    // Resolve the SPOKEN language (precedence §3): user selection → prior confirmed
-    // language for the unchanged source → Auto-Detect candidates from locale →
-    // TRANSCRIPT_LANGUAGE env → en-US. TRANSCRIPT_LANGUAGE NEVER overrides the
-    // user's pick. Captions stay in the spoken language — we never translate.
-    const asrModel = process.env.TRANSCRIPT_MODEL || "latest_long";
-    const asrProvider = process.env.TRANSCRIPT_PROVIDER?.trim().toLowerCase() || "";
-    const langConfig = resolveTranscriptLanguage({
-      mode: analysisOptions.transcriptLanguageMode,
-      selectedCode: analysisOptions.transcriptLanguageCode,
-      priorLanguage: priorTranscript?.status === "complete" ? priorTranscript.language : null,
-      locale: analysisOptions.transcriptLocaleHint,
-      envFallback: process.env.TRANSCRIPT_LANGUAGE,
-    });
-    // Transcript IDENTITY (video + language + model/provider): changing the
-    // language forces a fresh transcript; same language + unchanged video reuses.
-    const fingerprint = transcriptionFingerprint({
-      source: {
-        storagePath: project.storagePath as string | undefined,
-        originalVideoUrl: project.originalVideoUrl as string | undefined,
-        fileSize: project.fileSize as number | undefined,
-        duration: duration ?? undefined,
-      },
-      languageMode: langConfig.mode,
-      languageCode: langConfig.languageCode,
-      model: asrModel,
-      provider: asrProvider,
-    });
-    const execMode = asrExecutionMode();
-    // Captions toggle also gates transcription: with captions off we don't start
-    // a new (costly) transcription — an existing transcript is preserved for hook
-    // text (decideTranscription reuses it when not runnable).
-    const captionsAllowed = analysisOptions.generateCaptions !== false;
-    const decision = decideTranscription({
-      existing: priorTranscript,
-      fingerprint,
-      runnable: isAsrRunnable() && captionsAllowed,
-      // The "Wrong language?" action sets forceRetranscribe on the run options.
-      forceRetranscribe:
-        reqBody?.forceRetranscribe === true || analysisOptions.forceRetranscribe === true,
-      now: Date.now(),
-    });
-    // Language identity stamped on every transcript we (re)write, so the worker +
-    // UI know what was requested and the fingerprint stays language-aware.
-    const langStamp = {
-      languageMode: langConfig.mode,
-      requestedLanguageCode: langConfig.languageCode,
-      ...(langConfig.alternativeLanguageCodes.length
-        ? { requestedAlternativeLanguageCodes: langConfig.alternativeLanguageCodes }
-        : {}),
-    };
-    let transcript: Transcript;
-    let dispatchWorker = false;
-    if (decision.action === "reuse" || decision.action === "skip") {
-      transcript = priorTranscript ?? { status: "unavailable" };
-    } else if (decision.action === "unavailable") {
-      transcript = { status: "unavailable" };
-    } else {
-      // transcribe — a NEW ASR run, which is the ONLY thing that consumes
-      // caption minutes (reuse/skip above are free by construction). Gate +
-      // RESERVE the source duration atomically BEFORE any dispatch; a blocked
-      // quota only skips captions — the rest of the analysis continues.
-      const requiredSeconds =
-        typeof duration === "number" && Number.isFinite(duration) && duration > 0
-          ? requiredCaptionSeconds(duration)
-          : null;
-      const captionPlanLimits = CAPTION_PLAN_LIMITS[plan];
-      let quotaBlockedReason: string | null = null;
-      let quotaSkipReason: TranscriptSkipReason | null = null;
-      let usageKey: string | null = null;
-      let usagePeriodId: string | null = null;
-
-      if (requiredSeconds === null) {
-        // Fail-closed for billing: without a real duration we can't meter the
-        // audio, so we don't start a metered ASR run.
-        quotaBlockedReason =
-          "The video duration is unknown, so auto-caption minutes can't be metered for this run.";
-        quotaSkipReason = "unknown_duration";
-        logCaptionQuota("blocked", { uid, projectId, plan, reason: "unknown_duration" });
-      } else if (exceedsCaptionVideoLimit(plan, duration)) {
-        quotaBlockedReason = perVideoCaptionLimitMessage(plan);
-        quotaSkipReason = "per_video_limit";
-        logCaptionQuota("blocked", {
-          uid,
-          projectId,
-          plan,
-          requestedSeconds: requiredSeconds,
-          reason: "per_video_limit",
-        });
-      } else {
-        usageKey = `cap_${projectId}_${Date.now().toString(36)}`;
-        try {
-          const reserved = await reserveCaptionSeconds(db, {
-            uid,
-            projectId,
-            key: usageKey,
-            seconds: requiredSeconds,
-          });
-          usagePeriodId = reserved.periodId;
-        } catch (quotaErr) {
-          usageKey = null;
-          if (quotaErr instanceof CaptionQuotaExhaustedError) {
-            quotaBlockedReason = CAPTION_ALLOWANCE_EXHAUSTED_MESSAGE;
-            quotaSkipReason = "quota_exhausted";
-          } else {
-            // Ledger infrastructure failure must never take analysis down —
-            // captions skip honestly and everything else proceeds.
-            console.warn("[caption-quota] reserve failed", quotaErr);
-            quotaBlockedReason = "The caption usage check failed for this run. Try analyzing again.";
-            quotaSkipReason = "quota_check_failed";
-          }
-        }
-      }
-
-      if (quotaBlockedReason || !usageKey || !usagePeriodId) {
-        transcript = {
-          status: "unavailable",
-          error: quotaBlockedReason ?? "Caption quota reservation failed.",
-          ...(quotaSkipReason ? { skipReason: quotaSkipReason } : {}),
-          ...langStamp,
-          sourceFingerprint: fingerprint,
-          requestedAt: Date.now(),
-        };
-      } else {
-        // Reserved. ASYNC BY DEFAULT for real videos: analysis (and every other
-        // edit) is NEVER blocked on ASR — only SHORT videos in `inline` mode run
-        // synchronously (dev tests); everything else is dispatched to the
-        // background and the transcript lands `processing` — captions then appear
-        // live via the editor's Firestore subscription when the worker completes.
-        const usageStamp = { usageKey, usagePeriodId, usageSeconds: requiredSeconds ?? undefined };
-        const dispatch = resolveAsrDispatch({ execMode, durationSeconds: duration });
-        if (dispatch === "inline") {
-          // Short video, inline mode: run in-process, bounded by the budget so even
-          // here a slow provider can't push finalize past the platform's hard kill
-          // (it degrades to "failed" and the pass still generates every overlay).
-          const asrBudgetMs = Math.max(15_000, budgetRemainingMs() - 40_000);
-          try {
-            const raw = await withDeadline(
-              transcribeVideo({
-                videoUrl: (project.originalVideoUrl as string) ?? "",
-                mimeType: project.mimeType as string | undefined,
-                durationSeconds: duration ?? undefined,
-                languageCode: langConfig.languageCode,
-                alternativeLanguageCodes: langConfig.alternativeLanguageCodes,
-                maxDurationSeconds: captionPlanLimits.maxCaptionVideoSeconds,
-              }),
-              asrBudgetMs,
-              "inline transcription exceeded the analysis time budget"
-            );
-            transcript = {
-              ...raw,
-              ...langStamp,
-              ...usageStamp,
-              sourceFingerprint: fingerprint,
-              requestedAt: Date.now(),
-            };
-          } catch (asrErr) {
-            console.warn("[transcript:analysis] inline ASR budget exceeded — skipping captions this pass", asrErr);
-            transcript = {
-              status: "failed",
-              // Short, specific REASON only — the UI frames it ("Captions were
-              // skipped — …"), so this must NOT repeat that or it reads doubled.
-              error:
-                "Transcription took too long to finish in one pass. Try a shorter clip, or run ASR in worker mode.",
-              ...langStamp,
-              ...usageStamp,
-              sourceFingerprint: fingerprint,
-              requestedAt: Date.now(),
-            };
-          }
-          // Finalize the reservation for the inline run: any `complete`
-          // transcript (even an empty one — the provider processed the audio)
-          // COMMITS; failure/unavailable RELEASES. Both are idempotent.
-          try {
-            if (shouldCommitCaptionUsage(transcript.status)) {
-              await commitCaptionUsage(db, {
-                uid,
-                projectId,
-                key: usageKey,
-                periodId: usagePeriodId,
-                fallbackSeconds: requiredSeconds ?? undefined,
-              });
-            } else {
-              await releaseCaptionReservation(db, {
-                uid,
-                projectId,
-                key: usageKey,
-                periodId: usagePeriodId,
-              });
-            }
-          } catch (settleErr) {
-            // Non-fatal: the stale-reservation sweep reconciles from the
-            // recorded transcript state.
-            console.warn("[caption-quota] inline settle failed (sweep will reconcile)", settleErr);
-          }
-        } else if (dispatch === "background" && hasBackgroundAsrTarget()) {
-          // Mark processing now with the resolved language + the reservation
-          // stamp so the background worker (a) transcribes in the RIGHT language
-          // and (b) can VERIFY the reservation before calling the provider.
-          transcript = {
-            status: "processing",
-            ...langStamp,
-            ...usageStamp,
-            sourceFingerprint: fingerprint,
-            requestedAt: Date.now(),
-          };
-          dispatchWorker = true;
-        } else {
-          // Wanted background but there's nowhere to dispatch to → honest, not
-          // stuck — and the reservation is returned immediately.
-          transcript = { status: "unavailable" };
-          await releaseCaptionReservation(db, {
-            uid,
-            projectId,
-            key: usageKey,
-            periodId: usagePeriodId,
-          }).catch(() => {});
-        }
-      }
-    }
+    const transcript: Transcript = priorTranscript ?? { status: "unavailable" };
     const transcriptUsable = hasUsableTranscript(transcript);
     const silenceSegmentCount = audioAnalysis?.silenceSegments?.length ?? 0;
     console.info("[transcript:analysis]", {
       projectId,
-      action: decision.action,
-      reason: decision.reason,
-      execMode,
+      action: "reuse-only (captions decoupled from analysis)",
       status: transcript.status,
-      languageMode: langConfig.mode,
-      requestedLanguage: langConfig.languageCode,
-      altLanguages: langConfig.alternativeLanguageCodes,
-      detectedLanguage: transcript.language ?? null,
+      transcriptSegments: transcript.segments?.length ?? 0,
     });
-    // Failure protection (§10): if a COMPLETE transcript's script looks
-    // inconsistent with the selected language (e.g. Arabic requested but Latin
-    // text came back), flag it so the UI can offer "Wrong language?" — we NEVER
-    // silently translate. `null` = no opinion (too little signal / unchecked script).
-    if (
-      transcript.status === "complete" &&
-      langConfig.mode === "selected" &&
-      transcriptScriptMatchesLanguage(transcript.text, langConfig.languageCode) === false
-    ) {
-      transcript = { ...transcript, languageMismatch: true };
-      console.warn("[transcript:analysis] language mismatch — transcript script != selected language", {
-        projectId,
-        requested: langConfig.languageCode,
-      });
-      await emitActivity(
-        ref,
-        "warn",
-        "The transcript may be in the wrong language. Use “Wrong language?” to re-transcribe."
-      );
-    }
     console.info("[audio:analysis]", {
       projectId,
       audioStatus: audioAnalysis?.status ?? "not_run",
@@ -1804,50 +1535,27 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       appliedOutputCanvas: !!overlayGen.outputCanvas,
     });
 
-    // ── Phase 4: caption generation (transcript-driven) ─────────────────────
-    // Generated here (not in generateOverlayEdits) so that module stays free of
-    // cross-file value imports. Only when the recipe enabled captions (→ a real
-    // transcript exists) AND the user has no captions already. NEVER faked.
-    const captionsEnabled =
-      editRecipePlan.enabledCategories.includes("captions") && captionsAllowed;
-    // Only AI captions block regeneration — so "Wrong language?" (which deletes
-    // AI captions) regenerates in the new language, while MANUAL captions survive.
-    const hasExistingCaptions = finalMoments.some(
-      (m) => m.effectType === "captions" && m.source !== "user"
-    );
-    let captionCount = 0;
-    let captionsTruncated = false;
-    if (captionsEnabled && !hasExistingCaptions) {
-      const capRes = generateCaptionMoments(transcript, editRecipePlan.effectiveVideoType);
-      if (capRes.moments.length > 0) {
-        captionCount = capRes.moments.length;
-        captionsTruncated = capRes.truncated;
-        finalMoments = [...finalMoments, ...capRes.moments].sort(
-          (a, b) => a.startTime - b.startTime
-        );
-      }
-    }
-    console.info("[captions:generation]", {
-      projectId,
-      transcriptStatus: transcript.status,
-      captionsEnabled,
-      generatedCaptions: captionCount,
-      truncated: captionsTruncated,
-      skippedReason: captionCount
-        ? undefined
-        : hasExistingCaptions
-          ? "captions already present (manual)"
-          : !captionsEnabled
-            ? `captions disabled (transcript ${transcript.status})`
-            : "no caption lines produced",
-    });
-    if (captionCount > 0) {
-      await emitActivity(
-        ref,
-        "ok",
-        `Generated ${captionCount} caption${captionCount === 1 ? "" : "s"} from the transcript`
+    // ── Captions are DECOUPLED from analysis ────────────────────────────────
+    // Analysis NEVER generates captions (that lives behind the dedicated
+    // "Generate AI Captions" action). It MUST preserve every EXISTING caption
+    // moment — AI or manual — untouched across a re-analyze, regardless of the
+    // chosen existingEditMode, so the balancer's layer filter can't drop them.
+    const originalCaptions = (
+      (project.analysis as { detectedMoments?: DetectedMoment[] } | undefined)?.detectedMoments ?? []
+    ).filter((m) => m.effectType === "captions");
+    const presentIds = new Set(finalMoments.map((m) => m.id));
+    const reAddedCaptions = originalCaptions.filter((m) => !presentIds.has(m.id));
+    if (reAddedCaptions.length > 0) {
+      finalMoments = [...finalMoments, ...reAddedCaptions].sort(
+        (a, b) => a.startTime - b.startTime
       );
     }
+    console.info("[captions:analysis]", {
+      projectId,
+      decoupled: true,
+      existingCaptions: originalCaptions.length,
+      preserved: reAddedCaptions.length,
+    });
     if (overlayGen.moments.length > 0) {
       await emitActivity(
         ref,
@@ -1971,17 +1679,8 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       { merge: true }
     );
 
-    // ── Phase 4: dispatch async transcription (worker mode) ─────────────────
-    // AFTER the timeline is persisted, so the worker reads the complete timeline
-    // before appending captions. Fast + best-effort — the Next.js request never
-    // runs ffmpeg; the editor shows "processing" and captions arrive live when
-    // the worker finishes. A dispatch failure just retries on the next analysis.
-    if (dispatchWorker) {
-      await dispatchTranscription(uid, projectId, {
-        forceRetranscribe: reqBody?.forceRetranscribe === true,
-      });
-      await emitActivity(ref, "info", "Transcribing audio for captions…");
-    }
+    // (Transcription is NOT dispatched here — captions are generated only by
+    // the dedicated "Generate AI Captions" action, never by analysis.)
 
     // User-facing provenance summary — invariant 6 (trust).
     const pc = balanced.stats.provenanceCounts;

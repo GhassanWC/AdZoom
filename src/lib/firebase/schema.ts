@@ -874,6 +874,14 @@ export interface Transcript {
   usageSeconds?: number;
   /** Structured reason an `unavailable` transcript was skipped (quota, etc.). */
   skipReason?: TranscriptSkipReason;
+  /**
+   * Caption STYLING the user chose in the "Generate AI Captions" dialog,
+   * stamped on the `processing` transcript so the worker (and the reuse path)
+   * generate captions with the requested preset/position instead of the
+   * video-type default. Absent = fall back to the video-type style + bottom.
+   */
+  captionStylePreset?: OverlayTextPreset;
+  captionPosition?: CaptionPosition;
 }
 
 export type AudioAnalysisStatus = TranscriptStatus;

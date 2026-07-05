@@ -9,7 +9,7 @@
  * applied ones. Renders nothing for projects analyzed before recipes existed.
  */
 import * as React from "react";
-import { Sparkles, Check, Clock, Captions as CaptionsIcon, AudioLines, Loader2, Languages, RotateCcw } from "lucide-react";
+import { Sparkles, Check, Clock, Captions as CaptionsIcon, AudioLines, Loader2, Languages, RotateCcw, Trash2 } from "lucide-react";
 import {
   CATEGORY_LABELS,
   IMPLEMENTED_CATEGORIES,
@@ -22,6 +22,7 @@ import { useEditorReal } from "./context";
 import { useConfirm } from "@/components/ui/ConfirmDialog";
 import { estimateCaptionMinutes } from "@/lib/usage/caption-quota";
 import { CAPTION_STATE_LABEL, resolveCaptionState } from "@/lib/analysis/caption-state";
+import { resolveAiCaptionStatus, projectSourceFingerprint } from "@/lib/analysis/ai-caption-status";
 import { SpokenLanguagePicker } from "./SpokenLanguagePicker";
 import {
   transcriptLanguageLabel,
@@ -63,14 +64,33 @@ export function RecipeSummary({
   moments,
   transcript,
   audioAnalysis,
+  onGenerateCaptions,
 }: {
   recipe: EditRecipePlan;
   moments: DetectedMoment[];
   transcript?: Transcript;
   audioAnalysis?: AudioAnalysis;
+  /** Opens the dedicated "Generate AI Captions" dialog. */
+  onGenerateCaptions?: () => void;
 }) {
-  const { retranscribe, analyzing, project } = useEditorReal();
+  const { retranscribe, deleteAiCaptions, analyzing, project } = useEditorReal();
   const confirm = useConfirm();
+  // AI-caption existence/state (decoupled from analysis) — drives the empty
+  // state, the "N captions · language" summary, and the regeneration actions.
+  const aiStatus = resolveAiCaptionStatus({
+    moments,
+    transcript,
+    currentSourceFingerprint: projectSourceFingerprint(project),
+  });
+  const deleteCaptions = async () => {
+    const ok = await confirm({
+      title: "Delete AI captions?",
+      message: "Removes the AI-generated captions from the timeline. Manual captions are kept.",
+      confirmLabel: "Delete captions",
+      tone: "danger",
+    });
+    if (ok) await deleteAiCaptions();
+  };
   // "Wrong language?" inline picker — re-transcribes the same video in a chosen
   // spoken language without re-uploading.
   const [langFixOpen, setLangFixOpen] = React.useState(false);
@@ -266,10 +286,24 @@ export function RecipeSummary({
           )}
         </div>
 
-        {captionState === "disabled" && (
-          <p className="mt-2 text-[11px] leading-relaxed text-fog/70">
-            Captions are off for this analysis — every other AI edit still generated.
-            Turn them on under Captions &amp; transcription when you re-analyze.
+        {/* Empty state — no AI captions yet: the single "Generate AI Captions"
+            entry point (also on the toolbar). Manual captions never block it. */}
+        {!aiStatus.hasAiCaptions && !aiStatus.processing && onGenerateCaptions && (
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            <p className="text-[11px] leading-relaxed text-fog/70">No AI captions yet.</p>
+            <button
+              type="button"
+              onClick={onGenerateCaptions}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-violet-400/40 bg-violet-500/15 px-3 py-1.5 text-[12px] font-semibold text-violet-50 transition-colors hover:bg-violet-500/25"
+            >
+              <CaptionsIcon size={12} />
+              Generate AI Captions
+            </button>
+          </div>
+        )}
+        {aiStatus.stale && (
+          <p className="mt-2 text-[11px] leading-relaxed text-amber-200/90">
+            The video changed since these captions were made — regenerate to caption the current video.
           </p>
         )}
 
@@ -349,22 +383,36 @@ export function RecipeSummary({
           </p>
         )}
 
-        {/* ── "Wrong language?" — fix the spoken language + re-transcribe ──── */}
+        {/* ── Regeneration actions — Retranscribe / Change language / Delete.
+            The main "Generate AI Captions" button is NOT used for regeneration;
+            these captions-only actions live here beside the caption status. ── */}
         {transcript && transcript.status !== "not_started" && (
           <div className="mt-2.5">
             {!langFixOpen ? (
-              <button
-                type="button"
-                onClick={() => {
-                  setFixMode("selected");
-                  setFixCode(transcript.language ?? transcript.requestedLanguageCode ?? undefined);
-                  setLangFixOpen(true);
-                }}
-                className="inline-flex items-center gap-1.5 rounded-md border border-white/[0.08] bg-white/[0.02] px-2.5 py-1 text-[11px] font-medium text-fog transition-colors duration-150 hover:border-white/20 hover:text-white"
-              >
-                <Languages size={11} />
-                Wrong language?
-              </button>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setFixMode("selected");
+                    setFixCode(transcript.language ?? transcript.requestedLanguageCode ?? undefined);
+                    setLangFixOpen(true);
+                  }}
+                  className="inline-flex items-center gap-1.5 rounded-md border border-white/[0.08] bg-white/[0.02] px-2.5 py-1 text-[11px] font-medium text-fog transition-colors duration-150 hover:border-white/20 hover:text-white"
+                >
+                  <Languages size={11} />
+                  Retranscribe / change language
+                </button>
+                {aiStatus.hasAiCaptions && (
+                  <button
+                    type="button"
+                    onClick={() => void deleteCaptions()}
+                    className="inline-flex items-center gap-1.5 rounded-md border border-rose-400/25 bg-rose-500/[0.06] px-2.5 py-1 text-[11px] font-medium text-rose-200 transition-colors duration-150 hover:border-rose-400/50"
+                  >
+                    <Trash2 size={11} />
+                    Delete AI captions
+                  </button>
+                )}
+              </div>
             ) : (
               <div className="space-y-2 rounded-xl border border-white/[0.08] bg-white/[0.02] p-3">
                 <p className="text-[11.5px] leading-relaxed text-fog/85">

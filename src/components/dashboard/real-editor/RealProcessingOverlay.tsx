@@ -41,10 +41,7 @@ import type {
   AnalysisActivityEvent,
   AnalysisErrorKind,
   SelectedVideoType,
-  Transcript,
 } from "@/lib/firebase/schema";
-import { CAPTION_STATE_LABEL, resolveCaptionState } from "@/lib/analysis/caption-state";
-import { Captions as CaptionsIcon } from "lucide-react";
 import { cn } from "@/lib/cn";
 
 const LONG_PROCESS_WARN_MS = 90_000;
@@ -233,7 +230,6 @@ export function RealProcessingOverlay() {
                 activity={analysis?.activity ?? []}
                 longRunning={longRunning}
                 cvProgress={cvProgress}
-                transcript={analysis?.transcript ?? null}
                 onCancel={onCancel}
                 onMinimize={onMinimize}
               />
@@ -291,7 +287,6 @@ function ActiveBody({
   activity,
   longRunning,
   cvProgress,
-  transcript,
   onCancel,
   onMinimize,
 }: {
@@ -305,7 +300,6 @@ function ActiveBody({
   activity: AnalysisActivityEvent[];
   longRunning: boolean;
   cvProgress: number | null;
-  transcript: Transcript | null;
   onCancel: () => Promise<void>;
   onMinimize: () => void;
 }) {
@@ -417,15 +411,8 @@ function ActiveBody({
               );
             })}
           </ul>
-
-          {/* ── Captions — a SEPARATE track from the main analysis steps.
-              Transcription runs (and can keep running) independently: the
-              analysis above finishes either way. Driven by the transcript's
-              own lifecycle, never the analysis status. */}
-          <CaptionProgressRow
-            captionsRequested={options?.generateCaptions !== false}
-            transcript={transcript}
-          />
+          {/* Captions are NOT part of analysis — they generate via the separate
+              "Generate AI Captions" action, so no caption progress appears here. */}
         </div>
 
         {/* Right: activity feed (friendly labels; technical lives under details) */}
@@ -529,64 +516,6 @@ function ActiveBody({
           Cancel
         </button>
       </div>
-    </div>
-  );
-}
-
-/**
- * The captions/transcription track of the progress view — SEPARATE from the
- * main analysis steps because captions are an independent feature: they can
- * be off, quota-blocked, still transcribing after analysis completes, or
- * failed without the AI edit failing. States come from the transcript's own
- * lifecycle (`resolveCaptionState`), never the analysis status.
- */
-function CaptionProgressRow({
-  captionsRequested,
-  transcript,
-}: {
-  captionsRequested: boolean;
-  transcript: Transcript | null;
-}) {
-  const state = resolveCaptionState({ captionsRequested, transcript });
-  const detail =
-    state === "disabled"
-      ? "Off for this run — every other edit still generates."
-      : state === "not_started"
-        ? "Waiting…"
-        : state === "processing"
-          ? "Transcribing — the rest of your edit doesn't wait for this."
-          : state === "complete"
-            ? "Captions ready."
-            : state === "blocked_by_quota"
-              ? (transcript?.error ?? "Caption limit reached — other edits continue.")
-              : state === "failed"
-                ? "Transcription failed — every other edit still generated."
-                : "Transcription unavailable — every other edit still generated.";
-  return (
-    <div className="mt-4 rounded-xl border border-white/[0.06] bg-white/[0.015] px-3.5 py-2.5">
-      <div className="flex items-center gap-2 text-[12px]">
-        {state === "processing" ? (
-          <Loader2 size={12} className="animate-spin text-sky-300" />
-        ) : (
-          <CaptionsIcon size={12} className="text-sky-300/80" />
-        )}
-        <span className="font-semibold text-white/90">Captions</span>
-        <span
-          className={cn(
-            "text-[11px] font-medium",
-            state === "complete"
-              ? "text-emerald-200/90"
-              : state === "failed"
-                ? "text-rose-200/90"
-                : state === "blocked_by_quota"
-                  ? "text-amber-200/90"
-                  : "text-fog"
-          )}
-        >
-          {CAPTION_STATE_LABEL[state]}
-        </span>
-      </div>
-      <p className="mt-1 text-[11px] leading-relaxed text-fog/75">{detail}</p>
     </div>
   );
 }

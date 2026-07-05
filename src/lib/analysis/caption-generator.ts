@@ -6,6 +6,7 @@
  * transcript's own timings. Manual captions are untouched (the caller dedups).
  */
 import type {
+  CaptionPosition,
   DetectedMoment,
   OverlayTextPreset,
   SelectedVideoType,
@@ -106,16 +107,20 @@ export interface CaptionGenResult {
 
 /**
  * Generate caption moments from a transcript. Returns `[]` unless the transcript
- * is `complete` with segments (no fake captions). Style follows the video type.
+ * is `complete` with segments (no fake captions). Style follows the video type
+ * unless the caller (the dedicated "Generate AI Captions" flow) supplies an
+ * explicit `stylePreset` / `position` the user chose.
  */
 export function generateCaptionMoments(
   transcript: Transcript | null | undefined,
-  videoType: SelectedVideoType
+  videoType: SelectedVideoType,
+  override?: { stylePreset?: OverlayTextPreset; position?: CaptionPosition }
 ): CaptionGenResult {
   if (!transcript || transcript.status !== "complete" || !(transcript.segments?.length)) {
     return { moments: [], truncated: false };
   }
-  const stylePreset = captionStyleForVideoType(videoType);
+  const stylePreset = override?.stylePreset ?? captionStyleForVideoType(videoType);
+  const position: CaptionPosition = override?.position ?? "bottom";
   // Metadata only: `lang` from the transcript, `direction` derived from the actual
   // caption TEXT via the shared resolver (§3 — direction comes from the script, not
   // the ASR language). Rendering itself re-derives font + direction from the text
@@ -154,7 +159,7 @@ export function generateCaptionMoments(
         captions: {
           text: line.text,
           stylePreset,
-          position: "bottom",
+          position,
           direction: textDirection(line.text),
           ...(lang ? { lang } : {}),
           ...(line.words && line.words.length
