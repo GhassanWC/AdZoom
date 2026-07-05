@@ -11,9 +11,10 @@ import vm from "node:vm";
 import { createCanvas, ImageData } from "@napi-rs/canvas";
 import { buildRenderRecipe } from "@/lib/render/recipe";
 import { composeFrame } from "@/lib/render/compose-frame";
+import { summarizeEditsForLog } from "@/lib/render/edit-counts";
 import { SUPPORTED_CHUNK_EFFECT_TYPES } from "@/lib/export/chunk-plan";
 import type { SerializedRenderRecipe } from "@/lib/firebase/schema";
-import type { TimelineMap } from "@/lib/timeline/crop-speed";
+import { sourceTimeForOutput } from "@/lib/timeline/crop-speed";
 import {
   probeSource,
   canDecodeAudio,
@@ -137,25 +138,29 @@ export interface RenderResult {
   fps: number;
 }
 
-/** Map an output time to the source time it samples, via the timeline map. */
-function sourceTimeForOutput(map: TimelineMap, outputTime: number): number {
-  const segs = map.segments;
-  for (const s of segs) {
-    if (outputTime >= s.outputStart && outputTime < s.outputEnd) {
-      const st = s.sourceStart + (outputTime - s.outputStart) * s.speedMultiplier;
-      return Math.min(s.sourceEnd, Math.max(s.sourceStart, st));
-    }
-  }
-  // Past the last segment (rounding at the tail) → clamp to its end.
-  const last = segs[segs.length - 1];
-  return last ? last.sourceEnd : outputTime;
-}
+// Output→source mapping: the CANONICAL shared evaluator (sourceTimeForOutput
+// from @/lib/timeline/crop-speed) — the same mapping seeks the decoder AND
+// times the overlay/caption pass, so cuts/speed can never desync them.
 
 export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
   const warnings: string[] = [];
   const recipe = buildRenderRecipe({ ...opts.serialized, debugBorders: false });
   const { canvasW, canvasH, sourceWidth, sourceHeight, fps, outputDuration, timelineMap } =
     recipe;
+
+  // Stage log #2 of the caption-integrity chain: what THIS render actually
+  // received. Must match the `[export-create] edit snapshot` numbers — a
+  // smaller captionCount here means the job doc → worker hop dropped edits.
+  const editCounts = summarizeEditsForLog(recipe.moments);
+  console.log("[export-render] edit snapshot", {
+    captionsEnabled: editCounts.captionsEnabled,
+    captionCount: editCounts.captionCount,
+    enabledCaptionCount: editCounts.enabledCaptionCount,
+    totalMoments: editCounts.total,
+    enabledMoments: editCounts.enabled,
+    byType: editCounts.byType,
+    renderCoreOverlays: true,
+  });
 
   const info = await probeSource(opts.sourcePath);
 

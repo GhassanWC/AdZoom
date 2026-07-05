@@ -1914,6 +1914,18 @@ export interface ExportJobDoc {
   monthlyBucket: string;
   /** Raw render inputs the worker feeds to `buildRenderRecipe`. */
   renderRecipe: SerializedRenderRecipe;
+  /**
+   * Immutable audit of the snapshot at creation (caption + per-type edit
+   * counts). Render-stage logs must report the SAME numbers — a mismatch
+   * names the stage that dropped edits.
+   */
+  editCounts?: {
+    total: number;
+    enabled: number;
+    captionCount: number;
+    enabledCaptionCount: number;
+    byType: Record<string, number>;
+  };
   // ── Multi-VM claim + heartbeat (atomic claim lets many VM workers share the
   //    queue safely; these record WHICH worker took the job + liveness). ──────
   /** Id of the VM worker that claimed the job (EXPORT_WORKER_ID or hostname). */

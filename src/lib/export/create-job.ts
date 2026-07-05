@@ -25,6 +25,7 @@ import {
   exceedsCloudExportDuration,
 } from "@/lib/usage/cloud-minutes";
 import { buildRenderRecipe } from "@/lib/render/recipe";
+import { summarizeEditsForLog } from "@/lib/render/edit-counts";
 import { enqueueExportJob } from "@/lib/export/enqueue";
 import {
   BatchCapacityError,
@@ -420,6 +421,22 @@ export async function createCloudExportJob(
     ...(input.visualAnalysis != null ? { visualAnalysis: input.visualAnalysis } : {}),
   };
 
+  // Stage log #1 of the caption-integrity chain: what the immutable snapshot
+  // contains. The SAME summary is logged again by the render worker and the
+  // Remotion renderer — if captionCount changes between stages, the stage
+  // that logged the smaller number is where edits are being dropped.
+  const editCounts = summarizeEditsForLog(serializedRecipe.moments);
+  console.log("[export-create] edit snapshot", {
+    uid,
+    projectId,
+    captionsEnabled: editCounts.captionsEnabled,
+    captionCount: editCounts.captionCount,
+    enabledCaptionCount: editCounts.enabledCaptionCount,
+    totalMoments: editCounts.total,
+    enabledMoments: editCounts.enabled,
+    byType: editCounts.byType,
+  });
+
   const monthKey = currentMonthKey();
   const usageRef = db.doc(`users/${uid}/usage/${monthKey}`);
   const userRef = db.doc(`users/${uid}`);
@@ -627,6 +644,15 @@ export async function createCloudExportJob(
           : {}),
         monthlyBucket: monthKey,
         renderRecipe: serializedRecipe,
+        // Immutable audit of what the snapshot contained at creation — lets
+        // anyone diff a job's render logs against what was enqueued.
+        editCounts: {
+          total: editCounts.total,
+          enabled: editCounts.enabled,
+          captionCount: editCounts.captionCount,
+          enabledCaptionCount: editCounts.enabledCaptionCount,
+          byType: editCounts.byType,
+        },
         createdAt: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
       });

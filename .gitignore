@@ -41,3 +41,9 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Service build artifacts — ALWAYS built fresh (a stale committed bundle once
+# shipped a pre-captions render core; see services/export-worker/dist incident).
+services/export-worker/dist/
+services/asr-worker/dist/
+services/remotion-renderer/dist/

@@ -332,3 +332,23 @@ export function outputDurationFor(
   if (sourceDuration <= 0) return Math.max(0, sourceDuration);
   return buildTimelineMap(moments, sourceDuration).outputDuration;
 }
+
+/**
+ * Map an OUTPUT time to the SOURCE time it samples — the CANONICAL evaluator
+ * of {@link buildTimelineMap}. Video frames AND overlays (captions, hook
+ * text, …) must share this one mapping so cuts/speed can never desync them:
+ * the export worker seeks its decoder with it and passes the SAME sourceTime
+ * to the overlay pass. Past the last segment (frame-rounding at the tail)
+ * clamps to the final segment's end.
+ */
+export function sourceTimeForOutput(map: TimelineMap, outputTime: number): number {
+  const segs = map.segments;
+  for (const s of segs) {
+    if (outputTime >= s.outputStart && outputTime < s.outputEnd) {
+      const st = s.sourceStart + (outputTime - s.outputStart) * s.speedMultiplier;
+      return Math.min(s.sourceEnd, Math.max(s.sourceStart, st));
+    }
+  }
+  const last = segs[segs.length - 1];
+  return last ? last.sourceEnd : outputTime;
+}

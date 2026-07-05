@@ -27,6 +27,7 @@ import {
   VIDEO_DECODE_FAILED_MESSAGE,
 } from "./errors.js";
 import type { ExportJobDoc } from "@/lib/firebase/schema";
+import { summarizeEditsForLog } from "@/lib/render/edit-counts";
 import type { FramevoAudioMode, FramevoCompositionProps } from "@/remotion/types";
 
 const WORKER_ID = process.env.EXPORT_WORKER_ID || hostname() || "remotion-renderer";
@@ -276,6 +277,22 @@ export async function processRemotionJob(uid: string, jobId: string): Promise<st
       src: source.renderUrl,
       audioMode,
     };
+
+    // Stage log #2 (Remotion path) of the caption-integrity chain: what THIS
+    // render received off the job doc. Must match `[export-create] edit
+    // snapshot`. The SAME inputProps object feeds selectComposition, the
+    // first-frame smoke test, and renderMedia below — one snapshot, one props.
+    const editCounts = summarizeEditsForLog(job.renderRecipe?.moments);
+    log("[remotion-render] edit snapshot", {
+      uid,
+      jobId,
+      captionsEnabled: editCounts.captionsEnabled,
+      captionCount: editCounts.captionCount,
+      enabledCaptionCount: editCounts.enabledCaptionCount,
+      totalMoments: editCounts.total,
+      enabledMoments: editCounts.enabled,
+      byType: editCounts.byType,
+    });
 
     // ── Bundle ──────────────────────────────────────────────────────────────
     await progressPatch({ stage: "decoding", progress: 0.04, progressStage: "rendering" });
