@@ -33,23 +33,31 @@ import type {
   TransitionSettings,
 } from "@/lib/firebase/schema";
 import { resolveTextStyle, type ResolvedTextStyle, type TextScript } from "./text-shaping";
+import {
+  fontFamilyStack,
+  rgba,
+  resolveTextStyleValues,
+  type TextStyleValues,
+} from "./text-style";
 
 /**
- * Set ctx.font (script-appropriate family) + ctx.direction (text-derived) via the
- * SHARED script-aware resolver. Every text draw (caption / hook / text-overlay /
- * callout / CTA) calls this, so font + direction logic lives in ONE place, used
- * identically by preview and every export path. The canvas text engine then
- * shapes + bidi-reorders under ctx.direction — we NEVER reverse strings manually.
+ * Set ctx.font (family = user family choice layered over the script-appropriate
+ * stack) + ctx.direction (text-derived) via the SHARED resolvers. Every text draw
+ * (caption / hook / text-overlay / callout / CTA) calls this, so font + direction
+ * logic lives in ONE place, used identically by preview and every export path.
+ * The canvas text engine shapes + bidi-reorders under ctx.direction — we NEVER
+ * reverse strings manually.
  */
-function applyTextStyle(
+function applyEditFont(
   ctx: CanvasRenderingContext2D,
   text: string,
-  opts: { weight: number; fontSize: number }
+  v: TextStyleValues,
+  fontSizePx: number
 ): ResolvedTextStyle {
-  const style = resolveTextStyle(text);
-  ctx.font = `${opts.weight} ${opts.fontSize}px ${style.fontFamily}`;
-  ctx.direction = style.direction;
-  return style;
+  const shaped = resolveTextStyle(text);
+  ctx.font = `${v.fontWeight} ${fontSizePx}px ${fontFamilyStack(v.fontFamily, shaped.fontFamily)}`;
+  ctx.direction = shaped.direction;
+  return shaped;
 }
 
 /** Only cased scripts support an uppercase transform (Arabic/CJK/Thai/etc. don't). */
@@ -234,27 +242,145 @@ export function drawOutputOverlays(
   }
 }
 
-interface TextBoxStyle {
-  fontWeight: number;
-  fontScale: number; // fraction of canvasH
-  color: string;
-  bg?: string;
-  shadow: boolean;
-  uppercase?: boolean;
+// ── Unified styled-text renderer ─────────────────────────────────────────────
+// ONE function draws a multi-line text block for EVERY text edit, consuming the
+// shared resolved `TextStyleValues`. Every axis (family, size, weight, colour,
+// opacity, alignment, background none/solid/box/pill, stroke, shadow, letter
+// spacing, line height, padding, radius, uppercase) is honoured identically in
+// preview + export because this is the single code path both call.
+
+interface StyledTextAnchor {
+  /** Alignment reference point on x (glyph placement follows `v.align`). */
+  x: number;
+  /** Anchor y; meaning set by `vAlign`. */
+  y: number;
+  /** How `y` positions the block: block centre / top edge / bottom edge. */
+  vAlign: "center" | "top" | "bottom";
+  maxWidth: number;
+  minFontPx: number;
 }
 
-const CAPTION_PRESETS: Record<CaptionSettings["stylePreset"], TextBoxStyle> = {
-  clean: { fontWeight: 600, fontScale: 0.05, color: "#fff", bg: "rgba(0,0,0,0.55)", shadow: true },
-  bold_social: { fontWeight: 800, fontScale: 0.062, color: "#fff", bg: "rgba(0,0,0,0.35)", shadow: true, uppercase: true },
-  minimal: { fontWeight: 600, fontScale: 0.045, color: "#fff", shadow: true },
-  podcast: { fontWeight: 700, fontScale: 0.052, color: "#fff", bg: "rgba(12,10,24,0.72)", shadow: false },
-  tutorial: { fontWeight: 600, fontScale: 0.046, color: "#fff", bg: "rgba(0,0,0,0.6)", shadow: false },
-};
+/**
+ * Draw `text` at `anchor` using the fully-resolved style `v`. Caller sets
+ * `ctx.globalAlpha` to the appearance envelope and any animation transform; this
+ * bakes each element's own opacity into its colour, so text/background/shadow
+ * opacities compose with the envelope without extra save/restores.
+ */
+function drawStyledText(
+  ctx: CanvasRenderingContext2D,
+  text: string,
+  v: TextStyleValues,
+  canvasH: number,
+  anchor: StyledTextAnchor
+): void {
+  const fontSizePx = Math.max(anchor.minFontPx, Math.round(canvasH * v.fontScale));
+  const shaped = applyEditFont(ctx, text, v, fontSizePx);
+  ctx.textBaseline = "middle";
+  ctx.textAlign = v.align;
+  // Letter spacing via the standard Canvas property (browser + @napi-rs/canvas +
+  // Remotion Chromium all honour it; default 0 = no-op, so parity is unaffected
+  // unless the user opts in). Guarded so an older engine can't throw.
+  const lsPx = v.letterSpacing * fontSizePx;
+  setLetterSpacing(ctx, lsPx);
+  const display = v.uppercase && isCasedScript(shaped.script) ? text.toUpperCase() : text;
+  const lines = wrapText(ctx, display, anchor.maxWidth);
+  if (!lines.length) {
+    setLetterSpacing(ctx, 0);
+    return;
+  }
+  const lineH = fontSizePx * v.lineHeight;
+  const blockH = lines.length * lineH;
+  const padX = v.paddingX * fontSizePx;
+  const padY = v.paddingY * fontSizePx;
 
-function anchorY(pos: "top" | "center" | "bottom" | "custom", canvasH: number): number {
-  if (pos === "top") return canvasH * 0.14;
-  if (pos === "center") return canvasH * 0.5;
-  return canvasH * 0.82; // bottom / custom
+  // First-line baseline (textBaseline = middle) from the anchor + vAlign.
+  const firstBaseline =
+    anchor.vAlign === "top"
+      ? anchor.y + lineH / 2
+      : anchor.vAlign === "bottom"
+        ? anchor.y - blockH + lineH / 2
+        : anchor.y - blockH / 2 + lineH / 2;
+
+  const widths = lines.map((l) => ctx.measureText(l).width);
+  const blockW = Math.max(...widths, 1);
+  const lineLeft = (w: number) =>
+    v.align === "center" ? anchor.x - w / 2 : v.align === "right" ? anchor.x - w : anchor.x;
+  const blockTop = firstBaseline - lineH / 2;
+
+  // Block-level plate (solid / box) behind the whole block.
+  if (v.background === "solid" || v.background === "box") {
+    ctx.fillStyle = rgba(v.backgroundColor, v.backgroundOpacity);
+    const r = v.background === "box" ? v.borderRadius * fontSizePx : 0;
+    roundRectPath(ctx, lineLeft(blockW) - padX, blockTop - padY, blockW + padX * 2, blockH + padY * 2, r);
+    ctx.fill();
+  }
+
+  const hasShadow = v.shadow && v.shadowOpacity > 0;
+  const strokePx = v.strokeWidth * fontSizePx;
+  let by = firstBaseline;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const w = widths[i];
+    // Per-line pill plate.
+    if (v.background === "pill") {
+      ctx.fillStyle = rgba(v.backgroundColor, v.backgroundOpacity);
+      const boxH = lineH;
+      roundRectPath(ctx, lineLeft(w) - padX, by - boxH / 2, w + padX * 2, boxH, boxH / 2);
+      ctx.fill();
+    }
+    if (hasShadow) {
+      ctx.shadowColor = rgba(v.shadowColor, v.shadowOpacity);
+      ctx.shadowBlur = v.shadowBlur * fontSizePx;
+      ctx.shadowOffsetX = v.shadowOffsetX * fontSizePx;
+      ctx.shadowOffsetY = v.shadowOffsetY * fontSizePx;
+    }
+    if (strokePx > 0) {
+      ctx.lineJoin = "round";
+      ctx.lineWidth = strokePx;
+      ctx.strokeStyle = rgba(v.strokeColor, 1);
+      ctx.strokeText(line, anchor.x, by);
+      // Clear so the fill sits cleanly on the outline without a doubled shadow.
+      clearShadow(ctx);
+    }
+    ctx.fillStyle = rgba(v.color, v.textOpacity);
+    ctx.fillText(line, anchor.x, by);
+    clearShadow(ctx);
+    by += lineH;
+  }
+  setLetterSpacing(ctx, 0);
+}
+
+function clearShadow(ctx: CanvasRenderingContext2D): void {
+  ctx.shadowColor = "transparent";
+  ctx.shadowBlur = 0;
+  ctx.shadowOffsetX = 0;
+  ctx.shadowOffsetY = 0;
+}
+
+/** Set the canvas letterSpacing property if the engine supports it. */
+function setLetterSpacing(ctx: CanvasRenderingContext2D, px: number): void {
+  try {
+    (ctx as unknown as { letterSpacing?: string }).letterSpacing = `${px}px`;
+  } catch {
+    /* engine without letterSpacing support — spacing stays default (0). */
+  }
+}
+
+/** Resolve the anchor (x, y) for a vertically-anchored text block. */
+function positionedAnchor(
+  v: TextStyleValues,
+  canvasW: number,
+  canvasH: number,
+  table: { topF: number; centerF: number; bottomF: number; marginXF: number }
+): { x: number; y: number; vAlign: "center" | "top" | "bottom" } {
+  if (v.position === "custom") {
+    return { x: clamp01(v.customX) * canvasW, y: clamp01(v.customY) * canvasH, vAlign: "center" };
+  }
+  const mx = table.marginXF * canvasW;
+  const x = v.align === "left" ? mx : v.align === "right" ? canvasW - mx : canvasW / 2;
+  if (v.position === "top") return { x, y: table.topF * canvasH, vAlign: "top" };
+  if (v.position === "center") return { x, y: table.centerF * canvasH, vAlign: "center" };
+  return { x, y: table.bottomF * canvasH, vAlign: "bottom" };
 }
 
 function drawCaption(
@@ -266,52 +392,24 @@ function drawCaption(
 ): void {
   const alpha = envelopeAlpha(t, m.startTime, m.endTime);
   if (alpha <= 0 || !s.text.trim()) return;
-  const style = CAPTION_PRESETS[s.stylePreset] ?? CAPTION_PRESETS.clean;
-  const fontSize = Math.max(14, Math.round(canvasH * style.fontScale));
+  const v = resolveTextStyleValues(m);
+  const a = positionedAnchor(v, canvasW, canvasH, {
+    topF: 0.14,
+    centerF: 0.5,
+    bottomF: v.position === "custom" ? 0 : 0.82,
+    marginXF: 0.09,
+  });
   ctx.save();
   ctx.globalAlpha = alpha;
-  // Shared resolver: script-appropriate font + text-derived direction (drives
-  // canvas bidi/shaping — no manual reversal). Same result in preview + export.
-  const textStyle = applyTextStyle(ctx, s.text, { weight: style.fontWeight, fontSize });
-  ctx.textBaseline = "middle";
-  ctx.textAlign = "center";
-  // Uppercase only for cased scripts (Arabic/CJK/Thai have no case).
-  const text = style.uppercase && isCasedScript(textStyle.script) ? s.text.toUpperCase() : s.text;
-  const maxWidth = canvasW * 0.82;
-  const lines = wrapText(ctx, text, maxWidth);
-  const lineH = fontSize * 1.25;
-  const blockH = lines.length * lineH;
-  let cy = anchorY(s.position, canvasH) - blockH / 2 + lineH / 2;
-  const cx = canvasW / 2;
-  for (const line of lines) {
-    const w = ctx.measureText(line).width;
-    if (style.bg) {
-      const padX = fontSize * 0.55;
-      const padY = fontSize * 0.28;
-      ctx.fillStyle = style.bg;
-      roundRectPath(ctx, cx - w / 2 - padX, cy - lineH / 2 + padY * 0.4, w + padX * 2, lineH - padY * 0.2, fontSize * 0.28);
-      ctx.fill();
-    }
-    if (style.shadow) {
-      ctx.shadowColor = "rgba(0,0,0,0.6)";
-      ctx.shadowBlur = fontSize * 0.28;
-      ctx.shadowOffsetY = fontSize * 0.05;
-    }
-    ctx.fillStyle = style.color;
-    ctx.fillText(line, cx, cy);
-    ctx.shadowColor = "transparent";
-    ctx.shadowBlur = 0;
-    cy += lineH;
-  }
+  drawStyledText(ctx, s.text, v, canvasH, {
+    x: a.x,
+    y: a.y,
+    vAlign: a.vAlign,
+    maxWidth: canvasW * 0.82,
+    minFontPx: 14,
+  });
   ctx.restore();
 }
-
-const HOOK_PRESETS: Record<HookTextSettings["stylePreset"], TextBoxStyle> = {
-  bold: { fontWeight: 900, fontScale: 0.085, color: "#fff", shadow: true, uppercase: true },
-  minimal: { fontWeight: 700, fontScale: 0.07, color: "#fff", shadow: true },
-  neon: { fontWeight: 900, fontScale: 0.085, color: "#c4b5fd", shadow: true, uppercase: true },
-  shadow: { fontWeight: 800, fontScale: 0.08, color: "#fff", bg: "rgba(0,0,0,0.4)", shadow: true },
-};
 
 function drawHookText(
   ctx: CanvasRenderingContext2D,
@@ -322,85 +420,32 @@ function drawHookText(
 ): void {
   const alpha = envelopeAlpha(t, m.startTime, m.endTime);
   if (alpha <= 0 || !s.text.trim()) return;
-  const style = HOOK_PRESETS[s.stylePreset] ?? HOOK_PRESETS.bold;
-  const fontSize = Math.max(18, Math.round(canvasH * style.fontScale));
+  const v = resolveTextStyleValues(m);
   const p = easeOut(inProgress(t, m.startTime, m.endTime));
+  const a = positionedAnchor(v, canvasW, canvasH, {
+    topF: 0.14,
+    centerF: 0.5,
+    bottomF: 0.82,
+    marginXF: 0.07,
+  });
   ctx.save();
   ctx.globalAlpha = alpha;
-  const textStyle = applyTextStyle(ctx, s.text, { weight: style.fontWeight, fontSize });
-  ctx.textBaseline = "middle";
-  ctx.textAlign = "center";
-  const text = style.uppercase && isCasedScript(textStyle.script) ? s.text.toUpperCase() : s.text;
-  const maxWidth = canvasW * 0.86;
-  const lines = wrapText(ctx, text, maxWidth);
-  const lineH = fontSize * 1.16;
-  const blockH = lines.length * lineH;
-  const baseY = anchorY(s.position, canvasH);
-  // Animation offset.
-  let dx = 0;
-  let dy = 0;
-  let scale = 1;
-  if (s.animation === "slide") dx = (1 - p) * canvasW * 0.08;
-  else if (s.animation === "pop") scale = 0.85 + 0.15 * p;
-  ctx.translate(canvasW / 2 + dx, baseY + dy);
-  // The text block is centred on THIS origin: `cy` runs symmetrically from
-  // -blockH/2+lineH/2 to +blockH/2-lineH/2 (centre = 0). So `scale` grows it in
-  // place around its own centre — no translate-scale-translate needed, and no
-  // vertical drift as the pop animates.
-  ctx.scale(scale, scale);
-  let cy = -blockH / 2 + lineH / 2;
-  for (const line of lines) {
-    if (style.bg) {
-      const w = ctx.measureText(line).width;
-      const padX = fontSize * 0.5;
-      ctx.fillStyle = style.bg;
-      roundRectPath(ctx, -w / 2 - padX, cy - lineH / 2 + lineH * 0.12, w + padX * 2, lineH * 0.82, fontSize * 0.25);
-      ctx.fill();
-    }
-    if (style.shadow) {
-      ctx.shadowColor = style.color === "#c4b5fd" ? "rgba(139,92,246,0.7)" : "rgba(0,0,0,0.65)";
-      ctx.shadowBlur = fontSize * 0.4;
-    }
-    ctx.fillStyle = style.color;
-    ctx.fillText(line, 0, cy);
-    ctx.shadowColor = "transparent";
-    ctx.shadowBlur = 0;
-    cy += lineH;
+  // Animation: slide shifts x; pop scales in place about the block centre.
+  if (s.animation === "slide") ctx.translate((1 - p) * canvasW * 0.08, 0);
+  else if (s.animation === "pop") {
+    const scale = 0.85 + 0.15 * p;
+    ctx.translate(a.x, a.y);
+    ctx.scale(scale, scale);
+    ctx.translate(-a.x, -a.y);
   }
+  drawStyledText(ctx, s.text, v, canvasH, {
+    x: a.x,
+    y: a.y,
+    vAlign: a.vAlign,
+    maxWidth: canvasW * 0.86,
+    minFontPx: 18,
+  });
   ctx.restore();
-}
-
-const OVERLAY_SIZE_SCALE: Record<TextOverlaySettings["size"], number> = {
-  small: 0.032,
-  medium: 0.045,
-  large: 0.06,
-};
-
-function textOverlayAnchor(
-  pos: TextOverlaySettings["position"],
-  canvasW: number,
-  canvasH: number
-): { x: number; y: number; align: CanvasTextAlign } {
-  const mx = canvasW * 0.06;
-  const my = canvasH * 0.08;
-  const left = mx;
-  const centerX = canvasW / 2;
-  const right = canvasW - mx;
-  const top = my;
-  const middle = canvasH / 2;
-  const bottom = canvasH - my;
-  switch (pos) {
-    case "top-left": return { x: left, y: top, align: "left" };
-    case "top-center": return { x: centerX, y: top, align: "center" };
-    case "top-right": return { x: right, y: top, align: "right" };
-    case "middle-left": return { x: left, y: middle, align: "left" };
-    case "center": return { x: centerX, y: middle, align: "center" };
-    case "middle-right": return { x: right, y: middle, align: "right" };
-    case "bottom-left": return { x: left, y: bottom, align: "left" };
-    case "bottom-center": return { x: centerX, y: bottom, align: "center" };
-    case "bottom-right": return { x: right, y: bottom, align: "right" };
-    default: return { x: centerX, y: bottom, align: "center" };
-  }
 }
 
 function drawTextOverlay(
@@ -412,62 +457,32 @@ function drawTextOverlay(
 ): void {
   const baseAlpha = envelopeAlpha(t, m.startTime, m.endTime, s.animation === "fade" ? 0.4 : 0.2);
   if (baseAlpha <= 0 || !s.text.trim()) return;
-  const fontSize = Math.max(12, Math.round(canvasH * (OVERLAY_SIZE_SCALE[s.size] ?? 0.045)));
-  const anchor = textOverlayAnchor(s.position, canvasW, canvasH);
+  const v = resolveTextStyleValues(m);
   const p = easeOut(inProgress(t, m.startTime, m.endTime));
+  const a = positionedAnchor(v, canvasW, canvasH, {
+    topF: 0.08,
+    centerF: 0.5,
+    bottomF: 0.92,
+    marginXF: 0.06,
+  });
   ctx.save();
   ctx.globalAlpha = baseAlpha;
-  applyTextStyle(ctx, s.text, { weight: 700, fontSize });
-  ctx.textBaseline = "top";
-  ctx.textAlign = anchor.align;
-  const maxWidth = canvasW * 0.6;
-  const lines = wrapText(ctx, s.text, maxWidth);
-  const lineH = fontSize * 1.28;
-  let dx = 0;
-  let scale = 1;
-  if (s.animation === "slide") dx = (1 - p) * canvasW * 0.05 * (anchor.align === "right" ? -1 : 1);
-  else if (s.animation === "pop") scale = 0.9 + 0.1 * p;
-  const blockW = Math.max(...lines.map((l) => ctx.measureText(l).width), 1);
-  const blockH = lines.length * lineH;
-  // Origin for background box.
-  const originX =
-    anchor.align === "center" ? anchor.x - blockW / 2 : anchor.align === "right" ? anchor.x - blockW : anchor.x;
-  ctx.translate(dx, 0);
-  if (scale !== 1) {
-    ctx.translate(anchor.x, anchor.y);
+  if (s.animation === "slide") ctx.translate((1 - p) * canvasW * 0.05 * (v.align === "right" ? -1 : 1), 0);
+  else if (s.animation === "pop") {
+    const scale = 0.9 + 0.1 * p;
+    ctx.translate(a.x, a.y);
     ctx.scale(scale, scale);
-    ctx.translate(-anchor.x, -anchor.y);
+    ctx.translate(-a.x, -a.y);
   }
-  const padX = fontSize * 0.5;
-  const padY = fontSize * 0.32;
-  if (s.backgroundStyle === "pill" || s.backgroundStyle === "box") {
-    ctx.fillStyle = "rgba(10,10,16,0.72)";
-    const r = s.backgroundStyle === "pill" ? blockH / 2 + padY : fontSize * 0.24;
-    roundRectPath(ctx, originX - padX, anchor.y - padY, blockW + padX * 2, blockH + padY * 2, r);
-    ctx.fill();
-  }
-  let y = anchor.y;
-  for (const line of lines) {
-    if (s.backgroundStyle === "shadow") {
-      ctx.shadowColor = "rgba(0,0,0,0.7)";
-      ctx.shadowBlur = fontSize * 0.35;
-      ctx.shadowOffsetY = fontSize * 0.06;
-    }
-    ctx.fillStyle = "#fff";
-    ctx.fillText(line, anchor.x, y);
-    ctx.shadowColor = "transparent";
-    ctx.shadowBlur = 0;
-    y += lineH;
-  }
+  drawStyledText(ctx, s.text, v, canvasH, {
+    x: a.x,
+    y: a.y,
+    vAlign: a.vAlign,
+    maxWidth: canvasW * 0.62,
+    minFontPx: 12,
+  });
   ctx.restore();
 }
-
-const BRANDING_ACCENT: Record<BrandingCtaSettings["stylePreset"], { bg: string; fg: string }> = {
-  minimal: { bg: "rgba(255,255,255,0.92)", fg: "#0a0a12" },
-  creator: { bg: "rgba(139,92,246,0.95)", fg: "#fff" },
-  business: { bg: "rgba(37,99,235,0.95)", fg: "#fff" },
-  social: { bg: "rgba(236,72,153,0.95)", fg: "#fff" },
-};
 
 function drawBrandingCta(
   ctx: CanvasRenderingContext2D,
@@ -478,31 +493,48 @@ function drawBrandingCta(
 ): void {
   const alpha = envelopeAlpha(t, m.startTime, m.endTime, 0.3);
   if (alpha <= 0 || !s.ctaText.trim()) return;
-  const accent = BRANDING_ACCENT[s.stylePreset] ?? BRANDING_ACCENT.creator;
-  const fontSize = Math.max(14, Math.round(canvasH * 0.036));
+  const v = resolveTextStyleValues(m);
+  const fontSize = Math.max(14, Math.round(canvasH * v.fontScale));
   ctx.save();
   ctx.globalAlpha = alpha;
-  applyTextStyle(ctx, s.ctaText, { weight: 800, fontSize });
+  const shaped = applyEditFont(ctx, s.ctaText, v, fontSize);
   ctx.textBaseline = "middle";
-  const textW = ctx.measureText(s.ctaText).width;
-  const padX = fontSize * 0.9;
-  const padY = fontSize * 0.55;
+  const lsPx = v.letterSpacing * fontSize;
+  setLetterSpacing(ctx, lsPx);
+  const label = v.uppercase && isCasedScript(shaped.script) ? s.ctaText.toUpperCase() : s.ctaText;
+  const textW = ctx.measureText(label).width;
+  const padX = v.paddingX * fontSize;
+  const padY = v.paddingY * fontSize;
   const boxW = textW + padX * 2;
   const boxH = fontSize + padY * 2;
   const margin = canvasH * 0.05;
   let x: number;
-  const y = canvasH - boxH - margin;
-  if (s.position === "bottom-left") x = margin;
+  let y = canvasH - boxH - margin;
+  if (s.position === "custom") {
+    x = clamp01(v.customX) * canvasW - boxW / 2;
+    y = clamp01(v.customY) * canvasH - boxH / 2;
+  } else if (s.position === "bottom-left") x = margin;
   else if (s.position === "bottom-center") x = canvasW / 2 - boxW / 2;
-  else x = canvasW - boxW - margin; // bottom-right / custom
+  else x = canvasW - boxW - margin; // bottom-right
   const p = easeOut(inProgress(t, m.startTime, m.endTime, 0.4));
   ctx.translate(0, (1 - p) * boxH * 0.4);
-  ctx.fillStyle = accent.bg;
-  roundRectPath(ctx, x, y, boxW, boxH, boxH / 2);
-  ctx.fill();
-  ctx.fillStyle = accent.fg;
+  if (v.background !== "none") {
+    ctx.fillStyle = rgba(v.backgroundColor, v.backgroundOpacity);
+    const r = v.background === "pill" ? boxH / 2 : v.background === "box" ? v.borderRadius * fontSize : 0;
+    roundRectPath(ctx, x, y, boxW, boxH, r);
+    ctx.fill();
+  }
+  if (v.shadow && v.shadowOpacity > 0) {
+    ctx.shadowColor = rgba(v.shadowColor, v.shadowOpacity);
+    ctx.shadowBlur = v.shadowBlur * fontSize;
+    ctx.shadowOffsetX = v.shadowOffsetX * fontSize;
+    ctx.shadowOffsetY = v.shadowOffsetY * fontSize;
+  }
+  ctx.fillStyle = rgba(v.color, v.textOpacity);
   ctx.textAlign = "center";
-  ctx.fillText(s.ctaText, x + boxW / 2, y + boxH / 2);
+  ctx.fillText(label, x + boxW / 2, y + boxH / 2);
+  clearShadow(ctx);
+  setLetterSpacing(ctx, 0);
   ctx.restore();
 }
 
@@ -671,25 +703,50 @@ function drawCallout(
     ctx.stroke();
   }
 
-  // Optional label pill above the region. Uses the shared resolver too, so an
-  // Arabic/Hebrew callout label gets the right font + RTL direction (previously
-  // this was the one text draw that never set ctx.direction).
+  // Optional label pill above the region — styled by the SHARED text model, so
+  // the callout label honours the same font / colour / weight / uppercase /
+  // stroke / shadow / letter-spacing controls as every other text edit (and an
+  // Arabic/Hebrew label gets the right font + RTL direction).
   if (s.text && s.text.trim()) {
-    applyTextStyle(ctx, s.text, { weight: 700, fontSize });
+    const v = resolveTextStyleValues(m);
+    const labelFont = Math.max(12, Math.round(drawH * v.fontScale));
+    const shaped = applyEditFont(ctx, s.text, v, labelFont);
     ctx.textBaseline = "middle";
     ctx.textAlign = "center";
-    const tw = ctx.measureText(s.text).width;
-    const padX = fontSize * 0.6;
-    const padY = fontSize * 0.4;
+    const lsPx = v.letterSpacing * labelFont;
+    setLetterSpacing(ctx, lsPx);
+    const label = v.uppercase && isCasedScript(shaped.script) ? s.text.toUpperCase() : s.text;
+    const tw = ctx.measureText(label).width;
+    const padX = v.paddingX * labelFont;
+    const padY = v.paddingY * labelFont;
     const boxW = tw + padX * 2;
-    const boxH = fontSize + padY * 2;
+    const boxH = labelFont + padY * 2;
     const lx = cx - boxW / 2;
-    const ly = y - boxH - fontSize * 0.5;
-    ctx.fillStyle = accent;
-    roundRectPath(ctx, lx, ly, boxW, boxH, boxH / 2);
-    ctx.fill();
-    ctx.fillStyle = "#fff";
-    ctx.fillText(s.text, cx, ly + boxH / 2);
+    const ly = y - boxH - labelFont * 0.5;
+    if (v.background !== "none") {
+      ctx.fillStyle = rgba(v.backgroundColor, v.backgroundOpacity);
+      const r = v.background === "box" ? v.borderRadius * labelFont : boxH / 2;
+      roundRectPath(ctx, lx, ly, boxW, boxH, r);
+      ctx.fill();
+    }
+    if (v.shadow && v.shadowOpacity > 0) {
+      ctx.shadowColor = rgba(v.shadowColor, v.shadowOpacity);
+      ctx.shadowBlur = v.shadowBlur * labelFont;
+      ctx.shadowOffsetX = v.shadowOffsetX * labelFont;
+      ctx.shadowOffsetY = v.shadowOffsetY * labelFont;
+    }
+    const strokePx = v.strokeWidth * labelFont;
+    if (strokePx > 0) {
+      ctx.lineJoin = "round";
+      ctx.lineWidth = strokePx;
+      ctx.strokeStyle = rgba(v.strokeColor, 1);
+      ctx.strokeText(label, cx, ly + boxH / 2);
+      clearShadow(ctx);
+    }
+    ctx.fillStyle = rgba(v.color, v.textOpacity);
+    ctx.fillText(label, cx, ly + boxH / 2);
+    clearShadow(ctx);
+    setLetterSpacing(ctx, 0);
   }
   ctx.restore();
 }

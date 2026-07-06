@@ -69,6 +69,10 @@ import type {
   BrandingPreset,
 } from "@/lib/firebase/schema";
 import { isOverlayEffectType, DEFAULT_BLUR_STRENGTH } from "@/lib/firebase/schema";
+import type { TextStyle } from "@/lib/firebase/schema";
+import { TextStyleControls } from "./TextStyleControls";
+import { resolveTextStyleValues } from "@/lib/render/text-style";
+import type { TextStyleValues } from "@/lib/render/text-style";
 
 /**
  * Moment inspector — premium creative-tool layout.
@@ -1248,61 +1252,14 @@ function CutControls({
 
 // ─── Phase-3 overlay controls ──────────────────────────────────────────────
 
-const CAPTION_STYLE_OPTS: { id: OverlayTextPreset; label: string }[] = [
-  { id: "clean", label: "Clean" },
-  { id: "bold_social", label: "Bold" },
-  { id: "minimal", label: "Minimal" },
-  { id: "podcast", label: "Podcast" },
-  { id: "tutorial", label: "Tutorial" },
-];
-const CAPTION_POS_OPTS: { id: CaptionPosition; label: string }[] = [
-  { id: "bottom", label: "Bottom" },
-  { id: "center", label: "Center" },
-  { id: "top", label: "Top" },
-];
-const HOOK_STYLE_OPTS: { id: HookTextPreset; label: string }[] = [
-  { id: "bold", label: "Bold" },
-  { id: "minimal", label: "Minimal" },
-  { id: "neon", label: "Neon" },
-  { id: "shadow", label: "Shadow" },
-];
-const HOOK_POS_OPTS: { id: HookPosition; label: string }[] = [
-  { id: "top", label: "Top" },
-  { id: "center", label: "Center" },
-  { id: "bottom", label: "Bottom" },
-];
+// Style presets, positions, sizes, alignment, and backgrounds for text edits
+// are now handled by the shared <TextStyleControls>; only the type-specific,
+// non-styling option arrays remain here (animation, callout shape, etc.).
 const ANIM_OPTS: { id: OverlayAnimation; label: string }[] = [
   { id: "none", label: "None" },
   { id: "fade", label: "Fade" },
   { id: "pop", label: "Pop" },
   { id: "slide", label: "Slide" },
-];
-const TEXT_POS_OPTS: { id: TextOverlayPosition; label: string }[] = [
-  { id: "top-left", label: "↖" },
-  { id: "top-center", label: "↑" },
-  { id: "top-right", label: "↗" },
-  { id: "middle-left", label: "←" },
-  { id: "center", label: "•" },
-  { id: "middle-right", label: "→" },
-  { id: "bottom-left", label: "↙" },
-  { id: "bottom-center", label: "↓" },
-  { id: "bottom-right", label: "↘" },
-];
-const SIZE_OPTS: { id: OverlaySize; label: string }[] = [
-  { id: "small", label: "S" },
-  { id: "medium", label: "M" },
-  { id: "large", label: "L" },
-];
-const ALIGN_OPTS: { id: TextAlignment; label: string }[] = [
-  { id: "left", label: "Left" },
-  { id: "center", label: "Center" },
-  { id: "right", label: "Right" },
-];
-const BG_OPTS: { id: TextBackgroundStyle; label: string }[] = [
-  { id: "none", label: "None" },
-  { id: "pill", label: "Pill" },
-  { id: "box", label: "Box" },
-  { id: "shadow", label: "Shadow" },
 ];
 const CALLOUT_STYLE_OPTS: { id: CalloutStyle; label: string }[] = [
   { id: "box", label: "Box" },
@@ -1341,12 +1298,6 @@ const CTA_POS_OPTS: { id: BrandingPosition; label: string }[] = [
   { id: "bottom-right", label: "Right" },
   { id: "bottom-center", label: "Center" },
   { id: "bottom-left", label: "Left" },
-];
-const CTA_STYLE_OPTS: { id: BrandingPreset; label: string }[] = [
-  { id: "minimal", label: "Minimal" },
-  { id: "creator", label: "Creator" },
-  { id: "business", label: "Business" },
-  { id: "social", label: "Social" },
 ];
 
 function TextField({
@@ -1414,6 +1365,13 @@ function OverlayControls({
     </span>
   );
 
+  // Shared text-styling wiring — used by every text-based overlay. The controls
+  // read the fully-resolved values (defaults ← legacy preset ← textStyle) and
+  // write PARTIAL patches so a moment stores only what the user changed.
+  const styleValues = resolveTextStyleValues(moment);
+  const onStyle = (patch: Partial<TextStyle>) =>
+    onUpdate({ textStyle: { ...(moment.textStyle ?? {}), ...patch } });
+
   if (moment.effectType === "captions") {
     const c = moment.captions ?? { text: "", stylePreset: "clean" as OverlayTextPreset, position: "bottom" as CaptionPosition };
     const set = (patch: Partial<typeof c>) => onUpdate({ captions: { ...c, ...patch } });
@@ -1421,8 +1379,8 @@ function OverlayControls({
       <section className={shell}>
         {heading}
         <TextField label="Caption text" value={c.text} multiline placeholder="Caption line…" onChange={(text) => set({ text })} />
-        <Segmented label="Style" value={c.stylePreset} options={CAPTION_STYLE_OPTS} onChange={(stylePreset) => set({ stylePreset })} />
-        <Segmented label="Position" value={c.position} options={CAPTION_POS_OPTS} onChange={(position) => set({ position })} />
+        <TextStyleControls style={styleValues} onChange={onStyle} />
+        <ApplyToAllCaptions style={styleValues} />
         {!(c.words && c.words.length) && (
           <p className="text-[10.5px] leading-relaxed text-fog/70">
             No transcript is available, so captions aren&apos;t auto-generated. Type a line here — it renders in the preview + export.
@@ -1439,9 +1397,8 @@ function OverlayControls({
       <section className={shell}>
         {heading}
         <TextField label="Hook text" value={h.text} placeholder="Watch this…" onChange={(text) => set({ text })} />
-        <Segmented label="Style" value={h.stylePreset} options={HOOK_STYLE_OPTS} onChange={(stylePreset) => set({ stylePreset })} />
-        <Segmented label="Position" value={h.position} options={HOOK_POS_OPTS} onChange={(position) => set({ position })} />
         <Segmented label="Animation" value={h.animation} options={ANIM_OPTS} onChange={(animation) => set({ animation })} />
+        <TextStyleControls style={styleValues} onChange={onStyle} />
       </section>
     );
   }
@@ -1460,11 +1417,8 @@ function OverlayControls({
       <section className={shell}>
         {heading}
         <TextField label="Text" value={tOv.text} multiline placeholder="Overlay text…" onChange={(text) => set({ text })} />
-        <Segmented label="Position" value={tOv.position === "custom" ? "center" : tOv.position} options={TEXT_POS_OPTS} onChange={(position) => set({ position })} />
-        <Segmented label="Size" value={tOv.size} options={SIZE_OPTS} onChange={(size) => set({ size })} />
-        <Segmented label="Align" value={tOv.alignment} options={ALIGN_OPTS} onChange={(alignment) => set({ alignment })} />
-        <Segmented label="Background" value={tOv.backgroundStyle} options={BG_OPTS} onChange={(backgroundStyle) => set({ backgroundStyle })} />
         <Segmented label="Animation" value={tOv.animation} options={ANIM_OPTS} onChange={(animation) => set({ animation })} />
+        <TextStyleControls style={styleValues} onChange={onStyle} />
       </section>
     );
   }
@@ -1478,6 +1432,7 @@ function OverlayControls({
         <TextField label="Label" value={co.text} placeholder="Click here" onChange={(text) => set({ text })} />
         <Segmented label="Style" value={co.style} options={CALLOUT_STYLE_OPTS} onChange={(style) => set({ style })} />
         <p className="text-[10.5px] leading-relaxed text-fog/70">Points at the region below — drag it to aim the callout.</p>
+        {co.text.trim() !== "" && <TextStyleControls style={styleValues} onChange={onStyle} showPosition={false} />}
       </section>
     );
   }
@@ -1515,7 +1470,7 @@ function OverlayControls({
         {heading}
         <TextField label="CTA text" value={cta.ctaText} placeholder="Follow for more" onChange={(ctaText) => set({ ctaText })} />
         <Segmented label="Position" value={cta.position === "custom" ? "bottom-right" : cta.position} options={CTA_POS_OPTS} onChange={(position) => set({ position })} />
-        <Segmented label="Style" value={cta.stylePreset} options={CTA_STYLE_OPTS} onChange={(stylePreset) => set({ stylePreset })} />
+        <TextStyleControls style={styleValues} onChange={onStyle} showPosition={false} />
       </section>
     );
   }
@@ -1536,6 +1491,56 @@ function OverlayControls({
   }
 
   return null;
+}
+
+/**
+ * "Apply style to all captions" — pushes the selected caption's resolved style
+ * onto every caption moment in one undoable step, so a user styles once and the
+ * whole track matches. Shows a brief inline confirmation.
+ */
+function ApplyToAllCaptions({ style }: { style: TextStyleValues }) {
+  const { applyTextStyleToType } = useEditorReal();
+  const [applied, setApplied] = React.useState(false);
+  const [busy, setBusy] = React.useState(false);
+
+  const run = async () => {
+    setBusy(true);
+    try {
+      await applyTextStyleToType("captions", style);
+      setApplied(true);
+      window.setTimeout(() => setApplied(false), 2200);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <button
+      type="button"
+      onClick={run}
+      disabled={busy}
+      className={cn(
+        "inline-flex w-full items-center justify-center gap-1.5 rounded-lg border px-3 py-1.5 text-[11.5px] font-medium transition-colors duration-150 disabled:opacity-50",
+        applied
+          ? "border-emerald-400/40 bg-emerald-500/15 text-emerald-100"
+          : "border-white/[0.1] bg-white/[0.02] text-fog hover:border-white/25 hover:text-white"
+      )}
+    >
+      {applied ? (
+        <>
+          <BadgeCheck size={12} />
+          Applied to all captions
+        </>
+      ) : busy ? (
+        "Applying…"
+      ) : (
+        <>
+          <CaptionsIcon size={12} />
+          Apply this style to all captions
+        </>
+      )}
+    </button>
+  );
 }
 
 function EmptyInspector({

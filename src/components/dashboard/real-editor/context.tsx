@@ -21,6 +21,7 @@ import type {
   Preset,
   ProjectDoc,
   SelectedVideoType,
+  TextStyle,
 } from "@/lib/firebase/schema";
 import {
   normalizeSelectedVideoType,
@@ -210,6 +211,12 @@ interface EditorRealContextValue {
   setCaptionsEnabled: (enabled: boolean) => Promise<void>;
   /** Non-destructively enable/disable EVERY moment of these effect types (lane-level). */
   setLaneEnabled: (effectTypes: EffectType[], enabled: boolean) => Promise<void>;
+  /**
+   * Set the shared `textStyle` on EVERY moment of `effectType` at once (e.g.
+   * "apply this caption's style to all captions in the track"). Replaces each
+   * moment's textStyle with `style` so the whole lane renders identically.
+   */
+  applyTextStyleToType: (effectType: EffectType, style: TextStyle) => Promise<void>;
   /** Delete every moment of these effect types (lane-level "clear"). */
   deleteLane: (effectTypes: EffectType[]) => Promise<void>;
   /** Duplicate a moment just after itself, as a fresh user-owned edit. */
@@ -628,40 +635,68 @@ export function EditorRealProvider({
   // `undefined` anywhere in the doc) — centralising it here removes the
   // earlier inconsistency where only some mutators scrubbed.
   const writeMoments = React.useCallback(
-    async (next: DetectedMoment[]) => {
+    async (next: DetectedMoment[], coalesce = false) => {
       // Serialize through the per-project write queue so a user edit can't
       // collide with a chunk append / finalize write ("Another write batch or
       // compaction is already active").
-      await enqueueProjectWrite(project.id, "user-moments-write", () =>
-        setDoc(
-          projectRef,
-          {
-            analysis: stripUndefined({
-              ...(project.analysis ?? {}),
-              detectedMoments: next,
-            }),
-            updatedAt: serverTimestamp(),
-          },
-          { merge: true }
-        )
+      //
+      // `coalesce` (used by high-frequency edits like slider / colour drags)
+      // tags the write so that while one sits un-started in the queue, a newer
+      // one supersedes it and the older is skipped. This is SAFE here because
+      // every write persists the FULL `detectedMoments` array (a complete
+      // snapshot, never a partial merge), so the latest snapshot subsumes the
+      // ones it replaces. Without this, a fast drag enqueues dozens of setDocs
+      // and Firestore throws "Write stream exhausted maximum allowed queued
+      // writes"; the local cache still updates on each write that DOES run, so
+      // the preview stays live.
+      await enqueueProjectWrite(
+        project.id,
+        "user-moments-write",
+        () =>
+          setDoc(
+            projectRef,
+            {
+              analysis: stripUndefined({
+                ...(project.analysis ?? {}),
+                detectedMoments: next,
+              }),
+              updatedAt: serverTimestamp(),
+            },
+            { merge: true }
+          ),
+        coalesce ? { coalesceTag: "user-moments-write" } : undefined
       );
     },
     [project.analysis, project.id, projectRef]
   );
 
+  // Group rapid successive edits (a single slider/colour drag) into ONE undo
+  // step, so a drag doesn't evict 50 real edits from the bounded history.
+  const lastLiveCommitAtRef = React.useRef(0);
+  const GESTURE_COALESCE_MS = 600;
+
   const commitMoments = React.useCallback(
-    async (next: DetectedMoment[]) => {
-      undoStackRef.current.push(momentsRef.current);
-      if (undoStackRef.current.length > HISTORY_LIMIT) {
-        undoStackRef.current.shift();
+    async (next: DetectedMoment[], opts?: { coalesce?: boolean }) => {
+      const now = Date.now();
+      // Only skip the undo snapshot when this commit continues an in-progress
+      // gesture (coalesced edits arriving within the window); a single undo
+      // then reverts the whole drag to its pre-gesture state.
+      const continuesGesture =
+        opts?.coalesce === true && now - lastLiveCommitAtRef.current < GESTURE_COALESCE_MS;
+      if (!continuesGesture) {
+        undoStackRef.current.push(momentsRef.current);
+        if (undoStackRef.current.length > HISTORY_LIMIT) {
+          undoStackRef.current.shift();
+        }
+        redoStackRef.current = [];
+        setCanUndo(true);
+        setCanRedo(false);
       }
-      redoStackRef.current = [];
-      setCanUndo(true);
-      setCanRedo(false);
+      if (opts?.coalesce) lastLiveCommitAtRef.current = now;
       // Optimistic ref update so two rapid edits chain off each other's
       // result instead of both reading the same (now stale) snapshot.
       momentsRef.current = next;
-      await writeMoments(next);
+      await writeMoments(next, opts?.coalesce);
     },
     [writeMoments]
   );
@@ -705,7 +740,11 @@ export function EditorRealProvider({
       const next = momentsRef.current.map((m) =>
         m.id === id ? ({ ...m, ...patch, edited: true } as DetectedMoment) : m
       );
-      await commitMoments(next);
+      // Coalesce: inspector sliders / colour pickers / numeric fields fire this
+      // continuously during a drag. Latest-wins write coalescing + gesture-level
+      // undo grouping keep a drag from flooding Firestore's write stream while
+      // the preview stays live off each write that runs.
+      await commitMoments(next, { coalesce: true });
     },
     [commitMoments]
   );
@@ -748,6 +787,23 @@ export function EditorRealProvider({
           if ((m.enabled !== false) === enabled) return m; // already in state
           changed = true;
           return { ...m, enabled };
+        });
+        if (changed) await commitMoments(next);
+      },
+      [commitMoments]
+    );
+
+  // Apply one text style to every moment of a type in ONE undoable step. Used by
+  // the caption inspector's "Apply to all captions" action. `edited: true` marks
+  // them as user-tuned so the balancer/regeneration won't silently overwrite.
+  const applyTextStyleToType: EditorRealContextValue["applyTextStyleToType"] =
+    React.useCallback(
+      async (effectType, style) => {
+        let changed = false;
+        const next = momentsRef.current.map((m) => {
+          if (m.effectType !== effectType) return m;
+          changed = true;
+          return { ...m, textStyle: { ...style }, edited: true } as DetectedMoment;
         });
         if (changed) await commitMoments(next);
       },
@@ -1798,6 +1854,7 @@ export function EditorRealProvider({
     addMoment,
     setCaptionsEnabled,
     setLaneEnabled,
+    applyTextStyleToType,
     deleteLane,
     duplicateMoment,
     addMomentAtPlayhead,

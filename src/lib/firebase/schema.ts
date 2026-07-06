@@ -183,6 +183,86 @@ export type SmartCropFocus = "center" | "face" | "motion" | "screen_action" | "m
 export type BrandingPosition = "bottom-left" | "bottom-right" | "bottom-center" | "custom";
 export type BrandingPreset = "minimal" | "creator" | "business" | "social";
 
+// ── Shared text styling (one model for EVERY text-based edit) ──────────────
+// captions / hook-text / text-overlay / callout / branding-cta all carry an
+// optional `textStyle` on the moment. It is the SINGLE source of truth for
+// typography, colour, background, stroke, shadow, spacing, and position — used
+// identically by the editor preview and every export path (see
+// src/lib/render/text-style.ts + overlay-draw.ts). All fields are OPTIONAL: a
+// doc stores only what the user changed, and the resolver layers
+// defaults ← legacy-preset mapping ← textStyle so old docs decode unchanged.
+
+/** Curated font families (each resolves consistently in browser + server canvas).
+ *  "auto" = the script-aware default (current behavior). */
+export type TextFontFamily = "auto" | "sans" | "serif" | "mono";
+/** none = no plate; solid = square block; box = rounded block; pill = rounded per-line. */
+export type TextBgMode = "none" | "solid" | "box" | "pill";
+/** Vertical anchor; "custom" uses customX/customY for free X/Y placement. */
+export type TextVPosition = "top" | "center" | "bottom" | "custom";
+/** Starting-point presets — they ONLY populate styling values; all stay editable. */
+export type TextStylePreset = "clean" | "bold" | "minimal" | "neon" | "shadow";
+
+/**
+ * Stored, shared text style. All fields optional — a moment carries only what
+ * the user changed; unset fields fall back to defaults / legacy presets at draw
+ * time. Sizes are RESOLUTION-INDEPENDENT fractions (fontScale = fraction of
+ * canvas height; padding/stroke/shadow/letterSpacing = fractions of font size;
+ * customX/customY = 0..1 of canvas width/height).
+ */
+export interface TextStyle {
+  /** Which preset last seeded these values (UI hint only; values stay editable). */
+  preset?: TextStylePreset;
+  fontFamily?: TextFontFamily;
+  /** Em size as a fraction of canvas height (e.g. 0.05 = 5% of height). */
+  fontScale?: number;
+  /** 400 regular · 500 medium · 600 semibold · 700 bold (heavier allowed). */
+  fontWeight?: number;
+  /** Hex `#rrggbb`. */
+  color?: string;
+  /** 0..1 text opacity (multiplies the appearance envelope). */
+  textOpacity?: number;
+  align?: TextAlignment;
+  uppercase?: boolean;
+  /** Letter spacing as a fraction of font size (em-like). 0 = normal. */
+  letterSpacing?: number;
+  /** Line height multiplier. */
+  lineHeight?: number;
+  background?: TextBgMode;
+  /** Hex `#rrggbb`. */
+  backgroundColor?: string;
+  /** 0..1. */
+  backgroundOpacity?: number;
+  /** Horizontal plate padding as a fraction of font size. */
+  paddingX?: number;
+  /** Vertical plate padding as a fraction of font size. */
+  paddingY?: number;
+  /** Corner radius as a fraction of font size (box mode). */
+  borderRadius?: number;
+  /** Hex `#rrggbb`. */
+  strokeColor?: string;
+  /** Outline width as a fraction of font size. 0 = no outline. */
+  strokeWidth?: number;
+  shadow?: boolean;
+  /** Hex `#rrggbb`. */
+  shadowColor?: string;
+  /** Blur radius as a fraction of font size. */
+  shadowBlur?: number;
+  /** 0..1. */
+  shadowOpacity?: number;
+  /** Offset X as a fraction of font size. */
+  shadowOffsetX?: number;
+  /** Offset Y as a fraction of font size. */
+  shadowOffsetY?: number;
+  position?: TextVPosition;
+  /** 0..1 fraction of canvas width — used when position === "custom". */
+  customX?: number;
+  /** 0..1 fraction of canvas height — used when position === "custom". */
+  customY?: number;
+}
+
+/** Alias for the shared text alignment type (kept for the TextStyle model). */
+export type TextAlign = TextAlignment;
+
 /** One word of a caption line, with SOURCE-time bounds (seconds). */
 export interface CaptionWord {
   text: string;
@@ -509,6 +589,13 @@ export interface DetectedMoment {
   transition?: TransitionSettings;
   /** Present when `effectType === "branding-cta"`. */
   brandingCta?: BrandingCtaSettings;
+  /**
+   * Shared text styling for text-based edits (captions / hook-text /
+   * text-overlay / callout / branding-cta). Optional + additive: absent on all
+   * older docs, which resolve to legacy-preset defaults at draw time. Holds only
+   * the fields the user changed. See src/lib/render/text-style.ts.
+   */
+  textStyle?: TextStyle;
 
   // ── Attention-aware fields (Gemini-supplied, post-processed by balancer) ──
   /** Composite priority (0..1) — replaces importance going forward. */
