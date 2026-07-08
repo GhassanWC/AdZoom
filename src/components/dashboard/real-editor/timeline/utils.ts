@@ -48,3 +48,52 @@ export function writePersistedBool(key: string, value: boolean): void {
     /* ignore */
   }
 }
+
+/** Hydrate a localStorage-backed number once on mount (SSR-safe). */
+export function readPersistedNumber(key: string, fallback: number): number {
+  if (typeof window === "undefined") return fallback;
+  try {
+    const v = window.localStorage.getItem(key);
+    if (v !== null) {
+      const n = Number(v);
+      if (Number.isFinite(n)) return n;
+    }
+  } catch {
+    /* private mode etc. — fall through */
+  }
+  return fallback;
+}
+
+export function writePersistedNumber(key: string, value: number): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(key, String(value));
+  } catch {
+    /* ignore */
+  }
+}
+
+/** Hydrate a localStorage-backed string (from an allowed set) once on mount. */
+export function readPersistedString<T extends string>(
+  key: string,
+  allowed: readonly T[],
+  fallback: T
+): T {
+  if (typeof window === "undefined") return fallback;
+  try {
+    const v = window.localStorage.getItem(key);
+    if (v !== null && (allowed as readonly string[]).includes(v)) return v as T;
+  } catch {
+    /* fall through */
+  }
+  return fallback;
+}
+
+export function writePersistedString(key: string, value: string): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(key, value);
+  } catch {
+    /* ignore */
+  }
+}

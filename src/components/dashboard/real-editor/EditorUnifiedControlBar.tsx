@@ -1,0 +1,696 @@
+"use client";
+
+import * as React from "react";
+import {
+  ZoomIn,
+  ZoomOut,
+  Maximize2,
+  Undo2,
+  Redo2,
+  BarChart2,
+  Plus,
+  Scissors,
+  Copy,
+  Trash2,
+  Check,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  MoreHorizontal,
+  Zap,
+  MousePointer2,
+  Target,
+  FastForward,
+  Type,
+  Sparkles,
+  Megaphone,
+  EyeOff,
+  BadgeCheck,
+  Captions,
+  Shuffle,
+  Film,
+  PanelTop,
+  PanelBottom,
+  SquareSplitVertical,
+  type LucideIcon,
+} from "lucide-react";
+import { cn } from "@/lib/cn";
+import type { EffectType } from "@/lib/firebase/schema";
+import { useEditorReal } from "./context";
+import { useMomentReview } from "./useMomentReview";
+import { PlaybackTransport, PlaybackVolumeFullscreen } from "./PlaybackControls";
+import { MODE_FRACTION, modeForSplitFraction, type WorkspaceMode } from "./workspace-split";
+
+/** Aggregated single-signal health used by the dot. */
+export type TimelineHealth = "balanced" | "clustered" | "quiet" | "empty";
+
+/**
+ * ONE maximally-compact bar (48px) above the timeline lanes. Every secondary
+ * concern lives behind a dropdown so the bar reads as three groups, not a wall
+ * of buttons — a three-column grid keeps the Play button perfectly centered no
+ * matter how much content sits on either side.
+ *
+ *   Left:   title · health · Add (primary, stays visible) · Edit ▾ (Split/
+ *           Duplicate/Delete/Undo/Redo)
+ *   Center: PlaybackTransport (jump/back5/Play/forward5/time) — shared with
+ *           the fullscreen overlay pill, one playback implementation.
+ *   Right:  View ▾ (workspace mode/Scenes/Insights) · volume · fullscreen ·
+ *           ⋯ overflow (zoom, fit, edit review-nav, shortcuts)
+ *
+ * The optional scene/chapter strip itself renders as a sibling BELOW this bar
+ * (in RealTimeline) only while `scenesOpen` — the View menu just owns the toggle.
+ */
+export function EditorUnifiedControlBar({
+  health,
+  zoom,
+  minZoom,
+  maxZoom,
+  onZoomIn,
+  onZoomOut,
+  onFit,
+  insightsOpen,
+  onToggleInsights,
+  hasScenes,
+  canUndo,
+  canRedo,
+  onUndo,
+  onRedo,
+  hasSelection,
+  onAdd,
+  onDuplicate,
+  onDelete,
+}: {
+  health: TimelineHealth;
+  zoom: number;
+  minZoom: number;
+  maxZoom: number;
+  onZoomIn: () => void;
+  onZoomOut: () => void;
+  onFit: () => void;
+  insightsOpen: boolean;
+  onToggleInsights: () => void;
+  hasScenes: boolean;
+  canUndo: boolean;
+  canRedo: boolean;
+  onUndo: () => void;
+  onRedo: () => void;
+  hasSelection: boolean;
+  onAdd: (effectType: EffectType) => void;
+  onDuplicate: () => void;
+  onDelete: () => void;
+}) {
+  const { splitFraction, setSplitFraction, scenesOpen, toggleScenes } = useEditorReal();
+  // Edit-review navigation (prev / count / next) — lives in the overflow menu
+  // now; still timeline navigation, not an editor tool.
+  const review = useMomentReview();
+  const activeMode = modeForSplitFraction(splitFraction);
+
+  return (
+    <div
+      // Hold region: pressing any control here must NOT dismiss the floating
+      // moment inspector.
+      data-editor-dialog-hold
+      className="grid h-12 w-full shrink-0 grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-1.5 border-b border-white/[0.06] bg-surface px-2.5 sm:px-3"
+    >
+      {/* ── Left — identity + Add + Edit ─────────────────────────────────── */}
+      {/* No overflow-x-auto here: `overflow-x: auto` with no explicit overflow-y
+          makes browsers force overflow-y to `auto` too, which would clip the
+          absolutely-positioned dropdown panels (Add/Edit) below this row. Now
+          that almost everything lives behind dropdowns, wrapping risk is low
+          enough that plain `flex` (nowrap) + hidden labels at narrow widths is
+          sufficient. */}
+      <div className="flex min-w-0 items-center gap-1.5">
+        <div className="flex shrink-0 items-center gap-2 pr-0.5">
+          <h3 className="hidden font-display text-[13px] font-semibold tracking-tight text-white sm:inline">
+            Timeline
+          </h3>
+          <HealthDot health={health} />
+        </div>
+
+        <Divider />
+
+        <div className="flex shrink-0 items-center gap-1">
+          <AddMenu onAdd={onAdd} />
+          <EditMenu
+            canUndo={canUndo}
+            canRedo={canRedo}
+            onUndo={onUndo}
+            onRedo={onRedo}
+            hasSelection={hasSelection}
+            onDuplicate={onDuplicate}
+            onDelete={onDelete}
+          />
+        </div>
+      </div>
+
+      {/* ── Center — the transport group stays dead-centered ────────────── */}
+      <div className="flex items-center justify-center gap-1 justify-self-center sm:gap-1.5">
+        <PlaybackTransport />
+      </div>
+
+      {/* ── Right — View ▾ · volume/fullscreen · ⋯ overflow ──────────────── */}
+      {/* Same reasoning as the left group: no overflow-x-auto, so the
+          View/Overflow dropdown panels never get vertically clipped. */}
+      <div className="flex min-w-0 items-center justify-end gap-1">
+        <ViewMenu
+          activeMode={activeMode}
+          setSplitFraction={setSplitFraction}
+          hasScenes={hasScenes}
+          scenesOpen={scenesOpen}
+          toggleScenes={toggleScenes}
+          insightsOpen={insightsOpen}
+          onToggleInsights={onToggleInsights}
+        />
+
+        <div className="flex shrink-0 items-center gap-0.5">
+          <PlaybackVolumeFullscreen />
+        </div>
+
+        <OverflowMenu
+          zoom={zoom}
+          minZoom={minZoom}
+          maxZoom={maxZoom}
+          onZoomIn={onZoomIn}
+          onZoomOut={onZoomOut}
+          onFit={onFit}
+          review={review}
+        />
+      </div>
+    </div>
+  );
+}
+
+// ── Shared dropdown primitives ────────────────────────────────────────────
+
+/** Open state + outside-click-to-close, shared by every dropdown in this bar. */
+function useDropdown() {
+  const [open, setOpen] = React.useState(false);
+  const ref = React.useRef<HTMLDivElement | null>(null);
+  React.useEffect(() => {
+    if (!open) return;
+    const onClick = (e: MouseEvent) => {
+      if (!ref.current || ref.current.contains(e.target as Node)) return;
+      setOpen(false);
+    };
+    document.addEventListener("mousedown", onClick);
+    return () => document.removeEventListener("mousedown", onClick);
+  }, [open]);
+  return { open, setOpen, ref };
+}
+
+function MenuPanel({
+  align = "left",
+  width = "w-56",
+  children,
+}: {
+  align?: "left" | "right";
+  width?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div
+      className={cn(
+        "absolute top-11 z-40 max-h-[70vh] overflow-y-auto rounded-xl border border-white/10 bg-ink/95 p-1.5 shadow-cinematic backdrop-blur-xl",
+        width,
+        align === "left" ? "left-0" : "right-0"
+      )}
+    >
+      {children}
+    </div>
+  );
+}
+
+function MenuLabel({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="px-2.5 pb-1 pt-1.5 text-[9.5px] font-semibold uppercase tracking-[0.14em] text-fog/70">
+      {children}
+    </div>
+  );
+}
+
+function MenuDivider() {
+  return <div role="separator" className="my-1 border-t border-white/[0.07]" />;
+}
+
+function MenuItem({
+  Icon,
+  label,
+  shortcut,
+  tip,
+  active,
+  disabled,
+  danger,
+  onClick,
+}: {
+  Icon?: LucideIcon;
+  label: string;
+  shortcut?: string;
+  tip?: string;
+  active?: boolean;
+  disabled?: boolean;
+  danger?: boolean;
+  onClick?: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      title={tip}
+      className={cn(
+        "flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[12.5px] font-medium transition-colors duration-150",
+        disabled
+          ? "cursor-not-allowed text-fog/40"
+          : cn(
+              "text-white/90 hover:bg-white/[0.06]",
+              danger && "hover:bg-rose-500/10 hover:text-rose-200"
+            )
+      )}
+    >
+      {Icon && (
+        <Icon
+          size={14}
+          className={cn("shrink-0", active ? "text-violet-300" : disabled ? "text-fog/40" : "text-fog")}
+        />
+      )}
+      <span className="min-w-0 flex-1 truncate">{label}</span>
+      {active && <Check size={13} className="shrink-0 text-violet-300" />}
+      {shortcut && !active && (
+        <span className="shrink-0 font-mono text-[10.5px] text-fog/60">{shortcut}</span>
+      )}
+    </button>
+  );
+}
+
+function Divider() {
+  return <span aria-hidden className="hidden h-6 w-px shrink-0 bg-white/[0.08] sm:block" />;
+}
+
+// ── Edit dropdown — Split / Duplicate / Delete / Undo / Redo ───────────────
+
+function EditMenu({
+  canUndo,
+  canRedo,
+  onUndo,
+  onRedo,
+  hasSelection,
+  onDuplicate,
+  onDelete,
+}: {
+  canUndo: boolean;
+  canRedo: boolean;
+  onUndo: () => void;
+  onRedo: () => void;
+  hasSelection: boolean;
+  onDuplicate: () => void;
+  onDelete: () => void;
+}) {
+  const { open, setOpen, ref } = useDropdown();
+  const close = () => setOpen(false);
+
+  return (
+    <div ref={ref} className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        aria-label="Edit actions"
+        title="Edit — split, duplicate, delete, undo, redo"
+        className="inline-flex h-9 shrink-0 items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.025] px-2 text-[11.5px] font-medium text-white/85 transition-colors duration-150 hover:border-white/25 hover:bg-white/[0.06] hover:text-white"
+      >
+        <Scissors size={13} className="shrink-0" />
+        <span className="hidden sm:inline">Edit</span>
+        <ChevronDown size={11} className="shrink-0 opacity-70" />
+      </button>
+      {open && (
+        <MenuPanel width="w-52">
+          <MenuItem Icon={Scissors} label="Split" tip="Split clip at playhead — coming soon" disabled />
+          <MenuItem
+            Icon={Copy}
+            label="Duplicate"
+            shortcut="⌘D"
+            disabled={!hasSelection}
+            onClick={() => {
+              onDuplicate();
+              close();
+            }}
+          />
+          <MenuItem
+            Icon={Trash2}
+            label="Delete"
+            shortcut="Del"
+            disabled={!hasSelection}
+            danger
+            onClick={() => {
+              onDelete();
+              close();
+            }}
+          />
+          <MenuDivider />
+          <MenuItem
+            Icon={Undo2}
+            label="Undo"
+            shortcut="⌘Z"
+            disabled={!canUndo}
+            onClick={() => {
+              onUndo();
+              close();
+            }}
+          />
+          <MenuItem
+            Icon={Redo2}
+            label="Redo"
+            shortcut="⌘⇧Z"
+            disabled={!canRedo}
+            onClick={() => {
+              onRedo();
+              close();
+            }}
+          />
+        </MenuPanel>
+      )}
+    </div>
+  );
+}
+
+// ── View dropdown — workspace mode / Scenes / Insights ─────────────────────
+
+const MODE_META: { mode: WorkspaceMode; label: string; short: string; Icon: LucideIcon }[] = [
+  { mode: "preview", label: "Preview mode", short: "Preview", Icon: PanelTop },
+  { mode: "balanced", label: "Balanced mode", short: "Balanced", Icon: SquareSplitVertical },
+  { mode: "timeline", label: "Timeline mode", short: "Timeline", Icon: PanelBottom },
+];
+
+function ViewMenu({
+  activeMode,
+  setSplitFraction,
+  hasScenes,
+  scenesOpen,
+  toggleScenes,
+  insightsOpen,
+  onToggleInsights,
+}: {
+  activeMode: WorkspaceMode | null;
+  setSplitFraction: (f: number) => void;
+  hasScenes: boolean;
+  scenesOpen: boolean;
+  toggleScenes: () => void;
+  insightsOpen: boolean;
+  onToggleInsights: () => void;
+}) {
+  const { open, setOpen, ref } = useDropdown();
+  const close = () => setOpen(false);
+  const current = MODE_META.find((m) => m.mode === activeMode);
+
+  return (
+    <div ref={ref} className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        aria-label="View options"
+        title="View — workspace layout, scenes, insights"
+        className="inline-flex h-9 shrink-0 items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.025] px-2 text-[11.5px] font-medium text-white/85 transition-colors duration-150 hover:border-white/25 hover:bg-white/[0.06] hover:text-white"
+      >
+        <SquareSplitVertical size={13} className="shrink-0" />
+        <span className="hidden md:inline">{current?.short ?? "View"}</span>
+        <ChevronDown size={11} className="shrink-0 opacity-70" />
+      </button>
+      {open && (
+        <MenuPanel align="right" width="w-56">
+          <MenuLabel>Workspace layout</MenuLabel>
+          {MODE_META.map(({ mode, label, Icon }) => (
+            <MenuItem
+              key={mode}
+              Icon={Icon}
+              label={label}
+              active={activeMode === mode}
+              onClick={() => {
+                setSplitFraction(MODE_FRACTION[mode]);
+                close();
+              }}
+            />
+          ))}
+          <MenuDivider />
+          {hasScenes && (
+            <MenuItem
+              Icon={Film}
+              label={scenesOpen ? "Hide scenes" : "Show scenes"}
+              active={scenesOpen}
+              onClick={() => {
+                toggleScenes();
+                close();
+              }}
+            />
+          )}
+          <MenuItem
+            Icon={BarChart2}
+            label={insightsOpen ? "Close Insights" : "Open Insights"}
+            active={insightsOpen}
+            onClick={() => {
+              onToggleInsights();
+              close();
+            }}
+          />
+        </MenuPanel>
+      )}
+    </div>
+  );
+}
+
+// ── Overflow (⋯) — zoom, fit, edit review-nav, shortcuts ───────────────────
+
+const TIPS: ReadonlyArray<readonly [string, string]> = [
+  ["Drag a clip", "to move it"],
+  ["Drag the edges", "to retime"],
+  ["Click the lane", "to seek"],
+  ["Shift / ⌘ + click", "to multi-select"],
+  ["Space", "play / pause"],
+  ["Del / Backspace", "remove selection"],
+  ["⌘D", "duplicate"],
+  ["⌘Z / ⌘⇧Z", "undo / redo"],
+  ["Esc", "clear multi-select"],
+];
+
+function OverflowMenu({
+  zoom,
+  minZoom,
+  maxZoom,
+  onZoomIn,
+  onZoomOut,
+  onFit,
+  review,
+}: {
+  zoom: number;
+  minZoom: number;
+  maxZoom: number;
+  onZoomIn: () => void;
+  onZoomOut: () => void;
+  onFit: () => void;
+  review: ReturnType<typeof useMomentReview>;
+}) {
+  const { open, setOpen, ref } = useDropdown();
+
+  return (
+    <div ref={ref} className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        aria-label="More timeline options"
+        title="More options — zoom, fit, edit navigation, shortcuts"
+        className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg text-fog transition-colors duration-150 hover:bg-white/[0.06] hover:text-white"
+      >
+        <MoreHorizontal size={17} />
+      </button>
+      {open && (
+        <MenuPanel align="right" width="w-64">
+          <MenuLabel>Timeline zoom</MenuLabel>
+          <div className="flex items-center gap-1 px-1 pb-1.5">
+            <IconBtn Icon={ZoomOut} label="Zoom out" tip="Zoom timeline out" onClick={onZoomOut} disabled={zoom <= minZoom} bare />
+            <span className="flex-1 text-center font-mono text-[11px] tabular-nums text-fog">{zoom.toFixed(1)}×</span>
+            <IconBtn Icon={ZoomIn} label="Zoom in" tip="Zoom timeline in" onClick={onZoomIn} disabled={zoom >= maxZoom} bare />
+          </div>
+          <MenuItem Icon={Maximize2} label="Fit timeline to screen" tip="Resets zoom to 100%" onClick={() => { onFit(); setOpen(false); }} />
+
+          {review.total > 0 && (
+            <>
+              <MenuDivider />
+              <MenuLabel>Navigate edits</MenuLabel>
+              <div className="flex items-center gap-1 px-1 pb-1.5">
+                <IconBtn Icon={ChevronLeft} label="Previous edit" tip="Previous edit" onClick={review.goPrev} disabled={!review.hasPrev} bare />
+                <span className="flex-1 text-center font-mono text-[11px] tabular-nums text-fog">
+                  {review.position ? `${review.position.index} of ${review.position.total}` : `${review.total} edits`}
+                </span>
+                <IconBtn Icon={ChevronRight} label="Next edit" tip="Next edit" onClick={review.goNext} disabled={!review.hasNext} bare />
+              </div>
+            </>
+          )}
+
+          <MenuDivider />
+          <MenuLabel>Shortcuts</MenuLabel>
+          <ul className="space-y-1 px-2.5 pb-1.5 pt-0.5 text-[11.5px]">
+            {TIPS.map(([action, hint]) => (
+              <li key={action} className="flex items-baseline justify-between gap-3">
+                <span className="text-white/80">{action}</span>
+                <span className="text-fog">{hint}</span>
+              </li>
+            ))}
+          </ul>
+        </MenuPanel>
+      )}
+    </div>
+  );
+}
+
+// ── Small shared primitives ────────────────────────────────────────────────
+
+interface IconBtnProps {
+  Icon: LucideIcon;
+  label: string;
+  tip: string;
+  onClick?: () => void;
+  disabled?: boolean;
+  danger?: boolean;
+  /** Bare = no border/background chrome (used inside grouped pills). */
+  bare?: boolean;
+}
+
+function IconBtn({ Icon, label, tip, onClick, disabled, danger, bare }: IconBtnProps) {
+  if (bare) {
+    return (
+      <button
+        type="button"
+        onClick={onClick}
+        disabled={disabled}
+        aria-label={label}
+        title={tip}
+        className="inline-flex size-7 items-center justify-center rounded-md text-fog transition-colors duration-150 hover:bg-white/[0.06] hover:text-white disabled:pointer-events-none disabled:opacity-30"
+      >
+        <Icon size={13} />
+      </button>
+    );
+  }
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      aria-label={label}
+      title={tip}
+      className={cn(
+        "group inline-flex h-8 items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.025] px-2 text-[11.5px] font-medium text-white/85 transition-all duration-150",
+        "hover:border-white/25 hover:bg-white/[0.06] hover:text-white",
+        danger && "hover:border-rose-400/40 hover:bg-rose-500/10 hover:text-rose-200",
+        disabled &&
+          "cursor-not-allowed opacity-35 hover:border-white/10 hover:bg-white/[0.025] hover:text-white/85"
+      )}
+    >
+      <Icon size={13} className="shrink-0" />
+      <span className="hidden xl:inline">{label}</span>
+    </button>
+  );
+}
+
+type AddEffectSpec = { id: EffectType; label: string; Icon: LucideIcon; hint: string; group: "edit" | "overlay" };
+const ADD_EFFECTS: AddEffectSpec[] = [
+  { id: "zoom", label: "Zoom", Icon: Zap, hint: "Cinematic zoom into a region", group: "edit" },
+  { id: "cursor-focus", label: "Focus", Icon: MousePointer2, hint: "Soft focus / cursor follow", group: "edit" },
+  { id: "click-highlight", label: "Click", Icon: Target, hint: "Click highlight", group: "edit" },
+  { id: "cut", label: "Cut", Icon: Scissors, hint: "Mark a dead section to remove", group: "edit" },
+  { id: "speed-up", label: "Speed", Icon: FastForward, hint: "Speed up a slow stretch", group: "edit" },
+  { id: "text-overlay", label: "Text overlay", Icon: Type, hint: "Positioned text label", group: "overlay" },
+  { id: "hook-text", label: "Hook text", Icon: Sparkles, hint: "Big attention line", group: "overlay" },
+  { id: "captions", label: "Caption", Icon: Captions, hint: "A subtitle line you type", group: "overlay" },
+  { id: "callout", label: "Callout", Icon: Megaphone, hint: "Point at part of the frame", group: "overlay" },
+  { id: "blur-redaction", label: "Blur", Icon: EyeOff, hint: "Hide a sensitive region", group: "overlay" },
+  { id: "branding-cta", label: "CTA", Icon: BadgeCheck, hint: "End-card call to action", group: "overlay" },
+  { id: "transition", label: "Transition", Icon: Shuffle, hint: "Quick fade between scenes", group: "overlay" },
+  // NB: smart-crop is applied via the Canvas tool (output framing), not a
+  // playhead moment, so it's intentionally not offered here.
+];
+
+function AddMenu({ onAdd }: { onAdd: (e: EffectType) => void }) {
+  const { open, setOpen, ref } = useDropdown();
+
+  return (
+    <div ref={ref} className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        title="Insert a new edit at the playhead"
+        className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-violet-400/40 bg-violet-500/15 px-2.5 text-[11.5px] font-semibold text-violet-50 transition-colors duration-150 hover:bg-violet-500/25"
+      >
+        <Plus size={13} />
+        <span className="hidden sm:inline">Add</span>
+        <ChevronDown size={11} className="opacity-70" />
+      </button>
+      {open && (
+        <div className="absolute left-0 top-11 z-40 max-h-[70vh] w-52 overflow-y-auto rounded-xl border border-white/10 bg-ink/95 p-1 shadow-cinematic backdrop-blur-xl">
+          {ADD_EFFECTS.map(({ id, label, Icon, hint, group }, i) => (
+            <React.Fragment key={id}>
+              {group === "overlay" && ADD_EFFECTS[i - 1]?.group === "edit" && (
+                <div className="mx-2 my-1 border-t border-white/[0.07] pt-1 text-[9.5px] font-semibold uppercase tracking-[0.14em] text-fog/70">
+                  Overlays
+                </div>
+              )}
+              <button
+                type="button"
+                onClick={() => {
+                  onAdd(id);
+                  setOpen(false);
+                }}
+                className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors duration-150 hover:bg-white/[0.06]"
+              >
+                <span className="inline-flex size-7 shrink-0 items-center justify-center rounded-md bg-white/[0.05] text-violet-200 ring-1 ring-white/10">
+                  <Icon size={13} />
+                </span>
+                <span className="min-w-0">
+                  <span className="block text-[12px] font-medium text-white">{label}</span>
+                  <span className="block truncate text-[10.5px] text-fog">{hint}</span>
+                </span>
+              </button>
+            </React.Fragment>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const HEALTH_PRESENTATION: Record<TimelineHealth, { dot: string; label: string; tooltip: string }> = {
+  balanced: {
+    dot: "bg-emerald-400",
+    label: "Balanced",
+    tooltip: "Moments are well distributed and the density looks healthy. Open Insights for the full breakdown.",
+  },
+  clustered: {
+    dot: "bg-amber-300",
+    label: "Clustered",
+    tooltip: "Several moments are bunched together. Open Insights to see distribution.",
+  },
+  quiet: {
+    dot: "bg-amber-300",
+    label: "Quiet sections",
+    tooltip: "Parts of the video have no detected activity. Open Insights to find them.",
+  },
+  empty: {
+    dot: "bg-white/30",
+    label: "No moments",
+    tooltip: "No moments on the timeline yet.",
+  },
+};
+
+function HealthDot({ health }: { health: TimelineHealth }) {
+  const cfg = HEALTH_PRESENTATION[health];
+  return (
+    <span
+      title={cfg.tooltip}
+      className="hidden items-center gap-1.5 rounded-full border border-white/[0.06] bg-white/[0.02] px-2 py-[3px] text-[11px] font-medium text-fog md:inline-flex"
+    >
+      <span className={cn("size-1.5 rounded-full", cfg.dot)} />
+      <span>{cfg.label}</span>
+    </span>
+  );
+}

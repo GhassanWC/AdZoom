@@ -1,19 +1,7 @@
 "use client";
 
 import * as React from "react";
-import {
-  Play,
-  Pause,
-  Volume2,
-  VolumeX,
-  Maximize2,
-  Minimize2,
-  Sparkles,
-  Eye,
-  EyeOff,
-  Move3D,
-  RefreshCcw,
-} from "lucide-react";
+import { Eye, EyeOff, Move3D, RefreshCcw } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { useEditorReal } from "./context";
 import { useDebugParam } from "./use-debug-param";
@@ -30,7 +18,6 @@ import { coverFitDims } from "@/lib/timeline/cover";
 import {
   activeSpeedAt,
   activeCutAt,
-  snapOutOfActiveCut,
   DEFAULT_CROP,
 } from "@/lib/timeline/crop-speed";
 import {
@@ -46,6 +33,7 @@ import { applyCompareBypass } from "./editor-shell-behavior";
 import { CropEditorOverlay } from "./CropEditorOverlay";
 import { FocalPathOverlay } from "./FocalPathOverlay";
 import { PreviewInCameraOverlays, PreviewOutputOverlays } from "./PreviewOverlays";
+import { PlaybackControls } from "./PlaybackControls";
 import type {
   BackgroundMode,
   DetectedMoment,
@@ -77,28 +65,6 @@ function useContainerSize(
     return () => ro.disconnect();
   }, [ref, enabled]);
   return enabled ? size : null;
-}
-
-/**
- * Calls video.play() and swallows the AbortError that browsers throw when the
- * play promise is interrupted by a subsequent pause() or element removal.
- */
-function safePlay(v: HTMLVideoElement): Promise<void> {
-  const result = v.play();
-  if (result && typeof result.then === "function") {
-    return result.catch((err: unknown) => {
-      if (err instanceof DOMException && err.name === "AbortError") return;
-      throw err;
-    });
-  }
-  return Promise.resolve();
-}
-
-function fmt(s: number): string {
-  if (!Number.isFinite(s) || s < 0) return "0:00";
-  const m = Math.floor(s / 60);
-  const r = Math.floor(s % 60);
-  return `${m}:${String(r).padStart(2, "0")}`;
 }
 
 interface CameraDriverState {
@@ -349,7 +315,6 @@ export function RealVideoPlayer({
     videoRef,
     currentTime,
     setCurrentTime,
-    playing,
     setPlaying,
     exporting,
     duration,
@@ -365,12 +330,21 @@ export function RealVideoPlayer({
     setSourceCrop,
     clearSourceCrop,
     compareBypassId,
+    // Preview volume + fullscreen now live in context (shared with the unified
+    // control bar above the timeline). The element still lives here, so we
+    // sync it below.
+    muted,
+    volume,
+    isFullscreen,
+    previewFullscreenRef,
   } = useEditorReal();
 
   // Dev-only CV debug overlay gate (?debug=1 / Ctrl+Shift+D).
   const cvDebugOverlay = useDebugParam();
 
-  const containerRef = React.useRef<HTMLDivElement | null>(null);
+  // The fullscreen target is owned by context (so the unified control bar can
+  // toggle it); this component just attaches the ref to its outer container div.
+  const containerRef = previewFullscreenRef;
   const aspectRef = React.useRef<HTMLDivElement | null>(null);
   const transformWrapRef = React.useRef<HTMLDivElement | null>(null);
   // Canvas Fit layers: the offset layer (base-placement pan / manual drag),
@@ -389,9 +363,6 @@ export function RealVideoPlayer({
     ty: 0,
     momentId: null,
   });
-  const [muted, setMuted] = React.useState(false);
-  const [volume, setVolume] = React.useState(1);
-  const [isFullscreen, setIsFullscreen] = React.useState(false);
   // True when the source <video> failed to load — surfaced as a clear overlay
   // (with Retry) instead of a silent black frame.
   const [loadError, setLoadError] = React.useState(false);
@@ -404,54 +375,15 @@ export function RealVideoPlayer({
     h: number;
   } | null>(null);
 
-  // Track fullscreen state so we can swap the layout from "aspect-locked
-  // card centered in the page" to "fill the viewport, letterboxed by the
-  // video itself via object-contain".
+  // Apply the preview volume/mute preference (owned by context, shared with the
+  // playback bar) to the live <video>. This is a PLAYBACK-ONLY preference — it
+  // never touches export audio or the project's stored settings.
   React.useEffect(() => {
-    const onChange = () => {
-      const fs = document.fullscreenElement === containerRef.current;
-      setIsFullscreen(fs);
-
-      // Fullscreen dimension audit — the preview is a plain <video>, so
-      // displayed size vs intrinsic size + the resolved object-fit tells us
-      // immediately whether fullscreen is cropping (cover) or preserving
-      // the whole frame (contain). The camera scale/translate come from the
-      // live debug ref; at rest with no moment they must be 1 / 0 / 0.
-      if (process.env.NODE_ENV !== "production") {
-        const v = videoRef.current;
-        const box = aspectRef.current;
-        const cam = cameraDebugRef.current;
-        const fit = v ? getComputedStyle(v).objectFit : "—";
-        console.info(`[fullscreen] ${fs ? "entered" : "exited"}`, {
-          videoWidth: v?.videoWidth ?? 0,
-          videoHeight: v?.videoHeight ?? 0,
-          displayedWidth: v ? Math.round(v.getBoundingClientRect().width) : 0,
-          displayedHeight: v ? Math.round(v.getBoundingClientRect().height) : 0,
-          containerWidth: box ? Math.round(box.getBoundingClientRect().width) : 0,
-          containerHeight: box ? Math.round(box.getBoundingClientRect().height) : 0,
-          screenWidth: window.innerWidth,
-          screenHeight: window.innerHeight,
-          objectFit: fit,
-          cameraScale: +cam.scale.toFixed(4),
-          cameraTranslateX: +cam.tx.toFixed(3),
-          cameraTranslateY: +cam.ty.toFixed(3),
-          activeMomentId: cam.momentId,
-        });
-        if (fs && fit === "cover") {
-          console.warn(
-            "[fullscreen] object-fit is COVER — this crops the recording. Screen captures should use CONTAIN to preserve the full viewport."
-          );
-        }
-        if (cam.momentId === null && Math.abs(cam.scale - 1) > 0.01) {
-          console.warn(
-            `[fullscreen] no active moment but cameraScale=${cam.scale.toFixed(3)} (expected 1). A stuck camera transform is adding zoom.`
-          );
-        }
-      }
-    };
-    document.addEventListener("fullscreenchange", onChange);
-    return () => document.removeEventListener("fullscreenchange", onChange);
-  }, [videoRef]);
+    const v = videoRef.current;
+    if (!v) return;
+    v.muted = muted;
+    v.volume = volume;
+  }, [muted, volume, videoRef]);
 
   // Wire video element events
   React.useEffect(() => {
@@ -521,52 +453,6 @@ export function RealVideoPlayer({
       /* ignore — the error handler re-fires if it fails again */
     }
   }, [videoRef]);
-
-  const togglePlay = () => {
-    const v = videoRef.current;
-    if (!v) return;
-    if (v.paused) safePlay(v);
-    else v.pause();
-  };
-
-  const onScrub = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const v = videoRef.current;
-    if (!v) return;
-    // Seeking into an active cut snaps to the cut's end (nearest valid time).
-    const t = snapOutOfActiveCut(
-      project.analysis?.detectedMoments ?? [],
-      Number(e.target.value)
-    );
-    v.currentTime = t;
-    setCurrentTime(t);
-  };
-
-  const onVolume = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const v = videoRef.current;
-    if (!v) return;
-    const x = Number(e.target.value);
-    v.volume = x;
-    setVolume(x);
-    setMuted(x === 0);
-  };
-
-  const toggleMute = () => {
-    const v = videoRef.current;
-    if (!v) return;
-    const next = !muted;
-    v.muted = next;
-    setMuted(next);
-  };
-
-  const requestFullscreen = () => {
-    const el = containerRef.current;
-    if (!el) return;
-    if (document.fullscreenElement) {
-      document.exitFullscreen();
-    } else {
-      el.requestFullscreen?.();
-    }
-  };
 
   // Cinematic camera — the rAF loop recomputes the target each frame
   // from the live playhead by calling the SAME shared resolver the
@@ -1205,87 +1091,15 @@ export function RealVideoPlayer({
           />
         )}
 
-        {/* Controls — faded + non-interactive while cropping so they can't
-            cover or steal clicks from the crop toolbar (which sits at z-50). */}
-        <div
-          className={cn(
-            "absolute inset-x-0 bottom-0 z-40 bg-gradient-to-t from-black/85 via-black/40 to-transparent px-4 pb-3 pt-10 transition-opacity duration-200",
-            cropEditing && "pointer-events-none opacity-30"
-          )}
-        >
-          {/* scrubber row */}
-          <div className="mb-2 flex items-center gap-3">
-            <span className="font-mono text-[11px] tabular-nums text-fog">
-              {fmt(currentTime)}
-            </span>
-            <input
-              type="range"
-              min={0}
-              max={Math.max(duration, currentTime)}
-              step={0.01}
-              value={currentTime}
-              onChange={onScrub}
-              aria-label="Scrub video"
-              className="range-thumb h-1 flex-1"
-              style={{
-                background: `linear-gradient(to right, #8B5CF6 0%, #8B5CF6 ${
-                  duration > 0 ? (currentTime / duration) * 100 : 0
-                }%, rgba(255,255,255,0.15) ${
-                  duration > 0 ? (currentTime / duration) * 100 : 0
-                }%, rgba(255,255,255,0.15) 100%)`,
-                borderRadius: "9999px",
-              }}
-            />
-            <span className="font-mono text-[11px] tabular-nums text-fog/70">
-              {fmt(duration)}
-            </span>
+        {/* Fullscreen transport overlay. In windowed mode ALL controls live in
+            the unified control bar above the timeline (nothing floats over the
+            video). In fullscreen that bar is off-screen, so the preview
+            surfaces its own control pill (transport + volume + exit-fullscreen). */}
+        {isFullscreen && !cropEditing && (
+          <div className="absolute bottom-4 left-1/2 z-40 -translate-x-1/2">
+            <PlaybackControls />
           </div>
-
-          <div className="flex items-center gap-3">
-            <button
-              onClick={togglePlay}
-              aria-label={playing ? "Pause" : "Play"}
-              className="inline-flex size-8 items-center justify-center rounded-full bg-white text-ink transition-transform duration-200 hover:scale-105"
-            >
-              {playing ? (
-                <Pause size={14} className="fill-ink" />
-              ) : (
-                <Play size={14} className="fill-ink" />
-              )}
-            </button>
-
-            <button
-              onClick={toggleMute}
-              aria-label={muted ? "Unmute" : "Mute"}
-              className="text-fog transition-colors duration-200 hover:text-white"
-            >
-              {muted || volume === 0 ? <VolumeX size={14} /> : <Volume2 size={14} />}
-            </button>
-            <input
-              type="range"
-              min={0}
-              max={1}
-              step={0.01}
-              value={muted ? 0 : volume}
-              onChange={onVolume}
-              aria-label="Volume"
-              className="range-thumb h-0.5 w-16"
-            />
-
-            <span className="ml-auto inline-flex items-center gap-1.5 rounded-md border border-white/10 bg-white/[0.04] px-1.5 py-0.5 text-[10px] font-medium text-fog">
-              <Sparkles size={10} className="text-violet-300" />
-              {project.analysis?.detectedMoments?.length ?? 0} moments
-            </span>
-            <button
-              onClick={requestFullscreen}
-              aria-label={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
-              title={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
-              className="text-fog transition-colors duration-200 hover:text-white"
-            >
-              {isFullscreen ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
-            </button>
-          </div>
-        </div>
+        )}
       </div>
     </div>
   );

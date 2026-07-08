@@ -29,6 +29,19 @@ import {
 import { isOverlayEffectType, DEFAULT_BLUR_STRENGTH } from "@/lib/firebase/schema";
 import { applyPresetToSettings } from "@/lib/presets";
 import { useInteractions } from "./useInteractions";
+import {
+  readPersistedString,
+  writePersistedString,
+  readPersistedNumber,
+  writePersistedNumber,
+  readPersistedBool,
+  writePersistedBool,
+} from "./timeline/utils";
+import {
+  SPLIT_FRACTION_KEY,
+  MODE_FRACTION,
+  clampSplitFraction,
+} from "./workspace-split";
 import type { Interaction } from "@/lib/recording/types";
 import { getDoc } from "firebase/firestore";
 import {
@@ -154,6 +167,18 @@ function remapVisualAnalysisForCrop(
   };
 }
 
+/**
+ * The right-rail tools that open a docked inspector panel (one at a time).
+ * Crop is NOT here — it edits directly on the preview via CropEditorOverlay
+ * (no side panel needed); the rail's Crop button toggles `cropEditing` instead.
+ */
+export type RightTool =
+  | "canvas"
+  | "effects"
+  | "captions"
+  | "presets"
+  | "insights";
+
 interface EditorRealContextValue {
   project: ProjectDoc;
   uid: string;
@@ -186,7 +211,29 @@ interface EditorRealContextValue {
    */
   compareBypassId: string | null;
   setCompareBypassId: (id: string | null) => void;
-  /** Global "Canvas / Format" panel — opens from the header or the export summary. */
+  /**
+   * The single active right-rail tool / docked inspector (null = closed).
+   * ONE source of truth for which docked panel is open. Persisted across
+   * sessions. `canvasOpen`/`openCanvas`/`closeCanvas` below are derived from it.
+   */
+  activeTool: RightTool | null;
+  setActiveTool: (t: RightTool | null) => void;
+  /**
+   * Preview-vs-timeline vertical split ratio (fraction of height given to the
+   * preview, 0..1). Owned here (not locally in EditorSplitWorkspace) so the
+   * unified control bar's Preview/Balanced/Timeline buttons — rendered inside
+   * the timeline, far from the split's DOM — can read/set the same value.
+   * Persisted; EditorSplitWorkspace still owns the live pointer-drag mechanics
+   * and only calls this setter on commit (drag itself mutates the DOM directly
+   * for performance, no re-render mid-drag).
+   */
+  splitFraction: number;
+  setSplitFraction: (f: number) => void;
+  /** Collapsible scene/chapter strip below the unified control bar — closed by
+   *  default after analysis; remembers the user's last open/closed choice. */
+  scenesOpen: boolean;
+  toggleScenes: () => void;
+  /** Global "Canvas / Format" panel — derived from `activeTool === "canvas"`. */
   canvasOpen: boolean;
   openCanvas: () => void;
   closeCanvas: () => void;
@@ -292,6 +339,33 @@ interface EditorRealContextValue {
   processingMinimized: boolean;
   setProcessingMinimized: (v: boolean) => void;
   seek: (t: number) => void;
+  /**
+   * Toggle playback of the live preview. Drives the <video> element directly
+   * (the single source of truth) — if the playhead is parked at the end, play
+   * restarts from 0. Shared by the playback control bar, the fullscreen overlay
+   * and keyboard shortcuts so there is ONE play/pause implementation.
+   */
+  togglePlay: () => void;
+  /** Seek relative to the current time (e.g. -5 / +5 seconds), clamped + cut-safe. */
+  seekBy: (delta: number) => void;
+
+  // ── Preview volume — a LOCAL playback preference, never an exported edit ──
+  /** Preview mute state (applies to the live <video> only; export audio is untouched). */
+  muted: boolean;
+  /** Preview volume 0..1 (applies to the live <video> only; export audio is untouched). */
+  volume: number;
+  /** Toggle preview mute. */
+  toggleMute: () => void;
+  /** Set preview volume 0..1 (0 also mutes; a positive value unmutes). */
+  setPreviewVolume: (v: number) => void;
+
+  // ── Fullscreen (the preview/editor-preview container) ──
+  /** Ref the preview attaches to the element that should go fullscreen. */
+  previewFullscreenRef: React.RefObject<HTMLDivElement | null>;
+  /** True while the preview container is the document's fullscreen element. */
+  isFullscreen: boolean;
+  /** Enter fullscreen on the preview container, or exit if already fullscreen. */
+  toggleFullscreen: () => void;
 
   // ── Edit history (session-only, in-memory) ──────────────────────────────
   /** Revert the last moment mutation. No-op when the undo stack is empty. */
@@ -508,9 +582,52 @@ export function EditorRealProvider({
       logFramevoEvent(EVENTS.CAPTION_QUOTA_BLOCKED, { reason: t.skipReason });
     }
   }, [project.analysis?.transcript]);
-  const [canvasOpen, setCanvasOpen] = React.useState(false);
-  const openCanvas = React.useCallback(() => setCanvasOpen(true), []);
-  const closeCanvas = React.useCallback(() => setCanvasOpen(false), []);
+  // ONE source of truth for the docked right-rail inspector. Persisted so the
+  // editor reopens to the tool the user left open. `canvasOpen`/open/close are
+  // derived so existing callers (e.g. the Export panel's "Open Canvas") keep
+  // working unchanged.
+  const [activeTool, setActiveTool] = React.useState<RightTool | null>(() => {
+    const v = readPersistedString<RightTool | "">(
+      "framevo:editor-tool",
+      ["canvas", "effects", "captions", "presets", "insights", ""],
+      ""
+    );
+    return v === "" ? null : v;
+  });
+  React.useEffect(() => {
+    writePersistedString("framevo:editor-tool", activeTool ?? "");
+  }, [activeTool]);
+  const canvasOpen = activeTool === "canvas";
+  const openCanvas = React.useCallback(() => setActiveTool("canvas"), []);
+  const closeCanvas = React.useCallback(
+    () => setActiveTool((t) => (t === "canvas" ? null : t)),
+    []
+  );
+
+  // Preview/timeline split ratio — see workspace-split.ts for the shared
+  // constants/clamp. EditorSplitWorkspace's live drag mutates the DOM directly
+  // for performance and only calls this setter once, on release.
+  const [splitFraction, setSplitFractionState] = React.useState<number>(() =>
+    clampSplitFraction(readPersistedNumber(SPLIT_FRACTION_KEY, MODE_FRACTION.balanced))
+  );
+  const setSplitFraction = React.useCallback((f: number) => {
+    const c = clampSplitFraction(f);
+    setSplitFractionState(c);
+    writePersistedNumber(SPLIT_FRACTION_KEY, c);
+  }, []);
+
+  // Collapsible scene/chapter strip — closed by default after analysis;
+  // remembers the user's last open/closed choice.
+  const [scenesOpen, setScenesOpen] = React.useState(() =>
+    readPersistedBool("framevo:editor-scenes-open", false)
+  );
+  const toggleScenes = React.useCallback(() => {
+    setScenesOpen((v) => {
+      const next = !v;
+      writePersistedBool("framevo:editor-scenes-open", next);
+      return next;
+    });
+  }, []);
 
   const [cropEditing, setCropEditing] = React.useState(false);
   const openCropEditor = React.useCallback(() => setCropEditing(true), []);
@@ -595,6 +712,62 @@ export function EditorRealProvider({
     const snapped = snapOutOfActiveCut(momentsRef.current, t);
     v.currentTime = Math.max(0, Math.min(v.duration || snapped, snapped));
     setCurrentTime(v.currentTime);
+  }, []);
+
+  const togglePlay = React.useCallback(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    if (v.paused) {
+      // Parked at the end (the browser paused on 'ended') → restart from 0 so
+      // pressing Play again replays the video instead of doing nothing.
+      if (Number.isFinite(v.duration) && v.duration > 0 && v.currentTime >= v.duration - 0.05) {
+        v.currentTime = 0;
+        setCurrentTime(0);
+      }
+      // Swallow the AbortError browsers throw when play() races a pause().
+      const p = v.play();
+      if (p && typeof p.catch === "function") p.catch(() => {});
+    } else {
+      v.pause();
+    }
+  }, []);
+
+  const seekBy = React.useCallback(
+    (delta: number) => {
+      const v = videoRef.current;
+      const base = v ? v.currentTime : currentTime;
+      seek(base + delta);
+    },
+    [seek, currentTime]
+  );
+
+  // ── Preview volume + fullscreen (local playback prefs, shared by the
+  //    playback bar + the fullscreen overlay; the <video> element itself is
+  //    kept in sync by RealVideoPlayer, which owns the element). ──
+  const [muted, setMuted] = React.useState(false);
+  const [volume, setVolume] = React.useState(1);
+  const toggleMute = React.useCallback(() => setMuted((m) => !m), []);
+  const setPreviewVolume = React.useCallback((v: number) => {
+    const x = Math.max(0, Math.min(1, Number.isFinite(v) ? v : 0));
+    setVolume(x);
+    setMuted(x === 0); // dragging to 0 mutes; any positive value unmutes
+  }, []);
+
+  const previewFullscreenRef = React.useRef<HTMLDivElement | null>(null);
+  const [isFullscreen, setIsFullscreen] = React.useState(false);
+  React.useEffect(() => {
+    // Fires for both our requestFullscreen AND the browser's native Escape exit,
+    // so `isFullscreen` (and the icon) always reflect reality.
+    const onChange = () =>
+      setIsFullscreen(document.fullscreenElement === previewFullscreenRef.current);
+    document.addEventListener("fullscreenchange", onChange);
+    return () => document.removeEventListener("fullscreenchange", onChange);
+  }, []);
+  const toggleFullscreen = React.useCallback(() => {
+    const el = previewFullscreenRef.current;
+    if (!el) return;
+    if (document.fullscreenElement) void document.exitFullscreen?.();
+    else void el.requestFullscreen?.();
   }, []);
 
   const projectRef = React.useMemo(() => {
@@ -1838,6 +2011,12 @@ export function EditorRealProvider({
     closeInspector,
     compareBypassId,
     setCompareBypassId,
+    activeTool,
+    setActiveTool,
+    splitFraction,
+    setSplitFraction,
+    scenesOpen,
+    toggleScenes,
     canvasOpen,
     openCanvas,
     closeCanvas,
@@ -1883,6 +2062,15 @@ export function EditorRealProvider({
     processingMinimized,
     setProcessingMinimized,
     seek,
+    togglePlay,
+    seekBy,
+    muted,
+    volume,
+    toggleMute,
+    setPreviewVolume,
+    previewFullscreenRef,
+    isFullscreen,
+    toggleFullscreen,
     undo,
     redo,
     canUndo,

@@ -43,7 +43,7 @@ import { TimelineTrack, TrackLabel } from "./TimelineTrack";
 import { TimelineRuler, GridLines } from "./TimelineRuler";
 import { Playhead } from "./Playhead";
 import { GapIndicator, emptyQuartileRanges } from "./GapIndicator";
-import { TimelineToolbar, type TimelineHealth } from "./TimelineToolbar";
+import { EditorUnifiedControlBar, type TimelineHealth } from "../EditorUnifiedControlBar";
 import { NarrativeBand } from "./NarrativeBand";
 import { DensityBar } from "./DensityBar";
 import { AttentionWaveform } from "./AttentionWaveform";
@@ -69,6 +69,7 @@ export function RealTimeline() {
     currentTime,
     duration,
     seek,
+    seekBy,
     selectedMomentId,
     setSelectedMomentId,
     multiSelectIds,
@@ -92,6 +93,7 @@ export function RealTimeline() {
     interactionsLoading,
     startAnalyze,
     analyzing,
+    scenesOpen,
   } = useEditorReal();
 
   const moments = project.analysis?.detectedMoments ?? [];
@@ -161,6 +163,18 @@ export function RealTimeline() {
 
   const trackRef = React.useRef<HTMLDivElement | null>(null);
   const viewportRef = React.useRef<HTMLDivElement | null>(null);
+  // The frozen ruler + the frozen gutter live in separate scroll boxes; the
+  // lane viewport is the ONLY user-scrollable one and drives them via onScroll.
+  const rulerViewportRef = React.useRef<HTMLDivElement | null>(null);
+  const gutterScrollRef = React.useRef<HTMLDivElement | null>(null);
+  // Keep the frozen ruler (horizontal) + frozen gutter (vertical) in lockstep
+  // with the lane viewport. Direct DOM writes — no React state, no re-render.
+  const onViewportScroll = React.useCallback(() => {
+    const v = viewportRef.current;
+    if (!v) return;
+    if (rulerViewportRef.current) rulerViewportRef.current.scrollLeft = v.scrollLeft;
+    if (gutterScrollRef.current) gutterScrollRef.current.scrollTop = v.scrollTop;
+  }, []);
   // Scale model: percentage layout stays, but zoom + a measured px/sec are
   // derived here. `trackRef` (the content element) is what the drag math also
   // reads, so the two never disagree.
@@ -169,6 +183,7 @@ export function RealTimeline() {
   const onFit = React.useCallback(() => {
     fitToScreen();
     if (viewportRef.current) viewportRef.current.scrollLeft = 0;
+    if (rulerViewportRef.current) rulerViewportRef.current.scrollLeft = 0;
   }, [fitToScreen]);
 
   // Per-moment render diagnostics (req): start / end / duration / renderedWidthPx.
@@ -403,6 +418,14 @@ export function RealTimeline() {
         return;
       }
 
+      // ── Arrow keys → seek ∓5s (Shift = 1s fine step) ───────────────────
+      if ((e.key === "ArrowLeft" || e.key === "ArrowRight") && !mod) {
+        e.preventDefault();
+        const step = e.shiftKey ? 1 : 5;
+        seekBy(e.key === "ArrowLeft" ? -step : step);
+        return;
+      }
+
       // ── Selection-scoped actions ───────────────────────────────────────
       if (multiSelectIds.length > 0) {
         if (e.key === "Delete" || e.key === "Backspace") {
@@ -437,6 +460,7 @@ export function RealTimeline() {
     undo,
     redo,
     videoRef,
+    seekBy,
   ]);
 
   const withDraft = (m: DetectedMoment): DetectedMoment =>
@@ -682,11 +706,14 @@ export function RealTimeline() {
   }
 
   return (
-    // Bottom section of the fullscreen editor shell: full-width flat panel at
-    // its NATURAL height — no inner vertical scroll; the page scrolls to
-    // reach every lane.
-    <div className="relative border-t border-white/[0.06] bg-surface/50 backdrop-blur-xl">
-      <TimelineToolbar
+    // Bottom section of the fixed-height editor shell: fills its split pane and
+    // scrolls INTERNALLY. The unified control bar + warnings + optional scene
+    // strip + ruler stay frozen at the top; only the lane region scrolls
+    // (vertical lanes + horizontal time), so the preview above always stays
+    // visible.
+    <div className="relative flex h-full min-h-0 flex-col overflow-hidden border-t border-white/[0.06] bg-surface/50 backdrop-blur-xl">
+      <div className="shrink-0">
+      <EditorUnifiedControlBar
         health={health}
         zoom={zoom}
         minZoom={minZoom}
@@ -694,10 +721,9 @@ export function RealTimeline() {
         onZoomOut={zoomOut}
         onZoomIn={zoomIn}
         onFit={onFit}
-        currentTime={currentTime}
-        total={total}
         insightsOpen={insightsOpen}
         onToggleInsights={toggleInsights}
+        hasScenes={showNarrative}
         canUndo={canUndo}
         canRedo={canRedo}
         onUndo={() => void undo()}
@@ -709,6 +735,7 @@ export function RealTimeline() {
         }
         onDelete={() => selectedMomentId && void deleteMoment(selectedMomentId)}
       />
+      </div>
 
       {showClickLossWarning && (
         <div className="flex items-start gap-2 border-b border-rose-400/25 bg-rose-500/[0.08] px-6 py-2.5 text-[12.5px] text-rose-100">
@@ -774,13 +801,11 @@ export function RealTimeline() {
         </div>
       )}
 
-      {/* ── Chapters strip ────────────────────────────────────────────
-          Simplified: no heading row, no count chip, no "AI-classified"
-          caption — the band itself is self-explanatory. Slimmer top
-          padding so chapters feel like a soft section divider rather
-          than a primary panel. */}
-      {showNarrative && (
-        <div className="border-b border-white/[0.04] px-6 pb-3.5 pt-3.5">
+      {/* ── Scenes strip — collapsible, toggled from the unified bar's "Scenes"
+          button. Collapsed by default after analysis (scenesOpen persisted);
+          selecting a chapter still seeks the preview + timeline the same way. */}
+      {showNarrative && scenesOpen && (
+        <div className="shrink-0 border-b border-white/[0.04] px-6 py-2">
           <NarrativeBand
             segments={narrativeSegments}
             duration={total}
@@ -790,17 +815,38 @@ export function RealTimeline() {
         </div>
       )}
 
-      {/* ── Tracks ───────────────────────────────────────────────────── */}
-      <div className="px-4 pb-2 pt-4">
-        <div
-          className="grid"
-          style={{
-            gridTemplateColumns: `clamp(44px, 13vw, ${GUTTER_WIDTH}px) minmax(0, 1fr)`,
-          }}
-        >
-          {/* Left gutter — group headers + one label per lane. */}
-          <div className="flex flex-col pr-3">
-            <div style={{ height: TRACK_HEIGHTS.ruler }} />
+      {/* ── Tracks — frozen ruler + internally-scrolling lanes ─────────────
+          The ruler is pinned in its own header row (horizontally synced to the
+          lane viewport). The gutter (labels) and the lane viewport share ONE
+          vertical scroll via onViewportScroll → the lane viewport is the only
+          user-scrollable box; gutter.scrollTop + ruler.scrollLeft mirror it. */}
+      <div className="relative flex min-h-0 flex-1 flex-col px-4 pt-3">
+        {/* Frozen time ruler (stays visible while lanes scroll vertically). */}
+        <div className="flex shrink-0">
+          <div
+            aria-hidden
+            className="shrink-0"
+            style={{ width: `clamp(44px, 13vw, ${GUTTER_WIDTH}px)` }}
+          />
+          <div ref={rulerViewportRef} className="min-w-0 flex-1 overflow-hidden">
+            <div
+              className="relative select-none"
+              style={{ width: `${zoom * 100}%`, minWidth: "100%" }}
+            >
+              <TimelineRuler total={total} pxPerSec={pxPerSec} />
+            </div>
+          </div>
+        </div>
+
+        {/* Lane region — the only scroll surface (vertical lanes + horizontal
+            time). Gutter is vertical-synced; lane viewport owns both scrollbars. */}
+        <div className="flex min-h-0 flex-1">
+          {/* Left gutter — group headers + one label per lane (v-scroll synced). */}
+          <div
+            ref={gutterScrollRef}
+            className="flex shrink-0 flex-col overflow-hidden pr-3"
+            style={{ width: `clamp(44px, 13vw, ${GUTTER_WIDTH}px)` }}
+          >
             {insightsOpen && <div style={{ height: TRACK_HEIGHTS.gap }} />}
             {rows.map((r) =>
               r.kind === "group" ? (
@@ -835,16 +881,20 @@ export function RealTimeline() {
                 />
               )
             )}
+            {/* Bottom padding so the last lane clears the horizontal scrollbar. */}
+            <div aria-hidden className="h-3 shrink-0" />
           </div>
 
-          {/* Right side — scrollable, zoom-scaled lane viewport */}
-          <div ref={viewportRef} className="overflow-x-auto overflow-y-visible pb-2">
+          {/* Right side — scrollable, zoom-scaled lane viewport (both axes) */}
+          <div
+            ref={viewportRef}
+            onScroll={onViewportScroll}
+            className="min-w-0 flex-1 overflow-auto"
+          >
             <div
               className="relative select-none"
               style={{ width: `${zoom * 100}%`, minWidth: "100%" }}
             >
-              <TimelineRuler total={total} pxPerSec={pxPerSec} />
-
               <div
                 ref={trackRef}
                 className="relative"
@@ -907,6 +957,9 @@ export function RealTimeline() {
                   total={total}
                   rulerHeight={TRACK_HEIGHTS.ruler}
                 />
+
+                {/* Match the gutter's bottom padding so scroll extents align. */}
+                <div aria-hidden className="h-3" />
               </div>
             </div>
           </div>

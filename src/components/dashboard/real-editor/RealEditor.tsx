@@ -11,29 +11,19 @@ import { Button } from "@/components/ui/Button";
 import { SidebarNav } from "@/components/dashboard/Sidebar";
 import { EditorRealProvider, useEditorReal } from "./context";
 import { RealVideoPlayer } from "./RealVideoPlayer";
-import { RemotionPreviewPanel } from "./RemotionPreviewPanel";
+import { EditorSplitWorkspace } from "./EditorSplitWorkspace";
 import { RealTimeline } from "./RealTimeline";
 import { MomentInspectorModal } from "./MomentInspectorModal";
-import { EffectsModal } from "./EffectsModal";
 import { ExportModal } from "./ExportModal";
-import { CanvasModal } from "./CanvasModal";
 import { AnalysisOptionsModal } from "./AnalysisOptionsModal";
-import { CaptionsModal } from "./CaptionsModal";
-import { RecipeSummary } from "./RecipeSummary";
 import type { AnalysisOptions } from "@/lib/analysis/engine-layers";
 import { useWorkspaceSettings } from "@/lib/firebase/workspace-settings";
 import { RealProcessingOverlay } from "./RealProcessingOverlay";
-import { PresetsRail } from "./PresetsRail";
-import { RecommendedPresets } from "./RecommendedPresets";
 import { ProcessingMiniPill } from "./ProcessingMiniPill";
-import { AIConfidencePanel } from "./AIConfidencePanel";
-import { SuggestionsPanel } from "./SuggestionsPanel";
 import { DebugOverlay } from "./DebugOverlay";
-import { ClickPipelinePanel } from "./ClickPipelinePanel";
-import { EditDiagnosticsPanel } from "./EditDiagnosticsPanel";
-import { CvDebugPanel } from "./CvDebugPanel";
 import { EditorTopBar } from "./EditorTopBar";
-import { EditorToolbar } from "./EditorToolbar";
+import { EditorToolRail } from "./EditorToolRail";
+import { EditorInspectorDock } from "./EditorInspectorDock";
 import { EditorDrawer } from "./EditorDrawer";
 import { disposeThumbnails } from "./timeline/thumbnails";
 import { restoreEditorScrollLock } from "./scroll-lock";
@@ -119,17 +109,18 @@ export function RealEditorPage({ projectId }: { projectId: string }) {
 }
 
 /**
- * The fullscreen editing workspace. One column, PAGE-scrolled:
+ * The fullscreen editing workspace — a fixed-height shell (no page scroll):
  *
- *   EditorTopBar   — sticky: menu (nav drawer) · back · title · undo/redo · Export
- *   workspace      — the video preview at a stable viewport-relative height
- *   EditorToolbar  — compact tools row + Previous/Next edit review
- *   timeline       — natural height, NO internal scroll; the page scrolls
- *                    vertically to reach every lane
+ *   EditorTopBar        — sticky: menu (nav drawer) · back · title · undo/redo · Export
+ *   workspace ROW       — a resizable vertical split (preview + playback controls
+ *                         over an internally-scrolling timeline) fills the width;
+ *                         a docked inspector panel + the narrow tool RAIL flank it
+ *                         on the right, using horizontal space only.
  *
- * Nothing permanent flanks the preview: Framevo navigation, presets, and the
- * AI insights/suggestions all open as temporary overlay drawers, and every
- * edit's controls open in the shared moment editor dialog.
+ * The old horizontal tools row is gone: Crop / Canvas / Effects / Captions /
+ * Presets / Insights now live in the right rail and open a docked inspector
+ * (one `activeTool` source of truth); Re-analyze + Export stay as modals; the
+ * Previous/Next edit review nav moved into the timeline toolbar.
  */
 function Body() {
   const {
@@ -137,11 +128,8 @@ function Body() {
     startAnalyze,
     analyzing,
     analyzeError,
-    canvasOpen,
-    openCanvas,
-    closeCanvas,
+    activeTool,
     cropEditing,
-    openCropEditor,
     closeCropEditor,
     selectedVideoType,
     setSelectedVideoType,
@@ -153,14 +141,17 @@ function Body() {
   // case the primary "Generate AI edit" CTA must be reachable.
   const isAnalyzingNow = analyzing || project.status === "analyzing";
   const canAnalyze = !isAnalyzingNow && !!project.originalVideoUrl;
-  const [effectsOpen, setEffectsOpen] = React.useState(false);
   const [exportOpen, setExportOpen] = React.useState(false);
   const [analysisOptionsOpen, setAnalysisOptionsOpen] = React.useState(false);
-  const [captionsOpen, setCaptionsOpen] = React.useState(false);
   const [navOpen, setNavOpen] = React.useState(false);
-  const [presetsOpen, setPresetsOpen] = React.useState(false);
-  const [insightsOpen, setInsightsOpen] = React.useState(false);
   const { settings, save } = useWorkspaceSettings();
+
+  // Crop has no dock panel — it edits directly on the preview. Opening any
+  // OTHER tool exits crop mode (safety net; the rail's Crop button already
+  // does this proactively) so the two editing surfaces never overlap.
+  React.useEffect(() => {
+    if (activeTool && cropEditing) closeCropEditor();
+  }, [activeTool, cropEditing, closeCropEditor]);
 
   const analyzeTitle = isFailed
     ? "The previous analysis failed — try again."
@@ -173,7 +164,13 @@ function Body() {
   const lastRun = project.analysis?.lastRunOptions as Partial<AnalysisOptions> | undefined;
 
   return (
-    <div className="flex min-h-dvh flex-col">
+    // Fixed-height editor shell — fills the viewport and does NOT page-scroll.
+    // The header + transient strips are shrink-0; the split workspace fills the
+    // rest, and only the timeline scrolls internally (overflow-hidden here keeps
+    // the document body still while the preview stays permanently visible).
+    // NB: all drawers/modals portal to document.body, so overflow-hidden never
+    // clips them.
+    <div className="flex h-[100dvh] flex-col overflow-hidden">
       {/* ── 1. Editor top bar ─────────────────────────────────────────────── */}
       <EditorTopBar
         onOpenNav={() => setNavOpen(true)}
@@ -207,33 +204,39 @@ function Body() {
         />
       )}
 
-      {/* ── 3. Workspace — the preview at a stable viewport-relative height
-             (the bounded box the fill-mode player fits into). Marked as a
-             dialog "hold" region so crop-box drags / scrubbing never dismiss
-             the floating moment editor. ─────────────────────────────────── */}
-      <div data-editor-dialog-hold className="h-[56vh] shrink-0 px-3 py-3 sm:px-4">
-        <RealVideoPlayer fill />
+      {/* ── 3. Workspace ROW — the vertical split (preview + timeline) fills the
+             FULL width; the narrow tool rail sits flush on the right. Playback
+             transport now lives INSIDE the timeline's unified control bar (no
+             separate controls row) — see EditorUnifiedControlBar. The inspector
+             panel (EditorInspectorDock) floats as an ABSOLUTE popup anchored
+             just left of the rail — it overlays the workspace instead of
+             squeezing it, so opening a tool never reflows or resizes the
+             preview/timeline. `relative` here is what the dock's
+             `absolute inset-y-0` positions against. ─────────────────────── */}
+      <div className="relative flex min-h-0 flex-1 overflow-hidden">
+        <div className="flex min-w-0 flex-1 flex-col">
+          <EditorSplitWorkspace
+            preview={<RealVideoPlayer fill />}
+            timeline={
+              <div className="min-h-0 flex-1 overflow-hidden">
+                <RealTimeline />
+              </div>
+            }
+          />
+        </div>
+
+        {/* Floating inspector popup (renders only when a tool is active). */}
+        <EditorInspectorDock />
+
+        {/* Far-right tool rail — always visible. */}
+        <EditorToolRail
+          hasAnalysis={hasAnalysis}
+          isAnalyzingNow={isAnalyzingNow}
+          canAnalyze={canAnalyze}
+          analyzeTitle={analyzeTitle}
+          onReanalyze={() => setAnalysisOptionsOpen(true)}
+        />
       </div>
-
-      {/* ── 4. Compact toolbar ────────────────────────────────────────────── */}
-      <EditorToolbar
-        hasAnalysis={hasAnalysis}
-        isAnalyzingNow={isAnalyzingNow}
-        canAnalyze={canAnalyze}
-        analyzeTitle={analyzeTitle}
-        cropEditing={cropEditing}
-        onAnalyze={() => setAnalysisOptionsOpen(true)}
-        onToggleCrop={cropEditing ? closeCropEditor : openCropEditor}
-        onCanvas={openCanvas}
-        onEffects={() => setEffectsOpen(true)}
-        onPresets={() => setPresetsOpen(true)}
-        onInsights={() => setInsightsOpen(true)}
-        onGenerateCaptions={() => setCaptionsOpen(true)}
-      />
-
-      {/* ── 5. Timeline — natural height in the page flow (no inner scroll);
-             lane count grows the page and the PAGE scrolls. ─────────────── */}
-      <RealTimeline />
 
       {/* ── Overlay drawers — temporary, never resize the preview. ────────── */}
       <EditorDrawer
@@ -244,48 +247,6 @@ function Body() {
         widthClass="w-72"
       >
         <SidebarNav onNavigate={() => setNavOpen(false)} />
-      </EditorDrawer>
-
-      <EditorDrawer
-        open={presetsOpen}
-        onClose={() => setPresetsOpen(false)}
-        title="Presets"
-        widthClass="w-full max-w-xl"
-      >
-        <div className="space-y-5 p-5">
-          <RecommendedPresets onApplied={() => setPresetsOpen(false)} />
-          <PresetsRail onApplied={() => setPresetsOpen(false)} />
-        </div>
-      </EditorDrawer>
-
-      <EditorDrawer
-        open={insightsOpen}
-        onClose={() => setInsightsOpen(false)}
-        title="AI insights"
-        widthClass="w-full max-w-xl"
-      >
-        <div className="space-y-4 p-5">
-          {project.analysis?.editRecipe && (
-            <RecipeSummary
-              recipe={project.analysis.editRecipe}
-              moments={project.analysis.detectedMoments ?? []}
-              transcript={project.analysis.transcript}
-              audioAnalysis={project.analysis.audioAnalysis}
-              onGenerateCaptions={() => {
-                setInsightsOpen(false);
-                setCaptionsOpen(true);
-              }}
-            />
-          )}
-          <AIConfidencePanel />
-          <SuggestionsPanel />
-          {/* Flag-gated Remotion preview + dev diagnostics (?debug=1) live
-              here so they stay reachable without crowding the workspace. */}
-          <RemotionPreviewPanel />
-          <ClickPipelinePanel />
-          <EditDiagnosticsPanel />
-          <CvDebugPanel />
-        </div>
       </EditorDrawer>
 
       {/* ── Editing dialogs (shared shell) ────────────────────────────────── */}
@@ -306,10 +267,7 @@ function Body() {
           void startAnalyze(opts);
         }}
       />
-      <EffectsModal open={effectsOpen} onClose={() => setEffectsOpen(false)} />
       <ExportModal open={exportOpen} onClose={() => setExportOpen(false)} />
-      <CanvasModal open={canvasOpen} onClose={closeCanvas} />
-      <CaptionsModal open={captionsOpen} onClose={() => setCaptionsOpen(false)} />
 
       {/* Debug overlay — Ctrl+Shift+D in dev / ?debug=1 anywhere. */}
       <DebugOverlay />
