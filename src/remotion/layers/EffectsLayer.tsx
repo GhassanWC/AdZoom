@@ -15,6 +15,7 @@ import type { RenderRecipe } from "@/lib/render/recipe";
 import { resolveCameraFrame } from "@/lib/timeline/camera";
 import { buildTimelineMap } from "@/lib/timeline/crop-speed";
 import { drawClickHighlight } from "@/lib/timeline/click-highlight";
+import { resolveClickHighlight } from "@/lib/render/click-highlight";
 import {
   drawInCameraOverlays,
   drawOutputOverlays,
@@ -65,7 +66,11 @@ export function ClickHighlightOverlay({ recipe }: { recipe: RenderRecipe }): Rea
     if (!effects.clickHighlights) return;
     const sourceTime = sourceTimeForFrame(segments, frame, fps, recipe.sourceDuration);
     const { moment } = resolveCameraFrame(recipe.moments, sourceTime, { autoZoom: effects.autoZoom });
-    if (!moment || moment.effectType !== "click-highlight") return;
+    // Same resolver as compose-frame and the editor preview: this click's own
+    // style/size when it has them, the project's otherwise, and null when it
+    // shouldn't draw at all.
+    const click = resolveClickHighlight(moment, effects);
+    if (!click || !moment) return;
     const dur = Math.max(0.1, moment.endTime - moment.startTime);
     ctx.save();
     ctx.translate(base.drawW / 2, base.drawH / 2);
@@ -75,8 +80,8 @@ export function ClickHighlightOverlay({ recipe }: { recipe: RenderRecipe }): Rea
         cx: moment.focusRegion.x + moment.focusRegion.width / 2,
         cy: moment.focusRegion.y + moment.focusRegion.height / 2,
         progress: Math.max(0, Math.min(1, (sourceTime - moment.startTime) / dur)),
-        style: effects.clickHighlightStyle,
-        sizePct: effects.clickHighlightSize,
+        style: click.style,
+        sizePct: click.sizePct,
       },
       base.drawW,
       base.drawH,

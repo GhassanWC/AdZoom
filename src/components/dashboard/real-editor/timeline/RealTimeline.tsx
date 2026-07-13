@@ -3,33 +3,26 @@
 import * as React from "react";
 import {
   Sparkles,
-  MousePointer2,
   AlertTriangle,
   Trash2,
   Check,
   X as XIcon,
+  Scissors,
+  Upload,
   Film,
   Diamond,
   Bug,
   Activity,
-  ChevronDown,
-  ChevronRight,
-  MoreHorizontal,
-  Eye,
-  EyeOff,
-  type LucideIcon,
 } from "lucide-react";
 import { useEditorReal } from "../context";
 import { cn } from "@/lib/cn";
+import { scrollBehavior } from "@/lib/motion";
 import { distributionScore } from "@/lib/timeline-balancer";
-import { buildTimelineMap } from "@/lib/timeline/crop-speed";
 import { CvSignalTracks } from "../CvSignalTracks";
-import type { DetectedMoment, EffectType } from "@/lib/firebase/schema";
+import type { DetectedMoment } from "@/lib/firebase/schema";
 import type { AnalysisOptions, EngineLayer } from "@/lib/analysis/engine-layers";
 import {
   EFFECT_TONES,
-  EFFECT_ICONS,
-  GUTTER_WIDTH,
   MIN_MOMENT_LEN,
   MIN_PILL_PX,
   SNAP_PX,
@@ -37,9 +30,9 @@ import {
   TRACK_HEIGHTS,
   PROVENANCE_PRESENTATION,
 } from "./constants";
-import { readPersistedBool, writePersistedBool } from "./utils";
+import { readPersistedBool, writePersistedBool, fmt } from "./utils";
 import type { DragState, DragMode } from "./utils";
-import { TimelineTrack, TrackLabel } from "./TimelineTrack";
+import { TimelineTrack } from "./TimelineTrack";
 import { TimelineRuler, GridLines } from "./TimelineRuler";
 import { Playhead } from "./Playhead";
 import { GapIndicator, emptyQuartileRanges } from "./GapIndicator";
@@ -50,23 +43,33 @@ import { AttentionWaveform } from "./AttentionWaveform";
 import { useTimelineMetrics } from "./useTimelineMetrics";
 import { MomentLane } from "./MomentLane";
 import { InteractionsLane } from "./InteractionsLane";
-import type { TimelineLaneContext, TimelineTrackTone } from "./trackModel";
-import { planTimelineLanes, type LaneGroupId } from "./laneModel";
+import { AudioLane } from "./AudioLane";
+import { ClipsLane } from "./ClipsLane";
+import type { TimelineLaneContext } from "./trackModel";
+import { planTimelineLanes } from "./laneModel";
 
 /**
  * Track-based timeline orchestrator. Owns drag math, snap math, multi-select
  * state, and keyboard shortcuts. The visual surface is a stack of DAW-style
  * track rows (Edits, Cuts, Speed, and Cursor / Focus when real
- * cursor data exists) built from an ordered `TimelineTrackDescriptor[]`, so new
- * track types are config, not a render-tree rewrite. Analytics chrome
+ * cursor data exists) built from an ordered row list, so new track types are
+ * config, not a render-tree rewrite. Analytics chrome
  * (attention waveform, narrative chapters, density) stays behind the Insights
  * toggle.
+ *
+ * There is NO left label column. The classifier gutter (group bars + per-lane
+ * icon / name / count / ⋯ menu) is gone entirely: it consumed a fixed slice of
+ * every row's width to restate what the pills already show, and the timeline is
+ * the one surface where horizontal space IS the data. Lanes now start at x=0 and
+ * the whole width is time. Lane identity survives only as `aria-label` on each
+ * track row (and as the ordering data in `laneModel`), never as pixels.
  */
 export function RealTimeline() {
   const {
     project,
     videoRef,
     currentTime,
+    playing,
     duration,
     seek,
     seekBy,
@@ -82,9 +85,9 @@ export function RealTimeline() {
     updateMoment,
     deleteMoment,
     duplicateMoment,
+    splitAtPlayhead,
+    canSplitSelection,
     addMomentAtPlayhead,
-    setLaneEnabled,
-    deleteLane,
     undo,
     redo,
     canUndo,
@@ -94,7 +97,16 @@ export function RealTimeline() {
     startAnalyze,
     analyzing,
     scenesOpen,
+    clips,
+    focusedClipId,
+    openClip,
+    exitClip,
+    requestClipExport,
   } = useEditorReal();
+
+  const focusedClip = focusedClipId
+    ? clips.find((c) => c.id === focusedClipId) ?? null
+    : null;
 
   const moments = project.analysis?.detectedMoments ?? [];
   const va = project.visualAnalysis;
@@ -102,23 +114,28 @@ export function RealTimeline() {
   const narrativeSegments = project.analysis?.narrativeStructure ?? [];
   const attentionCurve = project.analysis?.attentionCurve;
 
+  // The Audio lane appears only when there is REAL audio analysis to draw. No
+  // data → no lane, rather than an empty row implying the audio is silent.
+  const audioAnalysis = project.analysis?.audioAnalysis;
+  const hasAudioData =
+    !!audioAnalysis &&
+    ((audioAnalysis.loudness?.length ?? 0) > 0 ||
+      (audioAnalysis.silenceSegments?.length ?? 0) > 0 ||
+      (audioAnalysis.speechSegments?.length ?? 0) > 0);
+
   // ── Lane model ──────────────────────────────────────────────────────────
   // Every edit type has its OWN lane now (no single "Overlays" lane). The plan
-  // groups the visible lanes (core camera/cut/speed always; overlay lanes only
-  // when populated) into collapsible groups, with each lane carrying its own
-  // moments. Routing is purely by effectType, so old projects load straight
-  // into the right new lanes (no migration).
+  // decides which lanes are visible (core camera/cut/speed always; overlay lanes
+  // only when populated) and carries each lane's moments. It still buckets them
+  // into groups internally, but that is an ORDERING detail only — the timeline
+  // renders lanes, never groups. Routing is purely by effectType, so old projects
+  // load straight into the right lanes (no migration).
   const lanePlan = React.useMemo(() => planTimelineLanes(moments), [moments]);
-  // Cut summary for the track header — "{active} active · {removed}s removed".
-  const cutMap = React.useMemo(
-    () => buildTimelineMap(moments, total),
-    [moments, total]
-  );
 
-  // Engine selection from the most recent analysis — drives the "Disabled for
-  // this analysis" gutter note and the one-click "Run this layer" affordance on
-  // empty lanes. A targeted run enables only that layer in "keep" mode, so it
-  // adds the missing layer without touching anything else on the timeline.
+  // Engine selection from the most recent analysis — decides whether an empty
+  // lane offers its one-click "Run this layer" affordance. A targeted run enables
+  // only that layer in "keep" mode, so it adds the missing layer without touching
+  // anything else on the timeline.
   const lastRun = project.analysis?.lastRunOptions;
   const layerDisabled = React.useCallback(
     (layer: EngineLayer): boolean => {
@@ -163,17 +180,17 @@ export function RealTimeline() {
 
   const trackRef = React.useRef<HTMLDivElement | null>(null);
   const viewportRef = React.useRef<HTMLDivElement | null>(null);
-  // The frozen ruler + the frozen gutter live in separate scroll boxes; the
-  // lane viewport is the ONLY user-scrollable one and drives them via onScroll.
+  // The frozen ruler lives in its own clipped box; the lane viewport is the ONLY
+  // user-scrollable one and drives the ruler's scrollLeft via onScroll. (Nothing
+  // is vertically synced any more — with the gutter gone, the lane viewport is the
+  // only column, so its own scrollbar IS the vertical scroll.)
   const rulerViewportRef = React.useRef<HTMLDivElement | null>(null);
-  const gutterScrollRef = React.useRef<HTMLDivElement | null>(null);
-  // Keep the frozen ruler (horizontal) + frozen gutter (vertical) in lockstep
-  // with the lane viewport. Direct DOM writes — no React state, no re-render.
+  // Keep the frozen ruler horizontally in lockstep with the lane viewport.
+  // Direct DOM write — no React state, no re-render.
   const onViewportScroll = React.useCallback(() => {
     const v = viewportRef.current;
     if (!v) return;
     if (rulerViewportRef.current) rulerViewportRef.current.scrollLeft = v.scrollLeft;
-    if (gutterScrollRef.current) gutterScrollRef.current.scrollTop = v.scrollTop;
   }, []);
   // Scale model: percentage layout stays, but zoom + a measured px/sec are
   // derived here. `trackRef` (the content element) is what the drag math also
@@ -185,6 +202,51 @@ export function RealTimeline() {
     if (viewportRef.current) viewportRef.current.scrollLeft = 0;
     if (rulerViewportRef.current) rulerViewportRef.current.scrollLeft = 0;
   }, [fitToScreen]);
+
+  /**
+   * Bring the opened clip / selected edit INTO VIEW when it isn't already.
+   *
+   * Two rules keep this from becoming annoying, because selection happens
+   * constantly:
+   *   • If the target is already on screen we don't scroll AT ALL. Re-centring a
+   *     pill the user can already see would yank the viewport out from under them
+   *     — the most common way "helpful" auto-scroll turns hostile.
+   *   • It only ever scrolls the minimum distance needed to clear the edge (plus
+   *     a small margin), rather than centring.
+   * Smooth by default; instant under prefers-reduced-motion, where a large
+   * sliding viewport is exactly the movement to avoid.
+   */
+  const selectedMoment = selectedMomentId
+    ? moments.find((m) => m.id === selectedMomentId) ?? null
+    : null;
+  const focusStart = focusedClip?.startTime ?? selectedMoment?.startTime ?? null;
+  const focusEnd = focusedClip?.endTime ?? selectedMoment?.endTime ?? null;
+
+  React.useEffect(() => {
+    const view = viewportRef.current;
+    const content = trackRef.current;
+    if (!view || !content || total <= 0) return;
+    if (focusStart === null || focusEnd === null) return;
+
+    const width = content.clientWidth;
+    if (width <= 0) return;
+    const x0 = (focusStart / total) * width;
+    const x1 = (focusEnd / total) * width;
+
+    const left = view.scrollLeft;
+    const right = left + view.clientWidth;
+    const PAD = 48;
+
+    let next = left;
+    if (x0 < left + PAD) next = x0 - PAD;
+    else if (x1 > right - PAD) next = x1 - view.clientWidth + PAD;
+    else return; // already comfortably visible → leave the viewport alone
+
+    next = Math.max(0, Math.min(next, content.scrollWidth - view.clientWidth));
+    if (Math.abs(next - left) < 1) return;
+
+    view.scrollTo({ left: next, behavior: scrollBehavior() });
+  }, [focusStart, focusEnd, total, zoom]);
 
   // Per-moment render diagnostics (req): start / end / duration / renderedWidthPx.
   // Logged once per (count, total, zoom) change so a "narrow marker" regression
@@ -373,6 +435,31 @@ export function RealTimeline() {
     seek,
   ]);
 
+  /**
+   * Split, with an explanation when it can't happen.
+   *
+   * `splitAtPlayhead` returns null on success and a human sentence on refusal
+   * (playhead outside the edit, or a half would be under 0.3s). Surfacing that
+   * is the difference between "the S key is broken" and "ah — my playhead is a
+   * frame outside the pill".
+   *
+   * Declared BEFORE the keyboard effect on purpose: the effect lists it as a
+   * dependency, and a dep array is evaluated during render, so a `const` further
+   * down the component would be in its temporal dead zone.
+   */
+  const [splitNote, setSplitNote] = React.useState<string | null>(null);
+  const runSplit = React.useCallback(
+    async (ids?: string[]) => {
+      setSplitNote(await splitAtPlayhead(ids));
+    },
+    [splitAtPlayhead]
+  );
+  React.useEffect(() => {
+    if (!splitNote) return;
+    const t = setTimeout(() => setSplitNote(null), 3400);
+    return () => clearTimeout(t);
+  }, [splitNote]);
+
   React.useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const el = e.target as HTMLElement | null;
@@ -426,6 +513,33 @@ export function RealTimeline() {
         return;
       }
 
+      // ── Zoom (⌘/Ctrl not required — the timeline owns +/−/0) ───────────
+      if (!mod && (e.key === "+" || e.key === "=")) {
+        e.preventDefault();
+        zoomIn();
+        return;
+      }
+      if (!mod && (e.key === "-" || e.key === "_")) {
+        e.preventDefault();
+        zoomOut();
+        return;
+      }
+      if (!mod && e.key === "0") {
+        e.preventDefault();
+        onFit();
+        return;
+      }
+
+      // ── Split at the playhead (S) — the NLE convention ─────────────────
+      // Works on the multi-selection when there is one, else the selected edit.
+      // `runSplit` explains itself when the playhead isn't inside the edit.
+      if (!mod && key === "s") {
+        if (!selectedMomentId && multiSelectIds.length === 0) return;
+        e.preventDefault();
+        void runSplit();
+        return;
+      }
+
       // ── Selection-scoped actions ───────────────────────────────────────
       if (multiSelectIds.length > 0) {
         if (e.key === "Delete" || e.key === "Backspace") {
@@ -446,6 +560,9 @@ export function RealTimeline() {
       } else if (mod && key === "d") {
         e.preventDefault();
         void duplicateMoment(selectedMomentId);
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        setSelectedMomentId(null);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -457,6 +574,11 @@ export function RealTimeline() {
     duplicateMoment,
     deleteMultiSelected,
     clearMultiSelect,
+    setSelectedMomentId,
+    runSplit,
+    zoomIn,
+    zoomOut,
+    onFit,
     undo,
     redo,
     videoRef,
@@ -483,25 +605,11 @@ export function RealTimeline() {
     writePersistedBool("adzoom.timeline.insights.open", next);
   };
 
-  // ── Lane-group collapse state (persisted per group) ──────────────────────
-  const [collapsedGroups, setCollapsedGroups] = React.useState<
-    Partial<Record<LaneGroupId, boolean>>
-  >({});
-  React.useEffect(() => {
-    const ids: LaneGroupId[] = ["camera", "pacing", "overlays", "canvas"];
-    setCollapsedGroups(
-      Object.fromEntries(
-        ids.map((id) => [id, readPersistedBool(`adzoom.timeline.group.${id}.collapsed`, false)])
-      )
-    );
-  }, []);
-  const toggleGroup = React.useCallback((id: LaneGroupId) => {
-    setCollapsedGroups((cur) => {
-      const next = !cur[id];
-      writePersistedBool(`adzoom.timeline.group.${id}.collapsed`, next);
-      return { ...cur, [id]: next };
-    });
-  }, []);
+  // Lane-group collapse is GONE along with the group header rows: with no bar to
+  // click there's nothing to collapse, and the lanes are compact enough now that
+  // hiding a whole group isn't the space-saver it was. (The persisted
+  // `adzoom.timeline.group.*.collapsed` keys are simply left unread — harmless,
+  // and nothing else reads them.)
 
   const hasMoments = moments.length > 0;
   const showNarrative = narrativeSegments.length > 0;
@@ -573,22 +681,23 @@ export function RealTimeline() {
   const showInteractionsTrack =
     hasCursorData || (interactionsLoading && !!project.interactionsPath);
 
-  // ── Grouped lane rows ───────────────────────────────────────────────────
-  // Every edit type gets its OWN lane, organised into collapsible groups
-  // (Camera / Pacing / Visual overlays / Canvas). `rows` interleaves group
-  // headers with lane rows so the gutter + lane columns map ONE ordered list
-  // and stay perfectly aligned. Core lanes (camera/cut/speed) always show with a
-  // "Run this layer" affordance; overlay lanes appear only when populated.
+  // ── Lane rows ───────────────────────────────────────────────────────────
+  // Every edit type gets its OWN lane. `rows` is ONE flat ordered list rendered
+  // in ONE column — there is no second (gutter) column to keep aligned with it
+  // any more. Core lanes (camera/cut/speed) always show with a "Run this layer"
+  // affordance; overlay lanes appear only when populated.
   const momentLane = (laneMoments: DetectedMoment[]) => (
     <MomentLane
       moments={laneMoments}
       total={total}
+      currentTime={currentTime}
       selectedMomentId={selectedMomentId}
       multiSelectIds={multiSelectIds}
       draftId={draft?.id ?? null}
       withDraft={withDraft}
       onBeginDrag={beginDrag}
       onDuplicate={(id) => void duplicateMoment(id)}
+      onSplit={(id) => void runSplit([id])}
       onDelete={(id) => void deleteMoment(id)}
       onEdit={onEditMoment}
     />
@@ -599,66 +708,48 @@ export function RealTimeline() {
     speed: "Run Speed",
   };
 
-  type LaneRow = {
-    kind: "lane";
+  /**
+   * ONE row type: a lane, and a lane is nothing but a strip of time.
+   *
+   * No group rows, no group labels, and — since the classifier gutter was
+   * deleted — no lane icon, tint, count, note or ⋯ menu either. Those were the
+   * gutter's fields; with no gutter to draw them in, carrying them here would be
+   * dead weight that quietly invites the column back. `label` survives ONLY as
+   * the row's `aria-label` (screen readers still need to know which track they
+   * are in), and `count` / `engineOff` survive only because the empty-lane "Run
+   * this layer" affordance keys off them.
+   *
+   * Grouping still exists as DATA — `planTimelineLanes` returns PlannedGroups and
+   * the lane tests assert on them — but it is purely an ordering input here: we
+   * flatten the groups and render their lanes.
+   */
+  type Row = {
     id: string;
-    height: number;
-    tone: TimelineTrackTone;
+    /** a11y only — never rendered as text. */
     label: string;
-    Icon: LucideIcon;
+    height: number;
     count: number;
-    note?: string;
     interactive: boolean;
+    /** This lane's engine layer was switched off for the last analysis run. */
+    engineOff: boolean;
     emptyAction?: { label: string; onRun: () => void };
-    /** Overlay lanes: bulk enable/disable/delete over these effect types. */
-    laneControls?: {
-      effectTypes: EffectType[];
-      anyEnabled: boolean;
-      anyDisabled: boolean;
-    };
     renderLane: (ctx: TimelineLaneContext) => React.ReactNode;
   };
-  type GroupRow = {
-    kind: "group";
-    id: LaneGroupId;
-    label: string;
-    count: number;
-    collapsed: boolean;
-  };
-  type Row = LaneRow | GroupRow;
 
   const rows: Row[] = [];
   for (const g of lanePlan) {
-    const collapsed = !!collapsedGroups[g.def.id];
-    rows.push({ kind: "group", id: g.def.id, label: g.def.label, count: g.count, collapsed });
-    if (collapsed) continue;
     for (const lane of g.lanes) {
       const def = lane.def;
       const isCamera = def.id === "camera";
       const engine = def.engineLayer;
       rows.push({
-        kind: "lane",
         id: def.id,
-        height: isCamera ? TRACK_HEIGHTS.ai : TRACK_HEIGHTS.overlay,
-        tone: def.tone,
         label: def.label,
-        Icon: EFFECT_ICONS[def.primaryEffect],
+        height: isCamera ? TRACK_HEIGHTS.ai : TRACK_HEIGHTS.overlay,
         count: lane.count,
-        note:
-          engine && layerDisabled(engine)
-            ? "Disabled for this analysis"
-            : def.id === "cut" && cutMap.activeCuts > 0
-              ? `${cutMap.activeCuts} active · ${Math.round(cutMap.totalRemoved)}s removed`
-              : undefined,
         interactive: true,
+        engineOff: !!engine && layerDisabled(engine),
         emptyAction: engine ? { label: RUN_LABEL[engine], onRun: () => runLayer(engine) } : undefined,
-        laneControls: def.overlay
-          ? {
-              effectTypes: def.effectTypes as EffectType[],
-              anyEnabled: lane.moments.some((m) => m.enabled !== false),
-              anyDisabled: lane.moments.some((m) => m.enabled === false),
-            }
-          : undefined,
         renderLane: () =>
           isCamera ? (
             <>
@@ -681,18 +772,73 @@ export function RealTimeline() {
       });
     }
   }
+  /**
+   * Clips — the AI-generated short clips, as a real lane rather than something
+   * you can only see once you've opened one. Read-only: a clip is a WINDOW into
+   * the source, not an edit, so it has no drag handles. Clicking one opens it
+   * (which is what actually scopes the preview + export to that window).
+   */
+  if (clips.length > 0) {
+    rows.push({
+      id: "clips",
+      label: "Generated clips",
+      height: TRACK_HEIGHTS.overlay,
+      count: clips.length,
+      interactive: false,
+      engineOff: false,
+      renderLane: () => (
+        <ClipsLane
+          clips={clips}
+          total={total}
+          focusedClipId={focusedClipId}
+          onOpen={openClip}
+          onSeek={seek}
+        />
+      ),
+    });
+  }
+
+  /**
+   * Audio — the real waveform, plus what the edits DO to it: cuts strike the
+   * audio they remove, muted speed-ups are dimmed, silences are banded.
+   *
+   * Read-only on purpose. Framevo has no audio edit type (the render core has
+   * no audio-clip concept in preview, browser export, the Cloud Run worker or
+   * Remotion), so an audio track you could drag clips around on would be a
+   * control that changes nothing in the exported file. What it CAN honestly do
+   * is show you the audio and let you see exactly which of it your cuts delete —
+   * which is the thing you actually need when trimming to a target length.
+   */
+  if (hasAudioData) {
+    rows.push({
+      id: "audio",
+      label: "Audio",
+      height: TRACK_HEIGHTS.attention,
+      count: 0,
+      interactive: false,
+      engineOff: false,
+      renderLane: () => (
+        <AudioLane
+          audioAnalysis={audioAnalysis}
+          moments={moments}
+          total={total}
+          height={TRACK_HEIGHTS.attention}
+          onSeek={seek}
+        />
+      ),
+    });
+  }
+
   // Cursor / Focus — read-only cursor data, appended (ungrouped) at the bottom
   // and only when real cursor data exists.
   if (showInteractionsTrack) {
     rows.push({
-      kind: "lane",
       id: "interactions",
-      height: TRACK_HEIGHTS.interactions,
-      tone: "fog",
       label: "Cursor / Focus",
-      Icon: MousePointer2,
+      height: TRACK_HEIGHTS.interactions,
       count: interactionClickCount,
       interactive: false,
+      engineOff: false,
       renderLane: () => (
         <InteractionsLane
           interactions={interactions}
@@ -733,9 +879,46 @@ export function RealTimeline() {
         onDuplicate={() =>
           selectedMomentId && void duplicateMoment(selectedMomentId)
         }
+        canSplit={canSplitSelection}
+        onSplit={() => void runSplit()}
         onDelete={() => selectedMomentId && void deleteMoment(selectedMomentId)}
       />
       </div>
+
+      {/* Focused-clip banner — set when a clip is "opened" from the Clips panel.
+          The playhead has already jumped to the clip; this marks the active
+          window and offers to export just this clip or exit back to the full
+          timeline. */}
+      {focusedClip && (
+        <div className="fv-pop-in flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1.5 border-b border-violet-400/25 bg-violet-500/[0.08] px-4 py-2 text-[12px]">
+          <span className="inline-flex items-center gap-2">
+            <Scissors size={13} className="shrink-0 text-violet-300" />
+            <span className="font-semibold text-white">Clip</span>
+            <span className="min-w-0 truncate text-violet-100/90">{focusedClip.title}</span>
+          </span>
+          <span className="font-mono text-[11px] tabular-nums text-violet-200/70">
+            {fmt(focusedClip.startTime)}–{fmt(focusedClip.endTime)} · {fmt(focusedClip.duration)}
+          </span>
+          <span className="ml-auto inline-flex items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => requestClipExport(focusedClip)}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-violet-400/45 bg-violet-500/20 px-2.5 py-1 text-[11px] font-medium text-violet-50 transition-colors duration-150 hover:bg-violet-500/30"
+            >
+              <Upload size={11} />
+              Export clip
+            </button>
+            <button
+              type="button"
+              onClick={exitClip}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.02] px-2.5 py-1 text-[11px] font-medium text-fog transition-colors duration-150 hover:border-white/25 hover:text-white"
+            >
+              <XIcon size={11} />
+              Exit
+            </button>
+          </span>
+        </div>
+      )}
 
       {showClickLossWarning && (
         <div className="flex items-start gap-2 border-b border-rose-400/25 bg-rose-500/[0.08] px-6 py-2.5 text-[12.5px] text-rose-100">
@@ -765,6 +948,15 @@ export function RealTimeline() {
               Check Analysis Debug for the drop reason.
             </span>
           </div>
+        </div>
+      )}
+
+      {/* Why a split didn't happen. Transient — it answers a question the user
+          just asked by pressing S, and then gets out of the way. */}
+      {splitNote && (
+        <div className="fv-pop-in flex shrink-0 items-center gap-2 border-b border-amber-300/25 bg-amber-400/[0.08] px-6 py-2 text-[12px] text-amber-100">
+          <AlertTriangle size={13} className="shrink-0 text-amber-300" />
+          <span>{splitNote}</span>
         </div>
       )}
 
@@ -816,151 +1008,124 @@ export function RealTimeline() {
       )}
 
       {/* ── Tracks — frozen ruler + internally-scrolling lanes ─────────────
-          The ruler is pinned in its own header row (horizontally synced to the
-          lane viewport). The gutter (labels) and the lane viewport share ONE
-          vertical scroll via onViewportScroll → the lane viewport is the only
-          user-scrollable box; gutter.scrollTop + ruler.scrollLeft mirror it. */}
-      <div className="relative flex min-h-0 flex-1 flex-col px-4 pt-3">
+          Two boxes, ONE column: the ruler is pinned above (clipped, horizontally
+          mirrored from the lane viewport via onViewportScroll) and the lane
+          viewport below owns BOTH scrollbars — vertical for lanes, horizontal for
+          time. Both start at x=0 and share the same zoom-scaled width, which is
+          what keeps the ruler, the gridlines and the playhead on the same pixel
+          as the pills. No left padding: a track starts at the far left edge. */}
+      <div className="relative flex min-h-0 flex-1 flex-col pt-3">
         {/* Frozen time ruler (stays visible while lanes scroll vertically). */}
-        <div className="flex shrink-0">
+        <div ref={rulerViewportRef} className="shrink-0 overflow-hidden">
           <div
-            aria-hidden
-            className="shrink-0"
-            style={{ width: `clamp(44px, 13vw, ${GUTTER_WIDTH}px)` }}
-          />
-          <div ref={rulerViewportRef} className="min-w-0 flex-1 overflow-hidden">
-            <div
-              className="relative select-none"
-              style={{ width: `${zoom * 100}%`, minWidth: "100%" }}
-            >
-              <TimelineRuler total={total} pxPerSec={pxPerSec} />
-            </div>
+            className="relative select-none"
+            style={{ width: `${zoom * 100}%`, minWidth: "100%" }}
+          >
+            <TimelineRuler total={total} pxPerSec={pxPerSec} />
           </div>
         </div>
 
         {/* Lane region — the only scroll surface (vertical lanes + horizontal
-            time). Gutter is vertical-synced; lane viewport owns both scrollbars. */}
-        <div className="flex min-h-0 flex-1">
-          {/* Left gutter — group headers + one label per lane (v-scroll synced). */}
+            time), full width of the card. */}
+        <div
+          ref={viewportRef}
+          onScroll={onViewportScroll}
+          // Tagged so a selected pill's action toolbar can find its clipping box
+          // and flip below the pill when there's no room above it (MomentPill).
+          // Without that, the toolbar on a top-lane edit renders outside this
+          // scroll box and is simply invisible — the Edit button with it.
+          data-timeline-scroll
+          className="min-h-0 flex-1 overflow-auto"
+        >
           <div
-            ref={gutterScrollRef}
-            className="flex shrink-0 flex-col overflow-hidden pr-3"
-            style={{ width: `clamp(44px, 13vw, ${GUTTER_WIDTH}px)` }}
-          >
-            {insightsOpen && <div style={{ height: TRACK_HEIGHTS.gap }} />}
-            {rows.map((r) =>
-              r.kind === "group" ? (
-                <GroupGutterHeader
-                  key={`g-${r.id}`}
-                  label={r.label}
-                  count={r.count}
-                  collapsed={r.collapsed}
-                  onToggle={() => toggleGroup(r.id)}
-                />
-              ) : (
-                <TrackLabel
-                  key={r.id}
-                  Icon={r.Icon}
-                  label={r.label}
-                  count={r.count}
-                  height={r.height}
-                  tone={r.tone}
-                  note={r.note}
-                  trailing={
-                    r.laneControls ? (
-                      <OverlayLaneMenu
-                        label={r.label}
-                        anyEnabled={r.laneControls.anyEnabled}
-                        anyDisabled={r.laneControls.anyDisabled}
-                        onEnableAll={() => void setLaneEnabled(r.laneControls!.effectTypes, true)}
-                        onDisableAll={() => void setLaneEnabled(r.laneControls!.effectTypes, false)}
-                        onDeleteAll={() => void deleteLane(r.laneControls!.effectTypes)}
-                      />
-                    ) : undefined
-                  }
-                />
-              )
-            )}
-            {/* Bottom padding so the last lane clears the horizontal scrollbar. */}
-            <div aria-hidden className="h-3 shrink-0" />
-          </div>
-
-          {/* Right side — scrollable, zoom-scaled lane viewport (both axes) */}
-          <div
-            ref={viewportRef}
-            onScroll={onViewportScroll}
-            className="min-w-0 flex-1 overflow-auto"
+            className="relative select-none"
+            style={{ width: `${zoom * 100}%`, minWidth: "100%" }}
           >
             <div
-              className="relative select-none"
-              style={{ width: `${zoom * 100}%`, minWidth: "100%" }}
+              ref={trackRef}
+              className="relative"
+              onPointerDown={onLaneClick}
             >
-              <div
-                ref={trackRef}
-                className="relative"
-                onPointerDown={onLaneClick}
-              >
-                <GridLines total={total} />
+              <GridLines total={total} />
 
-                {/* Quiet-region markers live behind Insights — when the
-                    panel is closed we keep the surface clean. */}
-                {insightsOpen && <GapIndicator ranges={emptyRanges} />}
-
-                {rows.map((r) => {
-                  if (r.kind === "group") {
-                    // A thin spacer row in the lane column keeps it aligned with
-                    // the gutter's group header (same height, subtle divider).
-                    return (
-                      <div
-                        key={`g-${r.id}`}
-                        aria-hidden
-                        style={{ height: TRACK_HEIGHTS.group }}
-                        className="border-b border-white/[0.05] bg-white/[0.012]"
-                      />
-                    );
-                  }
-                  // Show the one-click "Run this layer" affordance on an empty
-                  // lane when other tracks already have content (this layer is
-                  // conspicuously empty) or it was explicitly disabled last run.
-                  const showEmptyAction =
-                    r.count === 0 &&
-                    !!r.emptyAction &&
-                    (hasMoments || !!r.note);
-                  return (
-                    <TimelineTrack
-                      key={r.id}
-                      ariaLabel={`${r.label} track`}
-                      height={r.height}
-                      dimmed={!r.interactive}
-                    >
-                      {r.renderLane({ total, pxPerSec, zoom })}
-                      {showEmptyAction && (
-                        <TrackEmptyAction
-                          label={r.emptyAction!.label}
-                          onRun={r.emptyAction!.onRun}
-                          disabled={analyzing}
-                        />
-                      )}
-                    </TimelineTrack>
-                  );
-                })}
-
-                {snapGuide !== null && total > 0 && (
-                  <span
-                    className="pointer-events-none absolute inset-y-0 z-20 w-px bg-cyan-300/80 shadow-[0_0_6px_rgba(34,211,238,0.8)]"
-                    style={{ left: `${(snapGuide / total) * 100}%` }}
+              {/* FOCUSED CLIP MODE — dim everything outside the clip so the
+                  clip's own moments read as the subject. Pointer-transparent:
+                  the timeline stays fully editable underneath (and the main
+                  timeline itself is never modified). */}
+              {focusedClip && total > 0 && (
+                <>
+                  {focusedClip.startTime > 0 && (
+                    <div
+                      aria-hidden
+                      className="pointer-events-none absolute inset-y-0 left-0 z-[15] bg-ink/70"
+                      style={{ width: `${(focusedClip.startTime / total) * 100}%` }}
+                    />
+                  )}
+                  {focusedClip.endTime < total && (
+                    <div
+                      aria-hidden
+                      className="pointer-events-none absolute inset-y-0 right-0 z-[15] bg-ink/70"
+                      style={{ left: `${(focusedClip.endTime / total) * 100}%` }}
+                    />
+                  )}
+                  <div
+                    aria-hidden
+                    className="pointer-events-none absolute inset-y-0 z-[16] border-x-2 border-violet-400/70"
+                    style={{
+                      left: `${(focusedClip.startTime / total) * 100}%`,
+                      width: `${((focusedClip.endTime - focusedClip.startTime) / total) * 100}%`,
+                    }}
                   />
-                )}
+                </>
+              )}
 
-                <Playhead
-                  currentTime={currentTime}
-                  total={total}
-                  rulerHeight={TRACK_HEIGHTS.ruler}
+              {/* Quiet-region markers live behind Insights — when the
+                  panel is closed we keep the surface clean. */}
+              {insightsOpen && <GapIndicator ranges={emptyRanges} />}
+
+              {rows.map((r) => {
+                // Show the one-click "Run this layer" affordance on an empty
+                // lane when other tracks already have content (this layer is
+                // conspicuously empty) or it was explicitly disabled last run.
+                const showEmptyAction =
+                  r.count === 0 && !!r.emptyAction && (hasMoments || r.engineOff);
+                return (
+                  <TimelineTrack
+                    key={r.id}
+                    ariaLabel={`${r.label} track`}
+                    height={r.height}
+                    dimmed={!r.interactive}
+                  >
+                    {r.renderLane({ total, pxPerSec, zoom })}
+                    {showEmptyAction && (
+                      <TrackEmptyAction
+                        label={r.emptyAction!.label}
+                        onRun={r.emptyAction!.onRun}
+                        disabled={analyzing}
+                      />
+                    )}
+                  </TimelineTrack>
+                );
+              })}
+
+              {snapGuide !== null && total > 0 && (
+                <span
+                  className="pointer-events-none absolute inset-y-0 z-20 w-px bg-cyan-300/80 shadow-[0_0_6px_rgba(34,211,238,0.8)]"
+                  style={{ left: `${(snapGuide / total) * 100}%` }}
                 />
+              )}
 
-                {/* Match the gutter's bottom padding so scroll extents align. */}
-                <div aria-hidden className="h-3" />
-              </div>
+              <Playhead
+                videoRef={videoRef}
+                currentTime={currentTime}
+                playing={playing}
+                total={total}
+                rulerHeight={TRACK_HEIGHTS.ruler}
+              />
+
+              {/* Clearance so the last lane isn't sat on by the horizontal
+                  scrollbar. */}
+              <div aria-hidden className="h-3" />
             </div>
           </div>
         </div>
@@ -1243,146 +1408,6 @@ function TrackEmptyAction({
   );
 }
 
-/** Collapsible lane-group header shown in the left gutter. */
-function GroupGutterHeader({
-  label,
-  count,
-  collapsed,
-  onToggle,
-}: {
-  label: string;
-  count: number;
-  collapsed: boolean;
-  onToggle: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onToggle}
-      aria-expanded={!collapsed}
-      style={{ height: TRACK_HEIGHTS.group }}
-      className="group/gh flex w-full items-center gap-1 border-b border-white/[0.05] pr-1 text-left"
-    >
-      <span className="text-fog/60 transition-colors duration-150 group-hover/gh:text-white">
-        {collapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
-      </span>
-      <span className="hidden truncate text-[10px] font-semibold uppercase tracking-[0.14em] text-fog/70 transition-colors duration-150 group-hover/gh:text-white md:inline">
-        {label}
-      </span>
-      <span className="ml-auto hidden font-mono text-[10px] tabular-nums text-fog/45 md:inline">
-        {count}
-      </span>
-    </button>
-  );
-}
-
-/**
- * Per-overlay-lane ⋯ menu — bulk enable / disable / delete for every moment of
- * that lane's type. Non-destructive enable/disable (one undo step); delete
- * clears the lane. Closes on outside click.
- */
-function OverlayLaneMenu({
-  label,
-  anyEnabled,
-  anyDisabled,
-  onEnableAll,
-  onDisableAll,
-  onDeleteAll,
-}: {
-  label: string;
-  anyEnabled: boolean;
-  anyDisabled: boolean;
-  onEnableAll: () => void;
-  onDisableAll: () => void;
-  onDeleteAll: () => void;
-}) {
-  const [open, setOpen] = React.useState(false);
-  const ref = React.useRef<HTMLDivElement | null>(null);
-  React.useEffect(() => {
-    if (!open) return;
-    const onDown = (e: PointerEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
-    };
-    window.addEventListener("pointerdown", onDown);
-    return () => window.removeEventListener("pointerdown", onDown);
-  }, [open]);
-  return (
-    <div ref={ref} className="relative">
-      <button
-        type="button"
-        aria-label={`${label} lane options`}
-        onClick={() => setOpen((o) => !o)}
-        className="inline-flex size-6 items-center justify-center rounded-md text-fog/55 transition-colors duration-150 hover:bg-white/[0.06] hover:text-white"
-      >
-        <MoreHorizontal size={13} />
-      </button>
-      {open && (
-        // Opens rightward (into the wide lane area) — the gutter is the leftmost
-        // column inside the card's overflow-hidden, so a leftward menu would clip.
-        <div className="absolute left-0 top-7 z-40 w-40 overflow-hidden rounded-lg border border-white/10 bg-ink/95 p-1 shadow-cinematic backdrop-blur-xl">
-          <LaneMenuItem
-            Icon={Eye}
-            label="Enable all"
-            disabled={!anyDisabled}
-            onClick={() => {
-              onEnableAll();
-              setOpen(false);
-            }}
-          />
-          <LaneMenuItem
-            Icon={EyeOff}
-            label="Disable all"
-            disabled={!anyEnabled}
-            onClick={() => {
-              onDisableAll();
-              setOpen(false);
-            }}
-          />
-          <LaneMenuItem
-            Icon={Trash2}
-            label="Delete all"
-            danger
-            onClick={() => {
-              onDeleteAll();
-              setOpen(false);
-            }}
-          />
-        </div>
-      )}
-    </div>
-  );
-}
-
-function LaneMenuItem({
-  Icon,
-  label,
-  onClick,
-  disabled,
-  danger,
-}: {
-  Icon: LucideIcon;
-  label: string;
-  onClick: () => void;
-  disabled?: boolean;
-  danger?: boolean;
-}) {
-  return (
-    <button
-      type="button"
-      disabled={disabled}
-      onClick={onClick}
-      className={cn(
-        "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[12px] font-medium transition-colors duration-150 disabled:cursor-not-allowed disabled:opacity-40",
-        danger
-          ? "text-rose-200 hover:bg-rose-500/15"
-          : "text-fog hover:bg-white/[0.06] hover:text-white"
-      )}
-    >
-      <Icon size={12} />
-      {label}
-    </button>
-  );
-}
 
 function EmptyTimelineHint({ analyzed }: { analyzed: boolean }) {
   return (

@@ -29,6 +29,7 @@
 import { resolveCameraFrame, canvasTranslateFor } from "@/lib/timeline/camera";
 import { coverFitDims } from "@/lib/timeline/cover";
 import { drawClickHighlight } from "@/lib/timeline/click-highlight";
+import { resolveClickHighlight } from "./click-highlight";
 import { drawInCameraOverlays, drawOutputOverlays } from "./overlay-draw";
 import type { BackgroundMode } from "@/lib/firebase/schema";
 import type { RenderRecipe } from "./recipe";
@@ -137,9 +138,12 @@ function applyCameraFrame(
 
   // Click-highlight overlay — drawn INSIDE the camera transform so the
   // ring/pulse/burst scales with the zoom, matching the preview where the CSS
-  // scale on the wrapper magnifies the highlight's child span. Skipped when
-  // clickHighlights is off OR the active moment isn't a click-highlight.
-  if (effects.clickHighlights && moment && moment.effectType === "click-highlight") {
+  // scale on the wrapper magnifies the highlight's child span. The style/size
+  // come from the SHARED resolver (this click's own look, falling back to the
+  // project's), which the preview and Remotion call too — so per-edit clicks
+  // can't render one way here and another there.
+  const click = resolveClickHighlight(moment, effects);
+  if (click && moment) {
     const dur = Math.max(0.1, moment.endTime - moment.startTime);
     drawClickHighlight(
       ctx,
@@ -147,8 +151,8 @@ function applyCameraFrame(
         cx: moment.focusRegion.x + moment.focusRegion.width / 2,
         cy: moment.focusRegion.y + moment.focusRegion.height / 2,
         progress: Math.max(0, Math.min(1, (t - moment.startTime) / dur)),
-        style: effects.clickHighlightStyle,
-        sizePct: effects.clickHighlightSize,
+        style: click.style,
+        sizePct: click.sizePct,
       },
       base.drawW,
       base.drawH,

@@ -65,12 +65,21 @@ import {
   type AudioAnalysis,
   type ClickPipelineDiagnostics,
   type DetectedMoment,
+  type EffectsSettings,
   type MomentProvenance,
+  type OutputCanvas,
   type Pacing,
+  type ProjectDoc,
   type ProjectStatus,
   type Transcript,
   type VisualAnalysis,
 } from "@/lib/firebase/schema";
+// The Director runs as the FINAL STAGE of analysis (see the stage below) — the
+// user's brief, applied to the understanding this run just produced.
+import { materializeProject } from "@/lib/firebase/materialize-project";
+import { runDirectorStage } from "@/lib/director/analysis-stage";
+import { stripUndefinedDeep } from "@/lib/director/state";
+import { shouldRunDirectorStage, type DirectorState } from "@/lib/director/types";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -1564,6 +1573,81 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       );
     }
 
+    // ── THE DIRECTOR STAGE ───────────────────────────────────────────────────
+    // The last thing analysis does. Everything above produced the UNDERSTANDING
+    // (transcript, moments, narrative beats, attention); the Director turns the
+    // user's brief into real edits on top of it, choosing its designs from the
+    // validated preset library. This is what makes "Direct my video" part of one
+    // flow instead of a second pass the user has to remember to run.
+    //
+    // No brief (or the dialog's toggle turned it off) ⇒ none of this happens and
+    // analysis behaves exactly as it always has.
+    const directorBrief = project.directorBrief as ProjectDoc["directorBrief"];
+    let directorState: DirectorState | undefined;
+    let directorCanvas: OutputCanvas | undefined;
+
+    if (shouldRunDirectorStage(directorBrief, analysisOptions.applyDirectorBrief)) {
+      await setStage(ref, "analyzing" as ProjectStatus, "Directing your video");
+      await emitActivity(ref, "info", "Applying your Director brief");
+
+      // The Director plans against what analysis JUST learned, not what was on
+      // disk when the request came in — so it sees this run's transcript, moments
+      // and narrative structure rather than the previous run's.
+      //
+      // `audioAnalysis` MUST be the fresh one. `buildDirectorContext` derives its
+      // DEAD ZONES (long pauses + silences) from it, and the planner is told to
+      // remove silence ONLY from windows on that list. Passing the doc's stale
+      // value — which on a first analysis is absent entirely — would leave the
+      // list empty, and "remove the boring parts" would quietly do nothing while
+      // reporting success. It only reaches the document in the terminal write
+      // below, which happens AFTER this stage.
+      const directedProject = {
+        ...(materializeProject(projectId, project) as ProjectDoc),
+        duration,
+        visualAnalysis,
+        analysis: {
+          ...(project.analysis as ProjectDoc["analysis"]),
+          detectedMoments: finalMoments,
+          transcript,
+          ...(audioAnalysis ? { audioAnalysis } : {}),
+          narrativeStructure: sections.narrativeStructure,
+          attentionCurve: attention.curveQ8,
+          videoType: effectiveVideoType,
+        },
+        selectedVideoType,
+      } as ProjectDoc;
+
+      const effectsForDirector = {
+        ...((project.effectsSettings as EffectsSettings | undefined) ?? {}),
+        ...(overlayGen.outputCanvas ? { outputCanvas: overlayGen.outputCanvas } : {}),
+      } as EffectsSettings;
+
+      const directed = await runDirectorStage({
+        project: directedProject,
+        brief: directorBrief,
+        moments: finalMoments,
+        effects: effectsForDirector,
+        prior: project.director as DirectorState | undefined,
+      });
+
+      for (const line of directed.log) await emitActivity(ref, line.kind, line.text);
+
+      directorState = directed.state;
+      if (directed.applied) {
+        finalMoments = directed.moments;
+        directorCanvas = directed.outputCanvas;
+      }
+      // A Director failure does NOT sink the analysis: the understanding is real
+      // and the user waited for it. The failed state is persisted so the panel
+      // shows why, and the plain analysis timeline is what they keep.
+    }
+
+    // The Director's canvas WINS over the recipe's: a brief that says "make it
+    // vertical for TikTok" is an explicit instruction, where the recipe's smart
+    // crop is an inference. Explicit beats inferred.
+    const finalOutputCanvas: OutputCanvas | undefined =
+      directorCanvas ?? overlayGen.outputCanvas;
+
     const cleanMoments = stripUndefined(finalMoments);
     const cleanRawPool = stripUndefined(rawPool);
     const cleanRejectedPool = stripUndefined(balanced.rejectedPool);
@@ -1644,9 +1728,11 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
         // smart_crop applies the vertical/social reframe via the output canvas.
         // Merge-write only the canvas so the user's other effects are untouched;
         // only set when the recipe generated one (user had no canvas of their own).
-        ...(overlayGen.outputCanvas
-          ? { effectsSettings: { outputCanvas: overlayGen.outputCanvas } }
-          : {}),
+        ...(finalOutputCanvas ? { effectsSettings: { outputCanvas: finalOutputCanvas } } : {}),
+        // The plan behind every `source: "ai-director"` edit in `detectedMoments`
+        // above. Written in the SAME terminal write as the timeline it produced,
+        // so the two can never be observed out of step.
+        ...(directorState ? { director: stripUndefinedDeep(directorState) } : {}),
         analysis: {
           status: "complete",
           stage: "Complete",

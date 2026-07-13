@@ -5,6 +5,19 @@ import type { SourceCrop } from "@/lib/recording/types";
 // Type-only (erased at runtime → no import cycle): the edit-recipe plan the
 // analysis pipeline records for a project.
 import type { EditRecipePlan } from "@/lib/analysis/edit-recipe";
+// Type-only (erased at runtime → no import cycle, even though director/types.ts
+// imports the edit types from here): the AI Director's persisted state + the
+// per-moment back-link to the plan operation that produced an edit.
+import type {
+  DirectorBrief,
+  DirectorMomentRef,
+  DirectorState,
+} from "@/lib/director/types";
+// Type-only (erased at runtime → no import cycle, even though the preset modules
+// import TextStyle/EffectType from here): the declarative motion model and the
+// preset back-link an applied preset persists on its moment.
+import type { PresetAnimation } from "@/lib/presets/animation";
+import type { PresetRef } from "@/lib/presets/types";
 
 export type { SourceCrop };
 
@@ -155,6 +168,45 @@ export interface SpeedSettings {
 export interface CutSettings {
   /** True = the range is cut (removed). False = restored (kept). */
   active: boolean;
+}
+
+/**
+ * Per-edit CAMERA MOTION — zoom / cursor-focus.
+ *
+ * How fast this edit's camera ramps into and out of its framing. It is the
+ * per-edit half of what used to be a project-global "Zoom Speed" slider that no
+ * renderer ever read; here it drives the real ramp envelope in
+ * `camera.ts:cameraForMoment`, which preview, browser export, the Cloud Run
+ * worker and Remotion all resolve through — so one slider moves all four.
+ *
+ * Optional + additive, like `textStyle`: ABSENT means the shared default ramp,
+ * byte-for-byte what every existing project already renders. No backfill, no
+ * hash churn.
+ */
+export interface CameraMotionSettings {
+  /**
+   * 0..100. Higher = snappier (a shorter ramp); lower = a slower, more
+   * cinematic glide. 50 is the built-in default ramp.
+   */
+  speed: number;
+}
+
+/**
+ * Per-edit CLICK HIGHLIGHT look — `effectType === "click-highlight"`.
+ *
+ * The style and size of THIS click's ring/pulse/burst. Both were project-global
+ * before; a project-wide "all clicks are bursts" is a look, not an edit, so the
+ * globals survive as the DEFAULT (that's what a Look applies) and this bag
+ * overrides them for one click. Resolved at draw by
+ * `render/click-highlight.ts:resolveClickHighlight` — the one function preview,
+ * export, worker and Remotion all call.
+ *
+ * Optional + additive: absent ⇒ the project's effectsSettings, exactly as today.
+ */
+export interface ClickHighlightSettings {
+  style?: "ring" | "pulse" | "burst";
+  /** 0..100 — the highlight's size, same scale as the old global slider. */
+  size?: number;
 }
 
 // ── Phase 3: Core AI Edit Pack settings (additive, one bag per effectType) ──
@@ -419,8 +471,18 @@ export interface FocusRegion {
   height: number; // 0..1
 }
 
-/** Where a timeline edit came from — drives UI affordances + the AI/human split. */
-export type MomentSource = "ai" | "user";
+/**
+ * Where a timeline edit came from — drives UI affordances + the AI/human split.
+ *
+ * `ai-director` is an AI edit produced by the AI Director from a validated
+ * `DirectorPlan`. It is deliberately NOT `user`: every consumer discriminates on
+ * `=== "user"` / `!== "user"` (carry-over, caption counting, camera priority,
+ * pill tone), so a Director edit correctly classifies as AI everywhere while
+ * staying individually addressable for revision + undo. The moment itself is an
+ * ordinary `DetectedMoment` — the user can move, resize, disable or delete it
+ * exactly like any other edit.
+ */
+export type MomentSource = "ai" | "user" | "ai-director";
 
 /**
  * Detailed origin of a moment in the hybrid pipeline. Distinct from
@@ -570,6 +632,16 @@ export interface DetectedMoment {
    * the moment's `[startTime, endTime]`; `cut.active` toggles applied/restored.
    */
   cut?: CutSettings;
+  /**
+   * Camera ramp speed for THIS edit — `zoom` / `cursor-focus`. Absent ⇒ the
+   * shared default ramp (unchanged rendering for every existing project).
+   */
+  cameraMotion?: CameraMotionSettings;
+  /**
+   * This click's own highlight look — `click-highlight`. Absent ⇒ the project's
+   * `effectsSettings` values, which is what a Look sets.
+   */
+  clickHighlight?: ClickHighlightSettings;
 
   // ── Phase 3: Core AI Edit Pack — one optional bag per new effectType ──
   // Additive: present only for the matching effectType; absent on all older docs.
@@ -596,6 +668,38 @@ export interface DetectedMoment {
    * the fields the user changed. See src/lib/render/text-style.ts.
    */
   textStyle?: TextStyle;
+
+  /**
+   * Declarative motion for this edit — entrance, exit, loop and text reveal.
+   *
+   * Optional + additive, exactly like `textStyle`: absent on every older doc,
+   * which keeps rendering with the legacy `hookText.animation` / `textOverlay
+   * .animation` enums. When present it WINS, and it is what preset animations
+   * persist as. Resolve-at-draw, no migration, no hash churn.
+   *
+   * The renderer (`overlay-draw.ts`) evaluates it via `evaluateAnimation`, and
+   * that single module is what the editor preview, the browser exporter, the
+   * Cloud Run worker and Remotion all call — so a preset animates identically in
+   * all four. See src/lib/presets/animation.ts.
+   */
+  animation?: PresetAnimation;
+
+  /**
+   * The preset this edit was created from, if any. Provenance + the anchor the
+   * preset browser uses to show "applied". It does NOT drive rendering — the
+   * resolved `textStyle` + `animation` do, so a user who customises a preset
+   * keeps their changes and never gets them silently reset by a registry update.
+   */
+  preset?: PresetRef;
+
+  /**
+   * Back-link to the AI Director operation that produced this edit. Set only when
+   * `source === "ai-director"`. It is what lets a revision re-target, undo, or
+   * re-apply exactly this edit without touching anything the user made — and what
+   * makes re-running the same request idempotent instead of duplicating edits.
+   * See src/lib/director/types.ts.
+   */
+  director?: DirectorMomentRef;
 
   // ── Attention-aware fields (Gemini-supplied, post-processed by balancer) ──
   /** Composite priority (0..1) — replaces importance going forward. */
@@ -1575,6 +1679,103 @@ export interface MonthlyUsage {
   lastExportPlan?: "free" | "pro" | "creator";
 }
 
+// ── Smart Clip Generation ───────────────────────────────────────────────────
+// After analysis, Framevo can propose several short, self-contained clips cut
+// from the SAME source video. A clip is a lightweight [startTime,endTime] window
+// over the original — it NEVER duplicates the media file (export carves the
+// window with synthetic cut moments, see src/lib/clips/clip-generator.ts). The
+// full-project timeline is untouched; each clip carries its own suggested framing
+// and export status. Purely additive on ProjectDoc → no migration.
+
+/** The editorial category a clip represents (drives the card badge + framing). */
+export type ClipType =
+  | "best_hook"
+  | "valuable_explanation"
+  | "funny_moment"
+  | "emotional_moment"
+  | "product_demo_moment"
+  | "tutorial_step"
+  | "strong_opinion"
+  | "before_after"
+  | "result_reveal"
+  | "call_to_action";
+
+/** Aspect a clip is best exported at (Reels/Shorts = 9:16, etc.). */
+export type ClipAspectRatio = "9:16" | "1:1" | "4:5" | "16:9";
+
+/**
+ * Per-clip export lifecycle. Tracked INDEPENDENTLY of the full-video export
+ * status (a project can have a completed full export and a failed clip export,
+ * or several clips in different states at once).
+ */
+export type ClipExportStatus =
+  | "idle"
+  | "queued"
+  | "rendering"
+  | "completed"
+  | "failed";
+
+/**
+ * A suggested edit operation scoped to a clip. Kept intentionally loose (an
+ * effectType-ish `type` + a source-time window + free params) so the generator
+ * can record intent (e.g. "captions", "hook_text") without committing to the
+ * per-effect settings bags — full execution against the timeline is future work.
+ */
+export interface ClipEditOperation {
+  type: EffectType | "trim";
+  startTime: number;
+  endTime: number;
+  params?: Record<string, unknown>;
+}
+
+export interface GeneratedClip {
+  id: string;
+  /** Human title for the card (derived from narrative/transcript). */
+  title: string;
+  /** Why Framevo chose this clip — shown on the card so the pick is explainable. */
+  reason: string;
+  /** Source-time window (seconds) into the ORIGINAL video. */
+  startTime: number;
+  endTime: number;
+  /** endTime - startTime, cached for the UI. */
+  duration: number;
+  /** Overall strength 0..1 (drives card ranking + the score meter). */
+  score: number;
+  clipType: ClipType;
+  suggestedAspectRatio: ClipAspectRatio;
+  suggestedCaptionStyle: OverlayTextPreset;
+  suggestedHookText: string;
+  editOperations: ClipEditOperation[];
+
+  // ── Per-clip export tracking (never mixed with the full-video export) ──
+  exportStatus: ClipExportStatus;
+  /** The export job rendering THIS clip (cloud) — lets us follow its progress. */
+  exportJobId?: string;
+  /** Download URL once `exportStatus === "completed"`. */
+  exportUrl?: string;
+  /** Failure message when `exportStatus === "failed"`. */
+  exportError?: string;
+  /**
+   * Identity of the completed render: the settings hash + the source
+   * fingerprint it was produced from. A re-export request that matches BOTH is
+   * a duplicate → offer the existing download instead of creating a new job.
+   */
+  exportSettingsHash?: string;
+  exportSourceFingerprint?: string;
+
+  /** Short signal tags behind the score (e.g. "high attention", "result beat"). */
+  signals?: string[];
+  /**
+   * True when no strong standalone moment scored through and this window was
+   * filled in from attention / edit-density / even spacing instead. The card
+   * says so, so a weak-signal suggestion is never passed off as a strong one.
+   */
+  fallback?: boolean;
+  createdAt: number;
+  /** Bumped on rename / regenerate / export-status change. */
+  updatedAt?: number;
+}
+
 export interface ProjectDoc {
   id: string;
   userId: string;
@@ -1645,6 +1846,40 @@ export interface ProjectDoc {
   normalizedSourcePath?: string;
   normalizedSourceKey?: string;
   normalizedAudioDropped?: boolean;
+  /**
+   * AI-suggested short clips cut from this source (Smart Clip Generation).
+   * Top-level (like `visualAnalysis`/`sourceCrop`) so an analysis reset never
+   * clobbers them and so a clip's export status survives independently of the
+   * timeline. Absent until the user generates clips. See
+   * src/lib/clips/clip-generator.ts.
+   */
+  clips?: GeneratedClip[];
+  /**
+   * AI Director state — the original prompt, the validated plan that is the
+   * SINGLE source of truth for every Director edit, the applied operation ids,
+   * the review findings, and the full revision history (so "undo the last
+   * Director change" and reopening the project both restore exactly).
+   *
+   * Top-level (like `clips` / `visualAnalysis`) so an analysis reset never
+   * clobbers it. The edits it produced live where every other edit lives —
+   * `analysis.detectedMoments`, stamped `source: "ai-director"` — so preview,
+   * export and the timeline all read one array. This field is the PLAN, never a
+   * second copy of the timeline. See src/lib/director/types.ts.
+   */
+  director?: DirectorState;
+  /**
+   * THE DIRECTOR BRIEF — what the user asked for, as an INPUT to analysis.
+   *
+   * Distinct from `director` above, which records a run that already happened.
+   * The brief exists BEFORE any run: the analysis pipeline reads it when it
+   * starts and applies the Director as its final stage, which is what makes
+   * "Direct my video" part of the one analysis flow rather than a disconnected
+   * second pass over the result.
+   *
+   * Absent (or with an empty prompt) ⇒ analysis behaves exactly as it always
+   * has. This is the switch that keeps plain analysis working untouched.
+   */
+  directorBrief?: DirectorBrief;
   createdAt: number;
   updatedAt: number;
 }
@@ -1696,6 +1931,18 @@ export interface WorkspaceSettings {
     chunkMode?: "fast" | "balanced" | "detailed" | "very-detailed" | "custom";
     chunkSizeSeconds?: number;
   };
+  /**
+   * Preset-library state. Lives on the USER, not the project: a favourite is a
+   * statement about your taste, not about one video, and it should follow you to
+   * the next project. Ids are validated against the registry on read, so a
+   * preset that is later removed simply stops appearing rather than breaking the
+   * browser.
+   */
+  presetLibrary?: {
+    favouriteIds?: string[];
+    /** Most-recently-used first. */
+    recentIds?: string[];
+  };
   updatedAt?: number;
 }
 
@@ -1726,6 +1973,10 @@ export const DEFAULT_WORKSPACE_SETTINGS: Required<
   analysisDetail: {
     chunkMode: "balanced",
     chunkSizeSeconds: 30,
+  },
+  presetLibrary: {
+    favouriteIds: [],
+    recentIds: [],
   },
 };
 

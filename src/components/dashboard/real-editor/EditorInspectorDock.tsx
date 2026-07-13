@@ -2,13 +2,13 @@
 
 import * as React from "react";
 import { X as XIcon } from "lucide-react";
+import { cn } from "@/lib/cn";
 import { useEditorReal, type RightTool } from "./context";
 import { readPersistedNumber, writePersistedNumber } from "./timeline/utils";
 import { RealCanvasPanel } from "./RealCanvasPanel";
-import { RealEffectsPanel } from "./RealEffectsPanel";
 import { RealCaptionsPanel } from "./RealCaptionsPanel";
-import { RecommendedPresets } from "./RecommendedPresets";
-import { PresetsRail } from "./PresetsRail";
+import { ClipsPanel } from "./ClipsPanel";
+import { PresetBrowserPanel } from "./PresetBrowserPanel";
 import { RecipeSummary } from "./RecipeSummary";
 import { AIConfidencePanel } from "./AIConfidencePanel";
 import { SuggestionsPanel } from "./SuggestionsPanel";
@@ -32,10 +32,11 @@ const RAIL_WIDTH = 56;
 
 const TOOL_TITLE: Record<RightTool, string> = {
   canvas: "Canvas",
-  effects: "Effects",
   captions: "Captions",
-  presets: "Presets",
+  // One presets surface: the library AND the whole-recording Looks (a tab in it).
+  "presets-library": "Presets",
   insights: "Insights",
+  clips: "Clips",
 };
 
 /** Resize ceiling — leaves at least ~15% of the viewport (minus the rail)
@@ -67,6 +68,10 @@ function defaultWidthPx(): number {
  * left-edge handle (persisted). Content reuses the existing panels — one
  * source of truth, no duplicated state.
  */
+
+/** How long the exit animation runs — must match `.fv-panel-out` in globals.css. */
+const CLOSE_MS = 140;
+
 export function EditorInspectorDock() {
   const { activeTool, setActiveTool, project } = useEditorReal();
   const [width, setWidth] = React.useState<number>(() =>
@@ -74,6 +79,33 @@ export function EditorInspectorDock() {
   );
   const panelRef = React.useRef<HTMLDivElement | null>(null);
   const dragRef = React.useRef<{ startX: number; startW: number; live: number } | null>(null);
+
+  /**
+   * The panel has to outlive `activeTool` by one animation so it can animate OUT
+   * — unmounting immediately is what made closing feel like the panel was
+   * deleted rather than dismissed. `shownTool` is what we actually render;
+   * `closing` swaps the enter animation for the (faster) exit one.
+   *
+   * Switching directly from one tool to another does NOT animate: it's the same
+   * panel changing contents, and sliding it out and back in would be noise.
+   */
+  const [shownTool, setShownTool] = React.useState<RightTool | null>(activeTool);
+  const [closing, setClosing] = React.useState(false);
+
+  React.useEffect(() => {
+    if (activeTool) {
+      setShownTool(activeTool);
+      setClosing(false);
+      return;
+    }
+    // Tool cleared → play the exit, then unmount.
+    setClosing(true);
+    const t = setTimeout(() => {
+      setShownTool(null);
+      setClosing(false);
+    }, CLOSE_MS);
+    return () => clearTimeout(t);
+  }, [activeTool]);
 
   React.useEffect(() => {
     if (!activeTool) return;
@@ -122,20 +154,27 @@ export function EditorInspectorDock() {
     [width]
   );
 
-  if (!activeTool) return null;
+  if (!shownTool) return null;
 
   return (
     <div
       ref={panelRef}
       role="dialog"
-      aria-label={`${TOOL_TITLE[activeTool]} panel`}
+      aria-label={`${TOOL_TITLE[shownTool]} panel`}
       // Hold region: selecting timeline items / editing here must not dismiss
       // the floating moment inspector.
       data-editor-dialog-hold
       // Floating popup — absolute + inset-y-0 (relative to the workspace row)
       // takes it OUT of flex flow, so it never resizes the preview/timeline.
       // Opaque background + shadow give it clear elevation over the video.
-      className="absolute inset-y-0 z-40 flex flex-col border-l border-white/[0.08] bg-surface shadow-[-16px_0_40px_-12px_rgba(0,0,0,0.6)]"
+      //
+      // Motion: slides in from the rail it's anchored to (12px, not off-screen —
+      // a full-width slide would be theatre for a panel opened dozens of times a
+      // session). Exit is quicker than enter.
+      className={cn(
+        "absolute inset-y-0 z-40 flex flex-col border-l border-white/[0.08] bg-surface shadow-[-16px_0_40px_-12px_rgba(0,0,0,0.6)]",
+        closing ? "fv-panel-out" : "fv-panel-in"
+      )}
       style={{ width, right: RAIL_WIDTH }}
     >
       {/* Left-edge resize handle. */}
@@ -152,7 +191,7 @@ export function EditorInspectorDock() {
       {/* Header — title + close. */}
       <div className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-white/[0.06] px-3">
         <h2 className="truncate text-[13px] font-semibold text-white">
-          {TOOL_TITLE[activeTool]}
+          {TOOL_TITLE[shownTool]}
         </h2>
         <button
           type="button"
@@ -167,16 +206,11 @@ export function EditorInspectorDock() {
 
       {/* Body — scrolls internally. */}
       <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
-        {activeTool === "canvas" && <RealCanvasPanel />}
-        {activeTool === "effects" && <RealEffectsPanel />}
-        {activeTool === "captions" && <RealCaptionsPanel />}
-        {activeTool === "presets" && (
-          <div className="space-y-5 p-4">
-            <RecommendedPresets />
-            <PresetsRail />
-          </div>
-        )}
-        {activeTool === "insights" && (
+        {shownTool === "clips" && <ClipsPanel />}
+        {shownTool === "canvas" && <RealCanvasPanel />}
+        {shownTool === "captions" && <RealCaptionsPanel />}
+        {shownTool === "presets-library" && <PresetBrowserPanel />}
+        {shownTool === "insights" && (
           <div className="space-y-4 p-4">
             {project.analysis?.editRecipe && (
               <RecipeSummary

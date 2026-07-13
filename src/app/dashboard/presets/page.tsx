@@ -317,7 +317,9 @@ function EmptyCustom() {
         No custom presets yet
       </h3>
       <p className="mx-auto mt-1.5 max-w-sm text-sm text-fog">
-        Open any project, tune the sliders, then click <strong className="text-white">Save current as…</strong> in the presets rail.
+        Open any project, apply a look and set up your canvas, then click{" "}
+        <strong className="text-white">Save current as…</strong> in the editor&apos;s
+        Presets panel, under <strong className="text-white">Looks</strong>.
       </p>
       <div className="mt-3 inline-flex items-center gap-1.5 text-xs text-fog">
         <ChevronDown size={11} />

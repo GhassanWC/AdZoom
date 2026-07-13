@@ -33,9 +33,18 @@ interface GenFlags {
   callouts: boolean;
   transitions: boolean;
   cta: boolean;
+  /**
+   * Whether the Director will run. NOT derivable from `AnalysisOptions` alone —
+   * options can only SUPPRESS the brief (`applyDirectorBrief: false`); whether one
+   * exists at all is a property of the project. The caller supplies it.
+   */
+  director: boolean;
 }
 
-function flags(o: AnalysisOptions | null | undefined): GenFlags {
+function flags(
+  o: AnalysisOptions | null | undefined,
+  directing: boolean | undefined
+): GenFlags {
   return {
     camera: o?.generateCameraEdits !== false,
     cut: o?.generateCut !== false,
@@ -47,6 +56,7 @@ function flags(o: AnalysisOptions | null | undefined): GenFlags {
     callouts: o?.generateCallouts !== false,
     transitions: o?.generateTransitions !== false,
     cta: o?.generateCta !== false,
+    director: directing === true && o?.applyDirectorBrief !== false,
   };
 }
 
@@ -146,6 +156,9 @@ const STEP_TEMPLATES: StepTemplate[] = [
   { id: "cta", base: "Generating CTA", gate: (g) => g.cta },
   { id: "transitions", base: "Generating transitions", gate: (g) => g.transitions },
   { id: "timeline", base: "Adding selected edits to the timeline", gate: () => true },
+  // Only when the user actually wrote a brief — otherwise this step would sit
+  // there permanently unticked on every plain analysis, implying a stage failed.
+  { id: "director", base: "Directing your video", gate: (g) => g.director },
   { id: "finalize", base: "Finalizing AI edit", gate: () => true },
 ];
 
@@ -156,8 +169,10 @@ const STEP_TEMPLATES: StepTemplate[] = [
 export function buildProgressSteps(input: {
   videoType: SelectedVideoType;
   options: AnalysisOptions | null | undefined;
+  /** True when the project has a Director brief this run will apply. */
+  directing?: boolean;
 }): ProgressStep[] {
-  const g = flags(input.options);
+  const g = flags(input.options, input.directing);
   return STEP_TEMPLATES.filter((t) => t.gate(g)).map((t) => ({
     id: t.id,
     label: t.byType?.[input.videoType] ?? t.base,
@@ -228,6 +243,17 @@ const ACTIVITY_RENAMES: { test: RegExp; label: string }[] = [
 /** Un-renamed infra/technical lines — hidden from the feed (kept under details). */
 const TECHNICAL_ACTIVITY = /gemini|files api|file id|inline video|extracting frames|state:/i;
 
+/**
+ * Director lines are ALWAYS user-facing, whatever they contain.
+ *
+ * They are the record of decisions made on the user's behalf — which designs were
+ * chosen, what was applied, what couldn't be. Without this they'd be filtered by
+ * the technical rule the moment a message happened to mention the model (e.g.
+ * "Director planned without the model (gemini timeout)"), which is exactly the
+ * line the user most needs to see.
+ */
+const DIRECTOR_ACTIVITY = /^director\b|^applying your director/i;
+
 export interface FriendlyActivity {
   ts: number;
   kind: AnalysisActivityEvent["kind"];
@@ -241,6 +267,10 @@ export function mapActivity(e: AnalysisActivityEvent): FriendlyActivity {
   const raw = e.text ?? "";
   const rename = ACTIVITY_RENAMES.find((r) => r.test.test(raw));
   if (rename) return { ts: e.ts, kind: e.kind, label: rename.label, technical: false };
+  // Director decisions are shown verbatim — never renamed, never hidden.
+  if (DIRECTOR_ACTIVITY.test(raw)) {
+    return { ts: e.ts, kind: e.kind, label: raw, technical: false };
+  }
   return { ts: e.ts, kind: e.kind, label: raw, technical: TECHNICAL_ACTIVITY.test(raw) };
 }
 

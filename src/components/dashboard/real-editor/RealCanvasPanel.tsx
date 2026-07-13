@@ -3,6 +3,7 @@
 import * as React from "react";
 import { RotateCcw } from "lucide-react";
 import { Slider } from "@/components/ui/Slider";
+import { Toggle } from "@/components/ui/Toggle";
 import { Button } from "@/components/ui/Button";
 import { cn } from "@/lib/cn";
 import { useEditorReal } from "./context";
@@ -51,10 +52,18 @@ function defaultFitFor(aspect: AspectRatioId): FitMode {
  * what you set here is exactly what exports.
  */
 export function RealCanvasPanel() {
-  const { project, updateEffects, clearOutputCanvas } = useEditorReal();
+  const { project, updateEffects, clearOutputCanvas, setRemoveSharingBar } =
+    useEditorReal();
 
   const srcW = project.width && project.width > 0 ? project.width : 1920;
   const srcH = project.height && project.height > 0 ? project.height : 1080;
+
+  // Convenience toggle for the AUTO-detected sharing-bar crop only — a manual
+  // Frame Crop is managed from the Crop Frame tool, not here.
+  const barCrop =
+    project.sourceCrop?.reason === "browser-bar-cleanup"
+      ? project.sourceCrop
+      : undefined;
 
   // The live canvas (or null = "Source / full frame").
   const current = resolveOutputCanvas(project.effectsSettings);
@@ -293,6 +302,21 @@ export function RealCanvasPanel() {
             </Section>
           )}
         </>
+      )}
+
+      {/* The auto-detected browser sharing-bar crop. It rode along in the old
+          Effects panel, but it was never an effect: it trims the SOURCE frame
+          that feeds this canvas, which is this panel's subject. (A manual Frame
+          Crop is still the Crop tool's job.) */}
+      {barCrop && (
+        <Section title="Recording">
+          <Toggle
+            label="Remove browser sharing bar"
+            description="Framevo detected a browser tab sharing bar and is removing it from preview and export. Turn off to use the original captured frame."
+            checked={barCrop.enabled}
+            onChange={(v) => void setRemoveSharingBar(v)}
+          />
+        </Section>
       )}
 
       {/* Honest summary line. */}

@@ -16,9 +16,15 @@ import {
 import { useEditorReal } from "./context";
 import { cn } from "@/lib/cn";
 
-/** Shared button chrome for every secondary (non-primary) transport control. */
+/**
+ * Shared button chrome for every secondary (non-primary) transport control.
+ * `fv-press-sm` gives every one of them a scale-down on press — transport
+ * controls are hit constantly, and a button that doesn't answer the press is the
+ * fastest way to make a tool feel dead. Hover adds a soft surface so the target
+ * reads before it's clicked; both are gated to real pointers by `fv-press`/`fv-lift`.
+ */
 export const PLAYBACK_SECONDARY_CLS =
-  "inline-flex size-9 shrink-0 items-center justify-center rounded-full text-fog transition-colors duration-150 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/60 disabled:pointer-events-none disabled:opacity-30";
+  "fv-press-sm inline-flex size-9 shrink-0 items-center justify-center rounded-full text-fog transition-[color,background-color,transform] duration-150 ease-[cubic-bezier(0.23,1,0.32,1)] hover:bg-white/[0.06] hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/60 disabled:pointer-events-none disabled:opacity-30";
 
 /**
  * The center transport group — jump-to-start, back 5s, the large Play/Pause,
@@ -72,20 +78,29 @@ export function PlaybackTransport() {
         onClick={togglePlay}
         aria-label={playing ? "Pause" : "Play"}
         title={playing ? "Pause (Space)" : "Play (Space)"}
-        className="relative inline-flex size-10 shrink-0 items-center justify-center rounded-full bg-violet-500 text-white shadow-[0_6px_20px_-6px_rgba(139,92,246,0.7)] transition-[transform,background-color] duration-150 hover:bg-violet-400 active:scale-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-300 focus-visible:ring-offset-2 focus-visible:ring-offset-surface disabled:opacity-40"
+        // The primary control: a firmer press (0.94) than the icon buttons, and
+        // a hover lift so the most-used button in the editor feels alive.
+        className="relative inline-flex size-10 shrink-0 items-center justify-center rounded-full bg-violet-500 text-white shadow-[0_6px_20px_-6px_rgba(139,92,246,0.7)] transition-[transform,background-color,box-shadow] duration-150 ease-[cubic-bezier(0.23,1,0.32,1)] hover:bg-violet-400 hover:shadow-[0_8px_24px_-6px_rgba(139,92,246,0.85)] active:scale-[0.94] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-300 focus-visible:ring-offset-2 focus-visible:ring-offset-surface disabled:opacity-40"
       >
+        {/*
+          Play ⇄ Pause crossfade. The outgoing icon shrinks to 0.6 (never to 0 —
+          nothing in the real world vanishes to nothing) while the incoming one
+          scales up, so the two states read as ONE control changing rather than
+          two icons swapping. 160ms: this button is pressed constantly, and
+          anything slower starts to feel like the video is lagging the click.
+        */}
         <Play
           size={18}
           className={cn(
-            "absolute shrink-0 translate-x-[1px] fill-current transition-all duration-200",
-            playing ? "scale-50 opacity-0" : "scale-100 opacity-100"
+            "absolute shrink-0 translate-x-[1px] fill-current transition-[transform,opacity] duration-[160ms] ease-[cubic-bezier(0.23,1,0.32,1)]",
+            playing ? "scale-[0.6] opacity-0" : "scale-100 opacity-100"
           )}
         />
         <Pause
           size={18}
           className={cn(
-            "absolute shrink-0 fill-current transition-all duration-200",
-            playing ? "scale-100 opacity-100" : "scale-50 opacity-0"
+            "absolute shrink-0 fill-current transition-[transform,opacity] duration-[160ms] ease-[cubic-bezier(0.23,1,0.32,1)]",
+            playing ? "scale-100 opacity-100" : "scale-[0.6] opacity-0"
           )}
         />
       </button>
@@ -139,7 +154,16 @@ export function PlaybackVolumeFullscreen() {
         >
           <VolumeIcon size={17} className="shrink-0" />
         </button>
-        <div className="hidden overflow-hidden opacity-0 transition-[width,opacity] duration-200 sm:block sm:w-0 group-hover:w-[68px] group-hover:opacity-100 group-focus-within:w-[68px] group-focus-within:opacity-100">
+        {/*
+          The slider reveal is the one place the editor animates a layout property
+          (width). It's deliberate and safe: a single 68px element, on hover, with
+          nothing but the control bar's own flex row to re-lay-out — no list, no
+          scroll container, no per-frame cost anywhere else. Reserving the space
+          permanently (the transform-only alternative) would push the transport
+          controls off-centre at rest, which is a worse trade for a tool the user
+          stares at all day.
+        */}
+        <div className="hidden overflow-hidden opacity-0 transition-[width,opacity] duration-200 ease-[cubic-bezier(0.23,1,0.32,1)] sm:block sm:w-0 group-hover:w-[68px] group-hover:opacity-100 group-focus-within:w-[68px] group-focus-within:opacity-100">
           <input
             type="range"
             min={0}

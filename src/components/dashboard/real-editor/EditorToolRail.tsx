@@ -6,11 +6,11 @@ import {
   Loader2,
   Crop,
   Frame,
-  SlidersHorizontal,
   Captions as CaptionsIcon,
   CheckCircle2,
-  Wand2,
+  LayoutTemplate,
   Lightbulb,
+  Scissors,
 } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { useEditorReal, type RightTool } from "./context";
@@ -106,11 +106,19 @@ export function EditorToolRail({
 
       <span aria-hidden className="mx-2 my-1 h-px shrink-0 bg-white/[0.08]" />
 
+      {/* No Director button: the Director is not a tool you open, it's the final
+          stage of the analysis the AI action above starts. Its brief lives at the
+          top of that dialog (AnalysisOptionsModal → DirectorBriefFields). */}
       <RailButton label="Crop" title="Crop the source frame (applies everywhere)" icon={<Crop size={17} />} active={cropEditing} onClick={toggleCrop} />
+      <RailButton label="Clips" title="AI-generated short clips from this video" icon={<Scissors size={17} />} active={activeTool === "clips"} onClick={() => toggle("clips")} />
       <RailButton label="Canvas" title="Output canvas — aspect, fit, background" icon={<Frame size={17} />} active={activeTool === "canvas"} onClick={() => toggle("canvas")} />
-      <RailButton label="Effects" title="Global effects" icon={<SlidersHorizontal size={17} />} active={activeTool === "effects"} onClick={() => toggle("effects")} />
       <RailButton label="Captions" title="AI captions" icon={captionIcon} active={activeTool === "captions"} onClick={() => toggle("captions")} />
-      <RailButton label="Presets" title="One-click looks & your saved presets" icon={<Wand2 size={17} />} active={activeTool === "presets"} onClick={() => toggle("presets")} />
+      {/* ONE presets button. It holds the library (a designed caption / title /
+          hook / CTA / transition, dropped on the timeline as a real edit) AND the
+          whole-recording Looks, which used to be a second button of their own.
+          No Effects button either: those sliders were global, and they're now on
+          the edit you select — see MomentInspector's EffectMotionControls. */}
+      <RailButton label="Presets" title="Presets & Looks — captions, titles, hooks, CTAs, transitions, and one-click looks" icon={<LayoutTemplate size={17} />} active={activeTool === "presets-library"} onClick={() => toggle("presets-library")} />
       <RailButton label="Insights" title="AI insights & suggestions" icon={<Lightbulb size={17} />} active={activeTool === "insights"} onClick={() => toggle("insights")} />
     </nav>
   );
@@ -140,13 +148,26 @@ function RailButton({
       aria-label={label}
       aria-pressed={active === undefined ? undefined : active}
       className={cn(
-        "group flex flex-col items-center gap-1 rounded-lg px-1 py-2 text-[9.5px] font-medium leading-tight transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/60 disabled:pointer-events-none disabled:opacity-35",
+        "group flex flex-col items-center gap-1 rounded-lg px-1 py-2 text-[9.5px] font-medium leading-tight focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/60 disabled:pointer-events-none disabled:opacity-35",
+        // Colour/ring carry the active highlight; transform carries the press.
+        // Named properties only — `transition-all` here would also animate the
+        // icon swap (the captions icon morphs between states) into a smear.
+        "fv-press-sm transition-[background-color,color,box-shadow] duration-150 ease-[cubic-bezier(0.23,1,0.32,1)]",
         active
           ? "bg-violet-500/20 text-violet-100 ring-1 ring-violet-400/30"
           : "text-fog hover:bg-white/[0.04] hover:text-white"
       )}
     >
-      <span className="shrink-0">{icon}</span>
+      {/* The icon nudges up a hair when its tool is active — a quiet confirmation
+          that this rail item is the one driving the open panel. */}
+      <span
+        className={cn(
+          "shrink-0 transition-transform duration-200 ease-[cubic-bezier(0.23,1,0.32,1)]",
+          active && "-translate-y-px"
+        )}
+      >
+        {icon}
+      </span>
       <span className="w-full truncate text-center">{label}</span>
     </button>
   );

@@ -18,11 +18,32 @@ import type {
   DetectedMoment,
   EffectsSettings,
   EffectType,
+  GeneratedClip,
   Preset,
   ProjectDoc,
   SelectedVideoType,
   TextStyle,
 } from "@/lib/firebase/schema";
+import { generateClips as computeClips } from "@/lib/clips/clip-generator";
+import {
+  createClipGenerationController,
+  type ClipGenMode,
+  type ClipGenTrigger,
+  type ClipGenerationController,
+  type ClipGenerationResult,
+} from "@/lib/clips/clip-generation";
+import {
+  clipPreviewMoments,
+  clipEffects,
+  applyClipEditsToTimeline,
+} from "@/lib/clips/clip-edits";
+import {
+  withClipExportEvent,
+  replaceClip,
+  type ClipExportEvent,
+} from "@/lib/clips/clip-export-status";
+import { toRenderableClips, type DroppedClip } from "@/lib/clips/clip-render";
+import { trackEvent } from "@/lib/analytics/trackEvent";
 import {
   normalizeSelectedVideoType,
 } from "@/lib/analysis/video-type";
@@ -79,6 +100,12 @@ import {
   DEFAULT_SPEED,
 } from "@/lib/timeline/crop-speed";
 import {
+  canSplit,
+  splitBlockedMessage,
+  splitMomentsAt,
+  splitReason,
+} from "@/lib/timeline/split";
+import {
   resolveSourceRect,
   remapRegion,
   croppedToSource,
@@ -88,6 +115,8 @@ import {
 } from "@/lib/timeline/source-crop";
 import { quantize, dequantize } from "@/lib/cv/resample";
 import type { CaptionActionResult } from "@/lib/analysis/ai-caption-status";
+import type { DirectorRequestForm } from "@/lib/director/request";
+import type { DirectorBrief } from "@/lib/director/types";
 import type {
   AnalysisJob,
   CaptionPosition,
@@ -174,10 +203,19 @@ function remapVisualAnalysisForCrop(
  */
 export type RightTool =
   | "canvas"
-  | "effects"
   | "captions"
-  | "presets"
-  | "insights";
+  /**
+   * The ONE presets surface: the LIBRARY (captions/titles/hooks/CTAs/transitions
+   * from `src/lib/presets/registry.ts`, each compiling to a real timeline edit)
+   * AND the whole-recording Looks (BUILTIN_PRESETS), which are a tab inside it
+   * rather than a rail button of their own.
+   */
+  | "presets-library"
+  | "insights"
+  | "clips";
+
+/** Stable empty-array identity so this doesn't churn consumers each render. */
+const EMPTY_MOMENTS: DetectedMoment[] = [];
 
 interface EditorRealContextValue {
   project: ProjectDoc;
@@ -233,6 +271,74 @@ interface EditorRealContextValue {
    *  default after analysis; remembers the user's last open/closed choice. */
   scenesOpen: boolean;
   toggleScenes: () => void;
+
+  // ── Smart Clip Generation ───────────────────────────────────────────────
+  /**
+   * AI-suggested clips (from ProjectDoc.clips), normalized for rendering. THE
+   * single source of truth — count, list, cards and empty state all read this.
+   */
+  clips: GeneratedClip[];
+  /** How many clips are persisted, INCLUDING any we couldn't render. */
+  clipsStoredCount: number;
+  /** Persisted entries with no usable time window (shown, never hidden). */
+  clipsDropped: DroppedClip[];
+  /** True while (re)generating clips from analysis. */
+  clipsGenerating: boolean;
+  /**
+   * Outcome of the last generation run this session (null before the first).
+   * Carries the REASON for an empty/failed run so the panel can explain itself
+   * instead of falling back to a vague "No clips yet".
+   */
+  clipsLastRun: ClipGenerationResult | null;
+  /**
+   * Compute clips from the current analysis signals + persist them. Returns the
+   * outcome; a click while a run is in flight is a no-op (`status: "busy"`), so
+   * a double-click can't write two clip sets.
+   */
+  generateClips: (opts?: {
+    mode?: ClipGenMode;
+    trigger?: ClipGenTrigger;
+  }) => Promise<ClipGenerationResult>;
+  /** Re-roll ONE clip (keeps its id; resets only its export state). */
+  regenerateClip: (id: string) => Promise<void>;
+  renameClip: (id: string, title: string) => Promise<void>;
+  deleteClip: (id: string) => Promise<void>;
+  /** The clip currently "opened" in the editor, or null. */
+  focusedClipId: string | null;
+  focusedClip: GeneratedClip | null;
+  /** Open a clip: seek to its start + enter focused clip mode. */
+  openClip: (id: string) => void;
+  /** Exit clip focus (back to the full timeline). */
+  exitClip: () => void;
+  /**
+   * FOCUSED CLIP MODE render overrides. While a clip is open the preview renders
+   * its smart edits (hook text, restyled captions, emphasis zoom, CTA, aspect)
+   * WITHOUT writing anything — these are the moments/effects the player should
+   * use instead of `project.analysis.detectedMoments` / `project.effectsSettings`.
+   * Identical (same reference) to the base values when no clip is focused.
+   */
+  previewMoments: DetectedMoment[];
+  previewEffects: EffectsSettings;
+  /**
+   * The ONLY path that lets a clip mutate the project: bakes the clip's edits
+   * into the real timeline (undoable) + adopts its aspect. Confirm with the user.
+   */
+  applyClipToTimeline: (clip: GeneratedClip) => Promise<void>;
+  /**
+   * The clip a pending export is scoped to. When set, the export panel renders
+   * ONLY that clip's range WITH its smart edits + aspect — the full-video export
+   * path is untouched. Cleared when the export dialog closes.
+   */
+  clipExport: GeneratedClip | null;
+  /** Open the export dialog scoped to a clip. */
+  requestClipExport: (clip: GeneratedClip) => void;
+  /** Persist a clip's export lifecycle (queued → rendering → completed/failed). */
+  updateClipExport: (clipId: string, event: ClipExportEvent) => Promise<void>;
+  /** Export dialog open state (lifted here so the Clips panel can open it). */
+  exportModalOpen: boolean;
+  openExportModal: () => void;
+  closeExportModal: () => void;
+
   /** Global "Canvas / Format" panel — derived from `activeTool === "canvas"`. */
   canvasOpen: boolean;
   openCanvas: () => void;
@@ -268,6 +374,18 @@ interface EditorRealContextValue {
   deleteLane: (effectTypes: EffectType[]) => Promise<void>;
   /** Duplicate a moment just after itself, as a fresh user-owned edit. */
   duplicateMoment: (id: string) => Promise<void>;
+  /**
+   * Split the selected edit(s) at the playhead into two independent edits.
+   *
+   * Goes through the same `commitMoments` funnel as every other mutation, so it
+   * is one undo step and writes to the same `detectedMoments` array preview and
+   * export read. Returns a human-readable reason when nothing could be split
+   * (playhead outside the edit, or a half would be too short) — the caller shows
+   * it rather than leaving the user with a button that silently does nothing.
+   */
+  splitAtPlayhead: (ids?: string[]) => Promise<string | null>;
+  /** True when the current selection can actually be split where the playhead is. */
+  canSplitSelection: boolean;
   /** Manually insert an edit of the given effect at the current playhead. */
   addMomentAtPlayhead: (effectType: EffectType) => Promise<void>;
   /** Mint a stable unique id for a user-created moment. */
@@ -319,6 +437,18 @@ interface EditorRealContextValue {
   }) => Promise<CaptionActionResult>;
   /** "Wrong language?" / change language — captions-only FORCED regeneration. */
   retranscribe: (opts: { mode: TranscriptLanguageMode; code?: string }) => Promise<void>;
+
+  // ── AI Director ─────────────────────────────────────────────────────────
+  /**
+   * Persist the Director brief on the project.
+   *
+   * The brief is an INPUT to analysis, not a record of a run: the analyze route
+   * reads it back off the project document and runs the Director as analysis's
+   * final stage. There is no standalone Director run any more — the brief is
+   * written in the analysis dialog (AnalysisOptionsModal) and saved there, right
+   * before the run it belongs to is started.
+   */
+  saveDirectorBrief: (prompt: string, form: DirectorRequestForm) => Promise<void>;
   /** Delete AI-generated captions (manual captions survive). */
   deleteAiCaptions: () => Promise<void>;
   cancelAnalyze: () => Promise<void>;
@@ -587,9 +717,12 @@ export function EditorRealProvider({
   // derived so existing callers (e.g. the Export panel's "Open Canvas") keep
   // working unchanged.
   const [activeTool, setActiveTool] = React.useState<RightTool | null>(() => {
+    // A user whose last-open tool was the retired "effects" or "presets" (Looks)
+    // fails this whitelist and simply reopens with no panel — which is right:
+    // those panels no longer exist.
     const v = readPersistedString<RightTool | "">(
       "framevo:editor-tool",
-      ["canvas", "effects", "captions", "presets", "insights", ""],
+      ["canvas", "captions", "presets-library", "insights", "clips", ""],
       ""
     );
     return v === "" ? null : v;
@@ -775,6 +908,238 @@ export function EditorRealProvider({
     return doc(db, "users", uid, "projects", project.id);
   }, [uid, project.id]);
 
+  // ── Smart Clip Generation ───────────────────────────────────────────────
+  /**
+   * THE source of truth for clips: the persisted `ProjectDoc.clips`, normalized
+   * for rendering. Every consumer (panel, cards, count, empty state, export)
+   * reads this ONE list, so a count can never disagree with what's on screen.
+   *
+   * `clipsDropped` are entries we couldn't render at all (no usable time window)
+   * — surfaced in the panel rather than silently filtered. They're excluded from
+   * `clips`, so a later write (rename/delete/regenerate) drops them for good;
+   * that's a repair, not a loss — a clip with no window can't be opened, previewed
+   * or exported by anything.
+   */
+  const { clips, dropped: clipsDropped } = React.useMemo(
+    () => toRenderableClips(project.clips),
+    [project.clips]
+  );
+  const clipsStoredCount = project.clips?.length ?? 0;
+  const [clipsGenerating, setClipsGenerating] = React.useState(false);
+  const [clipsLastRun, setClipsLastRun] = React.useState<ClipGenerationResult | null>(null);
+  const [focusedClipId, setFocusedClipId] = React.useState<string | null>(null);
+  const [exportModalOpen, setExportModalOpen] = React.useState(false);
+  /** The clip a pending export is scoped to (the whole clip — its edits ride along). */
+  const [clipExport, setClipExport] = React.useState<GeneratedClip | null>(null);
+
+  const baseMoments = project.analysis?.detectedMoments ?? EMPTY_MOMENTS;
+  const focusedClip = React.useMemo(
+    () => (focusedClipId ? clips.find((c) => c.id === focusedClipId) ?? null : null),
+    [clips, focusedClipId]
+  );
+
+  /**
+   * FOCUSED CLIP MODE — the preview renders the clip's smart edits (hook text,
+   * restyled captions, emphasis zoom, CTA) and its suggested aspect. This is a
+   * RENDER-SIDE override only: `project.analysis.detectedMoments` and
+   * `project.effectsSettings` are never written. The original timeline is
+   * untouched until the user explicitly runs `applyClipToTimeline`.
+   * Falls back to the exact base objects (same reference) when no clip is
+   * focused, so nothing downstream re-renders on the normal path.
+   */
+  const previewMoments = React.useMemo(
+    () => (focusedClip ? clipPreviewMoments(baseMoments, focusedClip) : baseMoments),
+    [baseMoments, focusedClip]
+  );
+  const previewEffects = React.useMemo(
+    () =>
+      focusedClip
+        ? clipEffects(
+            project.effectsSettings,
+            focusedClip,
+            project.width ?? 0,
+            project.height ?? 0
+          )
+        : project.effectsSettings,
+    [project.effectsSettings, project.width, project.height, focusedClip]
+  );
+
+  const writeClips = React.useCallback(
+    async (next: GeneratedClip[]) => {
+      await setDoc(
+        projectRef,
+        { clips: next, updatedAt: serverTimestamp() },
+        { merge: true }
+      );
+    },
+    [projectRef]
+  );
+
+  const clipGenInput = React.useCallback(
+    () => ({
+      duration: project.duration ?? 0,
+      selectedVideoType: project.selectedVideoType,
+      analysis: project.analysis,
+      visualAnalysis: project.visualAnalysis,
+    }),
+    [project.duration, project.selectedVideoType, project.analysis, project.visualAnalysis]
+  );
+
+  /**
+   * The generation flow lives in a plain controller (src/lib/clips/clip-generation.ts)
+   * so the whole thing — one-run-at-a-time, the empty/failure reasons, the
+   * export-preserving regenerate, the six clips_* events — is testable without
+   * React. This ref keeps it reading FRESH clips/analysis on every run while
+   * staying identity-stable, so `generateClips` never changes identity and the
+   * panel's auto-run effect can't re-fire.
+   */
+  const clipDepsRef = React.useRef({
+    clips,
+    clipGenInput,
+    writeClips,
+    analysisComplete: project.analysis?.status === "complete",
+    projectId: project.id,
+  });
+  clipDepsRef.current = {
+    clips,
+    clipGenInput,
+    writeClips,
+    analysisComplete: project.analysis?.status === "complete",
+    projectId: project.id,
+  };
+
+  const clipControllerRef = React.useRef<ClipGenerationController | null>(null);
+  if (!clipControllerRef.current) {
+    clipControllerRef.current = createClipGenerationController({
+      buildInput: () => clipDepsRef.current.clipGenInput(),
+      readClips: () => clipDepsRef.current.clips,
+      writeClips: (next) => clipDepsRef.current.writeClips(next),
+      isAnalyzed: () => clipDepsRef.current.analysisComplete,
+      // COUNTS ONLY — the controller builds these payloads from ClipGenStats and
+      // never sees transcript text.
+      emit: (event, payload) => {
+        if (process.env.NODE_ENV !== "production") {
+          console.debug(`[clips] ${event}`, payload);
+        }
+        void trackEvent(event, payload, { projectId: clipDepsRef.current.projectId });
+      },
+      onRunningChange: setClipsGenerating,
+    });
+  }
+
+  const generateClips = React.useCallback(
+    async (opts?: { mode?: ClipGenMode; trigger?: ClipGenTrigger }) => {
+      const res = await clipControllerRef.current!.run(opts);
+      // A `busy` run did nothing — keep the previous outcome on screen.
+      if (res.status !== "busy") setClipsLastRun(res);
+      if (res.status === "failed" && res.error) {
+        console.error("[clips] generation failed:", res.error);
+      }
+      return res;
+    },
+    []
+  );
+
+  /**
+   * Re-roll ONE clip, keeping its id (so focus/export references stay valid) and
+   * leaving every other clip — including their export state — untouched. The
+   * content changes, so its own export state resets: the old render no longer
+   * represents this clip.
+   */
+  const regenerateClip = React.useCallback(
+    async (id: string) => {
+      const target = clips.find((c) => c.id === id);
+      if (!target) return;
+      setClipsGenerating(true);
+      try {
+        const fresh = computeClips(clipGenInput());
+        const others = clips.filter((c) => c.id !== id);
+        const overlap = (a: GeneratedClip, b: GeneratedClip) =>
+          Math.max(
+            0,
+            Math.min(a.endTime, b.endTime) - Math.max(a.startTime, b.startTime)
+          );
+        // Prefer a fresh window that isn't already covered by another clip;
+        // among those, the one closest to what this clip was.
+        const candidate =
+          fresh
+            .filter((f) => !others.some((o) => overlap(o, f) > 0.5 * Math.min(o.duration, f.duration)))
+            .sort((a, b) => overlap(target, b) - overlap(target, a) || b.score - a.score)[0] ??
+          fresh.sort((a, b) => b.score - a.score)[0];
+        if (!candidate) return;
+        const replaced: GeneratedClip = {
+          ...candidate,
+          id: target.id,
+          exportStatus: "idle",
+          updatedAt: Date.now(),
+        };
+        delete replaced.exportJobId;
+        delete replaced.exportUrl;
+        delete replaced.exportError;
+        delete replaced.exportSettingsHash;
+        delete replaced.exportSourceFingerprint;
+        await writeClips(clips.map((c) => (c.id === id ? replaced : c)));
+      } finally {
+        setClipsGenerating(false);
+      }
+    },
+    [clips, clipGenInput, writeClips]
+  );
+
+  const renameClip = React.useCallback(
+    async (id: string, title: string) => {
+      const clean = title.trim();
+      if (!clean) return;
+      await writeClips(
+        clips.map((c) => (c.id === id ? { ...c, title: clean, updatedAt: Date.now() } : c))
+      );
+    },
+    [clips, writeClips]
+  );
+
+  const deleteClip = React.useCallback(
+    async (id: string) => {
+      setFocusedClipId((cur) => (cur === id ? null : cur));
+      setClipExport((cur) => (cur?.id === id ? null : cur));
+      await writeClips(clips.filter((c) => c.id !== id));
+    },
+    [clips, writeClips]
+  );
+
+  /** Persist a clip's export lifecycle (queued → rendering → completed/failed). */
+  const updateClipExport = React.useCallback(
+    async (clipId: string, event: ClipExportEvent) => {
+      const cur = clips.find((c) => c.id === clipId);
+      if (!cur) return;
+      const next = withClipExportEvent(cur, event);
+      await writeClips(replaceClip(clips, next));
+    },
+    [clips, writeClips]
+  );
+
+  const openClip = React.useCallback(
+    (id: string) => {
+      const clip = clips.find((c) => c.id === id);
+      if (!clip) return;
+      setFocusedClipId(id);
+      seek(Math.max(0, clip.startTime + 0.01));
+    },
+    [clips, seek]
+  );
+  const exitClip = React.useCallback(() => setFocusedClipId(null), []);
+
+  const openExportModal = React.useCallback(() => setExportModalOpen(true), []);
+  const closeExportModal = React.useCallback(() => {
+    setExportModalOpen(false);
+    // A clip export is a per-export intent — never let it linger onto the next
+    // (full-video) export.
+    setClipExport(null);
+  }, []);
+  const requestClipExport = React.useCallback((clip: GeneratedClip) => {
+    setClipExport(clip);
+    setExportModalOpen(true);
+  }, []);
+
   // ── Shared interactions sidecar ─────────────────────────────────────────
   // Lazy-loaded once here (instead of per-consumer) so the inspector's
   // "Follow cursor" preset and the timeline's cursor/click lane share a
@@ -948,8 +1313,9 @@ export function EditorRealProvider({
     );
 
   // Lane-level enable/disable — non-destructive, whole layer, single undo step.
-  // Generalizes `setCaptionsEnabled` to any set of effect types (used by the
-  // per-type overlay lanes' gutter menu).
+  // Generalizes `setCaptionsEnabled` to any set of effect types. NOTE: its old
+  // caller (the timeline gutter's per-lane ⋯ menu) is gone with the gutter; this
+  // stays as context API for a future non-gutter entry point.
   const setLaneEnabled: EditorRealContextValue["setLaneEnabled"] =
     React.useCallback(
       async (effectTypes, enabled) => {
@@ -1062,6 +1428,65 @@ export function EditorRealProvider({
         setSelectedMomentId(copy.id);
       },
       [commitMoments, duration, newMomentId]
+    );
+
+  /**
+   * The edits a split would apply to: the multi-selection when there is one,
+   * otherwise the single selected edit.
+   */
+  const splitTargetIds = React.useMemo(
+    () =>
+      multiSelectIds.length > 0
+        ? multiSelectIds
+        : selectedMomentId
+          ? [selectedMomentId]
+          : [],
+    [multiSelectIds, selectedMomentId]
+  );
+
+  // Depends on the PROJECT's moments, not `momentsRef`: the ref is a mutable
+  // mirror, so reading it in a memo would leave the Split button stale after an
+  // edit moved the pill out from under the playhead.
+  const projectMoments = project.analysis?.detectedMoments;
+  const canSplitSelection = React.useMemo(() => {
+    if (splitTargetIds.length === 0) return false;
+    const ids = new Set(splitTargetIds);
+    return (projectMoments ?? []).some(
+      (m) => ids.has(m.id) && canSplit(m, currentTime)
+    );
+  }, [splitTargetIds, currentTime, projectMoments]);
+
+  const splitAtPlayhead: EditorRealContextValue["splitAtPlayhead"] =
+    React.useCallback(
+      async (ids) => {
+        // Explicit ids (a pill's own Split button) override the selection, so a
+        // pill can split itself without first waiting for a selection state
+        // update to land — which wouldn't have happened by the time we read it.
+        const targets = ids?.length ? ids : splitTargetIds;
+        if (targets.length === 0) return "Select an edit to split.";
+
+        const current = momentsRef.current;
+        const res = splitMomentsAt(current, targets, currentTime, newMomentId);
+
+        if (!res) {
+          // Nothing split — say WHY. A Split button that silently does nothing
+          // when the playhead is a hair outside the pill is the most confusing
+          // possible outcome, so we surface the actual reason.
+          const first = current.find((m) => targets.includes(m.id));
+          const reason = first ? splitReason(first, currentTime) : null;
+          return reason
+            ? splitBlockedMessage(reason)
+            : "Move the playhead inside the edit to split it.";
+        }
+
+        await commitMoments(res.moments.map((m) => stripUndefined(m)));
+        // Select the RIGHT half: the user just cut at the playhead, and the part
+        // AFTER the cut is what they're about to act on (trim, delete, restyle).
+        setSelectedMomentId(res.newIds[res.newIds.length - 1]);
+        clearMultiSelect();
+        return null;
+      },
+      [splitTargetIds, currentTime, newMomentId, commitMoments, clearMultiSelect]
     );
 
   const addMomentAtPlayhead: EditorRealContextValue["addMomentAtPlayhead"] =
@@ -1242,6 +1667,36 @@ export function EditorRealProvider({
     [project.effectsSettings, projectRef]
   );
 
+  /**
+   * "Apply edits to full timeline" — the ONLY path that lets a clip mutate the
+   * project. Bakes the clip's smart edits into the real timeline (as user-owned,
+   * undoable moments) and adopts its suggested output aspect. Everything else
+   * about clips is render-side only. The caller MUST confirm with the user first.
+   */
+  const applyClipToTimeline = React.useCallback(
+    async (clip: GeneratedClip) => {
+      const base = project.analysis?.detectedMoments ?? [];
+      await commitMoments(applyClipEditsToTimeline(base, clip));
+      const nextEffects = clipEffects(
+        project.effectsSettings,
+        clip,
+        project.width ?? 0,
+        project.height ?? 0
+      );
+      if (nextEffects.outputCanvas !== project.effectsSettings.outputCanvas) {
+        await updateEffects("outputCanvas", nextEffects.outputCanvas);
+      }
+    },
+    [
+      project.analysis?.detectedMoments,
+      project.effectsSettings,
+      project.width,
+      project.height,
+      commitMoments,
+      updateEffects,
+    ]
+  );
+
   // Reset the global output canvas to "Source / full frame" by removing the
   // field — `resolveOutputCanvas` then returns null and the export/preview use
   // the source-aspect, no-crop path. `deleteField()` is the only safe way to
@@ -1347,8 +1802,8 @@ export function EditorRealProvider({
 
   const applyPreset: EditorRealContextValue["applyPreset"] = React.useCallback(
     async (preset) => {
-      // Defensive plan gate — the calling UI (PresetsRail / RecommendedPresets
-      // / standalone page) already hides locked presets, but this catches
+      // Defensive plan gate — the calling UI (the Presets panel's Looks tab /
+      // standalone page) already hides locked presets, but this catches
       // direct programmatic calls and surface bugs. Reads the live plan from
       // Firestore so a recent webhook upgrade is honoured.
       if (preset.requiredPlan) {
@@ -1790,6 +2245,42 @@ export function EditorRealProvider({
     if (kept.length !== cur.length) await commitMoments(kept);
   }, [commitMoments]);
 
+  // ── AI Director ─────────────────────────────────────────────────────────
+  // The Director is a STAGE OF ANALYSIS, not a separate run: the analyze route
+  // plans → validates → applies → reviews → persists (`analysis.detectedMoments`
+  // + `project.director`) in one server transaction, and the live project
+  // subscription delivers the result. The only thing the client owns is the
+  // BRIEF — the input the user wrote in the analysis dialog.
+  //
+  // The brief is a plain project field, not a Director run — write it directly.
+  // Coalesced: an un-started save is safely superseded by a newer one, because
+  // each write carries the WHOLE brief rather than a patch.
+  const saveDirectorBrief: EditorRealContextValue["saveDirectorBrief"] =
+    React.useCallback(
+      async (prompt, form) => {
+        const brief: DirectorBrief = {
+          prompt,
+          form,
+          updatedAt: Date.now(),
+        };
+        await enqueueProjectWrite(
+          project.id,
+          "director-brief",
+          () =>
+            setDoc(
+              projectRef,
+              {
+                directorBrief: stripUndefined(brief),
+                updatedAt: serverTimestamp(),
+              },
+              { merge: true }
+            ),
+          { coalesceTag: "director-brief" }
+        );
+      },
+      [project.id, projectRef]
+    );
+
   // ── Resume an in-flight chunked job after a refresh ─────────────────────
   // Completed chunks already wrote their moments to the project doc, so the
   // timeline shows them instantly; we just re-attach the orchestrator to drive
@@ -2017,6 +2508,28 @@ export function EditorRealProvider({
     setSplitFraction,
     scenesOpen,
     toggleScenes,
+    clips,
+    clipsStoredCount,
+    clipsDropped,
+    clipsGenerating,
+    clipsLastRun,
+    generateClips,
+    regenerateClip,
+    renameClip,
+    deleteClip,
+    focusedClipId,
+    focusedClip,
+    openClip,
+    exitClip,
+    previewMoments,
+    previewEffects,
+    applyClipToTimeline,
+    clipExport,
+    requestClipExport,
+    updateClipExport,
+    exportModalOpen,
+    openExportModal,
+    closeExportModal,
     canvasOpen,
     openCanvas,
     closeCanvas,
@@ -2036,6 +2549,8 @@ export function EditorRealProvider({
     applyTextStyleToType,
     deleteLane,
     duplicateMoment,
+    splitAtPlayhead,
+    canSplitSelection,
     addMomentAtPlayhead,
     newMomentId,
     acceptSuggestion,
@@ -2053,6 +2568,7 @@ export function EditorRealProvider({
     generateCaptions,
     retranscribe,
     deleteAiCaptions,
+    saveDirectorBrief,
     cancelAnalyze,
     refineFraming,
     refiningFraming,

@@ -18,7 +18,7 @@ const FOCUSABLE_SELECTOR =
  * close. Only one drawer should be open at a time (the owner enforces that).
  *
  * NOTE (framer + position:fixed): the slide animation uses a transform, which
- * would trap `position: fixed` descendants (e.g. PresetsRail's save dialog).
+ * would trap `position: fixed` descendants (e.g. the Looks tab's save dialog).
  * framer-motion removes the inline transform once x reaches 0, so at rest —
  * the only time such dialogs can open — fixed positioning works normally.
  */

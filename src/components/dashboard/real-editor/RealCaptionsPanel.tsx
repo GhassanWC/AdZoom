@@ -17,6 +17,7 @@ import {
   CAPTION_ALLOWANCE_EXHAUSTED_MESSAGE,
 } from "@/lib/usage/caption-quota";
 import { resolveAiCaptionStatus, projectSourceFingerprint } from "@/lib/analysis/ai-caption-status";
+import { cn } from "@/lib/cn";
 import type { TranscriptLanguageMode } from "@/lib/transcript/language";
 import type { CaptionPosition, OverlayTextPreset } from "@/lib/firebase/schema";
 import { useToast } from "@/components/ui/Toast";
@@ -128,16 +129,41 @@ export function RealCaptionsPanel() {
 
   return (
     <div className="space-y-6 px-4 py-4">
-      {/* Status */}
-      <section className="rounded-xl border border-white/[0.08] bg-white/[0.02] p-3">
+      {/*
+        Status. The BORDER and ICON carry the state change (idle → generating →
+        generated) as a colour crossfade; the label text is swapped outright.
+        Deliberately no motion on the text itself — captions are a text-editing
+        surface, and animating copy the user is reading is the fastest way to
+        make a tool feel gimmicky.
+      */}
+      <section
+        className={cn(
+          "rounded-xl border bg-white/[0.02] p-3",
+          "transition-[border-color,background-color] duration-200 ease-[cubic-bezier(0.23,1,0.32,1)]",
+          processing
+            ? "border-violet-400/30"
+            : hasCaptions
+              ? "border-emerald-400/25"
+              : "border-white/[0.08]"
+        )}
+        aria-live="polite"
+      >
         <div className="flex items-center gap-2">
-          {processing ? (
-            <Loader2 size={15} className="shrink-0 animate-spin text-violet-300" />
-          ) : hasCaptions ? (
-            <Check size={15} className="shrink-0 text-emerald-400" />
-          ) : (
-            <CaptionsIcon size={15} className="shrink-0 text-fog" />
-          )}
+          {/* The status icon fades between states rather than hard-cutting — same
+              control, new state, not three different icons. */}
+          <span className="relative inline-flex size-[15px] shrink-0 items-center justify-center">
+            {processing ? (
+              <Loader2 size={15} className="shrink-0 animate-spin text-violet-300" />
+            ) : hasCaptions ? (
+              <Check
+                size={15}
+                className="fv-pop-in shrink-0 text-emerald-400"
+                key="done"
+              />
+            ) : (
+              <CaptionsIcon size={15} className="shrink-0 text-fog" />
+            )}
+          </span>
           <span className="text-[13px] font-medium text-white">
             {processing
               ? "Generating AI Captions…"

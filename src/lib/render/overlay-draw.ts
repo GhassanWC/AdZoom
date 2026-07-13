@@ -34,6 +34,16 @@ import type {
 } from "@/lib/firebase/schema";
 import { resolveTextStyle, type ResolvedTextStyle, type TextScript } from "./text-shaping";
 import {
+  evaluateAnimation,
+  revealText,
+  type AnimationFrame,
+} from "@/lib/presets/animation";
+import {
+  aspectOf,
+  resolveMaxWidthPx,
+  safeBox,
+} from "@/lib/presets/layout";
+import {
   fontFamilyStack,
   rgba,
   resolveTextStyleValues,
@@ -98,6 +108,93 @@ function inProgress(t: number, start: number, end: number, ramp = 0.35): number 
 
 function easeOut(p: number): number {
   return 1 - (1 - p) * (1 - p);
+}
+
+/**
+ * Apply a moment's declarative preset animation to the canvas.
+ *
+ * Returns the evaluated frame, or `null` when the moment carries no `animation`
+ * — in which case the caller keeps its LEGACY animation branch untouched. That
+ * is deliberate: every project made before the preset library must render
+ * byte-for-byte as it did, so `animation` is purely additive and only takes over
+ * when it is actually present.
+ *
+ * This is the ONE place preset motion is turned into pixels, and it lives in the
+ * module that the editor preview, the browser exporter, the Cloud Run worker and
+ * Remotion all call. A preset therefore animates identically in all four by
+ * construction — there is no second implementation to drift.
+ *
+ * The caller must `ctx.save()` first and `ctx.restore()` after (they all do).
+ */
+function applyPresetAnimation(
+  ctx: CanvasRenderingContext2D,
+  m: DetectedMoment,
+  t: number,
+  anchorX: number,
+  anchorY: number,
+  canvasW: number,
+  canvasH: number
+): AnimationFrame | null {
+  const anim = m.animation;
+  if (!anim) return null;
+
+  const f = evaluateAnimation(anim, t, m.startTime, m.endTime);
+
+  ctx.globalAlpha *= f.alpha;
+
+  if (f.translateX !== 0 || f.translateY !== 0) {
+    ctx.translate(f.translateX * canvasW, f.translateY * canvasH);
+  }
+  // Scale + rotate about the text's own anchor, so a "pop" grows in place rather
+  // than flying in from the canvas origin.
+  if (f.scale !== 1 || f.rotate !== 0) {
+    ctx.translate(anchorX, anchorY);
+    if (f.rotate !== 0) ctx.rotate((f.rotate * Math.PI) / 180);
+    if (f.scale !== 1) ctx.scale(f.scale, f.scale);
+    ctx.translate(-anchorX, -anchorY);
+  }
+  if (f.blur > 0) {
+    // Already proven across every render path — compose-frame.ts uses ctx.filter
+    // for the Canvas-Fit blurred background.
+    ctx.filter = `blur(${(f.blur * canvasH).toFixed(2)}px)`;
+  }
+  return f;
+}
+
+/**
+ * The text to actually draw, after the animation's progressive reveal.
+ * Identity when the moment has no reveal.
+ */
+function animatedText(text: string, frame: AnimationFrame | null, m: DetectedMoment): string {
+  const kind = m.animation?.reveal?.kind;
+  if (!frame || !kind || kind === "none") return text;
+  return revealText(text, kind, frame.revealFraction);
+}
+
+/**
+ * Fold the animation's letter-spacing delta into the resolved style. Presets
+ * animate tracking (a common title move: letters settling together), and
+ * `drawStyledText` reads it from the style rather than the frame.
+ */
+function withAnimatedTracking(
+  v: TextStyleValues,
+  frame: AnimationFrame | null
+): TextStyleValues {
+  if (!frame || frame.letterSpacing === 0) return v;
+  return { ...v, letterSpacing: v.letterSpacing + frame.letterSpacing };
+}
+
+/**
+ * The alpha envelope to use.
+ *
+ * A moment with its own `animation` owns its opacity completely: the preset's
+ * `in.opacity` / `out.opacity` ARE the fade. Multiplying the legacy envelope on
+ * top would double-fade it — a designed 0.2s snap-in would be smeared into the
+ * default 0.25s ramp and stop reading as a snap.
+ */
+function baseAlphaFor(m: DetectedMoment, t: number, legacyRamp?: number): number {
+  if (m.animation) return m.enabled === false ? 0 : 1;
+  return envelopeAlpha(t, m.startTime, m.endTime, legacyRamp);
 }
 
 function roundRectPath(
@@ -390,25 +487,50 @@ function drawCaption(
   t: number,
   { canvasW, canvasH }: OverlayLayout
 ): void {
-  const alpha = envelopeAlpha(t, m.startTime, m.endTime);
+  const alpha = baseAlphaFor(m, t);
   if (alpha <= 0 || !s.text.trim()) return;
-  const v = resolveTextStyleValues(m);
-  const a = positionedAnchor(v, canvasW, canvasH, {
+  const v0 = resolveTextStyleValues(m);
+  const a = positionedAnchor(v0, canvasW, canvasH, {
     topF: 0.14,
     centerF: 0.5,
-    bottomF: v.position === "custom" ? 0 : 0.82,
+    bottomF: v0.position === "custom" ? 0 : 0.82,
     marginXF: 0.09,
   });
   ctx.save();
   ctx.globalAlpha = alpha;
-  drawStyledText(ctx, s.text, v, canvasH, {
+  const f = applyPresetAnimation(ctx, m, t, a.x, a.y, canvasW, canvasH);
+  const v = withAnimatedTracking(v0, f);
+  drawStyledText(ctx, animatedText(s.text, f, m), v, canvasH, {
     x: a.x,
     y: a.y,
     vAlign: a.vAlign,
-    maxWidth: canvasW * 0.82,
+    // Wrap inside the platform's SAFE area, not the raw canvas: on a 9:16 feed
+    // the right 12% is the action rail, and a caption running under it is
+    // invisible to a real viewer no matter how good it looks in our preview.
+    maxWidth: safeTextWidth(canvasW, canvasH, 0.98, 0.82),
     minFontPx: 14,
   });
   ctx.restore();
+}
+
+/**
+ * Max text width in px, respecting the aspect's safe area.
+ *
+ * `safeFraction` is the share of the safe box to use; `legacyFraction` is the
+ * old share-of-canvas this call used before safe areas existed. On 16:9 the two
+ * land within a hair of each other (the safe inset is 5%), so existing
+ * horizontal projects wrap exactly as before; on 9:16 the safe box is what
+ * actually keeps text off the platform chrome.
+ */
+function safeTextWidth(
+  canvasW: number,
+  canvasH: number,
+  safeFraction: number,
+  legacyFraction: number
+): number {
+  const aspect = aspectOf(canvasW, canvasH);
+  if (aspect === "16:9") return canvasW * legacyFraction;
+  return Math.max(24, safeBox(canvasW, canvasH, aspect).width * safeFraction);
 }
 
 function drawHookText(
@@ -418,11 +540,11 @@ function drawHookText(
   t: number,
   { canvasW, canvasH }: OverlayLayout
 ): void {
-  const alpha = envelopeAlpha(t, m.startTime, m.endTime);
+  const alpha = baseAlphaFor(m, t);
   if (alpha <= 0 || !s.text.trim()) return;
-  const v = resolveTextStyleValues(m);
+  const v0 = resolveTextStyleValues(m);
   const p = easeOut(inProgress(t, m.startTime, m.endTime));
-  const a = positionedAnchor(v, canvasW, canvasH, {
+  const a = positionedAnchor(v0, canvasW, canvasH, {
     topF: 0.14,
     centerF: 0.5,
     bottomF: 0.82,
@@ -430,19 +552,28 @@ function drawHookText(
   });
   ctx.save();
   ctx.globalAlpha = alpha;
-  // Animation: slide shifts x; pop scales in place about the block centre.
-  if (s.animation === "slide") ctx.translate((1 - p) * canvasW * 0.08, 0);
-  else if (s.animation === "pop") {
-    const scale = 0.85 + 0.15 * p;
-    ctx.translate(a.x, a.y);
-    ctx.scale(scale, scale);
-    ctx.translate(-a.x, -a.y);
+
+  // A preset animation REPLACES the legacy enum rather than compounding with it
+  // — running both would fight (a preset "slide from the left" plus the legacy
+  // "pop" would arrive scaled AND offset, which is neither design).
+  const f = applyPresetAnimation(ctx, m, t, a.x, a.y, canvasW, canvasH);
+  if (!f) {
+    // Legacy path — byte-identical to before the preset library existed.
+    if (s.animation === "slide") ctx.translate((1 - p) * canvasW * 0.08, 0);
+    else if (s.animation === "pop") {
+      const scale = 0.85 + 0.15 * p;
+      ctx.translate(a.x, a.y);
+      ctx.scale(scale, scale);
+      ctx.translate(-a.x, -a.y);
+    }
   }
-  drawStyledText(ctx, s.text, v, canvasH, {
+
+  const v = withAnimatedTracking(v0, f);
+  drawStyledText(ctx, animatedText(s.text, f, m), v, canvasH, {
     x: a.x,
     y: a.y,
     vAlign: a.vAlign,
-    maxWidth: canvasW * 0.86,
+    maxWidth: safeTextWidth(canvasW, canvasH, 1, 0.86),
     minFontPx: 18,
   });
   ctx.restore();
@@ -455,11 +586,11 @@ function drawTextOverlay(
   t: number,
   { canvasW, canvasH }: OverlayLayout
 ): void {
-  const baseAlpha = envelopeAlpha(t, m.startTime, m.endTime, s.animation === "fade" ? 0.4 : 0.2);
+  const baseAlpha = baseAlphaFor(m, t, s.animation === "fade" ? 0.4 : 0.2);
   if (baseAlpha <= 0 || !s.text.trim()) return;
-  const v = resolveTextStyleValues(m);
+  const v0 = resolveTextStyleValues(m);
   const p = easeOut(inProgress(t, m.startTime, m.endTime));
-  const a = positionedAnchor(v, canvasW, canvasH, {
+  const a = positionedAnchor(v0, canvasW, canvasH, {
     topF: 0.08,
     centerF: 0.5,
     bottomF: 0.92,
@@ -467,18 +598,23 @@ function drawTextOverlay(
   });
   ctx.save();
   ctx.globalAlpha = baseAlpha;
-  if (s.animation === "slide") ctx.translate((1 - p) * canvasW * 0.05 * (v.align === "right" ? -1 : 1), 0);
-  else if (s.animation === "pop") {
+  const f = applyPresetAnimation(ctx, m, t, a.x, a.y, canvasW, canvasH);
+  const v = withAnimatedTracking(v0, f);
+  if (f) {
+    // Preset animation owns the transform — skip the legacy branch entirely.
+  } else if (s.animation === "slide") {
+    ctx.translate((1 - p) * canvasW * 0.05 * (v.align === "right" ? -1 : 1), 0);
+  } else if (s.animation === "pop") {
     const scale = 0.9 + 0.1 * p;
     ctx.translate(a.x, a.y);
     ctx.scale(scale, scale);
     ctx.translate(-a.x, -a.y);
   }
-  drawStyledText(ctx, s.text, v, canvasH, {
+  drawStyledText(ctx, animatedText(s.text, f, m), v, canvasH, {
     x: a.x,
     y: a.y,
     vAlign: a.vAlign,
-    maxWidth: canvasW * 0.62,
+    maxWidth: safeTextWidth(canvasW, canvasH, 0.86, 0.62),
     minFontPx: 12,
   });
   ctx.restore();
@@ -491,7 +627,7 @@ function drawBrandingCta(
   t: number,
   { canvasW, canvasH }: OverlayLayout
 ): void {
-  const alpha = envelopeAlpha(t, m.startTime, m.endTime, 0.3);
+  const alpha = baseAlphaFor(m, t, 0.3);
   if (alpha <= 0 || !s.ctaText.trim()) return;
   const v = resolveTextStyleValues(m);
   const fontSize = Math.max(14, Math.round(canvasH * v.fontScale));
@@ -516,8 +652,15 @@ function drawBrandingCta(
   } else if (s.position === "bottom-left") x = margin;
   else if (s.position === "bottom-center") x = canvasW / 2 - boxW / 2;
   else x = canvasW - boxW - margin; // bottom-right
-  const p = easeOut(inProgress(t, m.startTime, m.endTime, 0.4));
-  ctx.translate(0, (1 - p) * boxH * 0.4);
+
+  // A preset animation owns the CTA's motion; otherwise keep the legacy rise.
+  // The anchor is the pill's own centre, so a "pop" grows the button in place.
+  const f = applyPresetAnimation(ctx, m, t, x + boxW / 2, y + boxH / 2, canvasW, canvasH);
+  if (!f) {
+    const p = easeOut(inProgress(t, m.startTime, m.endTime, 0.4));
+    ctx.translate(0, (1 - p) * boxH * 0.4);
+  }
+
   if (v.background !== "none") {
     ctx.fillStyle = rgba(v.backgroundColor, v.backgroundOpacity);
     const r = v.background === "pill" ? boxH / 2 : v.background === "box" ? v.borderRadius * fontSize : 0;
@@ -547,16 +690,65 @@ function drawTransition(
 ): void {
   const dur = m.endTime - m.startTime;
   if (dur <= 0) return;
-  const center = m.startTime + dur / 2;
   const half = dur / 2;
-  // Triangular dip peaking at the window centre.
+  const center = m.startTime + half;
+  /** Triangular dip: 0 at the edges of the window, 1 at its centre. */
   const intensity = clamp01(1 - Math.abs(t - center) / half);
   if (intensity <= 0) return;
-  const isFlash = s.style === "flash";
+  /** Linear 0→1 across the whole window — what the directional styles sweep on. */
+  const sweep = clamp01((t - m.startTime) / dur);
+
   ctx.save();
-  ctx.globalAlpha = intensity * (isFlash ? 0.85 : 0.95);
-  ctx.fillStyle = isFlash ? "#ffffff" : "#000000";
-  ctx.fillRect(0, 0, canvasW, canvasH);
+  switch (s.style) {
+    case "flash":
+      ctx.globalAlpha = intensity * 0.85;
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, canvasW, canvasH);
+      break;
+
+    case "smooth_cut":
+      // A gentler, shallower dip — punctuation rather than a scene break.
+      ctx.globalAlpha = easeOut(intensity) * 0.55;
+      ctx.fillStyle = "#000000";
+      ctx.fillRect(0, 0, canvasW, canvasH);
+      break;
+
+    case "swipe": {
+      // A hard black bar wiping left→right across the frame. Directional, so it
+      // reads as a cut rather than a fade — and it is genuinely renderable over
+      // a SINGLE source, unlike a two-scene clip-path wipe.
+      const edge = sweep * canvasW * 2;
+      ctx.globalAlpha = 0.95;
+      ctx.fillStyle = "#000000";
+      // Leading half covers, trailing half uncovers.
+      if (sweep <= 0.5) ctx.fillRect(0, 0, Math.min(canvasW, edge), canvasH);
+      else ctx.fillRect(Math.min(canvasW, edge - canvasW), 0, canvasW, canvasH);
+      break;
+    }
+
+    case "zoom": {
+      // An IRIS: a black frame with a circular hole that closes to the centre and
+      // reopens. Drawn as an even-odd fill so the hole is genuinely transparent —
+      // the video shows through it, which is what makes it read as an iris rather
+      // than a vignette.
+      const maxR = Math.hypot(canvasW, canvasH) / 2;
+      const r = maxR * (1 - intensity);
+      ctx.globalAlpha = 0.95;
+      ctx.fillStyle = "#000000";
+      ctx.beginPath();
+      ctx.rect(0, 0, canvasW, canvasH);
+      ctx.arc(canvasW / 2, canvasH / 2, Math.max(0, r), 0, Math.PI * 2);
+      ctx.fill("evenodd");
+      break;
+    }
+
+    case "fade":
+    default:
+      ctx.globalAlpha = intensity * 0.95;
+      ctx.fillStyle = "#000000";
+      ctx.fillRect(0, 0, canvasW, canvasH);
+      break;
+  }
   ctx.restore();
 }
 

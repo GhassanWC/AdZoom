@@ -54,6 +54,16 @@ export const EVENTS = {
   CAPTION_QUOTA_BLOCKED: "caption_quota_blocked",
   CAPTION_DISABLED: "caption_disabled",
 
+  // ── Smart Clips ──────────────────────────────────────────────────────
+  // COUNTS ONLY in the metadata (duration, moment/attention/clip counts, a
+  // transcript-available boolean). Never the transcript text or any clip title.
+  CLIPS_GENERATE_CLICKED: "clips_generate_clicked",
+  CLIPS_GENERATION_STARTED: "clips_generation_started",
+  CLIPS_GENERATION_COMPLETED: "clips_generation_completed",
+  CLIPS_GENERATION_EMPTY: "clips_generation_empty",
+  CLIPS_GENERATION_FAILED: "clips_generation_failed",
+  CLIPS_GENERATION_FALLBACK_USED: "clips_generation_fallback_used",
+
   // ── Export ───────────────────────────────────────────────────────────
   EXPORT_STARTED: "export_started",
   EXPORT_COMPLETED: "export_completed",

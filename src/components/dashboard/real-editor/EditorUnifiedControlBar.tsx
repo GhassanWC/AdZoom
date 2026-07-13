@@ -11,6 +11,7 @@ import {
   Plus,
   Scissors,
   Copy,
+  SquareSplitHorizontal as SplitIcon,
   Trash2,
   Check,
   ChevronDown,
@@ -38,6 +39,7 @@ import { cn } from "@/lib/cn";
 import type { EffectType } from "@/lib/firebase/schema";
 import { useEditorReal } from "./context";
 import { useMomentReview } from "./useMomentReview";
+import { MenuPopover, useMenuPopover } from "./MenuPopover";
 import { PlaybackTransport, PlaybackVolumeFullscreen } from "./PlaybackControls";
 import { MODE_FRACTION, modeForSplitFraction, type WorkspaceMode } from "./workspace-split";
 
@@ -78,6 +80,8 @@ export function EditorUnifiedControlBar({
   hasSelection,
   onAdd,
   onDuplicate,
+  canSplit,
+  onSplit,
   onDelete,
 }: {
   health: TimelineHealth;
@@ -97,6 +101,9 @@ export function EditorUnifiedControlBar({
   hasSelection: boolean;
   onAdd: (effectType: EffectType) => void;
   onDuplicate: () => void;
+  /** The playhead is inside the selected edit and both halves would be usable. */
+  canSplit: boolean;
+  onSplit: () => void;
   onDelete: () => void;
 }) {
   const { splitFraction, setSplitFraction, scenesOpen, toggleScenes } = useEditorReal();
@@ -138,6 +145,8 @@ export function EditorUnifiedControlBar({
             onRedo={onRedo}
             hasSelection={hasSelection}
             onDuplicate={onDuplicate}
+            canSplit={canSplit}
+            onSplit={onSplit}
             onDelete={onDelete}
           />
         </div>
@@ -181,44 +190,18 @@ export function EditorUnifiedControlBar({
 }
 
 // ── Shared dropdown primitives ────────────────────────────────────────────
+//
+// Every menu in this bar opens through MenuPopover: the bar sits at the top of
+// the timeline pane, and the whole editor shell is overflow-hidden, so an
+// absolutely-positioned panel gets CLIPPED by the pane — its lower options
+// unreachable on short windows. MenuPopover portals the panel to <body>, flips
+// it above the button when it doesn't fit below, and scrolls it internally.
+// Panel widths are px numbers because the placement math needs them.
 
-/** Open state + outside-click-to-close, shared by every dropdown in this bar. */
-function useDropdown() {
-  const [open, setOpen] = React.useState(false);
-  const ref = React.useRef<HTMLDivElement | null>(null);
-  React.useEffect(() => {
-    if (!open) return;
-    const onClick = (e: MouseEvent) => {
-      if (!ref.current || ref.current.contains(e.target as Node)) return;
-      setOpen(false);
-    };
-    document.addEventListener("mousedown", onClick);
-    return () => document.removeEventListener("mousedown", onClick);
-  }, [open]);
-  return { open, setOpen, ref };
-}
-
-function MenuPanel({
-  align = "left",
-  width = "w-56",
-  children,
-}: {
-  align?: "left" | "right";
-  width?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div
-      className={cn(
-        "absolute top-11 z-40 max-h-[70vh] overflow-y-auto rounded-xl border border-white/10 bg-ink/95 p-1.5 shadow-cinematic backdrop-blur-xl",
-        width,
-        align === "left" ? "left-0" : "right-0"
-      )}
-    >
-      {children}
-    </div>
-  );
-}
+/** Menu widths (px) — were `w-52` / `w-56` / `w-64`. */
+const MENU_W_SM = 208;
+const MENU_W_MD = 224;
+const MENU_W_LG = 256;
 
 function MenuLabel({ children }: { children: React.ReactNode }) {
   return (
@@ -295,6 +278,8 @@ function EditMenu({
   onRedo,
   hasSelection,
   onDuplicate,
+  canSplit,
+  onSplit,
   onDelete,
 }: {
   canUndo: boolean;
@@ -303,17 +288,22 @@ function EditMenu({
   onRedo: () => void;
   hasSelection: boolean;
   onDuplicate: () => void;
+  /** The playhead is inside the selected edit and both halves would be usable. */
+  canSplit: boolean;
+  onSplit: () => void;
   onDelete: () => void;
 }) {
-  const { open, setOpen, ref } = useDropdown();
-  const close = () => setOpen(false);
+  const menu = useMenuPopover();
+  const { open, toggle, close } = menu;
 
   return (
-    <div ref={ref} className="relative">
+    <>
       <button
+        ref={menu.triggerRef}
         type="button"
-        onClick={() => setOpen((v) => !v)}
+        onClick={toggle}
         aria-expanded={open}
+        aria-haspopup="menu"
         aria-label="Edit actions"
         title="Edit — split, duplicate, delete, undo, redo"
         className="inline-flex h-9 shrink-0 items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.025] px-2 text-[11.5px] font-medium text-white/85 transition-colors duration-150 hover:border-white/25 hover:bg-white/[0.06] hover:text-white"
@@ -322,9 +312,24 @@ function EditMenu({
         <span className="hidden sm:inline">Edit</span>
         <ChevronDown size={11} className="shrink-0 opacity-70" />
       </button>
-      {open && (
-        <MenuPanel width="w-52">
-          <MenuItem Icon={Scissors} label="Split" tip="Split clip at playhead — coming soon" disabled />
+      <MenuPopover state={menu} width={MENU_W_SM} ariaLabel="Edit actions">
+          <MenuItem
+            Icon={SplitIcon}
+            label="Split"
+            shortcut="S"
+            tip={
+              !hasSelection
+                ? "Select an edit to split"
+                : canSplit
+                  ? "Split the selected edit at the playhead"
+                  : "Move the playhead inside the edit to split it"
+            }
+            disabled={!hasSelection || !canSplit}
+            onClick={() => {
+              onSplit();
+              close();
+            }}
+          />
           <MenuItem
             Icon={Copy}
             label="Duplicate"
@@ -367,9 +372,8 @@ function EditMenu({
               close();
             }}
           />
-        </MenuPanel>
-      )}
-    </div>
+      </MenuPopover>
+    </>
   );
 }
 
@@ -398,16 +402,18 @@ function ViewMenu({
   insightsOpen: boolean;
   onToggleInsights: () => void;
 }) {
-  const { open, setOpen, ref } = useDropdown();
-  const close = () => setOpen(false);
+  const menu = useMenuPopover();
+  const { open, toggle, close } = menu;
   const current = MODE_META.find((m) => m.mode === activeMode);
 
   return (
-    <div ref={ref} className="relative">
+    <>
       <button
+        ref={menu.triggerRef}
         type="button"
-        onClick={() => setOpen((v) => !v)}
+        onClick={toggle}
         aria-expanded={open}
+        aria-haspopup="menu"
         aria-label="View options"
         title="View — workspace layout, scenes, insights"
         className="inline-flex h-9 shrink-0 items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.025] px-2 text-[11.5px] font-medium text-white/85 transition-colors duration-150 hover:border-white/25 hover:bg-white/[0.06] hover:text-white"
@@ -416,8 +422,7 @@ function ViewMenu({
         <span className="hidden md:inline">{current?.short ?? "View"}</span>
         <ChevronDown size={11} className="shrink-0 opacity-70" />
       </button>
-      {open && (
-        <MenuPanel align="right" width="w-56">
+      <MenuPopover state={menu} align="right" width={MENU_W_MD} ariaLabel="View options">
           <MenuLabel>Workspace layout</MenuLabel>
           {MODE_META.map(({ mode, label, Icon }) => (
             <MenuItem
@@ -452,9 +457,8 @@ function ViewMenu({
               close();
             }}
           />
-        </MenuPanel>
-      )}
-    </div>
+      </MenuPopover>
+    </>
   );
 }
 
@@ -489,29 +493,31 @@ function OverflowMenu({
   onFit: () => void;
   review: ReturnType<typeof useMomentReview>;
 }) {
-  const { open, setOpen, ref } = useDropdown();
+  const menu = useMenuPopover();
+  const { open, toggle, close } = menu;
 
   return (
-    <div ref={ref} className="relative">
+    <>
       <button
+        ref={menu.triggerRef}
         type="button"
-        onClick={() => setOpen((v) => !v)}
+        onClick={toggle}
         aria-expanded={open}
+        aria-haspopup="menu"
         aria-label="More timeline options"
         title="More options — zoom, fit, edit navigation, shortcuts"
         className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg text-fog transition-colors duration-150 hover:bg-white/[0.06] hover:text-white"
       >
         <MoreHorizontal size={17} />
       </button>
-      {open && (
-        <MenuPanel align="right" width="w-64">
+      <MenuPopover state={menu} align="right" width={MENU_W_LG} ariaLabel="More timeline options">
           <MenuLabel>Timeline zoom</MenuLabel>
           <div className="flex items-center gap-1 px-1 pb-1.5">
             <IconBtn Icon={ZoomOut} label="Zoom out" tip="Zoom timeline out" onClick={onZoomOut} disabled={zoom <= minZoom} bare />
             <span className="flex-1 text-center font-mono text-[11px] tabular-nums text-fog">{zoom.toFixed(1)}×</span>
             <IconBtn Icon={ZoomIn} label="Zoom in" tip="Zoom timeline in" onClick={onZoomIn} disabled={zoom >= maxZoom} bare />
           </div>
-          <MenuItem Icon={Maximize2} label="Fit timeline to screen" tip="Resets zoom to 100%" onClick={() => { onFit(); setOpen(false); }} />
+          <MenuItem Icon={Maximize2} label="Fit timeline to screen" tip="Resets zoom to 100%" onClick={() => { onFit(); close(); }} />
 
           {review.total > 0 && (
             <>
@@ -537,9 +543,8 @@ function OverflowMenu({
               </li>
             ))}
           </ul>
-        </MenuPanel>
-      )}
-    </div>
+      </MenuPopover>
+    </>
   );
 }
 
@@ -611,14 +616,17 @@ const ADD_EFFECTS: AddEffectSpec[] = [
 ];
 
 function AddMenu({ onAdd }: { onAdd: (e: EffectType) => void }) {
-  const { open, setOpen, ref } = useDropdown();
+  const menu = useMenuPopover();
+  const { open, toggle, close } = menu;
 
   return (
-    <div ref={ref} className="relative">
+    <>
       <button
+        ref={menu.triggerRef}
         type="button"
-        onClick={() => setOpen((v) => !v)}
+        onClick={toggle}
         aria-expanded={open}
+        aria-haspopup="menu"
         title="Insert a new edit at the playhead"
         className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-violet-400/40 bg-violet-500/15 px-2.5 text-[11.5px] font-semibold text-violet-50 transition-colors duration-150 hover:bg-violet-500/25"
       >
@@ -626,36 +634,36 @@ function AddMenu({ onAdd }: { onAdd: (e: EffectType) => void }) {
         <span className="hidden sm:inline">Add</span>
         <ChevronDown size={11} className="opacity-70" />
       </button>
-      {open && (
-        <div className="absolute left-0 top-11 z-40 max-h-[70vh] w-52 overflow-y-auto rounded-xl border border-white/10 bg-ink/95 p-1 shadow-cinematic backdrop-blur-xl">
-          {ADD_EFFECTS.map(({ id, label, Icon, hint, group }, i) => (
-            <React.Fragment key={id}>
-              {group === "overlay" && ADD_EFFECTS[i - 1]?.group === "edit" && (
-                <div className="mx-2 my-1 border-t border-white/[0.07] pt-1 text-[9.5px] font-semibold uppercase tracking-[0.14em] text-fog/70">
-                  Overlays
-                </div>
-              )}
-              <button
-                type="button"
-                onClick={() => {
-                  onAdd(id);
-                  setOpen(false);
-                }}
-                className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors duration-150 hover:bg-white/[0.06]"
-              >
-                <span className="inline-flex size-7 shrink-0 items-center justify-center rounded-md bg-white/[0.05] text-violet-200 ring-1 ring-white/10">
-                  <Icon size={13} />
-                </span>
-                <span className="min-w-0">
-                  <span className="block text-[12px] font-medium text-white">{label}</span>
-                  <span className="block truncate text-[10.5px] text-fog">{hint}</span>
-                </span>
-              </button>
-            </React.Fragment>
-          ))}
-        </div>
-      )}
-    </div>
+      {/* The tallest menu in the bar — 12 items. It's the one that made the bug
+          obvious, and the one that most needs to scroll rather than be cut. */}
+      <MenuPopover state={menu} width={MENU_W_SM} className="p-1" ariaLabel="Add an edit">
+        {ADD_EFFECTS.map(({ id, label, Icon, hint, group }, i) => (
+          <React.Fragment key={id}>
+            {group === "overlay" && ADD_EFFECTS[i - 1]?.group === "edit" && (
+              <div className="mx-2 my-1 border-t border-white/[0.07] pt-1 text-[9.5px] font-semibold uppercase tracking-[0.14em] text-fog/70">
+                Overlays
+              </div>
+            )}
+            <button
+              type="button"
+              onClick={() => {
+                onAdd(id);
+                close();
+              }}
+              className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors duration-150 hover:bg-white/[0.06]"
+            >
+              <span className="inline-flex size-7 shrink-0 items-center justify-center rounded-md bg-white/[0.05] text-violet-200 ring-1 ring-white/10">
+                <Icon size={13} />
+              </span>
+              <span className="min-w-0">
+                <span className="block text-[12px] font-medium text-white">{label}</span>
+                <span className="block truncate text-[10.5px] text-fog">{hint}</span>
+              </span>
+            </button>
+          </React.Fragment>
+        ))}
+      </MenuPopover>
+    </>
   );
 }
 

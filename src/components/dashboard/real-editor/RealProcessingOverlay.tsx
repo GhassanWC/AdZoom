@@ -42,6 +42,7 @@ import type {
   AnalysisErrorKind,
   SelectedVideoType,
 } from "@/lib/firebase/schema";
+import { hasDirectorBrief } from "@/lib/director/types";
 import { cn } from "@/lib/cn";
 
 const LONG_PROCESS_WARN_MS = 90_000;
@@ -174,10 +175,15 @@ export function RealProcessingOverlay() {
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, y: 16, scale: 0.97 }}
             transition={{ duration: 0.32, ease: [0.22, 1, 0.36, 1] }}
-            className="glass-strong relative w-full max-w-3xl overflow-hidden rounded-2xl shadow-cinematic"
+            // A flex COLUMN capped to the viewport: the header and the progress /
+            // action footer are pinned (`shrink-0`), and only the body between them
+            // scrolls. Without the cap the card grew past a short viewport and
+            // `overflow-hidden` silently clipped the activity feed and the Cancel
+            // button, with no way to reach either.
+            className="glass-strong relative flex max-h-[min(88vh,54rem)] w-full max-w-3xl flex-col overflow-hidden rounded-2xl shadow-cinematic"
           >
             {/* close / minimize header */}
-            <div className="flex items-center justify-between border-b border-white/[0.06] px-5 py-3">
+            <div className="flex shrink-0 items-center justify-between border-b border-white/[0.06] px-5 py-3">
               <div className="flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.22em] text-violet-300">
                 <Sparkles size={11} />
                 Framevo AI
@@ -206,18 +212,26 @@ export function RealProcessingOverlay() {
               </div>
             </div>
 
-            {/* Body */}
+            {/* Body. The terminal states are short, but a failure message can be
+                long — they scroll inside the card rather than growing it past the
+                viewport. ActiveBody manages its own scroll + pinned footer. */}
             {failed ? (
-              <FailedBody
-                errorKind={analysis?.errorKind}
-                errorMessage={analysis?.errorMessage}
-                onRetry={onRetry}
-                onClose={onCloseTerminal}
-              />
+              <div className="min-h-0 flex-1 overflow-y-auto">
+                <FailedBody
+                  errorKind={analysis?.errorKind}
+                  errorMessage={analysis?.errorMessage}
+                  onRetry={onRetry}
+                  onClose={onCloseTerminal}
+                />
+              </div>
             ) : cancelled ? (
-              <CancelledBody onRetry={onRetry} onClose={onCloseTerminal} />
+              <div className="min-h-0 flex-1 overflow-y-auto">
+                <CancelledBody onRetry={onRetry} onClose={onCloseTerminal} />
+              </div>
             ) : done ? (
-              <CompleteBody editsCount={editsCount} onClose={onCloseTerminal} />
+              <div className="min-h-0 flex-1 overflow-y-auto">
+                <CompleteBody editsCount={editsCount} onClose={onCloseTerminal} />
+              </div>
             ) : (
               <ActiveBody
                 videoType={selectedVideoType}
@@ -304,7 +318,11 @@ function ActiveBody({
   onMinimize: () => void;
 }) {
   const [detailsOpen, setDetailsOpen] = React.useState(false);
-  const { chunkedJob } = useEditorReal();
+  const { chunkedJob, project } = useEditorReal();
+  // The Director step only exists when the user actually wrote a brief AND this
+  // run isn't suppressing it — see `GenFlags.director`.
+  const directing =
+    hasDirectorBrief(project?.directorBrief) && options?.applyDirectorBrief !== false;
   const job =
     chunkedJob && (chunkedJob.status === "running" || chunkedJob.status === "queued")
       ? chunkedJob
@@ -327,15 +345,20 @@ function ActiveBody({
   // so the checklist advances even without per-step server signals.
   const { headline, subtitle } = progressHeadline(videoType);
   const steps: ProgressStep[] = React.useMemo(
-    () => buildProgressSteps({ videoType, options }),
-    [videoType, options]
+    () => buildProgressSteps({ videoType, options, directing }),
+    [videoType, options, directing]
   );
   const activeStepIdx = Math.min(steps.length - 1, Math.max(0, Math.floor(pct * steps.length)));
   const activeStep = steps[activeStepIdx];
   const friendly = React.useMemo(() => friendlyActivityFeed(activity), [activity]);
 
   return (
-    <div className="p-6">
+    // `min-h-0` is what actually lets the scroll container below shrink — a flex
+    // child defaults to min-height:auto and would otherwise refuse to be smaller
+    // than its content, pushing the pinned footer off-screen instead of scrolling.
+    <div className="flex min-h-0 flex-1 flex-col">
+      {/* Scrolls. Everything that can grow without bound lives in here. */}
+      <div className="min-h-0 flex-1 overflow-y-auto p-6">
       <div className="grid grid-cols-1 gap-6 md:grid-cols-[1.05fr_1fr]">
         {/* Left: headline + dynamic step list */}
         <div>
@@ -427,43 +450,6 @@ function ActiveBody({
         </div>
       </div>
 
-      {/* Progress bar + time chips */}
-      <div className="mt-6 space-y-2">
-        <div className="h-1 overflow-hidden rounded-full bg-white/[0.06]">
-          <motion.div
-            initial={{ width: 0 }}
-            animate={{ width: `${pct * 100}%` }}
-            transition={{ duration: 0.5, ease: [0.22, 1, 0.36, 1] }}
-            className="h-full rounded-full bg-gradient-to-r from-violet-500 to-cyan-400 shadow-[0_0_16px_rgba(139,92,246,0.6)]"
-          />
-        </div>
-        <div className="flex flex-wrap items-center gap-2 text-[11px] text-fog">
-          <span className="inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-white/[0.02] px-2 py-0.5">
-            <Clock size={10} className="text-violet-300" />
-            Elapsed{" "}
-            <span className="font-mono tabular-nums text-white/85">
-              {fmtElapsed(elapsedMs)}
-            </span>
-          </span>
-          {estimateSeconds && (
-            <span className="inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-white/[0.02] px-2 py-0.5">
-              <Info size={10} />
-              Est.{" "}
-              <span className="font-mono tabular-nums text-white/85">
-                {estLow}–{estHigh}s
-              </span>
-            </span>
-          )}
-          <button
-            onClick={() => setDetailsOpen((v) => !v)}
-            className="ml-auto inline-flex items-center gap-1 rounded-full border border-white/10 bg-white/[0.02] px-2 py-0.5 text-[11px] text-fog transition-colors duration-200 hover:border-white/20 hover:text-white"
-          >
-            {detailsOpen ? <ChevronUp size={10} /> : <ChevronDown size={10} />}
-            Processing details
-          </button>
-        </div>
-      </div>
-
       {/* Expandable details */}
       <AnimatePresence initial={false}>
         {detailsOpen && (
@@ -501,20 +487,60 @@ function ActiveBody({
         </div>
       )}
 
-      {/* Actions */}
-      <div className="mt-5 flex flex-wrap justify-end gap-2">
-        <button
-          onClick={onMinimize}
-          className="rounded-full border border-white/10 bg-white/[0.02] px-4 py-2 text-sm text-fog transition-colors duration-200 hover:border-white/20 hover:text-white"
-        >
-          Continue in background
-        </button>
-        <button
-          onClick={onCancel}
-          className="rounded-full border border-rose-400/30 bg-rose-500/[0.06] px-4 py-2 text-sm text-rose-200 transition-colors duration-200 hover:border-rose-400/50 hover:bg-rose-500/[0.12]"
-        >
-          Cancel
-        </button>
+      </div>
+
+      {/* PINNED. Progress and the escape hatches (background / cancel) must stay
+          reachable no matter how long the activity feed grows — they are the two
+          things a user reaches for when a run is taking too long, which is exactly
+          when the content above them is longest. */}
+      <div className="shrink-0 space-y-2 border-t border-white/[0.06] px-6 py-4">
+        <div className="h-1 overflow-hidden rounded-full bg-white/[0.06]">
+          <motion.div
+            initial={{ width: 0 }}
+            animate={{ width: `${pct * 100}%` }}
+            transition={{ duration: 0.5, ease: [0.22, 1, 0.36, 1] }}
+            className="h-full rounded-full bg-gradient-to-r from-violet-500 to-cyan-400 shadow-[0_0_16px_rgba(139,92,246,0.6)]"
+          />
+        </div>
+        <div className="flex flex-wrap items-center gap-2 text-[11px] text-fog">
+          <span className="inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-white/[0.02] px-2 py-0.5">
+            <Clock size={10} className="text-violet-300" />
+            Elapsed{" "}
+            <span className="font-mono tabular-nums text-white/85">
+              {fmtElapsed(elapsedMs)}
+            </span>
+          </span>
+          {estimateSeconds && (
+            <span className="inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-white/[0.02] px-2 py-0.5">
+              <Info size={10} />
+              Est.{" "}
+              <span className="font-mono tabular-nums text-white/85">
+                {estLow}–{estHigh}s
+              </span>
+            </span>
+          )}
+          <button
+            onClick={() => setDetailsOpen((v) => !v)}
+            className="ml-auto inline-flex items-center gap-1 rounded-full border border-white/10 bg-white/[0.02] px-2 py-0.5 text-[11px] text-fog transition-colors duration-200 hover:border-white/20 hover:text-white"
+          >
+            {detailsOpen ? <ChevronUp size={10} /> : <ChevronDown size={10} />}
+            Processing details
+          </button>
+        </div>
+        <div className="flex flex-wrap justify-end gap-2 pt-1">
+          <button
+            onClick={onMinimize}
+            className="rounded-full border border-white/10 bg-white/[0.02] px-4 py-2 text-sm text-fog transition-colors duration-200 hover:border-white/20 hover:text-white"
+          >
+            Continue in background
+          </button>
+          <button
+            onClick={onCancel}
+            className="rounded-full border border-rose-400/30 bg-rose-500/[0.06] px-4 py-2 text-sm text-rose-200 transition-colors duration-200 hover:border-rose-400/50 hover:bg-rose-500/[0.12]"
+          >
+            Cancel
+          </button>
+        </div>
       </div>
     </div>
   );

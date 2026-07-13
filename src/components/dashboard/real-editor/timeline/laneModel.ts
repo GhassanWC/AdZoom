@@ -13,7 +13,6 @@
  * new lanes — no migration, no schema change.
  */
 import type { DetectedMoment, EffectType } from "@/lib/firebase/schema";
-import type { TimelineTrackTone } from "./trackModel";
 
 /** Collapsible lane groups (product spec §4). */
 export type LaneGroupId = "camera" | "pacing" | "overlays" | "canvas";
@@ -48,12 +47,12 @@ export type LaneId =
 export interface LaneDef {
   id: LaneId;
   group: LaneGroupId;
-  /** Left-gutter label. */
+  /**
+   * Human-readable lane name. NOT drawn anywhere — the left label column is
+   * gone. It survives as the track row's `aria-label` (screen readers still need
+   * to know which lane they are in) and as a stable name for tests.
+   */
   label: string;
-  /** Gutter tint. */
-  tone: TimelineTrackTone;
-  /** The effect type whose icon represents this lane. */
-  primaryEffect: EffectType;
   /** effectTypes routed into this lane. */
   effectTypes: readonly EffectType[];
   /**
@@ -62,10 +61,8 @@ export interface LaneDef {
    * moment (empty overlay types are reachable from the toolbar's Add menu).
    */
   core?: boolean;
-  /** The analysis engine layer this lane maps to (for the Run affordance + note). */
+  /** The analysis engine layer this lane maps to (for the Run affordance). */
   engineLayer?: "camera" | "cut" | "speed";
-  /** Overlay lanes support bulk enable / disable / delete in the gutter. */
-  overlay?: boolean;
 }
 
 /**
@@ -102,22 +99,20 @@ export const LANE_DEFS: readonly LaneDef[] = [
     id: "camera",
     group: "camera",
     label: "Zooms & focus",
-    tone: "violet",
-    primaryEffect: "zoom",
     effectTypes: ["zoom", "click-highlight", "cursor-focus"],
     core: true,
     engineLayer: "camera",
   },
-  { id: "cut", group: "pacing", label: "Cuts", tone: "rose", primaryEffect: "cut", effectTypes: ["cut"], core: true, engineLayer: "cut" },
-  { id: "speed", group: "pacing", label: "Speed", tone: "amber", primaryEffect: "speed-up", effectTypes: ["speed-up"], core: true, engineLayer: "speed" },
-  { id: "transition", group: "pacing", label: "Transitions", tone: "purple", primaryEffect: "transition", effectTypes: ["transition"], overlay: true },
-  { id: "captions", group: "overlays", label: "Captions", tone: "sky", primaryEffect: "captions", effectTypes: ["captions"], overlay: true },
-  { id: "hook-text", group: "overlays", label: "Hook text", tone: "pink", primaryEffect: "hook-text", effectTypes: ["hook-text"], overlay: true },
-  { id: "text-overlay", group: "overlays", label: "Text overlays", tone: "blue", primaryEffect: "text-overlay", effectTypes: ["text-overlay"], overlay: true },
-  { id: "callout", group: "overlays", label: "Callouts", tone: "orange", primaryEffect: "callout", effectTypes: ["callout"], overlay: true },
-  { id: "branding-cta", group: "overlays", label: "CTA / End card", tone: "lime", primaryEffect: "branding-cta", effectTypes: ["branding-cta"], overlay: true },
-  { id: "blur-redaction", group: "overlays", label: "Blur / Redaction", tone: "slate", primaryEffect: "blur-redaction", effectTypes: ["blur-redaction"], overlay: true },
-  { id: "smart-crop", group: "canvas", label: "Smart crop / Canvas", tone: "emerald", primaryEffect: "smart-crop", effectTypes: ["smart-crop", "crop"], overlay: true },
+  { id: "cut", group: "pacing", label: "Cuts", effectTypes: ["cut"], core: true, engineLayer: "cut" },
+  { id: "speed", group: "pacing", label: "Speed", effectTypes: ["speed-up"], core: true, engineLayer: "speed" },
+  { id: "transition", group: "pacing", label: "Transitions", effectTypes: ["transition"] },
+  { id: "captions", group: "overlays", label: "Captions", effectTypes: ["captions"] },
+  { id: "hook-text", group: "overlays", label: "Hook text", effectTypes: ["hook-text"] },
+  { id: "text-overlay", group: "overlays", label: "Text overlays", effectTypes: ["text-overlay"] },
+  { id: "callout", group: "overlays", label: "Callouts", effectTypes: ["callout"] },
+  { id: "branding-cta", group: "overlays", label: "CTA / End card", effectTypes: ["branding-cta"] },
+  { id: "blur-redaction", group: "overlays", label: "Blur / Redaction", effectTypes: ["blur-redaction"] },
+  { id: "smart-crop", group: "canvas", label: "Smart crop / Canvas", effectTypes: ["smart-crop", "crop"] },
 ] as const;
 
 /** Lane def by id (for quick lookup). */

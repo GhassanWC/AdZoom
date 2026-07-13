@@ -2,6 +2,7 @@
 
 import * as React from "react";
 import type { DetectedMoment } from "@/lib/firebase/schema";
+import { canSplit } from "@/lib/timeline/split";
 import type { DragMode } from "./utils";
 import { MomentPill } from "./MomentPill";
 
@@ -14,23 +15,28 @@ import { MomentPill } from "./MomentPill";
 export function MomentLane({
   moments,
   total,
+  currentTime,
   selectedMomentId,
   multiSelectIds,
   draftId,
   withDraft,
   onBeginDrag,
   onDuplicate,
+  onSplit,
   onDelete,
   onEdit,
 }: {
   moments: DetectedMoment[];
   total: number;
+  /** Playhead position — decides whether each pill's Split action is available. */
+  currentTime: number;
   selectedMomentId: string | null;
   multiSelectIds: string[];
   draftId: string | null;
   withDraft: (m: DetectedMoment) => DetectedMoment;
   onBeginDrag: (e: React.PointerEvent, m: DetectedMoment, mode: DragMode) => void;
   onDuplicate: (id: string) => void;
+  onSplit: (id: string) => void;
   onDelete: (id: string) => void;
   onEdit: (id: string) => void;
 }) {
@@ -46,8 +52,13 @@ export function MomentLane({
             selected={selectedMomentId === m0.id}
             multiSelected={multiSelectIds.includes(m0.id)}
             dragging={draftId === m0.id}
+            // Computed from the SAME pure predicate the context uses to decide
+            // whether the split will actually happen — so the button's enabled
+            // state can never disagree with what pressing it does.
+            canSplit={canSplit(m, currentTime)}
             onBeginDrag={onBeginDrag}
             onDuplicate={() => onDuplicate(m0.id)}
+            onSplit={() => onSplit(m0.id)}
             onDelete={() => onDelete(m0.id)}
             onEdit={() => onEdit(m0.id)}
           />

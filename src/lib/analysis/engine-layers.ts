@@ -53,6 +53,18 @@ export interface AnalysisOptions {
   generateTransitions?: boolean;
   /** CTA / end card. */
   generateCta?: boolean;
+  /**
+   * Apply the project's saved Director brief as the final stage of this analysis.
+   *
+   * Defaults to ON whenever a brief exists — the user wrote a brief so that their
+   * video would be directed, and making them re-opt-in on every run would be a
+   * trap. Set false for a deliberately plain re-analysis (the dialog's "Apply
+   * Director brief" toggle) — the brief stays saved, it just doesn't run.
+   *
+   * With no brief on the project this field is irrelevant: there is nothing to
+   * apply and analysis behaves exactly as it did before the Director existed.
+   */
+  applyDirectorBrief?: boolean;
   existingEditMode: ExistingEditMode;
   /** Analysis-granularity preset (or "custom"). */
   chunkMode: ChunkMode;

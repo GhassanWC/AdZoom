@@ -1,7 +1,14 @@
 "use client";
 
 import * as React from "react";
-import { Sparkles, AlertTriangle, RotateCcw, CheckCheck, Ban } from "lucide-react";
+import {
+  Sparkles,
+  AlertTriangle,
+  RotateCcw,
+  CheckCheck,
+  Ban,
+  Loader2,
+} from "lucide-react";
 import { EditorSheet } from "./EditorSheet";
 import { EditorDialogGrid } from "./EditorDialog";
 import { Button } from "@/components/ui/Button";
@@ -19,6 +26,15 @@ import {
   type GenerationToggles,
 } from "@/lib/analysis/edit-recipe";
 import { VideoTypePicker } from "./VideoTypePicker";
+import {
+  DirectorBriefFields,
+  directorDraftFromBrief,
+  directorDraftHasPrompt,
+  directorDraftToForm,
+  type DirectorBriefDraft,
+} from "./DirectorBriefFields";
+import type { DirectorBrief } from "@/lib/director/types";
+import type { DirectorRequestForm } from "@/lib/director/request";
 import type { SelectedVideoType } from "@/lib/firebase/schema";
 import {
   type ChunkMode,
@@ -82,10 +98,14 @@ export interface AnalysisDetailPrefs {
 }
 
 /**
- * "What should Framevo generate?" dialog — shown before every (re)analysis. Now
- * exposes ALL implemented automatic edit types (not just zoom/cut/speed): AI
- * edits, visual focus, and pacing. Toggles seed from the video-type recipe (and
- * the project's last run on re-analyze) and each one really gates generation.
+ * "What should Framevo generate?" dialog — shown before every (re)analysis, and
+ * the ONE place a run is configured.
+ *
+ * It carries the whole flow, top to bottom: the Director brief (what video you
+ * want), then the video type, then the automatic edit types, then the detail.
+ * The Director is the final STAGE of analysis, not a second pass bolted on
+ * afterwards — so there is no separate Director dialog and no second button.
+ * Writing a brief here directs the run; leaving it empty runs a plain analysis.
  */
 export function AnalysisOptionsModal({
   open,
@@ -100,6 +120,8 @@ export function AnalysisOptionsModal({
   initialDetail,
   onPersistDetail,
   onConfirm,
+  directorBrief,
+  onSaveDirectorBrief,
 }: {
   open: boolean;
   onClose: () => void;
@@ -118,6 +140,14 @@ export function AnalysisOptionsModal({
   initialDetail: AnalysisDetailPrefs;
   onPersistDetail: (detail: AnalysisDetailPrefs) => void;
   onConfirm: (options: AnalysisOptions) => void;
+  /** The project's saved Director brief — seeds the brief editor at the top. */
+  directorBrief?: DirectorBrief | null;
+  /**
+   * Persist the brief. Awaited BEFORE the run starts: the analyze route reads the
+   * brief off the project document server-side, so a brief that lands 600ms later
+   * is a brief this run never saw.
+   */
+  onSaveDirectorBrief: (prompt: string, form: DirectorRequestForm) => Promise<void>;
 }) {
   const [videoType, setVideoType] = React.useState<SelectedVideoType>(initialVideoType);
   // The chosen type's recipe defaults (for "Reset to recipe" + re-seed on switch).
@@ -136,6 +166,15 @@ export function AnalysisOptionsModal({
   const [customCount, setCustomCount] = React.useState<number>(() =>
     Math.max(1, chunkCountFor(videoDuration, initialDetail.chunkSizeSeconds) || 4)
   );
+  // The Director brief, seeded from what the user last wrote. This dialog IS the
+  // brief editor now — there is no other one — so the box's contents are the
+  // brief: fill it in and the run is directed, clear it and it isn't.
+  const [brief, setBrief] = React.useState<DirectorBriefDraft>(() =>
+    directorDraftFromBrief(directorBrief)
+  );
+  const [saving, setSaving] = React.useState(false);
+  const [briefError, setBriefError] = React.useState<string | null>(null);
+  const directing = directorDraftHasPrompt(brief);
 
   React.useEffect(() => {
     if (!open) return;
@@ -148,6 +187,9 @@ export function AnalysisOptionsModal({
       })
     );
     setMode("replace-selected");
+    setBrief(directorDraftFromBrief(directorBrief));
+    setSaving(false);
+    setBriefError(null);
     setChunkMode(initialDetail.chunkMode);
     setCustomBy("size");
     setCustomSize(clampChunkSize(initialDetail.chunkSizeSeconds));
@@ -178,8 +220,8 @@ export function AnalysisOptionsModal({
   const estimatedChunks = chunkCountFor(videoDuration, resolvedSize);
   const showWarning = resolvedSize <= 10 && estimatedChunks >= 12;
 
-  const handleConfirm = () => {
-    if (coreOff) return;
+  const handleConfirm = async () => {
+    if (coreOff || saving) return;
     if (gen.generateCameraEdits) logFramevoEvent(EVENTS.CAMERA_EDITS_ENABLED);
     if (gen.generateCut) logFramevoEvent(EVENTS.CUTS_ENABLED);
     if (gen.generateSpeed) logFramevoEvent(EVENTS.SPEED_ENABLED);
@@ -191,6 +233,29 @@ export function AnalysisOptionsModal({
     });
     onPersistDetail({ chunkMode, chunkSizeSeconds: resolvedSize });
     onSelectVideoType(videoType);
+
+    // The brief goes to Firestore BEFORE the run is started, because the analyze
+    // route reads it from the project document, not from this request. An empty
+    // prompt is saved too — that's how you clear a brief you no longer want.
+    //
+    // A failed write STOPS the run. Starting anyway would analyze against the
+    // brief still on the document — the old one, or none — and hand back a video
+    // directed by instructions the user didn't give.
+    setSaving(true);
+    setBriefError(null);
+    try {
+      await onSaveDirectorBrief(brief.prompt.trim(), directorDraftToForm(brief));
+    } catch (err) {
+      setBriefError(
+        err instanceof Error
+          ? `Couldn't save your Director brief — ${err.message}`
+          : "Couldn't save your Director brief. Check your connection and try again."
+      );
+      return;
+    } finally {
+      setSaving(false);
+    }
+
     // Captions are DECOUPLED — never send a caption/transcription instruction
     // from the analyze dialog. Strip generateCaptions so analysis can't start
     // ASR or touch captions.
@@ -202,6 +267,9 @@ export function AnalysisOptionsModal({
       existingEditMode: hasExistingEdits ? mode : "replace-selected",
       chunkMode,
       chunkSizeSeconds: resolvedSize,
+      // An empty brief can't be applied anyway (`shouldRunDirectorStage` checks
+      // for a prompt) — this just says the same thing at the call site.
+      applyDirectorBrief: directing,
       ...(chunkMode === "custom" && customBy === "count" ? { chunkCount: customCount } : {}),
     });
   };
@@ -211,28 +279,43 @@ export function AnalysisOptionsModal({
       open={open}
       onClose={onClose}
       title="Choose what Framevo should generate"
-      subtitle="Pick the kinds of automatic edits you want for this analysis."
+      subtitle="Describe the video you want, then pick the automatic edits for this analysis."
       icon={<Sparkles size={17} />}
       size="wide"
       footer={
         <div className="flex items-center justify-end gap-2">
-          <Button variant="ghost" size="sm" onClick={onClose}>
+          {briefError && (
+            <p className="mr-auto flex min-w-0 items-start gap-1.5 text-[11.5px] leading-relaxed text-rose-200/90">
+              <AlertTriangle size={12} className="mt-0.5 shrink-0" />
+              <span className="min-w-0">{briefError}</span>
+            </p>
+          )}
+          <Button variant="ghost" size="sm" onClick={onClose} disabled={saving}>
             Cancel
           </Button>
           <Button
             variant="primary"
             size="sm"
-            onClick={handleConfirm}
-            disabled={coreOff}
-            leftIcon={<Sparkles size={14} />}
+            onClick={() => void handleConfirm()}
+            disabled={coreOff || saving}
+            leftIcon={
+              saving ? <Loader2 size={14} className="animate-spin" /> : <Sparkles size={14} />
+            }
             title={coreOff ? "Turn on at least one of Zooms & focus, Cuts, or Speed to continue." : undefined}
           >
-            Start analysis
+            {saving ? "Starting…" : "Start analysis"}
           </Button>
         </div>
       }
     >
       <div className="space-y-7 px-6 py-6">
+        {/* ── The Director brief ────────────────────────────────────────────
+            FIRST, and always — this is the only place the brief is written. The
+            Director runs as the final stage of the analysis this dialog starts,
+            so its brief belongs in the same dialog, above the mechanical choices
+            it will act on. */}
+        <DirectorBriefFields value={brief} onChange={setBrief} disabled={saving} />
+
         {/* ── Video type (recipe) ───────────────────────────────────────── */}
         <section className="space-y-3">
           <h3 className="text-[11px] font-semibold uppercase tracking-[0.14em] text-fog">

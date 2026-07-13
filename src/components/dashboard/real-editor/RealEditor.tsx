@@ -133,6 +133,10 @@ function Body() {
     closeCropEditor,
     selectedVideoType,
     setSelectedVideoType,
+    saveDirectorBrief,
+    exportModalOpen,
+    openExportModal,
+    closeExportModal,
   } = useEditorReal();
   const hasAnalysis = (project.analysis?.detectedMoments?.length ?? 0) > 0;
   const isFailed = project.analysis?.status === "failed";
@@ -141,7 +145,6 @@ function Body() {
   // case the primary "Generate AI edit" CTA must be reachable.
   const isAnalyzingNow = analyzing || project.status === "analyzing";
   const canAnalyze = !isAnalyzingNow && !!project.originalVideoUrl;
-  const [exportOpen, setExportOpen] = React.useState(false);
   const [analysisOptionsOpen, setAnalysisOptionsOpen] = React.useState(false);
   const [navOpen, setNavOpen] = React.useState(false);
   const { settings, save } = useWorkspaceSettings();
@@ -170,11 +173,17 @@ function Body() {
     // the document body still while the preview stays permanently visible).
     // NB: all drawers/modals portal to document.body, so overflow-hidden never
     // clips them.
-    <div className="flex h-[100dvh] flex-col overflow-hidden">
+    //
+    // `fv-enter` is the whole page's only entrance animation: one 220ms fade +
+    // 6px rise on the shell. Deliberately NOT staggered per-region — the editor
+    // is a workspace you return to dozens of times a day, and a choreographed
+    // intro would be charming once and tiresome forever after. It exists only to
+    // stop the workspace from snapping into existence.
+    <div className="fv-enter flex h-[100dvh] flex-col overflow-hidden">
       {/* ── 1. Editor top bar ─────────────────────────────────────────────── */}
       <EditorTopBar
         onOpenNav={() => setNavOpen(true)}
-        onExport={() => setExportOpen(true)}
+        onExport={openExportModal}
       />
 
       {/* ── 2. Transient strips (error / first-run CTA) — compact, shrink-0 ── */}
@@ -262,12 +271,14 @@ function Body() {
         videoDuration={project.duration ?? 0}
         initialDetail={settings.analysisDetail}
         onPersistDetail={(detail) => void save({ analysisDetail: detail })}
+        directorBrief={project.directorBrief}
+        onSaveDirectorBrief={saveDirectorBrief}
         onConfirm={(opts) => {
           setAnalysisOptionsOpen(false);
           void startAnalyze(opts);
         }}
       />
-      <ExportModal open={exportOpen} onClose={() => setExportOpen(false)} />
+      <ExportModal open={exportModalOpen} onClose={closeExportModal} />
 
       {/* Debug overlay — Ctrl+Shift+D in dev / ?debug=1 anywhere. */}
       <DebugOverlay />

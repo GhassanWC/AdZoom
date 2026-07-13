@@ -28,11 +28,12 @@ import {
   BadgeCheck,
 } from "lucide-react";
 import { useEditorReal } from "./context";
+import { MenuPopover, useMenuPopover } from "./MenuPopover";
 import { DirectionalPresetRow } from "./DirectionalPresetRow";
 import { Slider } from "@/components/ui/Slider";
 import { Toggle } from "@/components/ui/Toggle";
 import { cn } from "@/lib/cn";
-import { seedKeyframes } from "@/lib/timeline/camera";
+import { seedKeyframes, CAMERA_SPEED_DEFAULT } from "@/lib/timeline/camera";
 import {
   cropBoxFor,
   outputDurationFor,
@@ -41,6 +42,7 @@ import {
   DEFAULT_SPEED,
 } from "@/lib/timeline/crop-speed";
 import type {
+  ClickHighlightSettings,
   CropAspect,
   CropPosition,
   CropSettings,
@@ -353,6 +355,12 @@ export function MomentInspector({ nav }: { nav?: MomentReviewNav } = {}) {
                 onChange={(v) => updateMoment(moment.id, { intensity: v / 100 })}
               />
             )}
+            {/* The settings that used to live in the global Effects panel — now
+                per-edit, and only the ones this edit actually has. */}
+            <EffectMotionControls
+              moment={moment}
+              onUpdate={(patch) => updateMoment(moment.id, patch)}
+            />
           </section>
         )}
 
@@ -602,25 +610,21 @@ function OverflowMenu({
   onDuplicate: () => void;
   onDelete: () => void;
 }) {
-  const [open, setOpen] = React.useState(false);
-  const ref = React.useRef<HTMLDivElement | null>(null);
-  React.useEffect(() => {
-    if (!open) return;
-    const onDown = (e: MouseEvent) => {
-      if (!ref.current || ref.current.contains(e.target as Node)) return;
-      setOpen(false);
-    };
-    document.addEventListener("mousedown", onDown);
-    return () => document.removeEventListener("mousedown", onDown);
-  }, [open]);
+  // Portalled + fixed (MenuPopover), like every other menu in the editor: the
+  // inspector floats inside an overflow-hidden shell, so an absolutely-placed
+  // panel could be clipped by it near the bottom of the window.
+  const menu = useMenuPopover();
+  const { open, toggle, close } = menu;
 
   return (
-    <div ref={ref} className="relative">
+    <>
       <button
+        ref={menu.triggerRef}
         type="button"
-        onClick={() => setOpen((v) => !v)}
+        onClick={toggle}
         aria-label="Moment actions"
         aria-expanded={open}
+        aria-haspopup="menu"
         className={cn(
           "inline-flex size-8 items-center justify-center rounded-lg text-fog transition-colors duration-150",
           open
@@ -630,30 +634,34 @@ function OverflowMenu({
       >
         <MoreHorizontal size={14} />
       </button>
-      {open && (
-        <div className="absolute right-0 top-9 z-30 w-44 overflow-hidden rounded-lg border border-white/10 bg-ink/95 py-1 shadow-cinematic backdrop-blur-xl">
-          <MenuItem
-            onClick={() => {
-              setOpen(false);
-              onDuplicate();
-            }}
-            Icon={Copy}
-            label="Duplicate"
-            hint="⌘D"
-          />
-          <MenuItem
-            onClick={() => {
-              setOpen(false);
-              onDelete();
-            }}
-            Icon={Trash2}
-            label="Delete"
-            hint="Del"
-            tone="danger"
-          />
-        </div>
-      )}
-    </div>
+      <MenuPopover
+        state={menu}
+        align="right"
+        width={176}
+        className="p-1"
+        ariaLabel="Moment actions"
+      >
+        <MenuItem
+          onClick={() => {
+            close();
+            onDuplicate();
+          }}
+          Icon={Copy}
+          label="Duplicate"
+          hint="⌘D"
+        />
+        <MenuItem
+          onClick={() => {
+            close();
+            onDelete();
+          }}
+          Icon={Trash2}
+          label="Delete"
+          hint="Del"
+          tone="danger"
+        />
+      </MenuPopover>
+    </>
   );
 }
 
@@ -987,6 +995,104 @@ const CROP_EASINGS: { id: CropSettings["easing"]; label: string }[] = [
   { id: "ease-in", label: "Ease in" },
   { id: "ease-out", label: "Ease out" },
 ];
+
+// ─── Per-edit effect settings (was the global Effects panel) ────────────────
+
+const CLICK_STYLES: ClickHighlightSettings["style"][] = ["ring", "pulse", "burst"];
+
+/**
+ * The motion + look settings for THIS edit.
+ *
+ * These used to be project-global sliders in an Effects panel, which meant
+ * "make this one zoom snappier" was not a thing you could ask for — you could
+ * only change every zoom in the video at once. They live on the selected edit
+ * now, and each one is rendered ONLY for the effect type it actually applies to:
+ *
+ *   zoom / cursor-focus  → camera speed (the ramp in and out)
+ *   click-highlight      → style, size, and whether this click shows at all
+ *
+ * The project's `effectsSettings` survive as the DEFAULTS these fall back to —
+ * that's what a Look applies — so an edit the user hasn't touched still follows
+ * the project's look, and one they have touched keeps its own.
+ */
+function EffectMotionControls({
+  moment,
+  onUpdate,
+}: {
+  moment: DetectedMoment;
+  onUpdate: (patch: Partial<DetectedMoment>) => void;
+}) {
+  const { project } = useEditorReal();
+  const effects = project.effectsSettings;
+
+  if (moment.effectType === "zoom" || moment.effectType === "cursor-focus") {
+    const speed = moment.cameraMotion?.speed ?? CAMERA_SPEED_DEFAULT;
+    return (
+      <div className="space-y-1.5">
+        <Slider
+          label="Camera speed"
+          value={speed}
+          min={0}
+          max={100}
+          onChange={(v) => onUpdate({ cameraMotion: { speed: v } })}
+        />
+        <p className="text-[11px] leading-relaxed text-fog/70">
+          {speed >= 75
+            ? "Snaps into frame — punchy, good for fast social cuts."
+            : speed <= 25
+              ? "Glides in slowly — cinematic, needs a longer edit to breathe."
+              : "How quickly the camera moves into this edit and back out again."}
+        </p>
+      </div>
+    );
+  }
+
+  if (moment.effectType === "click-highlight") {
+    const style = moment.clickHighlight?.style ?? effects.clickHighlightStyle;
+    const size = moment.clickHighlight?.size ?? effects.clickHighlightSize;
+    // Absent = shown. Only an explicit false hides an edit (same rule overlays use).
+    const shown = moment.enabled !== false;
+    return (
+      <div className="space-y-3">
+        <div>
+          <div className="mb-2 text-xs font-medium text-fog">Style</div>
+          <div className="grid grid-cols-3 gap-1 rounded-lg border border-white/10 bg-white/[0.02] p-1">
+            {CLICK_STYLES.map((s) => (
+              <button
+                key={s}
+                type="button"
+                onClick={() => onUpdate({ clickHighlight: { ...moment.clickHighlight, style: s } })}
+                className={cn(
+                  "rounded-md px-2 py-2 text-xs font-medium capitalize transition-colors duration-150",
+                  style === s
+                    ? "bg-violet-500/20 text-violet-200 ring-1 ring-violet-400/30"
+                    : "text-fog hover:bg-white/[0.04] hover:text-white"
+                )}
+              >
+                {s}
+              </button>
+            ))}
+          </div>
+        </div>
+        <Slider
+          label="Highlight size"
+          value={size}
+          min={0}
+          max={100}
+          onChange={(v) => onUpdate({ clickHighlight: { ...moment.clickHighlight, size: v } })}
+        />
+        <Toggle
+          label="Show this highlight"
+          description="Hides the ring for this click only — the edit stays on the timeline."
+          checked={shown}
+          onChange={(v) => onUpdate({ enabled: v })}
+        />
+      </div>
+    );
+  }
+
+  return null;
+}
 
 function CropControls({
   moment,

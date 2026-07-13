@@ -19,9 +19,11 @@ import {
   EyeOff,
   Shuffle,
   BadgeCheck,
+  Clapperboard,
   type LucideIcon,
 } from "lucide-react";
 import type {
+  DetectedMoment,
   EffectType,
   MomentProvenance,
   NarrativeRole,
@@ -286,6 +288,49 @@ export const PROVENANCE_PRESENTATION: Record<
   },
 };
 
+/**
+ * AI Director edits get their OWN presentation, distinct from the generic "AI"
+ * provenance chip.
+ *
+ * Why not just add a `MomentProvenance` member: provenance answers "which SIGNAL
+ * produced this" (a click, motion, Gemini), and a Director edit's signal is still
+ * one of those — what's different is WHO decided to place it. So a Director zoom
+ * grounded in a real click keeps `provenance: "ai"` (correct for the balancer and
+ * the carry-over logic), and the Director identity rides on `source`, which is
+ * what this presentation keys off. Adding a provenance member would also have
+ * silently changed the behaviour of every `Record<MomentProvenance, …>` in the
+ * app.
+ */
+export const DIRECTOR_PRESENTATION = {
+  label: "AI Director",
+  short: "Director",
+  Icon: Clapperboard,
+  dot: "bg-fuchsia-400",
+  chip: "border-fuchsia-400/50 bg-fuchsia-500/20 text-fuchsia-50",
+  text: "text-fuchsia-100",
+  blurb:
+    "Created by the AI Director from your prompt. Move, resize, split, disable or delete it like any other edit.",
+} as const;
+
+/** True when this edit was placed by the AI Director. */
+export function isDirectorEdit(m: Pick<DetectedMoment, "source">): boolean {
+  return m.source === "ai-director";
+}
+
+/**
+ * The identity chip a pill should show. Director edits win over provenance —
+ * "the Director put this here" is the more useful fact when you're deciding
+ * whether to keep it.
+ */
+export function presentationFor(
+  m: Pick<DetectedMoment, "source" | "provenance">
+): (typeof PROVENANCE_PRESENTATION)[MomentProvenance] | typeof DIRECTOR_PRESENTATION {
+  if (isDirectorEdit(m)) return DIRECTOR_PRESENTATION;
+  if (m.provenance) return PROVENANCE_PRESENTATION[m.provenance];
+  if (m.source === "user") return PROVENANCE_PRESENTATION.user;
+  return PROVENANCE_PRESENTATION.ai;
+}
+
 /** Convenience re-export — covers icons commonly used inline. */
 export const PROVENANCE_LEGEND_EXTRA = { Sparkles, User } as const;
 
@@ -310,28 +355,38 @@ export const MIN_PILL_PX = 34;
 export const MIN_RENDER_DURATION = 0.5;
 
 /**
- * Cinematic track heights. The AI/user rows are tall enough to show a
- * thumbnail strip + title + reasoning + intensity micro-bar without crowding.
+ * Cinematic track heights.
+ *
+ * Vertical space is the timeline's scarcest resource — every pixel spent on
+ * chrome is a pixel not spent on an edit lane. The camera lane stays tall
+ * because it earns it (thumbnail strip + title + intensity bar); everything else
+ * is a compact row. There is deliberately NO group-header height any more: lane
+ * groups are a data concept (see laneModel.ts), not a row that eats 30px in both
+ * columns.
  */
 export const TRACK_HEIGHTS = {
-  ai: 96,
+  /** Camera / zoom lane — the only lane whose pills show a thumbnail strip. */
+  ai: 84,
   user: 84,
   /** Compact height for the cut/speed + per-type overlay lanes (keeps the taller
    *  stack of lanes readable without a huge vertical footprint). */
-  overlay: 56,
-  /** Collapsible lane-group header row. */
-  group: 30,
+  overlay: 44,
   ruler: 36,
   gap: 22,
   /** Narrative chapter strip — the cinematic "act" band above the lane. */
   chapters: 56,
   /** Attention waveform layer drawn behind the AI track. */
-  attention: 96,
+  attention: 84,
   /** Read-only cursor / click / focus marker lane. */
-  interactions: 44,
+  interactions: 40,
   /** Future-feature placeholder lanes (speed / crop) — dimmed, non-interactive. */
   placeholder: 40,
 } as const;
 
-/** Width of the static left label gutter (px). */
-export const GUTTER_WIDTH = 128;
+/*
+ * There is deliberately NO gutter width constant. The left label column is gone:
+ * lanes and the ruler both start at x=0, so time — not a classifier — owns every
+ * pixel of the timeline's width. Re-introducing a width here would be the first
+ * step back toward a column that has to stay pixel-aligned with the lanes, the
+ * ruler and the playhead.
+ */

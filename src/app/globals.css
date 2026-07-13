@@ -37,8 +37,27 @@
   --font-sans: var(--font-inter), ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --font-display: var(--font-sora), var(--font-inter), ui-sans-serif, system-ui;
 
-  /* Motion */
+  /* Motion
+     ------
+     Editor motion is CALM: fast, crisp, transform/opacity only. The built-in
+     CSS easings are too weak to read as intentional, so everything routes
+     through these curves.
+
+     `--ease-out` is the workhorse (enters, exits, presses — starts fast, so the
+     UI answers the instant you touch it). `--ease-in-out` is for things MOVING
+     on screen. Never `ease-in` on UI: it delays the first frame, exactly when
+     the eye is watching. */
   --ease-cinematic: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
+
+  /* Durations — the editor is a professional tool the user lives in all day, so
+     motion stays under ~220ms. Anything slower starts to feel like latency. */
+  --dur-press: 140ms;
+  --dur-hover: 160ms;
+  --dur-panel: 200ms;
+  --dur-enter: 220ms;
 }
 
 /* Light theme — flips the design tokens. Tailwind utilities that reference
@@ -239,6 +258,141 @@ html.light {
   }
   .animate-indeterminate {
     animation: indeterminate 1.4s ease-in-out infinite;
+  }
+
+  /* ==========================================================================
+     EDITOR MOTION
+     A small, shared vocabulary for the editor page. Every one of these animates
+     ONLY transform + opacity (GPU-composited, no layout, no paint), so they stay
+     smooth with a timeline full of moments.
+
+     Reduced motion is handled ONCE, at the bottom of this block: movement is
+     dropped, the opacity fade is kept (it still explains what appeared). We do
+     NOT nuke all animation globally — that would freeze the loading spinners
+     that tell the user work is happening.
+     ========================================================================== */
+
+  /* Page / workspace entrance. Fires once on mount. */
+  @keyframes fv-enter {
+    from { opacity: 0; transform: translateY(6px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  .fv-enter {
+    animation: fv-enter var(--dur-enter) var(--ease-out) both;
+  }
+
+  /* Docked inspector panel — slides in from the rail it's anchored to, never
+     from nowhere. `--fv-panel-x` lets the exit reuse the same keyframe path. */
+  @keyframes fv-panel-in {
+    from { opacity: 0; transform: translateX(12px); }
+    to   { opacity: 1; transform: translateX(0); }
+  }
+  @keyframes fv-panel-out {
+    from { opacity: 1; transform: translateX(0); }
+    to   { opacity: 0; transform: translateX(12px); }
+  }
+  .fv-panel-in {
+    animation: fv-panel-in var(--dur-panel) var(--ease-drawer) both;
+  }
+  /* Exit is faster than enter — the system responding should never make the
+     user wait for a panel they've already dismissed. */
+  .fv-panel-out {
+    animation: fv-panel-out 140ms var(--ease-out) both;
+  }
+
+  /* List items (clip cards, suggestions) appearing as a group. Stagger is set
+     per-item via `--fv-stagger` — kept short (40ms) so a full list never feels
+     like it's queueing. */
+  @keyframes fv-card-in {
+    from { opacity: 0; transform: translateY(8px) scale(0.985); }
+    to   { opacity: 1; transform: translateY(0) scale(1); }
+  }
+  .fv-card-in {
+    animation: fv-card-in var(--dur-enter) var(--ease-out) both;
+    animation-delay: var(--fv-stagger, 0ms);
+  }
+
+  /* Small overlay pills over the preview (processing, clip-focus banner). Scales
+     from 0.96 — never from 0. Nothing in the real world appears from nothing. */
+  @keyframes fv-pop-in {
+    from { opacity: 0; transform: translateY(4px) scale(0.96); }
+    to   { opacity: 1; transform: translateY(0) scale(1); }
+  }
+  .fv-pop-in {
+    animation: fv-pop-in var(--dur-panel) var(--ease-out) both;
+  }
+
+  /* Press feedback. Any pressable element in the editor gets this — the UI has
+     to feel like it heard you. */
+  .fv-press {
+    transition: transform var(--dur-press) var(--ease-out);
+  }
+  .fv-press:active:not(:disabled) {
+    transform: scale(0.97);
+  }
+  /* Icon buttons are small; scale them a touch less or it reads as a twitch. */
+  .fv-press-sm {
+    transition: transform var(--dur-press) var(--ease-out);
+  }
+  .fv-press-sm:active:not(:disabled) {
+    transform: scale(0.92);
+  }
+
+  /* Hover lift for cards / timeline pills. Gated behind a real pointer: touch
+     devices fire :hover on tap, which would leave elements stuck lifted. */
+  @media (hover: hover) and (pointer: fine) {
+    .fv-lift {
+      transition: transform var(--dur-hover) var(--ease-out),
+                  box-shadow var(--dur-hover) var(--ease-out);
+    }
+    .fv-lift:hover {
+      transform: translateY(-1px);
+    }
+  }
+
+  /* Disclosure (timeline lanes, panel sections) without measuring heights in JS.
+     grid-template-rows 0fr → 1fr animates cleanly and needs no ResizeObserver. */
+  .fv-disclosure {
+    display: grid;
+    grid-template-rows: 0fr;
+    transition: grid-template-rows var(--dur-panel) var(--ease-out);
+  }
+  .fv-disclosure[data-open="true"] {
+    grid-template-rows: 1fr;
+  }
+  .fv-disclosure > * {
+    overflow: hidden;
+    min-height: 0;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    /* Keep the fade (it explains the change), drop the movement. */
+    .fv-enter, .fv-panel-in, .fv-card-in, .fv-pop-in {
+      animation-name: fv-fade-only;
+      animation-duration: 140ms;
+      animation-delay: 0ms;
+    }
+    .fv-panel-out {
+      animation-name: fv-fade-out-only;
+      animation-duration: 100ms;
+    }
+    .fv-press:active:not(:disabled),
+    .fv-press-sm:active:not(:disabled),
+    .fv-lift:hover {
+      transform: none;
+    }
+    /* An instant disclosure beats an animated height for motion-sensitive users. */
+    .fv-disclosure {
+      transition: none;
+    }
+  }
+  @keyframes fv-fade-only {
+    from { opacity: 0; }
+    to   { opacity: 1; }
+  }
+  @keyframes fv-fade-out-only {
+    from { opacity: 1; }
+    to   { opacity: 0; }
   }
 
   /* Subtle shimmer for loading states */

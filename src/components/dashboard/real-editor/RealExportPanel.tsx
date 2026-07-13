@@ -35,6 +35,13 @@ import {
 } from "@/components/export/ExportProvider";
 import { resolveOutputCanvas } from "@/lib/timeline/canvas-layout";
 import { buildTimelineMap } from "@/lib/timeline/crop-speed";
+import { clipExportMoments, clipEffects } from "@/lib/clips/clip-edits";
+import {
+  decideClipExport,
+  stableHash,
+  type ClipExportIdentity,
+} from "@/lib/clips/clip-export-status";
+import { projectSourceFingerprint } from "@/lib/analysis/ai-caption-status";
 import type { ExportFormat, ExportUiStage, FitMode } from "@/lib/firebase/schema";
 import { useStoragePlan } from "@/lib/usage/useStoragePlan";
 import { planMeetsMinimum } from "@/lib/usage/plan";
@@ -151,11 +158,24 @@ function validateForBrowserExport(
 }
 
 export function RealExportPanel({ onClose }: { onClose?: () => void }) {
-  const { project, duration, updateEffects, openCanvas } = useEditorReal();
+  const { project, duration, updateEffects, openCanvas, clipExport, updateClipExport } =
+    useEditorReal();
+  /** Set by "Re-export anyway" — bypasses the duplicate-render check once. */
+  const [forceClipReexport, setForceClipReexport] = React.useState(false);
+
+  // ── Clip export ────────────────────────────────────────────────────────────
+  // A clip renders with ITS OWN effects (suggested aspect) — so every downstream
+  // read below (canvas summary, format, resolution, render params) must go
+  // through `effects`, not `project.effectsSettings`. With no clip in flight
+  // this IS `project.effectsSettings` (same reference), so the full-video export
+  // path is byte-for-byte unchanged.
+  const effects = clipExport
+    ? clipEffects(project.effectsSettings, clipExport, project.width ?? 0, project.height ?? 0)
+    : project.effectsSettings;
 
   // Output aspect/fit lives in the global Canvas panel; export reads it via
   // `resolveOutputCanvas`. `format` is derived for the permit + a label only.
-  const outputCanvas = resolveOutputCanvas(project.effectsSettings);
+  const outputCanvas = resolveOutputCanvas(effects);
   const format: ExportFormat = !outputCanvas
     ? "Source"
     : outputCanvas.aspectRatio === "9:16"
@@ -222,10 +242,49 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
   const supported = pickedMimeAvailable();
 
   // ── Duration + estimates ──────────────────────────────────────────────────
-  const moments = project.analysis?.detectedMoments ?? [];
-  const zoomCount = moments.filter((m) => m.effectType === "zoom").length;
   const sourceDuration = duration || project.duration || 0;
+  const baseMoments = project.analysis?.detectedMoments ?? [];
+  // Single-clip export: the clip's SMART EDITS (hook text, restyled captions,
+  // emphasis zoom, CTA) are materialized into real moments, then two synthetic
+  // cuts carve the timeline down to exactly [start,end]. Every render engine
+  // honors cuts via buildTimelineMap, so the clip exports as its own short video
+  // — with its edits baked in — without duplicating the source. With no clip in
+  // flight this is exactly the project's moments (full edited video, unchanged).
+  const moments = clipExport
+    ? clipExportMoments(baseMoments, clipExport, sourceDuration)
+    : baseMoments;
+  const zoomCount = moments.filter((m) => m.effectType === "zoom").length;
   const cutMap = buildTimelineMap(moments, sourceDuration);
+
+  // ── Clip export identity + duplicate check ────────────────────────────────
+  // Identity = (clip id) + (source fingerprint) + (settings hash over the EXACT
+  // moments/effects/format we're about to render). If a completed render already
+  // matches, we offer its download instead of burning another job — unless the
+  // user explicitly clicks "Re-export anyway".
+  const clipIdentity: ClipExportIdentity | null = clipExport
+    ? {
+        sourceFingerprint: projectSourceFingerprint(project),
+        settingsHash: stableHash({
+          resolution,
+          fps,
+          format,
+          container,
+          moments,
+          effects,
+          sourceCrop: project.sourceCrop ?? null,
+        }),
+      }
+    : null;
+  // `liveActive` (an export is genuinely running right now) beats the persisted
+  // status, so a stale "rendering" — left behind when the dialog was closed
+  // mid-render — can never permanently block a clip from being exported again.
+  const clipDecision =
+    clipExport && clipIdentity
+      ? decideClipExport(clipExport, clipIdentity, {
+          force: forceClipReexport,
+          liveActive: cloud.hasActiveExport || isExporting,
+        })
+      : null;
   const exportDuration = cutMap.outputDuration;
   const estMinutes = estimateExportMinutes(exportDuration);
   const estRenderSeconds = exportDuration > 0 ? Math.ceil(exportDuration + 8) : 0;
@@ -264,6 +323,34 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
   const showStatus = !!view;
   const exportingNow = view?.phase === "active";
 
+  // ── Clip export status sync ───────────────────────────────────────────────
+  // Fold the unified export view (either engine) into THIS clip's status, so the
+  // clip card tracks its own render — completely separate from the project's
+  // full-video export state. Only runs while a clip export is in flight.
+  const clipId = clipExport?.id ?? null;
+  const clipDownloadUrl =
+    view?.engine === "server" ? cloud.job?.downloadUrl ?? undefined : undefined;
+  React.useEffect(() => {
+    if (!clipId || !view) return;
+    if (view.phase === "active") {
+      void updateClipExport(clipId, { status: "rendering", jobId: view.jobId });
+    } else if (view.phase === "ready") {
+      void updateClipExport(clipId, {
+        status: "completed",
+        jobId: view.jobId,
+        url: clipDownloadUrl,
+      });
+    } else if (view.phase === "failed") {
+      void updateClipExport(clipId, {
+        status: "failed",
+        jobId: view.jobId,
+        error: view.errorText,
+      });
+    } else if (view.phase === "canceled") {
+      void updateClipExport(clipId, { status: "idle" });
+    }
+  }, [clipId, view?.phase, view?.jobId, view?.errorText, clipDownloadUrl, updateClipExport, view]);
+
   // ONE active export per user: any active server job OR the browser single-flight.
   const blockedByActive = cloud.hasActiveExport || isExporting;
   // In the settings view, a block means ANOTHER export (this project's active one
@@ -280,7 +367,7 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
     sourceHeight: project.height ?? 0,
     sourceDuration,
     moments,
-    effects: project.effectsSettings,
+    effects,
     sourceCrop: project.sourceCrop,
     visualAnalysis: project.visualAnalysis,
   };
@@ -305,6 +392,14 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
     cloud.clearError();
     console.log("[export-ui:path]", { path: exportPath });
 
+    // A clip that's already rendering (or already rendered with these exact
+    // settings) must not spawn a second job — the banner offers Download /
+    // Re-export instead.
+    if (clipExport && clipDecision && clipDecision.kind !== "start") {
+      if (clipDecision.kind === "blocked") setBlockedWarning(clipDecision.reason);
+      return;
+    }
+
     if (exportPath === "cloud") {
       // Cloud export is INDEPENDENT of browser codec limitations. We never run
       // MediaRecorder / canPlayType / audio-decode checks here — the VM worker
@@ -327,6 +422,16 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
       void cloud.startCloudExport(serverInput).then((r) => {
         if (r.ok) {
           console.log("[export-ui:cloud-submit]", { jobId: r.jobId });
+          // Stamp the clip as queued WITH the identity that produced it, so the
+          // card shows progress even if the dialog is closed, and so a later
+          // identical request is recognized as a duplicate.
+          if (clipExport && clipIdentity) {
+            void updateClipExport(clipExport.id, {
+              status: "queued",
+              jobId: r.jobId,
+              identity: clipIdentity,
+            });
+          }
         } else {
           console.log("[export-ui:error]", { source: "cloud", code: r.kind ?? "start_failed" });
           const msg = friendlyExportError(r.kind, r.error);
@@ -355,7 +460,7 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
       originalVideoUrl: project.originalVideoUrl!,
       duration: sourceDuration,
       moments,
-      effects: project.effectsSettings,
+      effects,
       visualAnalysis: project.visualAnalysis,
       sourceCrop: project.sourceCrop,
       resolution,
@@ -364,7 +469,16 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
       container,
       outputFormat: `${canvasSummary} · ${resolution} · ${fps}fps · ${container === "mp4" ? "MP4" : "WebM"}`,
     };
-    if (!startExport(params)) setBlockedWarning(cloud.alreadyRunningMessage);
+    if (!startExport(params)) {
+      setBlockedWarning(cloud.alreadyRunningMessage);
+      return;
+    }
+    if (clipExport && clipIdentity) {
+      void updateClipExport(clipExport.id, {
+        status: "rendering",
+        identity: clipIdentity,
+      });
+    }
   };
 
   const exportAgain = () => {
@@ -434,6 +548,63 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
         />
       ) : (
         <>
+          {/* ── Single-clip export banner ─────────────────────────────────── */}
+          {clipExport && (
+            <div className="flex items-start gap-2 rounded-xl border border-violet-400/30 bg-violet-500/[0.08] px-3 py-2.5 text-[12px]">
+              <Scissors size={14} className="mt-0.5 shrink-0 text-violet-300" />
+              <div className="min-w-0">
+                <p className="font-semibold text-white">Exporting one clip</p>
+                <p className="truncate text-violet-100/85">{clipExport.title}</p>
+                <p className="mt-0.5 font-mono text-[11px] tabular-nums text-violet-200/70">
+                  {clipTimeLabel(clipExport.startTime)}–{clipTimeLabel(clipExport.endTime)} ·{" "}
+                  {clipTimeLabel(exportDuration)} output
+                </p>
+                {/* The clip's smart edits ride along with the render. */}
+                <p className="mt-1 text-[11px] leading-relaxed text-violet-200/70">
+                  Includes {clipExport.suggestedAspectRatio} framing
+                  {clipExport.suggestedHookText ? ", hook text" : ""}
+                  {clipExport.editOperations.some((o) => o.type === "captions")
+                    ? `, ${clipExport.suggestedCaptionStyle.replace("_", " ")} captions`
+                    : ""}
+                  {clipExport.editOperations.some((o) => o.type === "zoom")
+                    ? ", emphasis zoom"
+                    : ""}
+                  . Your full video is unchanged.
+                </p>
+
+                {/* Already rendered with these exact settings → don't burn a
+                    second job. Offer the existing file, or an explicit re-run. */}
+                {clipDecision?.kind === "reuse" && (
+                  <div className="mt-2 flex flex-wrap items-center gap-2 rounded-lg border border-emerald-400/25 bg-emerald-500/[0.08] px-2.5 py-2">
+                    <span className="inline-flex items-center gap-1.5 text-[11.5px] font-medium text-emerald-100">
+                      <CheckCircle2 size={12} />
+                      Already exported with these settings
+                    </span>
+                    <span className="ml-auto inline-flex items-center gap-1.5">
+                      <a
+                        href={clipDecision.url}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-400/45 bg-emerald-500/20 px-2.5 py-1 text-[11px] font-medium text-emerald-50 transition-colors duration-150 hover:bg-emerald-500/30"
+                      >
+                        <Download size={11} />
+                        Download
+                      </a>
+                      <button
+                        type="button"
+                        onClick={() => setForceClipReexport(true)}
+                        className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.02] px-2.5 py-1 text-[11px] font-medium text-fog transition-colors duration-150 hover:border-white/25 hover:text-white"
+                      >
+                        <RefreshCw size={11} />
+                        Re-export anyway
+                      </button>
+                    </span>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
           {/* ── Previous export (manual download only — never auto) ────────── */}
           {cloud.previousExport && (
             <PreviousExportCard
@@ -1305,6 +1476,12 @@ function fmtDuration(seconds: number): string {
   const r = s % 60;
   if (m === 0) return `${r}s`;
   return `${m}m ${String(r).padStart(2, "0")}s`;
+}
+
+/** m:ss — for clip in/out points (a position, not a duration). */
+function clipTimeLabel(seconds: number): string {
+  const s = Math.max(0, Math.floor(seconds));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 }
 
 function PreFlightRow({

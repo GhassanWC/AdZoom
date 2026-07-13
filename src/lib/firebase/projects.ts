@@ -26,6 +26,7 @@ import type { Interaction, SourceCrop } from "@/lib/recording/types";
 import { assessCoordinateTrust } from "@/lib/recording/interaction-trust";
 import type { CaptureDimensions } from "@/lib/recording/scope-detect";
 import { getFirebase } from "./client";
+import { materializeProject } from "./materialize-project";
 import {
   DEFAULT_EFFECTS_SETTINGS,
   type ProjectDoc,
@@ -342,81 +343,6 @@ export async function setAnalysisStage(
   );
 }
 
-function materializeProject(id: string, data: Record<string, unknown>): ProjectDoc {
-  return {
-    id,
-    userId: data.userId as string,
-    title: (data.title as string) ?? "Untitled",
-    originalVideoUrl: (data.originalVideoUrl as string) ?? "",
-    storagePath: (data.storagePath as string) ?? "",
-    duration: tsNum(data.duration),
-    width: tsNum(data.width),
-    height: tsNum(data.height),
-    fileSize: tsNum(data.fileSize),
-    mimeType: (data.mimeType as string) ?? undefined,
-    status: ((data.status as ProjectStatus) ?? "uploaded") as ProjectStatus,
-    analysis: (data.analysis as ProjectDoc["analysis"]) ?? undefined,
-    effectsSettings:
-      (data.effectsSettings as ProjectDoc["effectsSettings"]) ?? DEFAULT_EFFECTS_SETTINGS,
-    exportUrl: (data.exportUrl as string) ?? undefined,
-    interactionScope: (data.interactionScope as ProjectDoc["interactionScope"]) ?? undefined,
-    interactionsPath: (data.interactionsPath as string) ?? undefined,
-    captureDimensions: (data.captureDimensions as ProjectDoc["captureDimensions"]) ?? undefined,
-    sourceCrop: materializeSourceCrop(data),
-    createdAt: tsMs(data.createdAt) ?? Date.now(),
-    updatedAt: tsMs(data.updatedAt) ?? Date.now(),
-  };
-}
-
-/**
- * Read the global `sourceCrop`, with a back-compat shim for projects saved
- * under the earlier bottom-only `recordingCleanup` model: synthesize an
- * equivalent bottom-only crop rect so they keep removing the sharing bar.
- */
-function materializeSourceCrop(
-  data: Record<string, unknown>
-): SourceCrop | undefined {
-  const direct = data.sourceCrop as SourceCrop | undefined;
-  if (direct) return direct;
-  const legacy = data.recordingCleanup as
-    | {
-        removeBottomCaptureBar?: boolean;
-        bottomCropPx?: number;
-        sourceHeight?: number;
-        confidence?: number;
-      }
-    | undefined;
-  if (
-    legacy &&
-    legacy.removeBottomCaptureBar &&
-    (legacy.bottomCropPx ?? 0) > 0 &&
-    (legacy.sourceHeight ?? 0) > 0
-  ) {
-    const height = Math.max(
-      0,
-      Math.min(1, (legacy.sourceHeight! - legacy.bottomCropPx!) / legacy.sourceHeight!)
-    );
-    return {
-      enabled: true,
-      x: 0,
-      y: 0,
-      width: 1,
-      height,
-      reason: "browser-bar-cleanup",
-      confidence: legacy.confidence,
-    };
-  }
-  return undefined;
-}
-
-function tsNum(v: unknown): number | undefined {
-  return typeof v === "number" ? v : undefined;
-}
-
-function tsMs(v: unknown): number | undefined {
-  if (v && typeof v === "object" && "toMillis" in v) {
-    return (v as { toMillis(): number }).toMillis();
-  }
-  if (typeof v === "number") return v;
-  return undefined;
-}
+// `materializeProject` (snapshot → ProjectDoc) now lives in ./materialize-project
+// — pure, unit-tested, and typed so that forgetting a ProjectDoc field there is a
+// COMPILE error rather than a field that silently reads back as undefined.

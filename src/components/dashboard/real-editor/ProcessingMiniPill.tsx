@@ -101,7 +101,9 @@ export function ProcessingMiniPill() {
           exit={{ opacity: 0, y: 12, scale: 0.96 }}
           transition={{ duration: 0.24, ease: [0.22, 1, 0.36, 1] }}
           onClick={() => setProcessingMinimized(false)}
-          className="fixed bottom-5 right-5 z-[115] flex w-72 items-center gap-3 rounded-xl border border-violet-400/30 bg-surface/95 p-3 text-left shadow-cinematic backdrop-blur-xl transition-colors duration-200 hover:border-violet-400/50"
+          // Pops in from 0.96 (never from nothing) so it reads as arriving over
+          // the preview rather than being teleported in.
+          className="fv-pop-in fv-press fixed bottom-5 right-5 z-[115] flex w-72 items-center gap-3 rounded-xl border border-violet-400/30 bg-surface/95 p-3 text-left shadow-cinematic backdrop-blur-xl transition-[border-color,transform] duration-200 ease-[cubic-bezier(0.23,1,0.32,1)] hover:border-violet-400/50"
           aria-label="Re-open processing details"
         >
           <span className="relative inline-flex size-9 shrink-0 items-center justify-center rounded-lg bg-violet-500/15 text-violet-300">

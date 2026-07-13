@@ -14,6 +14,8 @@ import {
   type NotificationPreferences,
   type WorkspaceSettings,
 } from "./schema";
+import { isValidPresetId } from "@/lib/presets/registry";
+import { MAX_RECENT_PRESETS } from "@/lib/presets/types";
 
 /**
  * Live + writable per-user workspace settings.
@@ -33,6 +35,7 @@ export interface ResolvedWorkspaceSettings {
   notifications: Required<NotificationPreferences>;
   analysisEngines: Required<NonNullable<WorkspaceSettings["analysisEngines"]>>;
   analysisDetail: Required<NonNullable<WorkspaceSettings["analysisDetail"]>>;
+  presetLibrary: Required<NonNullable<WorkspaceSettings["presetLibrary"]>>;
   updatedAt?: number;
 }
 
@@ -124,7 +127,36 @@ function mergeWithDefaults(
     notifications: mergeNotifications(raw?.notifications),
     analysisEngines: mergeAnalysisEngines(raw?.analysisEngines),
     analysisDetail: mergeAnalysisDetail(raw?.analysisDetail),
+    presetLibrary: mergePresetLibrary(raw?.presetLibrary),
     updatedAt: raw?.updatedAt,
+  };
+}
+
+/**
+ * Favourites + recents, filtered against the LIVE registry.
+ *
+ * A preset id that no longer exists (renamed, retired) is dropped on read rather
+ * than surfacing as a broken card. Doing it here — at the single resolve point —
+ * means every consumer gets valid ids and no UI has to defend against a stale
+ * one.
+ */
+function mergePresetLibrary(
+  raw: WorkspaceSettings["presetLibrary"]
+): Required<NonNullable<WorkspaceSettings["presetLibrary"]>> {
+  const clean = (ids: string[] | undefined, cap: number): string[] => {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const id of ids ?? []) {
+      if (typeof id !== "string" || !isValidPresetId(id) || seen.has(id)) continue;
+      seen.add(id);
+      out.push(id);
+      if (out.length >= cap) break;
+    }
+    return out;
+  };
+  return {
+    favouriteIds: clean(raw?.favouriteIds, 200),
+    recentIds: clean(raw?.recentIds, MAX_RECENT_PRESETS),
   };
 }
 

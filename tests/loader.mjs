@@ -25,8 +25,18 @@ function withExtension(fileUrl) {
   return null;
 }
 
+/** Next-only packages that have no runtime behaviour outside the Next toolchain. */
+const STUBS = {
+  // Guards CLIENT bundles; not installed for `node --test`. See stubs/server-only.mjs.
+  "server-only": pathToFileURL(path.resolve(process.cwd(), "tests/stubs/server-only.mjs"))
+    .href,
+};
+
 export async function resolve(specifier, context, nextResolve) {
   let spec = specifier;
+  if (Object.hasOwn(STUBS, spec)) {
+    return { url: STUBS[spec], shortCircuit: true };
+  }
   // `@/x` → src/x
   if (spec.startsWith("@/")) {
     spec = pathToFileURL(path.join(SRC, spec.slice(2))).href;

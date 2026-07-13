@@ -14,6 +14,7 @@ import {
   type CameraState,
 } from "@/lib/timeline/camera";
 import { clickHighlightGeometry } from "@/lib/timeline/click-highlight";
+import { resolveClickHighlight } from "@/lib/render/click-highlight";
 import { coverFitDims } from "@/lib/timeline/cover";
 import {
   activeSpeedAt,
@@ -330,6 +331,8 @@ export function RealVideoPlayer({
     setSourceCrop,
     clearSourceCrop,
     compareBypassId,
+    previewMoments,
+    previewEffects,
     // Preview volume + fullscreen now live in context (shared with the unified
     // control bar above the timeline). The element still lives here, so we
     // sync it below.
@@ -462,19 +465,20 @@ export function RealVideoPlayer({
   // Before/After hold-to-compare removes ONLY the compared moment from the
   // PREVIEW's list (camera + overlays) — persisted data and export are
   // untouched, and with no active compare this is the same array reference.
-  const allMoments = applyCompareBypass(
-    project.analysis?.detectedMoments ?? [],
-    compareBypassId
-  );
+  // `previewMoments` is the clip-aware list: in FOCUSED CLIP MODE it carries the
+  // open clip's smart edits (hook text, restyled captions, emphasis zoom, CTA);
+  // otherwise it IS `project.analysis.detectedMoments` (same reference). Either
+  // way this is render-side only — nothing is persisted.
+  const allMoments = applyCompareBypass(previewMoments, compareBypassId);
   useCinematicCamera(
     transformWrapRef,
     videoRef,
     {
       moments: allMoments,
       previewMode,
-      autoZoom: project.effectsSettings.autoZoom,
-      zoomSpeed: project.effectsSettings.zoomSpeed,
-      pacing: project.effectsSettings.pacing,
+      autoZoom: previewEffects.autoZoom,
+      zoomSpeed: previewEffects.zoomSpeed,
+      pacing: previewEffects.pacing,
       exporting,
       cropEditing,
     },
@@ -604,8 +608,8 @@ export function RealVideoPlayer({
   // only the per-moment cinematic camera stays gated on previewMode (inside
   // `useCinematicCamera`). `null` = full-frame source (legacy behaviour).
   const oc = React.useMemo(
-    () => resolveOutputCanvas(project.effectsSettings),
-    [project.effectsSettings]
+    () => resolveOutputCanvas(previewEffects),
+    [previewEffects]
   );
 
   // Source dims as a ratio (absolute scale cancels in the placement math), so
@@ -940,7 +944,7 @@ export function RealVideoPlayer({
                 {cvDebugOverlay && va && va.sampleCount > 0 && (
                   <CvDebugOverlay
                     visualAnalysis={va}
-                    moments={project.analysis?.detectedMoments ?? []}
+                    moments={previewMoments}
                     currentTime={currentTime}
                   />
                 )}
@@ -969,9 +973,9 @@ export function RealVideoPlayer({
                 <OverlayLayer
                   moment={activeMoment}
                   currentTime={currentTime}
-                  clickHighlightStyle={project.effectsSettings.clickHighlightStyle}
-                  clickHighlightSize={project.effectsSettings.clickHighlightSize}
-                  clickHighlightsEnabled={project.effectsSettings.clickHighlights}
+                  clickHighlightStyle={previewEffects.clickHighlightStyle}
+                  clickHighlightSize={previewEffects.clickHighlightSize}
+                  clickHighlightsEnabled={previewEffects.clickHighlights}
                 />
               )}
 
@@ -1065,7 +1069,7 @@ export function RealVideoPlayer({
             what you get; if it's off here it'll be off in the exported
             file. The CSS gradient mirrors the exporter's
             `drawVignette` radial gradient byte-for-byte. */}
-        {project.effectsSettings.vignette && (
+        {previewEffects.vignette && (
           <div
             aria-hidden
             className="pointer-events-none absolute inset-0 bg-[radial-gradient(ellipse_at_center,transparent_60%,rgba(0,0,0,0.25)_100%)]"
@@ -1548,9 +1552,16 @@ function OverlayLayer({
   clickHighlightSize: number;
   clickHighlightsEnabled: boolean;
 }) {
-  if (!clickHighlightsEnabled || moment.effectType !== "click-highlight") {
-    return null;
-  }
+  // The SHARED resolver — the same one compose-frame (browser export + the Cloud
+  // Run worker) and Remotion call. The click's own style/size win over the
+  // project's; null means it shouldn't be drawn at all. Preview and export can
+  // therefore only disagree if this function is wrong for both of them.
+  const click = resolveClickHighlight(moment, {
+    clickHighlights: clickHighlightsEnabled,
+    clickHighlightStyle,
+    clickHighlightSize,
+  });
+  if (!click) return null;
   return (
     <ClickHighlight
       x={moment.focusRegion.x + moment.focusRegion.width / 2}
@@ -1559,8 +1570,8 @@ function OverlayLayer({
         (currentTime - moment.startTime) /
         Math.max(0.1, moment.endTime - moment.startTime)
       }
-      style={clickHighlightStyle}
-      sizePct={clickHighlightSize}
+      style={click.style}
+      sizePct={click.sizePct}
     />
   );
 }

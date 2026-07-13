@@ -64,6 +64,20 @@ const EDGE_FRACTION = 0.18; // 18% of the moment on each edge
 const EDGE_MIN_S = 0.12; // never shorter than this (so flash-short moments still ease)
 const EDGE_MAX_S = 0.4; // never longer than this (so long moments don't waste runtime)
 
+// ── Per-edit camera speed (DetectedMoment.cameraMotion.speed, 0..100) ────────
+// The slider SCALES the ramp above rather than replacing it. 50 = the base ramp,
+// so the default is exactly today's rendering and an untouched slider changes
+// nothing.
+/** The neutral position: identical to no `cameraMotion` at all. */
+export const CAMERA_SPEED_DEFAULT = 50;
+/** At speed 0 the ramp is this many times the base — a slow cinematic glide. */
+const RAMP_SLOWEST_MULT = 2.5;
+/** At speed 100 — a near-instant snap into frame. */
+const RAMP_SNAPPIEST_MULT = 0.15;
+/** Hard bounds. Never 0 (that's a hard cut, and it flickers). */
+const RAMP_MIN_S = 0.04;
+const RAMP_MAX_S = 1.2;
+
 function clamp01(v: number): number {
   if (!Number.isFinite(v)) return 0;
   return Math.max(0, Math.min(1, v));
@@ -173,9 +187,9 @@ function clampCenterToFrame(
  * overlap; we shorten them proportionally so the curve still peaks at 1
  * in the middle.
  */
-function edgeEnvelope(localProg: number, durSec: number): number {
+function edgeEnvelope(localProg: number, durSec: number, speed?: number): number {
   if (durSec <= 0) return 1;
-  let edgeSec = clampRange(durSec * EDGE_FRACTION, EDGE_MIN_S, EDGE_MAX_S);
+  let edgeSec = rampSeconds(durSec, speed);
   if (edgeSec * 2 > durSec) edgeSec = durSec / 2;
   const edge = edgeSec / durSec; // 0..0.5
   if (edge <= 0) return 1;
@@ -183,6 +197,35 @@ function edgeEnvelope(localProg: number, durSec: number): number {
   if (localProg > 1 - edge)
     return applyEase("ease-in-out", (1 - localProg) / edge);
   return 1;
+}
+
+/**
+ * How long this edit's camera ramp lasts, in seconds.
+ *
+ * `speed` is the per-edit control (`DetectedMoment.cameraMotion.speed`, 0..100):
+ * higher = snappier. It scales the default ramp rather than replacing it, so the
+ * duration-relative behaviour (short moments still ease, long ones don't waste
+ * runtime) survives at every speed.
+ *
+ * ABSENT speed ⇒ the base ramp, byte-for-byte what every project rendered before
+ * per-edit speed existed. That exactness is the point: adding the field must not
+ * silently re-render anyone's finished video. `CAMERA_SPEED_DEFAULT` is the same
+ * value by construction, so a slider left alone is also a no-op.
+ */
+export function rampSeconds(durSec: number, speed?: number): number {
+  const base = clampRange(durSec * EDGE_FRACTION, EDGE_MIN_S, EDGE_MAX_S);
+  if (speed === undefined || speed === CAMERA_SPEED_DEFAULT) return base;
+
+  const t = clamp01(speed / 100);
+  // Two linear halves through (0 → SLOW), (0.5 → 1×), (1 → FAST). A single
+  // curve through three points would make the default a bump on the way past;
+  // the user's mental model is "50 is normal, left is slower, right is faster".
+  const multiplier =
+    t <= 0.5
+      ? RAMP_SLOWEST_MULT + (1 - RAMP_SLOWEST_MULT) * (t / 0.5)
+      : 1 + (RAMP_SNAPPIEST_MULT - 1) * ((t - 0.5) / 0.5);
+
+  return clampRange(base * multiplier, RAMP_MIN_S, RAMP_MAX_S);
 }
 
 /**
@@ -274,9 +317,14 @@ export function cameraForMoment(
   // Apply the edge envelope to scale + pan so preview and export both
   // ramp in/out the same way. The clamp uses the FULL target scale so the
   // visible window never leaks off the source frame mid-ramp.
+  //
+  // `cameraMotion.speed` is the edit's OWN ramp speed (set in the inspector).
+  // It rides through this one resolver, so preview, browser export, the Cloud
+  // Run worker and Remotion all inherit it — there is no second place to change.
   const env = edgeEnvelope(
     clamp01(localProgressValue),
-    Math.max(0, m.endTime - m.startTime)
+    Math.max(0, m.endTime - m.startTime),
+    m.cameraMotion?.speed
   );
   const scale = 1 + (targetScale - 1) * env;
   const targetPanXPct = (0.5 - cx) * 100;
