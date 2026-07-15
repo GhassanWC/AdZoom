@@ -122,6 +122,51 @@ export function isOverlayEffectType(t: EffectType | undefined): boolean {
   return t !== undefined && OVERLAY_EFFECT_TYPE_SET.has(t);
 }
 
+/**
+ * TIMELINE LAYERS — one per lane on the timeline. Every {@link EffectType} maps
+ * into exactly one of these (see `EFFECT_TO_LAYER` in src/lib/timeline/layers.ts,
+ * which owns the mapping and the render-time gate).
+ *
+ * The ids are the persisted keys of {@link ProjectDoc.timelineLayers}, so they
+ * are part of the document format: renaming one orphans a user's saved
+ * visibility for that lane (it would read back as "visible").
+ */
+export type TimelineLayerId =
+  | "camera"
+  | "cut"
+  | "speed"
+  | "transition"
+  | "captions"
+  | "hook-text"
+  | "text-overlay"
+  | "callout"
+  | "branding-cta"
+  | "blur-redaction"
+  | "smart-crop";
+
+/**
+ * Which layers are hidden. ABSENT (or `true`) = visible — same absent-means-on
+ * rule as {@link DetectedMoment.enabled}, so a project that has never toggled a
+ * layer stores nothing and renders exactly as before.
+ *
+ * Persisted with an EXPLICIT boolean per layer (never by omitting a key): the
+ * doc is written with `merge: true`, which deep-merges maps, so a dropped key
+ * would leave a stale `false` in the document. See `normalizeLayerVisibility`.
+ */
+export type LayerVisibility = Partial<Record<TimelineLayerId, boolean>>;
+
+/**
+ * The single gate for {@link DetectedMoment.enabled} — ABSENT means enabled, so
+ * legacy docs (which have no flag) render exactly as before; only an explicit
+ * `false` hides. Every renderer reaches its edits through one of the three
+ * selectors that call this (`pickActiveMoment` for camera, `buildTimelineMap`
+ * for cut/speed, `activeOverlays` for overlays), so gating here hides a disabled
+ * edit in preview, browser export, the Cloud Run worker and Remotion at once.
+ */
+export function isMomentEnabled(m: { enabled?: boolean }): boolean {
+  return m.enabled !== false;
+}
+
 // ── Manual Crop/Reframe + Speed settings (additive) ─────────────────────────
 // Crop/Reframe and Speed are manual timeline effects. They extend
 // `DetectedMoment` without a parallel type so existing projects decode
@@ -595,11 +640,20 @@ export interface DetectedMoment {
   /** User-tuned override of intensity (0..1). Falls back to project effectsSettings. */
   intensity?: number;
   /**
-   * Non-destructive on/off for OVERLAY edits (captions / hook / text / callout /
-   * blur / transition / branding). `false` hides the overlay in preview + export
-   * while keeping it on the timeline (re-enableable). ABSENT is treated as
-   * enabled, so older overlays + all cut/zoom/speed moments are unaffected — only
-   * `enabled === false` hides, and only overlay rendering consults it.
+   * Non-destructive on/off for ANY edit — camera (zoom / focus / crop), timing
+   * (cut / speed) and overlays alike. `false` hides the edit from preview AND
+   * export while keeping it on the timeline: still selectable, still editable,
+   * re-enableable at any time. A disabled cut keeps its range (nothing is
+   * removed); a disabled speed section plays at 1×; a disabled zoom leaves the
+   * camera where it was.
+   *
+   * ABSENT is treated as enabled, so older docs are unaffected — only
+   * `enabled === false` hides. Read it through {@link isMomentEnabled}, never
+   * by hand: that predicate is the one place the absent-means-enabled rule lives.
+   *
+   * Distinct from `cut.active`, which is the cut lane's own restore affordance
+   * (a restored cut is likewise not applied). Either one being off keeps the
+   * range.
    */
   enabled?: boolean;
   /** True if the user added/edited this moment (vs raw AI output). */
@@ -1880,6 +1934,24 @@ export interface ProjectDoc {
    * has. This is the switch that keeps plain analysis working untouched.
    */
   directorBrief?: DirectorBrief;
+  /**
+   * PER-LAYER visibility — one switch per timeline lane (Zooms & focus, Cuts,
+   * Speed, Captions, Callouts, Transitions, …). Hiding a layer hides every edit
+   * in it from preview + export.
+   *
+   * Deliberately its OWN field rather than a bulk write of `enabled: false`
+   * across the lane's moments. A layer toggle must not TOUCH the individual
+   * edits: if it did, re-enabling the layer would resurrect edits the user had
+   * hidden one-by-one (their own `enabled: false` would have been overwritten),
+   * and every toggle would rewrite N moments. Keeping the two axes separate is
+   * what makes "restore all its edits exactly as before" true by construction —
+   * the moments are never modified, so there is nothing to restore.
+   *
+   * An edit renders only when BOTH gates are open: its layer is visible AND
+   * {@link isMomentEnabled}. Absent (or `true`) = visible, so every existing
+   * project is unaffected. See src/lib/timeline/layers.ts.
+   */
+  timelineLayers?: LayerVisibility;
   createdAt: number;
   updatedAt: number;
 }

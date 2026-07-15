@@ -28,7 +28,8 @@ import type {
   EaseKind,
   MomentKeyframe,
 } from "@/lib/firebase/schema";
-import { isOverlayEffectType } from "@/lib/firebase/schema";
+import { isMomentEnabled, isOverlayEffectType } from "@/lib/firebase/schema";
+import { isActiveCut } from "@/lib/timeline/crop-speed";
 
 export interface CameraState {
   /** Final zoom scale applied to the frame (≥ 1). */
@@ -414,6 +415,12 @@ function cameraPriority(m: DetectedMoment): number {
  * Among the rest, the highest `cameraPriority` wins (user crop > user zoom >
  * AI), ties break on the LATEST startTime ("last-authored wins"). Export and
  * preview both call this, so they always agree on which moment is active.
+ *
+ * DISABLED edits (`enabled === false`) are skipped outright — this is the gate
+ * that hides a zoom/focus/crop from preview + export. Skipping (rather than
+ * picking-then-drawing-nothing) matters: a disabled edit must not out-priority
+ * a lower-priority enabled one underneath it, and `composeFrame` resolves the
+ * click highlight from whatever moment this function returns.
  */
 function pickActiveMoment(
   moments: DetectedMoment[],
@@ -422,9 +429,7 @@ function pickActiveMoment(
   // Active cut ranges (removed time). A camera edit fully inside one is hidden
   // from preview + export, so it's never picked. A straddling edit still
   // applies on its visible part.
-  const activeCuts = moments.filter(
-    (m) => m.effectType === "cut" && m.cut?.active !== false
-  );
+  const activeCuts = moments.filter(isActiveCut);
   const insideActiveCut = (m: DetectedMoment): boolean =>
     activeCuts.some((c) => m.startTime >= c.startTime && m.endTime <= c.endTime);
 
@@ -436,6 +441,7 @@ function pickActiveMoment(
     // (applied via the output canvas) never move the per-moment camera either.
     if (m.effectType === "speed-up" || m.effectType === "cut") continue;
     if (isOverlayEffectType(m.effectType)) continue;
+    if (!isMomentEnabled(m)) continue;
     if (insideActiveCut(m)) continue;
     if (t < m.startTime || t > m.endTime) continue;
     const pri = cameraPriority(m);

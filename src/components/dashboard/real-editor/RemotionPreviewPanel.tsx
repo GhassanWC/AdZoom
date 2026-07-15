@@ -15,6 +15,7 @@ import {
   REMOTION_PREVIEW_ENABLED,
 } from "@/components/editor/RemotionPreview";
 import type { SerializedRenderRecipe } from "@/lib/firebase/schema";
+import { visibleMoments } from "@/lib/timeline/layers";
 
 export function RemotionPreviewPanel() {
   const { project, videoRef, duration } = useEditorReal();
@@ -48,7 +49,12 @@ export function RemotionPreviewPanel() {
       resolution: "1080p",
       format: "Source",
       sourceDuration: srcDuration > 0 ? srcDuration : 1,
-      moments: project.analysis?.detectedMoments ?? [],
+      // Hidden layers are dropped, exactly as `createCloudExportJob` will drop
+      // them — this panel exists to show what the export will look like.
+      moments: visibleMoments(
+        project.analysis?.detectedMoments ?? [],
+        project.timelineLayers
+      ),
       effects: project.effectsSettings,
       sourceCrop: project.sourceCrop ?? null,
       applyWatermark: false,
@@ -61,6 +67,7 @@ export function RemotionPreviewPanel() {
       srcH,
       srcDuration,
       project.analysis?.detectedMoments,
+      project.timelineLayers,
       project.effectsSettings,
       project.sourceCrop,
       project.visualAnalysis,

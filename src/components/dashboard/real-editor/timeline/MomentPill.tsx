@@ -11,12 +11,15 @@ import {
   Trash2,
   Pencil,
   Check,
+  Eye,
+  EyeOff,
 } from "lucide-react";
 import type {
   DetectedMoment,
   MomentProvenance,
   UIContext,
 } from "@/lib/firebase/schema";
+import { isMomentEnabled } from "@/lib/firebase/schema";
 import { cn } from "@/lib/cn";
 import {
   EFFECT_ICONS,
@@ -196,18 +199,23 @@ function PillToolbar({
   active,
   geometry,
   canSplit,
+  enabled,
   onEdit,
   onSplit,
   onDuplicate,
+  onToggleEnabled,
   onDelete,
 }: {
   anchorRef: React.RefObject<HTMLDivElement | null>;
   active: boolean;
   geometry: string;
   canSplit: boolean;
+  /** This edit renders (absent `enabled` = on). */
+  enabled: boolean;
   onEdit: () => void;
   onSplit: () => void;
   onDuplicate: () => void;
+  onToggleEnabled: () => void;
   onDelete: () => void;
 }) {
   const pos = useToolbarPosition(anchorRef, active, geometry);
@@ -249,6 +257,14 @@ function PillToolbar({
       <PillAction title="Duplicate (⌘D)" onClick={onDuplicate}>
         <Copy size={12} />
       </PillAction>
+      {/* Hide/show — the non-destructive alternative to Delete, so it sits next
+          to it. The edit stays on the timeline and stays editable while off. */}
+      <PillAction
+        title={enabled ? "Hide — keep on the timeline (H)" : "Show again (H)"}
+        onClick={onToggleEnabled}
+      >
+        {enabled ? <Eye size={12} /> : <EyeOff size={12} />}
+      </PillAction>
       <PillAction title="Delete (Del)" onClick={onDelete} danger>
         <Trash2 size={12} />
       </PillAction>
@@ -275,9 +291,11 @@ export function MomentPill({
   multiSelected,
   dragging,
   canSplit,
+  layerHidden = false,
   onBeginDrag,
   onDuplicate,
   onSplit,
+  onToggleEnabled,
   onDelete,
   onEdit,
 }: {
@@ -288,9 +306,12 @@ export function MomentPill({
   dragging: boolean;
   /** The playhead is inside this edit and both halves would be long enough. */
   canSplit: boolean;
+  /** This edit's whole LAYER is switched off (distinct from its own `enabled`). */
+  layerHidden?: boolean;
   onBeginDrag: (e: React.PointerEvent, m: DetectedMoment, mode: DragMode) => void;
   onDuplicate: () => void;
   onSplit: () => void;
+  onToggleEnabled: () => void;
   onDelete: () => void;
   onEdit: () => void;
 }) {
@@ -322,9 +343,13 @@ export function MomentPill({
   const provInfo = presentationFor(m);
   // A restored cut is inactive (range kept) — render it dimmed.
   const cutRestored = m.effectType === "cut" && m.cut?.active === false;
-  // A disabled overlay is hidden from preview/export (kept on the timeline) —
-  // render it dimmed like a restored cut so its off-state reads at a glance.
-  const overlayDisabled = m.enabled === false;
+  // TWO ways an edit can be off, and the pill must not conflate them:
+  //   • the edit's own switch  (`enabled: false`)   — this pill, hidden.
+  //   • its LAYER's switch     (Layers menu)        — the whole lane, hidden.
+  // Either way it renders nothing but stays on the timeline, fully editable — so
+  // both dim the pill; only the first is something this pill's eye button owns.
+  const selfDisabled = !isMomentEnabled(m);
+  const isDisabled = selfDisabled || layerHidden;
   // Crop shows its target aspect (9:16); speed shows its multiplier (2×); a cut
   // shows how much it removes (or "Restored" when inactive).
   const badge =
@@ -396,7 +421,11 @@ export function MomentPill({
         "group absolute touch-none transition-[opacity,filter] duration-200",
         dragging ? "z-40" : selected ? "z-30" : "hover:z-20",
         // A restored cut is inactive — desaturate it so it reads as "kept".
-        cutRestored && "saturate-[0.4]"
+        // A disabled edit is off entirely, so drain it further (colour is what
+        // signals "this effect is live"), but never to invisible: it stays a
+        // target you can click, drag and re-enable.
+        cutRestored && "saturate-[0.4]",
+        isDisabled && "saturate-[0.15]"
       )}
       style={{
         left: `${left}%`,
@@ -406,7 +435,7 @@ export function MomentPill({
         minWidth: `${MIN_PILL_PX}px`,
         top: insetY,
         bottom: insetY,
-        opacity: cutRestored || overlayDisabled ? bodyOpacity * 0.5 : bodyOpacity,
+        opacity: cutRestored || isDisabled ? bodyOpacity * 0.5 : bodyOpacity,
       }}
     >
       {/* ── Floating action toolbar — portalled, see useToolbarPosition ─── */}
@@ -415,9 +444,13 @@ export function MomentPill({
         active={selected && !dragging}
         geometry={`${left}:${widthPct}`}
         canSplit={canSplit}
+        // The eye toggles THIS EDIT's switch, never the layer's — a per-edit
+        // control that silently flipped a whole lane would be a trap.
+        enabled={!selfDisabled}
         onEdit={onEdit}
         onSplit={onSplit}
         onDuplicate={onDuplicate}
+        onToggleEnabled={onToggleEnabled}
         onDelete={onDelete}
       />
 
@@ -427,6 +460,28 @@ export function MomentPill({
           className="pointer-events-none absolute -right-1.5 -top-1.5 z-30 inline-flex size-4 items-center justify-center rounded-full bg-rose-500 text-white shadow-cinematic ring-2 ring-ink"
         >
           <Check size={9} strokeWidth={3} />
+        </span>
+      )}
+
+      {/* Hidden marker. Dimming alone is ambiguous on a timeline that already
+          dims by attention — this badge says WHY, and it survives the icon-only
+          tier where there's no room for a text badge. Amber = the LAYER is off
+          (matching the Layers button), plain = just this edit. */}
+      {isDisabled && (
+        <span
+          aria-label={
+            layerHidden
+              ? "Hidden — this whole layer is switched off"
+              : "Hidden from preview and export"
+          }
+          className={cn(
+            "pointer-events-none absolute -left-1.5 -top-1.5 z-30 inline-flex size-4 items-center justify-center rounded-full shadow-cinematic ring-1",
+            layerHidden
+              ? "bg-ink text-amber-300 ring-amber-300/40"
+              : "bg-ink text-fog ring-white/25"
+          )}
+        >
+          <EyeOff size={9} strokeWidth={2.5} />
         </span>
       )}
 
@@ -440,7 +495,15 @@ export function MomentPill({
           e.stopPropagation();
           onEdit();
         }}
-        title={`${m.label}\n${provInfo.label} · Confidence ${(confidence * 100).toFixed(0)}\n${
+        title={`${m.label}${
+          layerHidden
+            ? " — this layer is hidden (Layers menu)"
+            : selfDisabled
+              ? " — hidden from preview & export"
+              : ""
+        }\n${
+          provInfo.label
+        } · Confidence ${(confidence * 100).toFixed(0)}\n${
           m.confidenceReason || reasoning
         }\nAttention ${(attention * 100).toFixed(0)} · Intensity ${(intensity * 100).toFixed(0)}${
           m.uiContext ? ` · ${m.uiContext}` : ""

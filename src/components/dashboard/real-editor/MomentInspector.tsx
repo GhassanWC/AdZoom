@@ -70,7 +70,13 @@ import type {
   BrandingPosition,
   BrandingPreset,
 } from "@/lib/firebase/schema";
-import { isOverlayEffectType, DEFAULT_BLUR_STRENGTH } from "@/lib/firebase/schema";
+import {
+  isMomentEnabled,
+  isOverlayEffectType,
+  DEFAULT_BLUR_STRENGTH,
+} from "@/lib/firebase/schema";
+import { isLayerVisible } from "@/lib/timeline/layers";
+import { LANE_BY_ID, laneForEffectType } from "./timeline/laneModel";
 import type { TextStyle } from "@/lib/firebase/schema";
 import { TextStyleControls } from "./TextStyleControls";
 import { resolveTextStyleValues } from "@/lib/render/text-style";
@@ -239,6 +245,27 @@ export interface MomentReviewNav {
   onNext: () => void;
 }
 
+/**
+ * What "off" actually means for this effect type. Worth spelling out: for an
+ * overlay "hidden" is self-explanatory, but a disabled CUT keeps its range
+ * (the footage comes back) and a disabled SPEED plays at 1× — saying only
+ * "hidden" would leave the user guessing what happens to the time.
+ */
+function disabledHint(t: EffectType): string {
+  switch (t) {
+    case "cut":
+      return "Off — its range is kept, nothing is removed. Still on the timeline.";
+    case "speed-up":
+      return "Off — this range plays at normal speed. Still on the timeline.";
+    case "zoom":
+    case "cursor-focus":
+    case "crop":
+      return "Off — the camera doesn't move here. Still on the timeline.";
+    default:
+      return "Hidden from preview & export — still on the timeline.";
+  }
+}
+
 export function MomentInspector({ nav }: { nav?: MomentReviewNav } = {}) {
   const {
     project,
@@ -247,7 +274,9 @@ export function MomentInspector({ nav }: { nav?: MomentReviewNav } = {}) {
     updateMoment,
     deleteMoment,
     duplicateMoment,
-    setCaptionsEnabled,
+    setMomentEnabled,
+    layers,
+    setLayerVisible,
     currentTime,
     duration,
     seek,
@@ -256,10 +285,6 @@ export function MomentInspector({ nav }: { nav?: MomentReviewNav } = {}) {
   } = useEditorReal();
 
   const moments = project.analysis?.detectedMoments ?? [];
-  const captionCount = moments.filter((m) => m.effectType === "captions").length;
-  const allCaptionsEnabled =
-    captionCount > 0 &&
-    moments.every((m) => m.effectType !== "captions" || m.enabled !== false);
   const sourceAspect =
     project.width && project.height ? project.width / project.height : 16 / 9;
   const sourceDuration = duration || project.duration || 0;
@@ -273,6 +298,13 @@ export function MomentInspector({ nav }: { nav?: MomentReviewNav } = {}) {
   if (!moment) {
     return <EmptyInspector hasMoments={moments.length > 0} status={project.status} />;
   }
+
+  // This edit's LAYER (its timeline lane) — the second, coarser visibility gate.
+  const layerDef = LANE_BY_ID[laneForEffectType(moment.effectType)];
+  const layerVisible = isLayerVisible(layers, layerDef.id);
+  const layerCount = moments.filter(
+    (m) => laneForEffectType(m.effectType) === layerDef.id
+  ).length;
 
   const effectSpec = EFFECT_BY_ID[moment.effectType];
   const relevance = ADVANCED_RELEVANCE[moment.effectType];
@@ -405,30 +437,39 @@ export function MomentInspector({ nav }: { nav?: MomentReviewNav } = {}) {
         {/* ══ RIGHT — status, timing, advanced, AI reasoning ══ */}
         <div className="min-w-0 space-y-4">
 
-        {/* Non-destructive enable/disable — hidden overlays stay on the
-            timeline (re-enableable) but never render in preview or export. */}
-        {isOverlay && (
-          <section className="space-y-3">
+        {/* Non-destructive enable/disable — EVERY edit type, not just overlays.
+            A hidden edit stays on the timeline and stays editable; it simply
+            renders nothing. `setMomentEnabled` (not `updateMoment`) so the
+            toggle is its own undo step and doesn't stamp the edit as user-tuned. */}
+        <section className="space-y-3">
+          <Toggle
+            label="Enabled"
+            description={
+              moment.enabled === false
+                ? disabledHint(moment.effectType)
+                : "Shown in preview & export."
+            }
+            checked={moment.enabled !== false}
+            onChange={(v) => void setMomentEnabled(moment.id, v)}
+          />
+          {/* This edit's LAYER — the same switch the timeline's Layers menu owns,
+              surfaced here because "hide every caption" is a thought you have
+              while looking at a caption. It hides the lane WITHOUT touching any
+              edit in it (including the toggle above), so turning it back on
+              restores them exactly. */}
+          {layerCount > 1 && (
             <Toggle
-              label="Enabled"
+              label={`${layerDef.label} layer (${layerCount})`}
               description={
-                moment.enabled === false
-                  ? "Hidden from preview & export — still on the timeline."
-                  : "Shown in preview & export."
+                layerVisible
+                  ? "Hide every edit in this lane at once — they stay on the timeline, unchanged."
+                  : "The whole lane is hidden. Its edits are untouched — turn this on to bring them all back."
               }
-              checked={moment.enabled !== false}
-              onChange={(v) => updateMoment(moment.id, { enabled: v })}
+              checked={layerVisible}
+              onChange={(v) => void setLayerVisible(layerDef.id, v)}
             />
-            {moment.effectType === "captions" && captionCount > 1 && (
-              <Toggle
-                label={`All captions (${captionCount})`}
-                description="Enable or disable the whole caption layer at once."
-                checked={allCaptionsEnabled}
-                onChange={(v) => void setCaptionsEnabled(v)}
-              />
-            )}
-          </section>
-        )}
+          )}
+        </section>
 
         {/* Timing — single row, no boxes, click-to-seek chips. */}
         <TimingRow
@@ -1050,8 +1091,8 @@ function EffectMotionControls({
   if (moment.effectType === "click-highlight") {
     const style = moment.clickHighlight?.style ?? effects.clickHighlightStyle;
     const size = moment.clickHighlight?.size ?? effects.clickHighlightSize;
-    // Absent = shown. Only an explicit false hides an edit (same rule overlays use).
-    const shown = moment.enabled !== false;
+    // No show/hide toggle here: `enabled` is universal now, and the inspector's
+    // own "Enabled" toggle (right column) owns it for every effect type.
     return (
       <div className="space-y-3">
         <div>
@@ -1080,12 +1121,6 @@ function EffectMotionControls({
           min={0}
           max={100}
           onChange={(v) => onUpdate({ clickHighlight: { ...moment.clickHighlight, size: v } })}
-        />
-        <Toggle
-          label="Show this highlight"
-          description="Hides the ring for this click only — the edit stays on the timeline."
-          checked={shown}
-          onChange={(v) => onUpdate({ enabled: v })}
         />
       </div>
     );
@@ -1315,7 +1350,14 @@ function CutControls({
   moment: DetectedMoment;
   onUpdate: (patch: Partial<DetectedMoment>) => void;
 }) {
+  // A cut has TWO independent off-switches and either one keeps the range: the
+  // universal Enabled toggle (every edit type has it, right column) and this
+  // panel's own Restore affordance. So this panel must report the EFFECTIVE
+  // state — a hidden cut that still says "Removed / Cut active" would be lying
+  // about what the export does.
   const active = moment.cut?.active !== false;
+  const hidden = !isMomentEnabled(moment);
+  const applied = active && !hidden;
   const removed = Math.max(0, moment.endTime - moment.startTime);
   return (
     <section className="space-y-3 rounded-xl border border-rose-400/15 bg-rose-500/[0.04] p-3">
@@ -1326,24 +1368,26 @@ function CutControls({
         <span
           className={cn(
             "text-[11px] font-medium",
-            active ? "text-rose-200" : "text-fog"
+            applied ? "text-rose-200" : "text-fog"
           )}
         >
-          {active ? "Removed" : "Restored (kept)"}
+          {hidden ? "Hidden (kept)" : active ? "Removed" : "Restored (kept)"}
         </span>
       </div>
       <Toggle
         label="Cut active"
         description={
-          active
-            ? "Removed from preview + export — output is shorter."
-            : "Restored — the range plays and exports normally."
+          hidden
+            ? "This edit is hidden, so the range plays either way — switch Enabled back on to apply this."
+            : active
+              ? "Removed from preview + export — output is shorter."
+              : "Restored — the range plays and exports normally."
         }
         checked={active}
         onChange={(v) => onUpdate({ cut: { active: v } })}
       />
       <div className="flex items-center justify-between rounded-lg bg-black/20 p-2.5 text-[11.5px]">
-        <span className="text-fog">{active ? "Removes" : "Would remove"}</span>
+        <span className="text-fog">{applied ? "Removes" : "Would remove"}</span>
         <span className="font-mono tabular-nums text-white">
           {removed.toFixed(removed < 10 ? 1 : 0)}s
         </span>

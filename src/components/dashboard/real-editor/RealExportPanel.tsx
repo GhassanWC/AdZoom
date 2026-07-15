@@ -35,6 +35,7 @@ import {
 } from "@/components/export/ExportProvider";
 import { resolveOutputCanvas } from "@/lib/timeline/canvas-layout";
 import { buildTimelineMap } from "@/lib/timeline/crop-speed";
+import { visibleMoments } from "@/lib/timeline/layers";
 import { clipExportMoments, clipEffects } from "@/lib/clips/clip-edits";
 import {
   decideClipExport,
@@ -243,7 +244,15 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
 
   // ── Duration + estimates ──────────────────────────────────────────────────
   const sourceDuration = duration || project.duration || 0;
-  const baseMoments = project.analysis?.detectedMoments ?? [];
+  // HIDDEN LAYERS are dropped here, at the single point where the export's moment
+  // list is built — every engine (browser MediaRecorder/WebCodecs, the Cloud Run
+  // worker, Remotion) derives its recipe from THIS array, so one filter covers
+  // them all, and the export job's recipe snapshot records exactly what rendered.
+  // The project's own `detectedMoments` are untouched, so nothing is lost.
+  const baseMoments = visibleMoments(
+    project.analysis?.detectedMoments ?? [],
+    project.timelineLayers
+  );
   // Single-clip export: the clip's SMART EDITS (hook text, restyled captions,
   // emphasis zoom, CTA) are materialized into real moments, then two synthetic
   // cuts carve the timeline down to exactly [start,end]. Every render engine

@@ -513,13 +513,13 @@ export function RealVideoPlayer({
   // offset inside an overflow-clipped wrapper so only the crop rect shows. The
   // stage/frame box is the effective crop aspect → the scaled video's element
   // box ends up at the FULL source aspect, so `object-fill` fills it without
-  // distortion, matching the exporter's source-rect draw. Suppressed while
-  // editing (the editor shows the full frame with the draggable crop box) and
-  // in native fullscreen (a non-WYSIWYG "watch" affordance whose box is
-  // viewport-aspect, where the sprite-fill would distort — show the raw frame).
+  // distortion, matching the exporter's source-rect draw. Suppressed ONLY while
+  // editing the crop (the editor shows the full frame with the draggable crop
+  // box). Native fullscreen keeps the crop applied — fullscreen is now full
+  // WYSIWYG (the fitted output frame is sized to the crop/canvas aspect, so the
+  // sprite-fill lands correctly, exactly as in the windowed preview).
   const cropActive =
     !cropEditing &&
-    !isFullscreen &&
     !!srcRect &&
     srcRect.cropActive &&
     !!naturalSize;
@@ -650,15 +650,15 @@ export function RealVideoPlayer({
     };
   }, [oc, srcAspectVal, va, allMoments]);
 
-  // Sizing + object-fit for the visible frame. The Canvas composite is
-  // disabled in fullscreen, which falls back to a source-contain view (a
-  // "watch the recording" affordance — the windowed preview is the WYSIWYG
-  // export preview). Outside the canvas path the video is letterboxed via
-  // `object-contain` exactly like before.
+  // Sizing + object-fit for the visible frame. Native fullscreen is now full
+  // WYSIWYG: it runs the SAME Canvas-Fit composite as the windowed preview
+  // (output aspect, crop, cinematic camera, overlays, captions), just scaled up
+  // to fit the viewport — so fullscreen matches the export exactly instead of
+  // showing the raw source recording.
   // While editing the crop, bypass the Canvas-Fit composite and show the full
   // source frame (object-contain at natural aspect) with the crop box on top.
-  const canvasActive = !!previewPlacement && !isFullscreen && !cropEditing;
-  const applySourceAspect = !canvasActive && !isFullscreen;
+  const canvasActive = !!previewPlacement && !cropEditing;
+  const applySourceAspect = !canvasActive;
   const previewAspect = sourceAspect ?? 16 / 9;
   const videoObjectFit = canvasActive ? "object-cover" : "object-contain";
 
@@ -681,22 +681,33 @@ export function RealVideoPlayer({
     ? "h-[72vh] w-auto max-w-full"
     : "w-full max-h-[56vh] max-w-[100vh]";
 
-  // Fullscreen-editor `fill` mode: fit the frame into the measured parent at
-  // the exact frame aspect (explicit px keep the ratio true for BOTH tall and
-  // wide frames — no viewport units, no over-constrained CSS).
+  // Fit-to-container modes. Both the fullscreen-editor `fill` layout AND native
+  // fullscreen size the frame to FIT the measured container at the exact frame
+  // aspect (explicit px keep the ratio true for BOTH tall and wide frames — no
+  // viewport units, no over-constrained CSS). In native fullscreen the
+  // container IS the viewport, so the fitted frame is letterboxed by the black
+  // container around it — the same framing the export produces.
   const fillActive = fill && !isFullscreen;
-  const containerSize = useContainerSize(containerRef, fillActive);
+  const fitToContainer = fillActive || isFullscreen;
+  const containerSize = useContainerSize(containerRef, fitToContainer);
   const frameAspect =
     canvasActive && previewPlacement
       ? previewPlacement.canvasW / previewPlacement.canvasH
       : previewAspect;
   const fittedStyle: React.CSSProperties | null =
-    fillActive && containerSize && containerSize.w > 8 && containerSize.h > 8
+    fitToContainer && containerSize && containerSize.w > 8 && containerSize.h > 8
       ? (() => {
           const w = Math.min(containerSize.w, containerSize.h * frameAspect);
           return { width: Math.floor(w), height: Math.floor(w / frameAspect) };
         })()
       : null;
+  // Pre-measurement fallback for native fullscreen: keep the frame aspect-true
+  // with a viewport-unit box for the one frame before the ResizeObserver
+  // reports the viewport size, so the frame never flashes stretched full-bleed.
+  const fsFallbackClass =
+    frameAspect < 1
+      ? "h-[96vh] w-auto max-w-[96vw]"
+      : "w-[96vw] h-auto max-h-[96vh]";
 
   const place = canvasActive ? previewPlacement?.place : undefined;
   const stageStyle: React.CSSProperties | undefined =
@@ -795,11 +806,10 @@ export function RealVideoPlayer({
       ref={containerRef}
       className={cn(
         "relative",
-        // In native fullscreen the container becomes the viewport, so let it
-        // fill it and let the inner card stretch to match. The video element
-        // already uses `object-contain`, so any letterboxing happens cleanly
-        // inside the frame instead of as page chrome around it.
-        isFullscreen && "h-screen w-screen bg-black",
+        // In native fullscreen the container becomes the viewport. Center the
+        // fitted output frame inside it so the letterbox margins are pure black
+        // page chrome — the frame itself carries the true output aspect.
+        isFullscreen && "flex h-screen w-screen items-center justify-center bg-black",
         // `fill` mode centers the fitted frame inside the flexible workspace.
         fillActive && "flex h-full w-full min-h-0 items-center justify-center"
       )}
@@ -810,7 +820,12 @@ export function RealVideoPlayer({
         className={cn(
           "relative overflow-hidden bg-black shadow-cinematic",
           isFullscreen
-            ? "h-full w-full rounded-none border-0"
+            ? cn(
+                "rounded-none border-0",
+                // Fitted px once measured; aspect-true viewport fallback for the
+                // one frame before the ResizeObserver reports the viewport size.
+                fittedStyle ? "max-h-full max-w-full" : fsFallbackClass
+              )
             : cn(
                 "rounded-xl border border-white/[0.06] mx-auto",
                 // Until the first measurement lands, fall back to the legacy

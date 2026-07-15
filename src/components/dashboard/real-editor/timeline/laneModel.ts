@@ -13,6 +13,8 @@
  * new lanes — no migration, no schema change.
  */
 import type { DetectedMoment, EffectType } from "@/lib/firebase/schema";
+import { EFFECT_TO_LAYER, layerForEffectType } from "@/lib/timeline/layers";
+import type { TimelineLayerId } from "@/lib/timeline/layers";
 
 /** Collapsible lane groups (product spec §4). */
 export type LaneGroupId = "camera" | "pacing" | "overlays" | "canvas";
@@ -30,19 +32,14 @@ export const LANE_GROUPS: readonly LaneGroupDef[] = [
   { id: "canvas", label: "Canvas" },
 ] as const;
 
-/** One lane per user-facing edit type. */
-export type LaneId =
-  | "camera"
-  | "cut"
-  | "speed"
-  | "transition"
-  | "captions"
-  | "hook-text"
-  | "text-overlay"
-  | "callout"
-  | "branding-cta"
-  | "blur-redaction"
-  | "smart-crop";
+/**
+ * One lane per user-facing edit type. A lane IS a layer — same ids, because the
+ * layer visibility a user toggles is persisted per lane. The type lives in
+ * `@/lib/timeline/layers` (which the render gate and the export-job builder also
+ * import; neither may depend on a component module), and `LaneId` stays as the
+ * name the timeline code reads best.
+ */
+export type LaneId = TimelineLayerId;
 
 export interface LaneDef {
   id: LaneId;
@@ -66,32 +63,16 @@ export interface LaneDef {
 }
 
 /**
- * Every EffectType → its lane. STATIC + exhaustive (compile error if a new
- * EffectType is added without a lane), which is what guarantees old docs route
- * correctly. `crop` (legacy source-crop / reframe) rides the Canvas lane with
- * smart-crop since both are framing edits.
+ * Every EffectType → its lane. ONE mapping, shared with the render gate — if the
+ * timeline drew an edit in a lane the gate assigned to a different layer, hiding
+ * that layer would hide a lane the user wasn't looking at. Re-exported under the
+ * lane vocabulary; `@/lib/timeline/layers` owns it.
  */
-export const EFFECT_TO_LANE: Record<EffectType, LaneId> = {
-  zoom: "camera",
-  "click-highlight": "camera",
-  "cursor-focus": "camera",
-  cut: "cut",
-  "speed-up": "speed",
-  crop: "smart-crop",
-  captions: "captions",
-  "hook-text": "hook-text",
-  "text-overlay": "text-overlay",
-  "smart-crop": "smart-crop",
-  callout: "callout",
-  "blur-redaction": "blur-redaction",
-  transition: "transition",
-  "branding-cta": "branding-cta",
-};
+export const EFFECT_TO_LANE: Record<EffectType, LaneId> = EFFECT_TO_LAYER;
 
 /** The lane a moment belongs to (by effectType). Unknown/legacy → camera. */
-export function laneForEffectType(t: EffectType | undefined): LaneId {
-  return (t && EFFECT_TO_LANE[t]) || "camera";
-}
+export const laneForEffectType: (t: EffectType | undefined) => LaneId =
+  layerForEffectType;
 
 /** Ordered lane definitions. Order within a group is top-to-bottom. */
 export const LANE_DEFS: readonly LaneDef[] = [

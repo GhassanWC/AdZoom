@@ -19,7 +19,9 @@ import assert from "node:assert/strict";
 
 import { splitMoment, splitMomentsAt } from "../src/lib/timeline/split.ts";
 import { buildTimelineMap } from "../src/lib/timeline/crop-speed.ts";
+import { resolveCameraFrame } from "../src/lib/timeline/camera.ts";
 import { buildRenderRecipe } from "../src/lib/render/recipe.ts";
+import { summarizeTimelineForChunking } from "../src/lib/export/chunk-plan.ts";
 import {
   EFFECT_TO_LANE,
   laneForEffectType,
@@ -286,6 +288,105 @@ test("parity: DISABLE hides an overlay from preview AND export, without deleting
   // preview canvas and the export compositor read, so they can't disagree.
   assert.equal(on[0].enabled, true);
   assert.equal(off[0].enabled, false);
+});
+
+/* ── DISABLE applies to EVERY edit type, not just overlays ──────────────────
+ *
+ * `enabled` started as an overlay-only flag. It now gates every effect type, so
+ * these tests pin what "off" means for the types that are NOT drawn as overlays:
+ * a disabled CUT must give its footage back, a disabled SPEED must play at 1×,
+ * and a disabled CAMERA edit must not move the camera — in preview and export
+ * alike, which here means: through the same three selectors both paths call.
+ */
+
+test("disable: a CUT gives its range back (nothing is removed) but stays on the timeline", () => {
+  const cut = moment("cut1", "cut", 10, 30); // 20s
+  const on = [cut];
+  const off = [{ ...cut, enabled: false }];
+
+  assert.equal(recipeFor(on).outputDuration, SOURCE - 20, "enabled: 20s removed");
+
+  assertParity(off, "after disabling a cut");
+  assert.equal(recipeFor(off).outputDuration, SOURCE, "disabled: the full source survives");
+
+  const map = buildTimelineMap(off, SOURCE);
+  assert.equal(map.totalRemoved, 0, "no source time is removed");
+  assert.equal(map.activeCuts, 0, "the cut is not applied…");
+  assert.equal(map.inactiveCuts, 1, "…but it is still counted as a cut on the timeline");
+  assert.equal(recipeFor(off).moments.length, 1, "and it is NOT deleted");
+});
+
+test("disable: a SPEED section plays at 1× (no compression)", () => {
+  const speed = moment("s1", "speed-up", 20, 40); // 20s at 2× → 10s
+  const on = [speed];
+  const off = [{ ...speed, enabled: false }];
+
+  assert.equal(recipeFor(on).outputDuration, SOURCE - 10, "enabled: 2× halves those 20s");
+
+  assertParity(off, "after disabling a speed section");
+  assert.equal(recipeFor(off).outputDuration, SOURCE, "disabled: nothing is compressed");
+
+  const seg = buildTimelineMap(off, SOURCE).segments;
+  assert.equal(seg.length, 1, "the timeline is one unbroken 1× segment");
+  assert.equal(seg[0].speedMultiplier, 1);
+});
+
+test("disable: a CAMERA edit is not selected, and cannot out-priority an enabled one", () => {
+  const t = 52; // inside both edits below
+
+  // A disabled zoom leaves the camera at identity.
+  const zoomOff = [moment("z1", "zoom", 50, 56, { enabled: false })];
+  assert.equal(
+    resolveCameraFrame(zoomOff, t, { autoZoom: 50 }).moment,
+    null,
+    "no moment is active, so the camera holds identity"
+  );
+  assert.equal(resolveCameraFrame(zoomOff, t, { autoZoom: 50 }).camera.scale, 1);
+
+  // The subtle one: selection is by PRIORITY (user > AI), and a disabled edit
+  // must not win and then draw nothing — that would swallow the enabled edit
+  // underneath it. Skipping beats picking-then-hiding.
+  const userCropOff = moment("crop1", "crop", 50, 56, { source: "user", enabled: false });
+  const aiZoomOn = moment("z1", "zoom", 50, 56, { source: "ai" });
+  const picked = resolveCameraFrame([userCropOff, aiZoomOn], t, { autoZoom: 50 }).moment;
+  assert.equal(picked?.id, "z1", "the higher-priority crop is off, so the zoom applies");
+});
+
+test("disable: a hidden edit is still fully editable — re-enabling restores it exactly", () => {
+  const cut = moment("cut1", "cut", 10, 30);
+  const off = { ...cut, enabled: false };
+
+  // Trim it WHILE hidden (the timeline keeps drag/resize live on disabled pills).
+  const trimmed = { ...off, endTime: 25, edited: true };
+  assert.equal(recipeFor([trimmed]).outputDuration, SOURCE, "still hidden: still no cut");
+
+  // Re-enable: the edit comes back with the edit made while it was off.
+  const back = { ...trimmed, enabled: true };
+  assertParity([back], "after re-enabling");
+  assert.equal(
+    recipeFor([back]).outputDuration,
+    SOURCE - 15,
+    "re-enabled: removes 10→25, the range as trimmed while hidden"
+  );
+});
+
+test("disable: hiding an unsupported effect does not force a timeline off the chunked path", () => {
+  // `transition` is outside the chunk allowlist — enabled, it blocks chunking.
+  const transition = moment("t1", "transition", 10, 12);
+  assert.deepEqual(
+    summarizeTimelineForChunking([transition]).unsupportedEffects,
+    ["transition"],
+    "enabled: it blocks the chunked renderer"
+  );
+
+  // Hidden, it renders nothing, so it can't break a chunk. The worker's
+  // fail-closed backstop applies the same filter — if these two ever disagree,
+  // hiding an edit would make the app dispatch a job the worker then rejects.
+  assert.deepEqual(
+    summarizeTimelineForChunking([{ ...transition, enabled: false }]).unsupportedEffects,
+    [],
+    "disabled: nothing to reproduce, so nothing to block"
+  );
 });
 
 test("parity: DELETE removes it from the export too", () => {

@@ -19,11 +19,19 @@ import type {
   EffectsSettings,
   EffectType,
   GeneratedClip,
+  LayerVisibility,
   Preset,
   ProjectDoc,
   SelectedVideoType,
   TextStyle,
+  TimelineLayerId,
 } from "@/lib/firebase/schema";
+import {
+  hiddenLayerIds,
+  isLayerVisible,
+  normalizeLayerVisibility,
+  visibleMoments,
+} from "@/lib/timeline/layers";
 import { generateClips as computeClips } from "@/lib/clips/clip-generator";
 import {
   createClipGenerationController,
@@ -216,6 +224,18 @@ export type RightTool =
 
 /** Stable empty-array identity so this doesn't churn consumers each render. */
 const EMPTY_MOMENTS: DetectedMoment[] = [];
+/** Same, for the layer map: "nothing hidden" must be one stable reference. */
+const EMPTY_LAYERS: LayerVisibility = {};
+
+/**
+ * One undo step. Both halves of the editable state travel together — the edits,
+ * and which layers are hidden — so ⌘Z unwinds a mixed sequence of edit changes
+ * and layer toggles in the exact order the user made them.
+ */
+interface EditorSnapshot {
+  moments: DetectedMoment[];
+  layers: LayerVisibility;
+}
 
 interface EditorRealContextValue {
   project: ProjectDoc;
@@ -360,10 +380,26 @@ interface EditorRealContextValue {
   updateMoment: (id: string, patch: Partial<DetectedMoment>) => Promise<void>;
   deleteMoment: (id: string) => Promise<void>;
   addMoment: (m: DetectedMoment) => Promise<void>;
-  /** Non-destructively enable/disable ALL caption moments at once (whole layer). */
-  setCaptionsEnabled: (enabled: boolean) => Promise<void>;
-  /** Non-destructively enable/disable EVERY moment of these effect types (lane-level). */
-  setLaneEnabled: (effectTypes: EffectType[], enabled: boolean) => Promise<void>;
+  /**
+   * Show/hide ONE edit non-destructively (any effect type). The edit stays on
+   * the timeline, selectable and editable, and renders nothing in preview or
+   * export while off. Its own undo step — never coalesced into a neighbouring
+   * gesture, because a toggle is a decision, not a drag.
+   */
+  setMomentEnabled: (id: string, enabled: boolean) => Promise<void>;
+  /**
+   * Which timeline LAYERS are hidden (absent = visible). Read it through
+   * `isLayerVisible` / `visibleMoments` — never index it raw.
+   */
+  layers: LayerVisibility;
+  /**
+   * Show/hide a whole layer (Zooms & focus, Cuts, Captions, …). Hides every edit
+   * in that lane from preview + export WITHOUT touching the edits themselves, so
+   * re-showing restores them exactly. Persisted on the project doc; undoable.
+   */
+  setLayerVisible: (layer: TimelineLayerId, visible: boolean) => Promise<void>;
+  /** Un-hide every layer in ONE undoable step (never a toggle-per-layer loop). */
+  showAllLayers: () => Promise<void>;
   /**
    * Set the shared `textStyle` on EVERY moment of `effectType` at once (e.g.
    * "apply this caption's style to all captions in the track"). Replaces each
@@ -947,9 +983,22 @@ export function EditorRealProvider({
    * Falls back to the exact base objects (same reference) when no clip is
    * focused, so nothing downstream re-renders on the normal path.
    */
+  /**
+   * Layer visibility is applied HERE, on the way to the renderer — not on the
+   * timeline. The timeline keeps drawing every edit (dimmed when its layer is
+   * off, so you can still select, edit and un-hide it); the PLAYER is handed a
+   * list with the hidden layers' edits removed entirely, which is why a hidden
+   * Cuts layer stops cutting and a hidden Captions layer stops drawing: the
+   * selectors downstream never see those moments at all.
+   */
+  const layers = project.timelineLayers ?? EMPTY_LAYERS;
   const previewMoments = React.useMemo(
-    () => (focusedClip ? clipPreviewMoments(baseMoments, focusedClip) : baseMoments),
-    [baseMoments, focusedClip]
+    () =>
+      visibleMoments(
+        focusedClip ? clipPreviewMoments(baseMoments, focusedClip) : baseMoments,
+        layers
+      ),
+    [baseMoments, focusedClip, layers]
   );
   const previewEffects = React.useMemo(
     () =>
@@ -1150,12 +1199,17 @@ export function EditorRealProvider({
   });
 
   // ── Edit history (session-only, in-memory) ──────────────────────────────
-  // Every moment mutation funnels through `commitMoments`, which snapshots the
-  // prior array onto an undo stack before writing. `undo`/`redo` move whole
-  // `detectedMoments` arrays between the two stacks and persist via the same
-  // `setDoc` path — so the camera/export contract (which only reads the array)
-  // is never touched. History is in-memory: a refresh starts fresh, matching
+  // Every mutation funnels through `commitSnapshot`, which pushes the PRIOR
+  // snapshot onto an undo stack before writing. `undo`/`redo` move whole
+  // snapshots between the two stacks and persist via the same `setDoc` path — so
+  // the camera/export contract (which only reads the moment array) is never
+  // touched. History is in-memory: a refresh starts fresh, matching
   // editor-session expectations and keeping the Firestore doc lean.
+  //
+  // A snapshot is BOTH editable states, because both are things the user can
+  // change and therefore expects ⌘Z to take back: the moments, and which layers
+  // are hidden. They travel together so a mixed sequence (hide a layer → move a
+  // clip → hide another layer) unwinds in the exact order it was made.
   const HISTORY_LIMIT = 50;
   const momentsRef = React.useRef<DetectedMoment[]>(
     project.analysis?.detectedMoments ?? []
@@ -1163,17 +1217,23 @@ export function EditorRealProvider({
   React.useEffect(() => {
     momentsRef.current = project.analysis?.detectedMoments ?? [];
   }, [project.analysis?.detectedMoments]);
-  const undoStackRef = React.useRef<DetectedMoment[][]>([]);
-  const redoStackRef = React.useRef<DetectedMoment[][]>([]);
+
+  const layersRef = React.useRef<LayerVisibility>(project.timelineLayers ?? {});
+  React.useEffect(() => {
+    layersRef.current = project.timelineLayers ?? {};
+  }, [project.timelineLayers]);
+
+  const undoStackRef = React.useRef<EditorSnapshot[]>([]);
+  const redoStackRef = React.useRef<EditorSnapshot[]>([]);
   const [canUndo, setCanUndo] = React.useState(false);
   const [canRedo, setCanRedo] = React.useState(false);
 
-  // The single funnel: persist `next`, recording the prior array for undo.
+  // The single funnel: persist a whole snapshot (moments + layer visibility).
   // `stripUndefined` runs on every write (Firestore rejects literal
   // `undefined` anywhere in the doc) — centralising it here removes the
   // earlier inconsistency where only some mutators scrubbed.
-  const writeMoments = React.useCallback(
-    async (next: DetectedMoment[], coalesce = false) => {
+  const writeSnapshot = React.useCallback(
+    async (snap: EditorSnapshot, coalesce = false) => {
       // Serialize through the per-project write queue so a user edit can't
       // collide with a chunk append / finalize write ("Another write batch or
       // compaction is already active").
@@ -1181,12 +1241,20 @@ export function EditorRealProvider({
       // `coalesce` (used by high-frequency edits like slider / colour drags)
       // tags the write so that while one sits un-started in the queue, a newer
       // one supersedes it and the older is skipped. This is SAFE here because
-      // every write persists the FULL `detectedMoments` array (a complete
-      // snapshot, never a partial merge), so the latest snapshot subsumes the
-      // ones it replaces. Without this, a fast drag enqueues dozens of setDocs
-      // and Firestore throws "Write stream exhausted maximum allowed queued
-      // writes"; the local cache still updates on each write that DOES run, so
-      // the preview stays live.
+      // every write persists the FULL snapshot (never a partial merge), so the
+      // latest one subsumes the ones it replaces. Without this, a fast drag
+      // enqueues dozens of setDocs and Firestore throws "Write stream exhausted
+      // maximum allowed queued writes"; the local cache still updates on each
+      // write that DOES run, so the preview stays live.
+      //
+      // Both fields go in every write. `timelineLayers` is tiny (11 booleans),
+      // and writing it unconditionally is what lets undo/redo restore a snapshot
+      // with ONE call — no "which half changed?" bookkeeping to get wrong.
+      //
+      // It is NORMALIZED (every layer, explicit boolean) because `merge: true`
+      // deep-merges maps: a sparse map can add a `false` but can never take one
+      // away, so re-showing a layer — or undoing a hide — would write a map that
+      // merges to no change at all. See normalizeLayerVisibility.
       await enqueueProjectWrite(
         project.id,
         "user-moments-write",
@@ -1196,8 +1264,9 @@ export function EditorRealProvider({
             {
               analysis: stripUndefined({
                 ...(project.analysis ?? {}),
-                detectedMoments: next,
+                detectedMoments: snap.moments,
               }),
+              timelineLayers: normalizeLayerVisibility(snap.layers),
               updatedAt: serverTimestamp(),
             },
             { merge: true }
@@ -1213,8 +1282,8 @@ export function EditorRealProvider({
   const lastLiveCommitAtRef = React.useRef(0);
   const GESTURE_COALESCE_MS = 600;
 
-  const commitMoments = React.useCallback(
-    async (next: DetectedMoment[], opts?: { coalesce?: boolean }) => {
+  const commitSnapshot = React.useCallback(
+    async (next: EditorSnapshot, opts?: { coalesce?: boolean }) => {
       const now = Date.now();
       // Only skip the undo snapshot when this commit continues an in-progress
       // gesture (coalesced edits arriving within the window); a single undo
@@ -1222,7 +1291,10 @@ export function EditorRealProvider({
       const continuesGesture =
         opts?.coalesce === true && now - lastLiveCommitAtRef.current < GESTURE_COALESCE_MS;
       if (!continuesGesture) {
-        undoStackRef.current.push(momentsRef.current);
+        undoStackRef.current.push({
+          moments: momentsRef.current,
+          layers: layersRef.current,
+        });
         if (undoStackRef.current.length > HISTORY_LIMIT) {
           undoStackRef.current.shift();
         }
@@ -1233,31 +1305,79 @@ export function EditorRealProvider({
       if (opts?.coalesce) lastLiveCommitAtRef.current = now;
       // Optimistic ref update so two rapid edits chain off each other's
       // result instead of both reading the same (now stale) snapshot.
-      momentsRef.current = next;
-      await writeMoments(next, opts?.coalesce);
+      momentsRef.current = next.moments;
+      layersRef.current = next.layers;
+      await writeSnapshot(next, opts?.coalesce);
     },
-    [writeMoments]
+    [writeSnapshot]
+  );
+
+  /** Commit new moments, carrying the CURRENT layer visibility unchanged. */
+  const commitMoments = React.useCallback(
+    async (next: DetectedMoment[], opts?: { coalesce?: boolean }) => {
+      await commitSnapshot({ moments: next, layers: layersRef.current }, opts);
+    },
+    [commitSnapshot]
   );
 
   const undo = React.useCallback(async () => {
     const prev = undoStackRef.current.pop();
     if (!prev) return;
-    redoStackRef.current.push(momentsRef.current);
-    momentsRef.current = prev;
+    redoStackRef.current.push({
+      moments: momentsRef.current,
+      layers: layersRef.current,
+    });
+    momentsRef.current = prev.moments;
+    layersRef.current = prev.layers;
     setCanUndo(undoStackRef.current.length > 0);
     setCanRedo(true);
-    await writeMoments(prev);
-  }, [writeMoments]);
+    await writeSnapshot(prev);
+  }, [writeSnapshot]);
 
   const redo = React.useCallback(async () => {
     const next = redoStackRef.current.pop();
     if (!next) return;
-    undoStackRef.current.push(momentsRef.current);
-    momentsRef.current = next;
+    undoStackRef.current.push({
+      moments: momentsRef.current,
+      layers: layersRef.current,
+    });
+    momentsRef.current = next.moments;
+    layersRef.current = next.layers;
     setCanUndo(true);
     setCanRedo(redoStackRef.current.length > 0);
-    await writeMoments(next);
-  }, [writeMoments]);
+    await writeSnapshot(next);
+  }, [writeSnapshot]);
+
+  /**
+   * Show/hide a whole LAYER. Writes only `timelineLayers` — the lane's moments
+   * are not read, not rewritten, not marked edited. That is the guarantee: hide
+   * Captions, then show it again, and every caption comes back exactly as it was,
+   * including any that the user had individually hidden (those stay hidden,
+   * because their own `enabled: false` was never overwritten).
+   */
+  const setLayerVisible: EditorRealContextValue["setLayerVisible"] =
+    React.useCallback(
+      async (layer, visible) => {
+        if (isLayerVisible(layersRef.current, layer) === visible) return;
+        const nextLayers: LayerVisibility = {
+          ...layersRef.current,
+          [layer]: visible,
+        };
+        await commitSnapshot({ moments: momentsRef.current, layers: nextLayers });
+      },
+      [commitSnapshot]
+    );
+
+  const showAllLayers: EditorRealContextValue["showAllLayers"] =
+    React.useCallback(async () => {
+      const hidden = hiddenLayerIds(layersRef.current);
+      if (hidden.length === 0) return;
+      // ONE commit, so "Show all layers" is ONE ⌘Z — not one per layer. The write
+      // is normalized to explicit booleans, so this genuinely clears every `false`.
+      const next: LayerVisibility = { ...layersRef.current };
+      for (const id of hidden) next[id] = true;
+      await commitSnapshot({ moments: momentsRef.current, layers: next });
+    }, [commitSnapshot]);
 
   // A fresh analysis replaces the entire moment set, so any captured
   // snapshots become meaningless — clear both stacks at that transition.
@@ -1297,12 +1417,16 @@ export function EditorRealProvider({
     [commitMoments, selectedMomentId]
   );
 
-  const setCaptionsEnabled: EditorRealContextValue["setCaptionsEnabled"] =
+  // Per-edit show/hide. Deliberately NOT routed through `updateMoment`: that one
+  // coalesces (for slider drags) and stamps `edited: true`. Hiding an edit
+  // changes no edit content, and each toggle should be one clean undo step you
+  // can take back on its own.
+  const setMomentEnabled: EditorRealContextValue["setMomentEnabled"] =
     React.useCallback(
-      async (enabled) => {
+      async (id, enabled) => {
         let changed = false;
         const next = momentsRef.current.map((m) => {
-          if (m.effectType !== "captions") return m;
+          if (m.id !== id) return m;
           if ((m.enabled !== false) === enabled) return m; // already in state
           changed = true;
           return { ...m, enabled };
@@ -1312,25 +1436,13 @@ export function EditorRealProvider({
       [commitMoments]
     );
 
-  // Lane-level enable/disable — non-destructive, whole layer, single undo step.
-  // Generalizes `setCaptionsEnabled` to any set of effect types. NOTE: its old
-  // caller (the timeline gutter's per-lane ⋯ menu) is gone with the gutter; this
-  // stays as context API for a future non-gutter entry point.
-  const setLaneEnabled: EditorRealContextValue["setLaneEnabled"] =
-    React.useCallback(
-      async (effectTypes, enabled) => {
-        const types = new Set<EffectType>(effectTypes);
-        let changed = false;
-        const next = momentsRef.current.map((m) => {
-          if (!types.has(m.effectType)) return m;
-          if ((m.enabled !== false) === enabled) return m; // already in state
-          changed = true;
-          return { ...m, enabled };
-        });
-        if (changed) await commitMoments(next);
-      },
-      [commitMoments]
-    );
+  // NOTE: `setCaptionsEnabled` / `setLaneEnabled` (bulk `enabled: false` sweeps
+  // across a lane's moments) are GONE — `setLayerVisible` replaces both. They
+  // couldn't satisfy "re-enabling restores the edits exactly": stamping every
+  // caption with `enabled: false` overwrites the flag of any caption the user had
+  // hidden ONE BY ONE, so switching the lane back on would resurrect it. Layer
+  // visibility is its own field precisely so a layer toggle never writes to an
+  // edit. Don't reintroduce a lane-wide moment sweep for visibility.
 
   // Apply one text style to every moment of a type in ONE undoable step. Used by
   // the caption inspector's "Apply to all captions" action. `edited: true` marks
@@ -2544,8 +2656,10 @@ export function EditorRealProvider({
     updateMoment,
     deleteMoment,
     addMoment,
-    setCaptionsEnabled,
-    setLaneEnabled,
+    setMomentEnabled,
+    layers,
+    setLayerVisible,
+    showAllLayers,
     applyTextStyleToType,
     deleteLane,
     duplicateMoment,

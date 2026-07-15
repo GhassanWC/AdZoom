@@ -2,14 +2,7 @@
 
 import * as React from "react";
 import Link from "next/link";
-import {
-  ArrowLeft,
-  Menu,
-  Pencil,
-  Undo2,
-  Redo2,
-  Upload,
-} from "lucide-react";
+import { ArrowLeft, Menu, Pencil, Upload } from "lucide-react";
 import { cn } from "@/lib/cn";
 import type { ProjectDoc } from "@/lib/firebase/schema";
 import { updateProject } from "@/lib/firebase/projects";
@@ -22,8 +15,8 @@ import { useEditorReal } from "./context";
  * Compact editor-specific top bar for the fullscreen editing workspace —
  * replaces the dashboard Topbar (search / record / notifications stay out of
  * the editor; they're reachable through the nav drawer). Left: menu + logo +
- * back + editable title + status. Right: undo/redo + the single primary
- * Export action.
+ * back + editable title + status. Right: the single primary Export action.
+ * Undo/redo live in the timeline control bar, next to the edits they affect.
  */
 export function EditorTopBar({
   onOpenNav,
@@ -32,7 +25,7 @@ export function EditorTopBar({
   onOpenNav: () => void;
   onExport: () => void;
 }) {
-  const { project, uid, undo, redo, canUndo, canRedo } = useEditorReal();
+  const { project, uid } = useEditorReal();
   const hasAnalysis = (project.analysis?.detectedMoments?.length ?? 0) > 0;
 
   return (
@@ -69,26 +62,6 @@ export function EditorTopBar({
         <StatusBadge status={headerStatus(project, hasAnalysis)} />
       </div>
 
-      {/* Undo / redo — the same session history the timeline shortcuts drive. */}
-      <div className="hidden shrink-0 items-center gap-1 sm:flex">
-        <TopBarIconButton
-          label="Undo"
-          hint="⌘Z"
-          disabled={!canUndo}
-          onClick={() => void undo()}
-        >
-          <Undo2 size={15} />
-        </TopBarIconButton>
-        <TopBarIconButton
-          label="Redo"
-          hint="⌘⇧Z"
-          disabled={!canRedo}
-          onClick={() => void redo()}
-        >
-          <Redo2 size={15} />
-        </TopBarIconButton>
-      </div>
-
       <Button
         onClick={onExport}
         variant="primary"
@@ -99,33 +72,6 @@ export function EditorTopBar({
         Export
       </Button>
     </header>
-  );
-}
-
-function TopBarIconButton({
-  label,
-  hint,
-  disabled,
-  onClick,
-  children,
-}: {
-  label: string;
-  hint?: string;
-  disabled?: boolean;
-  onClick: () => void;
-  children: React.ReactNode;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      disabled={disabled}
-      aria-label={label}
-      title={hint ? `${label} (${hint})` : label}
-      className="inline-flex size-9 items-center justify-center rounded-lg text-fog transition-colors duration-150 hover:bg-white/[0.04] hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/60 disabled:pointer-events-none disabled:opacity-35"
-    >
-      {children}
-    </button>
   );
 }
 

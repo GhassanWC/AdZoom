@@ -21,7 +21,9 @@ import { distributionScore } from "@/lib/timeline-balancer";
 import { CvSignalTracks } from "../CvSignalTracks";
 import type { DetectedMoment } from "@/lib/firebase/schema";
 import type { AnalysisOptions, EngineLayer } from "@/lib/analysis/engine-layers";
+import { isLayerVisible } from "@/lib/timeline/layers";
 import {
+  EFFECT_ICONS,
   EFFECT_TONES,
   MIN_MOMENT_LEN,
   MIN_PILL_PX,
@@ -36,7 +38,11 @@ import { TimelineTrack } from "./TimelineTrack";
 import { TimelineRuler, GridLines } from "./TimelineRuler";
 import { Playhead } from "./Playhead";
 import { GapIndicator, emptyQuartileRanges } from "./GapIndicator";
-import { EditorUnifiedControlBar, type TimelineHealth } from "../EditorUnifiedControlBar";
+import {
+  EditorUnifiedControlBar,
+  type LayerRow,
+  type TimelineHealth,
+} from "../EditorUnifiedControlBar";
 import { NarrativeBand } from "./NarrativeBand";
 import { DensityBar } from "./DensityBar";
 import { AttentionWaveform } from "./AttentionWaveform";
@@ -85,6 +91,10 @@ export function RealTimeline() {
     updateMoment,
     deleteMoment,
     duplicateMoment,
+    setMomentEnabled,
+    layers,
+    setLayerVisible,
+    showAllLayers,
     splitAtPlayhead,
     canSplitSelection,
     addMomentAtPlayhead,
@@ -131,6 +141,39 @@ export function RealTimeline() {
   // renders lanes, never groups. Routing is purely by effectType, so old projects
   // load straight into the right lanes (no migration).
   const lanePlan = React.useMemo(() => planTimelineLanes(moments), [moments]);
+
+  /**
+   * The Layers menu's content: one row per lane the timeline is actually showing
+   * (core lanes always, overlay lanes once populated) — so "one toggle per
+   * layer" means exactly the layers the user can see. The lane's icon is its
+   * first effect type's, which is the same icon its pills wear.
+   */
+  const layerRows: LayerRow[] = React.useMemo(
+    () =>
+      lanePlan.flatMap((g) =>
+        g.lanes.map((lane) => ({
+          id: lane.def.id,
+          label: lane.def.label,
+          count: lane.count,
+          visible: isLayerVisible(layers, lane.def.id),
+          Icon: EFFECT_ICONS[lane.def.effectTypes[0]] ?? Sparkles,
+        }))
+      ),
+    [lanePlan, layers]
+  );
+
+  /**
+   * Show/hide one edit. Declared HERE (not further down) because the keyboard
+   * effect lists it as a dependency — see the note on `splitNote` below.
+   */
+  const toggleMomentEnabled = React.useCallback(
+    async (id: string) => {
+      const m = moments.find((x) => x.id === id);
+      if (!m) return;
+      await setMomentEnabled(id, m.enabled === false);
+    },
+    [moments, setMomentEnabled]
+  );
 
   // Engine selection from the most recent analysis — decides whether an empty
   // lane offers its one-click "Run this layer" affordance. A targeted run enables
@@ -560,6 +603,10 @@ export function RealTimeline() {
       } else if (mod && key === "d") {
         e.preventDefault();
         void duplicateMoment(selectedMomentId);
+      } else if (!mod && key === "h") {
+        // H → hide/show the selected edit. Delete's non-destructive neighbour.
+        e.preventDefault();
+        void toggleMomentEnabled(selectedMomentId);
       } else if (e.key === "Escape") {
         e.preventDefault();
         setSelectedMomentId(null);
@@ -572,6 +619,7 @@ export function RealTimeline() {
     multiSelectIds,
     deleteMoment,
     duplicateMoment,
+    toggleMomentEnabled,
     deleteMultiSelected,
     clearMultiSelect,
     setSelectedMomentId,
@@ -686,7 +734,7 @@ export function RealTimeline() {
   // in ONE column — there is no second (gutter) column to keep aligned with it
   // any more. Core lanes (camera/cut/speed) always show with a "Run this layer"
   // affordance; overlay lanes appear only when populated.
-  const momentLane = (laneMoments: DetectedMoment[]) => (
+  const momentLane = (laneMoments: DetectedMoment[], layerHidden = false) => (
     <MomentLane
       moments={laneMoments}
       total={total}
@@ -695,9 +743,14 @@ export function RealTimeline() {
       multiSelectIds={multiSelectIds}
       draftId={draft?.id ?? null}
       withDraft={withDraft}
+      // The lane keeps rendering every pill while its layer is off — you can
+      // still select, drag, retime and inspect them. They just don't render in
+      // the video, and they say so.
+      layerHidden={layerHidden}
       onBeginDrag={beginDrag}
       onDuplicate={(id) => void duplicateMoment(id)}
       onSplit={(id) => void runSplit([id])}
+      onToggleEnabled={(id) => void toggleMomentEnabled(id)}
       onDelete={(id) => void deleteMoment(id)}
       onEdit={onEditMoment}
     />
@@ -730,6 +783,8 @@ export function RealTimeline() {
     height: number;
     count: number;
     interactive: boolean;
+    /** The user switched this LAYER off — its edits render nowhere (Layers menu). */
+    layerHidden?: boolean;
     /** This lane's engine layer was switched off for the last analysis run. */
     engineOff: boolean;
     emptyAction?: { label: string; onRun: () => void };
@@ -742,12 +797,16 @@ export function RealTimeline() {
       const def = lane.def;
       const isCamera = def.id === "camera";
       const engine = def.engineLayer;
+      // This LAYER is switched off: its edits are still here and still editable,
+      // but none of them reach the preview or the export.
+      const hidden = !isLayerVisible(layers, def.id);
       rows.push({
         id: def.id,
-        label: def.label,
+        label: hidden ? `${def.label} (hidden)` : def.label,
         height: isCamera ? TRACK_HEIGHTS.ai : TRACK_HEIGHTS.overlay,
         count: lane.count,
         interactive: true,
+        layerHidden: hidden,
         engineOff: !!engine && layerDisabled(engine),
         emptyAction: engine ? { label: RUN_LABEL[engine], onRun: () => runLayer(engine) } : undefined,
         renderLane: () =>
@@ -764,10 +823,10 @@ export function RealTimeline() {
                   />
                 </div>
               )}
-              {momentLane(lane.moments)}
+              {momentLane(lane.moments, hidden)}
             </>
           ) : (
-            momentLane(lane.moments)
+            momentLane(lane.moments, hidden)
           ),
       });
     }
@@ -870,6 +929,9 @@ export function RealTimeline() {
         insightsOpen={insightsOpen}
         onToggleInsights={toggleInsights}
         hasScenes={showNarrative}
+        layerRows={layerRows}
+        onToggleLayer={(id, visible) => void setLayerVisible(id, visible)}
+        onShowAllLayers={() => void showAllLayers()}
         canUndo={canUndo}
         canRedo={canRedo}
         onUndo={() => void undo()}
@@ -1094,7 +1156,9 @@ export function RealTimeline() {
                     key={r.id}
                     ariaLabel={`${r.label} track`}
                     height={r.height}
-                    dimmed={!r.interactive}
+                    // A hidden LAYER greys its whole strip, so the timeline can
+                    // never quietly show edits that the export won't contain.
+                    dimmed={!r.interactive || !!r.layerHidden}
                   >
                     {r.renderLane({ total, pxPerSec, zoom })}
                     {showEmptyAction && (

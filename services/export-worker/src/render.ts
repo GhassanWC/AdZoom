@@ -14,7 +14,8 @@ import { composeFrame } from "@/lib/render/compose-frame";
 import { summarizeEditsForLog } from "@/lib/render/edit-counts";
 import { SUPPORTED_CHUNK_EFFECT_TYPES } from "@/lib/export/chunk-plan";
 import type { SerializedRenderRecipe } from "@/lib/firebase/schema";
-import { sourceTimeForOutput } from "@/lib/timeline/crop-speed";
+import { isMomentEnabled } from "@/lib/firebase/schema";
+import { isActiveSpeed, sourceTimeForOutput } from "@/lib/timeline/crop-speed";
 import {
   probeSource,
   canDecodeAudio,
@@ -233,7 +234,9 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
   // full source linearly → map the source audio straight through (direct):
   // simpler, perfectly in sync, and immune to filtergraph edge cases. This is
   // the common case (e.g. zoom-only edits don't touch the timeline).
-  const hasSpeed = recipe.moments.some((m) => m.effectType === "speed-up");
+  // Only speed sections that actually apply retime the timeline — a DISABLED one
+  // leaves the map linear, so the audio can take the simple direct path.
+  const hasSpeed = recipe.moments.some(isActiveSpeed);
   const hasCuts = timelineMap.totalRemoved > 0;
 
   // ── Chunk backstop (fail-closed) ────────────────────────────────────────────
@@ -243,10 +246,19 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
   // transition that reads neighbor frames). The app's eligibility gate
   // (chunk-plan.ts) already refuses those; this mirrors that allowlist so a stale/
   // buggy caller can never slip an unsupported effect into a chunk task.
+  //
+  // DISABLED edits are skipped on BOTH sides of that mirror: they render nothing,
+  // so they can't break a chunk — and if this backstop counted them while
+  // `summarizeTimelineForChunking` didn't, merely HIDING an unsupported effect
+  // would make the app dispatch a chunked job that this line then failed.
   if (opts.chunk) {
     const supported = new Set<string>(SUPPORTED_CHUNK_EFFECT_TYPES);
     const unsupported = [
-      ...new Set(recipe.moments.map((m) => m.effectType as string)),
+      ...new Set(
+        recipe.moments
+          .filter(isMomentEnabled)
+          .map((m) => m.effectType as string)
+      ),
     ].filter((t) => !supported.has(t));
     if (unsupported.length > 0) {
       throw new Error(

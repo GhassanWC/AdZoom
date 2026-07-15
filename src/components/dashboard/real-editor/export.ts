@@ -13,6 +13,7 @@ import { cameraDiagnostic } from "@/lib/timeline/camera";
 import {
   activeSpeedAt,
   activeCutAt,
+  isActiveSpeed,
   DEFAULT_SPEED,
 } from "@/lib/timeline/crop-speed";
 import { probeVideoBottomBand } from "@/lib/recording/health-check";
@@ -756,7 +757,8 @@ export async function renderProjectClientSide(
   // ── Export audio diagnostics (req) ──────────────────────────────────────
   // Answers "why is/isn't there audio?" from the console alone.
   const sourceHasAudio = detectSourceHasAudio(video);
-  const speedMoments = moments.filter((m) => m.effectType === "speed-up");
+  // Only speed sections that actually apply — a disabled one mutes nothing.
+  const speedMoments = moments.filter(isActiveSpeed);
   const mutedSectionsCount = speedMoments.filter(
     (m) => (m.speed?.audioMode ?? DEFAULT_SPEED.audioMode) === "mute"
   ).length;
@@ -1038,7 +1040,7 @@ export async function renderProjectClientSide(
   // playbackRate. Reported honestly so "did cuts/speed apply?" is answerable.
   {
     const map = recipe.timelineMap;
-    const speedSections = moments.filter((m) => m.effectType === "speed-up").length;
+    const speedSections = moments.filter(isActiveSpeed).length;
     console.info("[cut-map]", {
       sourceDuration: +map.sourceDuration.toFixed(2),
       activeCuts: map.activeCuts,

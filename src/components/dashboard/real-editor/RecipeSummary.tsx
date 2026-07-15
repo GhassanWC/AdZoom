@@ -29,6 +29,7 @@ import {
   type TranscriptLanguageMode,
 } from "@/lib/transcript/language";
 import type { AudioAnalysis, DetectedMoment, Transcript } from "@/lib/firebase/schema";
+import { isMomentEnabled } from "@/lib/firebase/schema";
 
 /** Human name for a transcript provider id. */
 function providerLabel(id: string | undefined): string | null {
@@ -52,11 +53,17 @@ const CATEGORY_EFFECTS: Partial<Record<EditOperationCategory, ReadonlySet<string
   blur_redaction: new Set(["blur-redaction"]),
 };
 
-/** Count moments actually on the timeline for a recipe category. */
+/**
+ * Count the moments that will actually RENDER for a recipe category. Disabled
+ * edits are excluded: this summary answers "what is the plan doing to my video",
+ * and a hidden edit does nothing to it — counting it would overstate the output.
+ */
 function countForCategory(cat: EditOperationCategory, moments: DetectedMoment[]): number {
   const set = CATEGORY_EFFECTS[cat];
   if (!set) return 0;
-  return moments.filter((m) => m.effectType && set.has(m.effectType)).length;
+  return moments.filter(
+    (m) => m.effectType && set.has(m.effectType) && isMomentEnabled(m)
+  ).length;
 }
 
 export function RecipeSummary({

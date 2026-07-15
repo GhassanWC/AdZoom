@@ -25,18 +25,20 @@ import {
   Type,
   Sparkles,
   Megaphone,
+  Eye,
   EyeOff,
   BadgeCheck,
   Captions,
   Shuffle,
   Film,
+  Layers,
   PanelTop,
   PanelBottom,
   SquareSplitVertical,
   type LucideIcon,
 } from "lucide-react";
 import { cn } from "@/lib/cn";
-import type { EffectType } from "@/lib/firebase/schema";
+import type { EffectType, TimelineLayerId } from "@/lib/firebase/schema";
 import { useEditorReal } from "./context";
 import { useMomentReview } from "./useMomentReview";
 import { MenuPopover, useMenuPopover } from "./MenuPopover";
@@ -53,7 +55,7 @@ export type TimelineHealth = "balanced" | "clustered" | "quiet" | "empty";
  * matter how much content sits on either side.
  *
  *   Left:   title · health · Add (primary, stays visible) · Edit ▾ (Split/
- *           Duplicate/Delete/Undo/Redo)
+ *           Duplicate/Delete) · Layers ▾ (one show/hide per lane) · undo/redo
  *   Center: PlaybackTransport (jump/back5/Play/forward5/time) — shared with
  *           the fullscreen overlay pill, one playback implementation.
  *   Right:  View ▾ (workspace mode/Scenes/Insights) · volume · fullscreen ·
@@ -73,6 +75,9 @@ export function EditorUnifiedControlBar({
   insightsOpen,
   onToggleInsights,
   hasScenes,
+  layerRows,
+  onToggleLayer,
+  onShowAllLayers,
   canUndo,
   canRedo,
   onUndo,
@@ -94,6 +99,10 @@ export function EditorUnifiedControlBar({
   insightsOpen: boolean;
   onToggleInsights: () => void;
   hasScenes: boolean;
+  /** One row per lane on the timeline — the Layers menu's whole content. */
+  layerRows: LayerRow[];
+  onToggleLayer: (id: TimelineLayerId, visible: boolean) => void;
+  onShowAllLayers: () => void;
   canUndo: boolean;
   canRedo: boolean;
   onUndo: () => void;
@@ -139,16 +148,25 @@ export function EditorUnifiedControlBar({
         <div className="flex shrink-0 items-center gap-1">
           <AddMenu onAdd={onAdd} />
           <EditMenu
-            canUndo={canUndo}
-            canRedo={canRedo}
-            onUndo={onUndo}
-            onRedo={onRedo}
             hasSelection={hasSelection}
             onDuplicate={onDuplicate}
             canSplit={canSplit}
             onSplit={onSplit}
             onDelete={onDelete}
           />
+          <LayersMenu
+            rows={layerRows}
+            onToggle={onToggleLayer}
+            onShowAll={onShowAllLayers}
+          />
+        </div>
+
+        <Divider />
+
+        {/* Undo / redo — the same session history the keyboard shortcuts drive. */}
+        <div className="flex shrink-0 items-center gap-0.5">
+          <HistoryBtn Icon={Undo2} label="Undo" shortcut="⌘Z" disabled={!canUndo} onClick={onUndo} />
+          <HistoryBtn Icon={Redo2} label="Redo" shortcut="⌘⇧Z" disabled={!canRedo} onClick={onRedo} />
         </div>
       </div>
 
@@ -269,23 +287,161 @@ function Divider() {
   return <span aria-hidden className="hidden h-6 w-px shrink-0 bg-white/[0.08] sm:block" />;
 }
 
-// ── Edit dropdown — Split / Duplicate / Delete / Undo / Redo ───────────────
+// ── Layers dropdown — one show/hide switch per timeline lane ───────────────
+
+/** One row of the Layers menu: a lane, its edit count, and its on/off state. */
+export interface LayerRow {
+  id: TimelineLayerId;
+  label: string;
+  count: number;
+  visible: boolean;
+  Icon: LucideIcon;
+}
+
+/**
+ * ONE switch per layer (Zooms & focus, Cuts, Speed, Captions, Callouts,
+ * Transitions, …). Turning one off hides every edit in that lane from preview
+ * and export without touching the edits themselves.
+ *
+ * It lives in a menu rather than in a column beside the lanes because the
+ * timeline has no gutter — that column was deliberately deleted, and a row of
+ * eyes down the left would reinstate it. The trade is discoverability, which the
+ * trigger buys back: it wears the hidden-layer count, so a hidden layer is
+ * visible from the bar without opening anything (and the lanes themselves grey
+ * out, so the timeline never silently lies about what will render).
+ *
+ * The menu does NOT close on toggle — hiding three layers to audition a cut is
+ * one task, not three trips through a dropdown.
+ */
+function LayersMenu({
+  rows,
+  onToggle,
+  onShowAll,
+}: {
+  rows: LayerRow[];
+  onToggle: (id: TimelineLayerId, visible: boolean) => void;
+  onShowAll: () => void;
+}) {
+  const menu = useMenuPopover();
+  const { open, toggle } = menu;
+  const hiddenCount = rows.filter((r) => !r.visible).length;
+
+  return (
+    <>
+      <button
+        ref={menu.triggerRef}
+        type="button"
+        onClick={toggle}
+        aria-expanded={open}
+        aria-haspopup="menu"
+        aria-label="Layers"
+        title="Layers — show or hide a whole lane"
+        className={cn(
+          "inline-flex h-9 shrink-0 items-center gap-1.5 rounded-lg border px-2 text-[11.5px] font-medium transition-colors duration-150",
+          hiddenCount > 0
+            ? "border-amber-300/40 bg-amber-400/[0.08] text-amber-100 hover:border-amber-300/60"
+            : "border-white/10 bg-white/[0.025] text-white/85 hover:border-white/25 hover:bg-white/[0.06] hover:text-white"
+        )}
+      >
+        <Layers size={13} className="shrink-0" />
+        <span className="hidden sm:inline">Layers</span>
+        {hiddenCount > 0 && (
+          <span className="rounded bg-amber-400/20 px-1 py-[1px] text-[9.5px] font-bold tabular-nums leading-none">
+            {hiddenCount} off
+          </span>
+        )}
+        <ChevronDown size={11} className="shrink-0 opacity-70" />
+      </button>
+      <MenuPopover state={menu} width={MENU_W_LG} ariaLabel="Layers">
+        <MenuLabel>Show / hide layers</MenuLabel>
+        {rows.map((r) => (
+          <button
+            key={r.id}
+            type="button"
+            role="menuitemcheckbox"
+            aria-checked={r.visible}
+            onClick={() => onToggle(r.id, !r.visible)}
+            title={
+              r.visible
+                ? `Hide ${r.label} — its ${r.count} edit${r.count === 1 ? "" : "s"} stay on the timeline`
+                : `Show ${r.label} again`
+            }
+            className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[12.5px] font-medium text-white/90 transition-colors duration-150 hover:bg-white/[0.06]"
+          >
+            <r.Icon
+              size={14}
+              className={cn("shrink-0", r.visible ? "text-fog" : "text-fog/40")}
+            />
+            <span className={cn("min-w-0 flex-1 truncate", !r.visible && "text-fog/50")}>
+              {r.label}
+            </span>
+            <span
+              className={cn(
+                "shrink-0 font-mono text-[10.5px] tabular-nums",
+                r.visible ? "text-fog/60" : "text-fog/35"
+              )}
+            >
+              {r.count}
+            </span>
+            {r.visible ? (
+              <Eye size={13} className="shrink-0 text-violet-300" />
+            ) : (
+              <EyeOff size={13} className="shrink-0 text-amber-300" />
+            )}
+          </button>
+        ))}
+        {hiddenCount > 0 && (
+          <>
+            <MenuDivider />
+            <MenuItem
+              Icon={Eye}
+              label={`Show all layers (${hiddenCount} hidden)`}
+              onClick={onShowAll}
+            />
+          </>
+        )}
+      </MenuPopover>
+    </>
+  );
+}
+
+/** Icon-only undo/redo button — sits beside the Add/Edit group in this bar. */
+function HistoryBtn({
+  Icon,
+  label,
+  shortcut,
+  disabled,
+  onClick,
+}: {
+  Icon: LucideIcon;
+  label: string;
+  shortcut: string;
+  disabled: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      aria-label={label}
+      title={`${label} (${shortcut})`}
+      className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg text-fog transition-colors duration-150 hover:bg-white/[0.06] hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/60 disabled:pointer-events-none disabled:opacity-35"
+    >
+      <Icon size={15} />
+    </button>
+  );
+}
+
+// ── Edit dropdown — Split / Duplicate / Delete ─────────────────────────────
 
 function EditMenu({
-  canUndo,
-  canRedo,
-  onUndo,
-  onRedo,
   hasSelection,
   onDuplicate,
   canSplit,
   onSplit,
   onDelete,
 }: {
-  canUndo: boolean;
-  canRedo: boolean;
-  onUndo: () => void;
-  onRedo: () => void;
   hasSelection: boolean;
   onDuplicate: () => void;
   /** The playhead is inside the selected edit and both halves would be usable. */
@@ -305,7 +461,7 @@ function EditMenu({
         aria-expanded={open}
         aria-haspopup="menu"
         aria-label="Edit actions"
-        title="Edit — split, duplicate, delete, undo, redo"
+        title="Edit — split, duplicate, delete"
         className="inline-flex h-9 shrink-0 items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.025] px-2 text-[11.5px] font-medium text-white/85 transition-colors duration-150 hover:border-white/25 hover:bg-white/[0.06] hover:text-white"
       >
         <Scissors size={13} className="shrink-0" />
@@ -348,27 +504,6 @@ function EditMenu({
             danger
             onClick={() => {
               onDelete();
-              close();
-            }}
-          />
-          <MenuDivider />
-          <MenuItem
-            Icon={Undo2}
-            label="Undo"
-            shortcut="⌘Z"
-            disabled={!canUndo}
-            onClick={() => {
-              onUndo();
-              close();
-            }}
-          />
-          <MenuItem
-            Icon={Redo2}
-            label="Redo"
-            shortcut="⌘⇧Z"
-            disabled={!canRedo}
-            onClick={() => {
-              onRedo();
               close();
             }}
           />
@@ -472,6 +607,7 @@ const TIPS: ReadonlyArray<readonly [string, string]> = [
   ["Space", "play / pause"],
   ["Del / Backspace", "remove selection"],
   ["⌘D", "duplicate"],
+  ["H", "hide / show selection"],
   ["⌘Z / ⌘⇧Z", "undo / redo"],
   ["Esc", "clear multi-select"],
 ];

@@ -20,6 +20,7 @@
  * {@link SUPPORTED_CHUNK_EFFECT_TYPES} force a single render (fail-closed).
  */
 import type { DetectedMoment } from "@/lib/firebase/schema";
+import { isMomentEnabled } from "@/lib/firebase/schema";
 
 export type RenderMode = "single" | "chunked";
 
@@ -97,7 +98,9 @@ function intEnv(env: Record<string, string | undefined>, key: string, fallback: 
  */
 export function summarizeTimelineForChunking(
   moments:
-    | ReadonlyArray<Pick<DetectedMoment, "effectType" | "cut" | "keyframes">>
+    | ReadonlyArray<
+        Pick<DetectedMoment, "effectType" | "cut" | "keyframes" | "enabled">
+      >
     | null
     | undefined
 ): ChunkTimelineSummary {
@@ -108,6 +111,9 @@ export function summarizeTimelineForChunking(
   let hasAnimations = false;
   const unsupported = new Set<string>();
   for (const m of list) {
+    // A disabled edit renders nothing, so it can't make a timeline unchunkable —
+    // and it must not, or hiding one edit would silently force the slow path.
+    if (!isMomentEnabled(m)) continue;
     const t = m.effectType as string;
     if (t === "speed-up") hasSpeed = true;
     // Restored cuts (active:false) don't remove time; the `cut` TYPE is supported

@@ -20,9 +20,11 @@ export function MomentLane({
   multiSelectIds,
   draftId,
   withDraft,
+  layerHidden = false,
   onBeginDrag,
   onDuplicate,
   onSplit,
+  onToggleEnabled,
   onDelete,
   onEdit,
 }: {
@@ -34,9 +36,13 @@ export function MomentLane({
   multiSelectIds: string[];
   draftId: string | null;
   withDraft: (m: DetectedMoment) => DetectedMoment;
+  /** This lane's LAYER is switched off — every pill in it renders nowhere. */
+  layerHidden?: boolean;
   onBeginDrag: (e: React.PointerEvent, m: DetectedMoment, mode: DragMode) => void;
   onDuplicate: (id: string) => void;
   onSplit: (id: string) => void;
+  /** Show/hide this edit — non-destructive, it stays on the lane either way. */
+  onToggleEnabled: (id: string) => void;
   onDelete: (id: string) => void;
   onEdit: (id: string) => void;
 }) {
@@ -56,9 +62,11 @@ export function MomentLane({
             // whether the split will actually happen — so the button's enabled
             // state can never disagree with what pressing it does.
             canSplit={canSplit(m, currentTime)}
+            layerHidden={layerHidden}
             onBeginDrag={onBeginDrag}
             onDuplicate={() => onDuplicate(m0.id)}
             onSplit={() => onSplit(m0.id)}
+            onToggleEnabled={() => onToggleEnabled(m0.id)}
             onDelete={() => onDelete(m0.id)}
             onEdit={() => onEdit(m0.id)}
           />

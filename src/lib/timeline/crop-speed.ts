@@ -15,6 +15,7 @@ import type {
   FocusRegion,
   SpeedSettings,
 } from "@/lib/firebase/schema";
+import { isMomentEnabled } from "@/lib/firebase/schema";
 
 export const DEFAULT_CROP: CropSettings = {
   aspectRatio: "9:16",
@@ -123,6 +124,11 @@ export function cropAspectLabel(aspect: CropAspect | undefined): string {
   }
 }
 
+/** True when a speed moment is applied (enabled → compresses its range). */
+export function isActiveSpeed(m: DetectedMoment): boolean {
+  return m.effectType === "speed-up" && isMomentEnabled(m);
+}
+
 /** The active speed section's settings at time `t`, or null (latest start wins). */
 export function activeSpeedAt(
   moments: DetectedMoment[] | null | undefined,
@@ -131,16 +137,21 @@ export function activeSpeedAt(
   if (!moments) return null;
   let pick: DetectedMoment | null = null;
   for (const m of moments) {
-    if (m.effectType !== "speed-up") continue;
+    if (!isActiveSpeed(m)) continue;
     if (t < m.startTime || t > m.endTime) continue;
     if (!pick || m.startTime > pick.startTime) pick = m;
   }
   return pick ? pick.speed ?? DEFAULT_SPEED : null;
 }
 
-/** True when a cut moment is active (applied → removes its range). */
-function isActiveCut(m: DetectedMoment): boolean {
-  return m.effectType === "cut" && m.cut?.active !== false;
+/**
+ * True when a cut moment is active (applied → removes its range). TWO
+ * independent off-switches keep the range: `enabled === false` (the universal
+ * per-edit hide, shared with every other effect type) and `cut.active === false`
+ * (the cut lane's own "restore" affordance). Either one wins.
+ */
+export function isActiveCut(m: DetectedMoment): boolean {
+  return m.effectType === "cut" && m.cut?.active !== false && isMomentEnabled(m);
 }
 
 /**
@@ -232,8 +243,11 @@ export function buildTimelineMap(
   const dur = Math.max(0, sourceDuration);
   const list = moments ?? [];
   const activeCuts = list.filter(isActiveCut).length;
+  // Every cut that is NOT applied — restored (`cut.active: false`) or disabled
+  // (`enabled: false`). Both keep their range, so both belong in this count;
+  // active + inactive therefore always equals the number of cut moments.
   const inactiveCuts = list.filter(
-    (m) => m.effectType === "cut" && m.cut?.active === false
+    (m) => m.effectType === "cut" && !isActiveCut(m)
   ).length;
 
   if (dur <= 0) {
@@ -263,7 +277,7 @@ export function buildTimelineMap(
 
   // 3. Speed-section boundaries (start/end times) for splitting included ranges.
   const speeds = list
-    .filter((m) => m.effectType === "speed-up")
+    .filter(isActiveSpeed)
     .map((m) => ({
       start: Math.max(0, Math.min(dur, m.startTime)),
       end: Math.max(0, Math.min(dur, m.endTime)),

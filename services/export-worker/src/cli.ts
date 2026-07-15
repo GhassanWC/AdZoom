@@ -60,6 +60,7 @@ import { computePreflight, AUDIO_UNSUPPORTED_WARNING } from "./preflight.js";
 import { normalizeSource, probeSource, ffmpegBin, type SourceInfo } from "./ffmpeg.js";
 import { buildAudioFilterComplex } from "./audio.js";
 import { buildRenderRecipe } from "@/lib/render/recipe";
+import { isActiveSpeed } from "@/lib/timeline/crop-speed";
 import { toUserFacingError } from "./errors.js";
 import type { SerializedRenderRecipe } from "@/lib/firebase/schema";
 
@@ -301,7 +302,8 @@ async function runAudioMux(spec: JobSpec, signal: AbortSignal): Promise<void> {
 
   const recipe = buildRenderRecipe({ ...spec.serializedRecipe, debugBorders: false });
   const { fps, outputDuration, timelineMap } = recipe;
-  const hasSpeed = recipe.moments.some((m) => m.effectType === "speed-up");
+  // Disabled speed sections don't retime anything — see the note in render.ts.
+  const hasSpeed = recipe.moments.some(isActiveSpeed);
   const hasCuts = timelineMap.totalRemoved > 0;
 
   // Obtain a clean AAC audio source. The merge normally passes the PERSISTED

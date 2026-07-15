@@ -64,6 +64,10 @@ export function materializeProject(
     // line to exist.
     director: (data.director as ProjectDoc["director"]) ?? undefined,
     directorBrief: (data.directorBrief as ProjectDoc["directorBrief"]) ?? undefined,
+    // Per-layer visibility (Zooms & focus / Cuts / Captions / …). Absent = every
+    // layer visible, which is what every project written before this field had.
+    timelineLayers:
+      (data.timelineLayers as ProjectDoc["timelineLayers"]) ?? undefined,
     createdAt: tsMs(data.createdAt) ?? Date.now(),
     updatedAt: tsMs(data.updatedAt) ?? Date.now(),
   };
