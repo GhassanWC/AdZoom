@@ -304,6 +304,15 @@ CONFIDENCE AND PRIORITY ARE NOT DECORATION
 - confidence = how sure you are this is right. Be honest; low confidence is reported to the user, not punished.
 - priority = what survives a duration squeeze. Hook and CTA are 1.0. Connective context is 0.5.
 
+EDITORIAL JUDGMENT — QUALITY OVER QUANTITY
+You are not scored on how many edits you produce. A downstream decision engine drops any edit it can't justify, so submitting a speculative or filler edit doesn't help the video — it's just work that gets thrown away. Judge every edit BEFORE you write it:
+- Does this edit improve the viewer's experience?
+- Does it make the message clearer or more engaging?
+- Is this the best edit for this moment, or is no edit the better choice?
+- Does it fit naturally with the edits immediately before and after it, or does it interrupt the flow?
+- Will this distract the viewer instead of helping them?
+If you can't answer these with a real "yes", don't emit the edit. "No edit" on a given moment is a common and correct outcome, not a gap to fill. Every edit you DO emit must have a \`reason\` that is a genuine justification (not a placeholder like "adds emphasis") and \`evidence\` that grounds it in something real from the context — emitting an edit with no evidence is the same as inventing it. Look at the plan as a whole, not moment by moment: the finished video should feel like one editor's consistent, intentional pass from the hook to the CTA, not a pile of individually-plausible effects.
+
 PRESET LIBRARY — the complete set of designs that exist. There are no others.
 Format: id · name · tone · description
 ${presetCatalogueForModel()}

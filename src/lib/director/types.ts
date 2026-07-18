@@ -280,6 +280,28 @@ export interface DirectorSection {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// Editorial justification — the internal "why" behind a surviving edit
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * The category of "why" behind an edit that survived the decision engine
+ * (`editorial-judgment.ts`). Not necessarily shown to the user — it exists so
+ * that every edit that reaches the timeline can point at a concrete editorial
+ * purpose (emphasizing a point, guiding attention, keeping pace, …) rather
+ * than existing because the model could technically produce it.
+ */
+export const DIRECTOR_JUSTIFICATIONS = [
+  "emphasis",
+  "pacing",
+  "attention",
+  "action",
+  "clarity",
+  "engagement",
+  "structure",
+] as const;
+export type DirectorJustification = (typeof DIRECTOR_JUSTIFICATIONS)[number];
+
+// ════════════════════════════════════════════════════════════════════════════
 // Operations — every one carries id / window / reason / confidence /
 // evidence / priority, and names an EXACT existing Framevo edit type
 // ════════════════════════════════════════════════════════════════════════════
@@ -359,6 +381,11 @@ export interface DirectorEditOperation extends DirectorOperationBase {
   /** 0..1 camera strength. */
   intensity?: number;
   params?: DirectorEditParams;
+  /**
+   * Stamped by the decision engine once this edit survives judgment. Absent on
+   * a freshly-planned (pre-judgment) operation.
+   */
+  justification?: DirectorJustification;
 }
 
 /**
@@ -497,6 +524,8 @@ export interface DirectorMomentRef {
   /** Which revision applied it (0 = the initial run). */
   revision: number;
   sectionId?: string;
+  /** The decision engine's internal "why" for this edit. See `DirectorJustification`. */
+  justification?: DirectorJustification;
 }
 
 export const DIRECTOR_FAILURE_REASONS = [
@@ -512,6 +541,13 @@ export const DIRECTOR_FAILURE_REASONS = [
   // wearing the design the deterministic scorer picked instead.
   "unknown_preset",
   "executor_error",
+  // The editorial decision engine (`editorial-judgment.ts`) couldn't justify this
+  // edit — no real reason, no grounding evidence, or confidence too low to trust.
+  // A VALID edit type in a VALID window that simply isn't worth making.
+  "not_editorially_justified",
+  // Same-kind edits crowding one beat (two callouts a second apart, three text
+  // overlays back to back). Only the strongest of the crowd was kept.
+  "editorially_redundant",
 ] as const;
 export type DirectorFailureReason = (typeof DIRECTOR_FAILURE_REASONS)[number];
 

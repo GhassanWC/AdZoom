@@ -475,11 +475,16 @@ export function executePlan(input: ExecutePlanInput): DirectorExecution {
     presetUse.set(slot, (presetUse.get(slot) ?? 0) + 1);
   };
 
-  const ref = (operationId: string, sectionId?: string): DirectorMomentRef => ({
+  const ref = (
+    operationId: string,
+    sectionId?: string,
+    justification?: DirectorMomentRef["justification"]
+  ): DirectorMomentRef => ({
     operationId,
     planVersion: plan.planVersion,
     revision,
     ...(sectionId ? { sectionId } : {}),
+    ...(justification ? { justification } : {}),
   });
 
   // Deterministic ids: same plan + same revision ⇒ same moment ids. This is what
@@ -578,7 +583,11 @@ export function executePlan(input: ExecutePlanInput): DirectorExecution {
         continue;
       }
 
-      const compiled = compileEditOperation(op, ref(op.id, op.sectionId), momentId(op.id));
+      const compiled = compileEditOperation(
+        op,
+        ref(op.id, op.sectionId, op.justification),
+        momentId(op.id)
+      );
 
       // Dress it in the library preset chosen for this slot. The preset supplies
       // the typography + motion; the Director supplies the copy, the timing and
