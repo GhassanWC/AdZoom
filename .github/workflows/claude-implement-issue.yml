@@ -1,0 +1,153 @@
+name: Claude — implement issue
+
+# Trigger: add the `claude` label to an issue. Filing an issue alone does
+# nothing, so half-specified tickets and bug reports never start a run.
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: write # create the branch and commit to it
+  pull-requests: write # open the PR
+  issues: write # comment back on the issue with the result
+
+concurrency:
+  # One run per issue. Re-labelling while a run is in flight queues rather than
+  # racing two agents on the same branch.
+  group: claude-issue-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  implement:
+    # `issues: [labeled]` also fires for pull requests — the second clause keeps
+    # this to real issues only.
+    if: >-
+      github.event.label.name == 'claude' &&
+      !github.event.issue.pull_request
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      # ── Token selection ────────────────────────────────────────────────
+      # This matters more than it looks: a PR opened with the default
+      # GITHUB_TOKEN does NOT trigger other workflows, so ci.yml would never
+      # run on Claude's PR — it would sit there looking green-by-absence.
+      # A GitHub App token does trigger them.
+      #
+      # SETUP: create a GitHub App with Contents + Issues + Pull Requests
+      # (read & write), then set repo variable CLAUDE_APP_ID and secret
+      # CLAUDE_APP_PRIVATE_KEY. Without them this still works, but you must
+      # push an empty commit (or close/reopen the PR) to kick off CI.
+      - name: Mint GitHub App token
+        id: app-token
+        if: ${{ vars.CLAUDE_APP_ID != '' }}
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.CLAUDE_APP_ID }}
+          private-key: ${{ secrets.CLAUDE_APP_PRIVATE_KEY }}
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history + all branches so `staging` is available to branch from.
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Configure git identity
+        run: |
+          git config user.name "claude[bot]"
+          git config user.email "claude[bot]@users.noreply.github.com"
+
+      - name: Implement the issue
+        uses: anthropics/claude-code-action@v1
+        env:
+          # `gh` is preinstalled on the runner but needs an authenticated token.
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+          # Placeholder Firebase config so Claude can run `npm run build`
+          # locally to check its work. Same rationale as ci.yml.
+          NEXT_PUBLIC_FIREBASE_API_KEY: "ci-placeholder-api-key"
+          NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN: "ci-placeholder.firebaseapp.com"
+          NEXT_PUBLIC_FIREBASE_PROJECT_ID: "ci-placeholder"
+          NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET: "ci-placeholder.appspot.com"
+          NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID: "000000000000"
+          NEXT_PUBLIC_FIREBASE_APP_ID: "1:000000000000:web:0000000000000000000000"
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+          # Swap to claude-opus-4-8 for architecturally hard tasks; sonnet-5 is
+          # the cost/quality default for routine implementation work.
+          claude_args: |
+            --model claude-sonnet-5
+            --max-turns 60
+            --allowedTools Bash,Read,Write,Edit,Glob,Grep
+          prompt: |
+            You are implementing GitHub issue #${{ github.event.issue.number }}
+            in the Framevo repository (a Next.js 16 + Firebase video editor).
+
+            ## The task
+
+            Title: ${{ github.event.issue.title }}
+
+            ${{ github.event.issue.body }}
+
+            ## How to work
+
+            1. Read CLAUDE.md and docs/DEVELOPMENT_WORKFLOW.md first if they
+               exist. Follow the conventions already in this codebase — match
+               the surrounding naming, comment density, and idiom rather than
+               importing your own style.
+
+            2. Create a branch off `staging` (NOT `master`):
+                   git fetch origin staging
+                   git checkout -b claude/issue-${{ github.event.issue.number }} origin/staging
+
+            3. Implement the change. Stay inside the scope of the issue. If you
+               discover the issue is underspecified, ambiguous, or rests on a
+               mistaken premise, STOP, push nothing, and comment on the issue
+               explaining precisely what is blocking you. Do not guess at
+               requirements and do not expand scope on your own initiative.
+
+            4. Add or update tests under `tests/` (node:test) for the logic you
+               changed. If the change has a user-facing surface, consider an
+               `e2e/` Playwright spec.
+
+            5. Verify BEFORE opening the PR — run each of these and fix what
+               you break:
+                   npm run typecheck
+                   npm test
+                   npm run build
+                   npm run lint      # advisory: do not fix pre-existing
+                                     # violations unrelated to your change
+
+            6. Commit and push the branch, then open a PR:
+                   gh pr create --base staging \
+                     --title "<concise imperative summary>" \
+                     --body "<what changed, why, how you verified, Closes #${{ github.event.issue.number }}>"
+
+               The PR MUST target `staging`. Never open a PR against `master`,
+               never push directly to `staging` or `master`, and never merge
+               your own PR — a human reviews and merges.
+
+            ## Reporting
+
+            In the PR body, state honestly what you verified and what you did
+            not. If a check fails and you could not fix it, say so explicitly
+            rather than omitting it. If you could not complete the task, open
+            no PR and comment on the issue instead.
+
+            ## Hard constraints
+
+            - Do NOT deploy anything, run any `npm run deploy:*` / `*:deploy`
+              script, or touch production infrastructure.
+            - Do NOT modify firestore.rules, storage.rules, apphosting.yaml, or
+              any cloudbuild*.yaml unless the issue explicitly asks for it.
+            - Do NOT commit secrets, credentials, or .env files.

@@ -1,0 +1,135 @@
+name: CI
+
+# Runs on every PR into the integration branches, and on direct pushes to them.
+# NOTHING here merges, tags, or deploys — release to production is a manual act.
+on:
+  pull_request:
+    branches: [staging, master]
+  push:
+    branches: [staging, master]
+
+# A new push to the same PR supersedes the old run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Node 24: the unit tests execute .ts directly via `node --test` + the
+  # augment-only resolver in tests/register-resolver.mjs, which relies on
+  # native type stripping (stable and on-by-default from Node 23.6+).
+  # Older LTS lines would need --experimental-strip-types.
+  NODE_VERSION: "24"
+
+  # ── Placeholder Firebase config ────────────────────────────────────
+  # NEXT_PUBLIC_* values are inlined at BUILD time, so the build needs them
+  # present. These are deliberately fake: CI only exercises public pages, and
+  # src/lib/firebase/client.ts guards real access behind isFirebaseConfigured().
+  # Do NOT swap these for real credentials to widen E2E coverage — use the
+  # Firebase emulator instead (see docs/DEVELOPMENT_WORKFLOW.md).
+  NEXT_PUBLIC_FIREBASE_API_KEY: "ci-placeholder-api-key"
+  NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN: "ci-placeholder.firebaseapp.com"
+  NEXT_PUBLIC_FIREBASE_PROJECT_ID: "ci-placeholder"
+  NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET: "ci-placeholder.appspot.com"
+  NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID: "000000000000"
+  NEXT_PUBLIC_FIREBASE_APP_ID: "1:000000000000:web:0000000000000000000000"
+  NEXT_PUBLIC_APP_URL: "http://127.0.0.1:3100"
+
+jobs:
+  lint:
+    name: Lint (non-blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      # WARN-ONLY, INTENTIONALLY. ESLint was introduced after the codebase
+      # existed and starts with a backlog (~124 errors). Failing here would
+      # block every PR on unrelated debt.
+      #
+      # TO MAKE LINT BLOCKING: clear the backlog (`npm run lint:fix` handles
+      # some), then delete the `continue-on-error` line below. That is the
+      # only change required.
+      - name: ESLint
+        continue-on-error: true
+        run: npm run lint
+
+  typecheck:
+    name: TypeScript
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - name: tsc --noEmit
+        run: npm run typecheck
+
+  unit-tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - name: node --test
+        run: npm test
+
+  build-and-e2e:
+    name: Production build & Playwright
+    runs-on: ubuntu-latest
+    # Build and E2E share one job on purpose: Playwright serves the production
+    # build via `next start`, and the built .next/ (standalone output) is large
+    # enough that uploading/downloading it as an artifact costs more than the
+    # rebuild it would save. A failure in either step fails this job; the step
+    # names tell you which gate broke.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+
+      - name: Production build
+        run: npm run build
+
+      # Cache the browser binaries against the resolved Playwright version so a
+      # dependency bump correctly misses the cache instead of using stale binaries.
+      - name: Resolve Playwright version
+        id: pw
+        run: echo "version=$(node -p "require('@playwright/test/package.json').version")" >> "$GITHUB_OUTPUT"
+      - name: Cache Playwright browsers
+        id: pw-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
+      - name: Install Playwright browsers
+        if: steps.pw-cache.outputs.cache-hit != 'true'
+        run: npx playwright install --with-deps chromium
+      # Even on a cache hit the OS-level shared libraries are not cached.
+      - name: Install Playwright system deps
+        if: steps.pw-cache.outputs.cache-hit == 'true'
+        run: npx playwright install-deps chromium
+
+      - name: Playwright E2E
+        run: npm run test:e2e
+
+      - name: Upload Playwright report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 7

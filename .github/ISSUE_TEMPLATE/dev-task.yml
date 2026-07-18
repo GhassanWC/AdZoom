@@ -1,0 +1,73 @@
+name: Development task
+description: A unit of work for Claude (or a human) to implement.
+title: "[task] "
+labels: ["task"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This issue becomes Claude's specification. Everything it needs must be
+        written here — it cannot ask follow-up questions mid-run.
+
+        When the task is ready to build, add the **`claude`** label. That is the
+        trigger; filing the issue alone does nothing.
+
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What should be true when this is done? Describe the outcome, not the implementation.
+      placeholder: Users on the Free plan see a clear upgrade prompt when they hit the export minutes cap.
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: A checklist Claude must satisfy. Be concrete — this is what the PR gets reviewed against.
+      value: |
+        - [ ]
+        - [ ]
+    validations:
+      required: true
+
+  - type: textarea
+    id: pointers
+    attributes:
+      label: Where to look
+      description: Relevant files, modules, or prior art. Saves Claude a lot of searching and keeps the change in the right place.
+      placeholder: |
+        src/lib/usage/ — quota logic
+        src/lib/export/ — export gating
+    validations:
+      required: false
+
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Constraints & non-goals
+      description: Anything that must NOT change, plus scope boundaries. Architectural invariants belong here.
+      placeholder: |
+        - Do not change the Firestore schema.
+        - Do not touch the export worker deployment.
+        - Out of scope: redesigning the pricing page.
+    validations:
+      required: false
+
+  - type: textarea
+    id: testing
+    attributes:
+      label: How to verify
+      description: How should this be proven to work? Name the tests to add, or the flow to exercise.
+      placeholder: Add unit tests in tests/ covering the cap boundary (at, just under, just over).
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Readiness
+      options:
+        - label: This task is self-contained and specified well enough to implement without asking questions.
+          required: true

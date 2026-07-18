@@ -7,8 +7,12 @@
     "build": "next build",
     "start": "next start",
     "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
     "gen:icons": "node scripts/gen-icons.mjs",
     "test": "node --import ./tests/register-resolver.mjs --test \"tests/**/*.test.ts\"",
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui",
     "test:smoke": "node scripts/admin-smoke.mjs",
     "worker:install": "npm --prefix services/export-worker install",
     "worker:dev": "npm --prefix services/export-worker run dev",
@@ -57,10 +61,13 @@
     "tailwind-merge": "^3.6.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.61.1",
     "@tailwindcss/postcss": "^4",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "eslint": "^9.39.5",
+    "eslint-config-next": "^16.2.6",
     "tailwindcss": "^4",
     "typescript": "^5"
   }
