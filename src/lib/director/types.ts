@@ -284,6 +284,30 @@ export interface DirectorSection {
 // evidence / priority, and names an EXACT existing Framevo edit type
 // ════════════════════════════════════════════════════════════════════════════
 
+/**
+ * Why an edit earned its place — the editorial judgment's internal answer to
+ * "what is this edit actually doing for the viewer". Not necessarily shown to
+ * the user verbatim (the human-readable `reason` is what they see); this is the
+ * category the decision engine used to decide the edit was worth keeping.
+ */
+export const DIRECTOR_JUSTIFICATION_KINDS = [
+  /** Emphasizes an important point. */
+  "emphasis",
+  /** Maintains pacing (speed changes, transitions). */
+  "pacing",
+  /** Guides the viewer's attention (callouts, cursor/click focus). */
+  "attention",
+  /** Highlights a real action the viewer performed on screen. */
+  "action",
+  /** Improves clarity (captions, text overlays that explain). */
+  "clarity",
+  /** Increases engagement (hooks, CTAs). */
+  "engagement",
+  /** Structural — the narrative spine itself (story sections, framing). */
+  "structure",
+] as const;
+export type DirectorJustificationKind = (typeof DIRECTOR_JUSTIFICATION_KINDS)[number];
+
 /** Shared shape — the spec's per-operation requirements, in one place. */
 export interface DirectorOperationBase {
   /** Stable id. Deterministic across retries of the same request → no duplicates. */
@@ -299,6 +323,12 @@ export interface DirectorOperationBase {
   evidence: DirectorEvidence[];
   /** The story section this op serves. */
   sectionId?: string;
+  /**
+   * Set by the editorial judgment pass once an edit has been judged worth
+   * keeping. An operation that reaches the executor without one either predates
+   * the decision engine or is a clip/audio op the engine doesn't classify.
+   */
+  justification?: DirectorJustificationKind;
 }
 
 /**
@@ -511,6 +541,11 @@ export const DIRECTOR_FAILURE_REASONS = [
   // category). Reported, never coerced into a lookalike — the edit still lands,
   // wearing the design the deterministic scorer picked instead.
   "unknown_preset",
+  // The editorial judgment pass could not justify this edit — no reason, no
+  // evidence, confidence too low to trust, or it lost out to a stronger edit
+  // competing for the same moment. A structurally valid op can still fail here;
+  // this is the "would a professional editor actually keep this" gate.
+  "weak_justification",
   "executor_error",
 ] as const;
 export type DirectorFailureReason = (typeof DIRECTOR_FAILURE_REASONS)[number];

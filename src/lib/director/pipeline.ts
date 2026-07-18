@@ -3,13 +3,21 @@
  *
  * ONE path from a plan to a finished timeline:
  *
- *     plan → validate → execute → review → (fixed) timeline
+ *     plan → validate → judge → execute → review → (fixed) timeline
  *
  * The initial run and every revision go through this exact function. There is no
  * second code path that could produce a timeline the first one couldn't, and no
  * place for the UI, the preview or the export to independently interpret the
  * model's response — by the time anything sees a result, it is already a
- * validated plan compiled into ordinary `DetectedMoment`s.
+ * validated, editorially-judged plan compiled into ordinary `DetectedMoment`s.
+ *
+ * The JUDGE step is the decision engine: `validate` only asks whether an
+ * operation CAN exist (a real edit type, an in-bounds window, required params
+ * present); `applyEditorialJudgment` asks whether it DESERVES to — a real
+ * reason, real evidence, honest confidence, and no crowding out its neighbors.
+ * An edit that fails validation is broken; an edit that fails judgment is fine,
+ * just not good enough to keep. Both are reported as failures either way, and
+ * neither one sinks the run.
  *
  * Pure. No I/O, no model calls. The caller supplies the plan (from Gemini or the
  * heuristic planner) and persists the result.
@@ -21,6 +29,7 @@ import type {
   SelectedVideoType,
   Transcript,
 } from "../firebase/schema";
+import { applyEditorialJudgment } from "./editorial-judgment";
 import { executePlan } from "./executor";
 import { reviewDirectorResult } from "./review";
 import { validateDirectorPlan } from "./validate";
@@ -46,14 +55,14 @@ export interface RunPipelineInput {
 }
 
 export interface RunPipelineResult {
-  /** The VALIDATED plan — this, not the input plan, is what gets persisted. */
+  /** The VALIDATED, JUDGED plan — this, not the input plan, is what gets persisted. */
   plan: DirectorPlan;
   /** The finished timeline, after execution AND the review's auto-fixes. */
   moments: DetectedMoment[];
   outputCanvas?: OutputCanvas;
   summary: DirectorSummary;
   review: DirectorReviewResult;
-  /** Validation rejections + executor failures, together. */
+  /** Validation rejections + editorial judgment rejections + executor failures, together. */
   failures: DirectorFailure[];
   appliedOperationIds: string[];
   /**
@@ -70,9 +79,14 @@ export function runDirectorPipeline(input: RunPipelineInput): RunPipelineResult 
   // ── 1. Validate. Rejected ops become reported failures, not silent drops. ──
   const validation = validateDirectorPlan(input.plan, duration);
 
-  // ── 2. Execute the surviving plan. Per-op failures don't sink the run. ────
+  // ── 2. Judge. The decision engine: is each surviving edit actually earned? ─
+  // Runs on the STRUCTURALLY valid plan only — judging a window that's already
+  // out of bounds or missing required params would be double work for no gain.
+  const judgment = applyEditorialJudgment(validation.plan);
+
+  // ── 3. Execute the judged plan. Per-op failures don't sink the run. ───────
   const execution = executePlan({
-    plan: validation.plan,
+    plan: judgment.plan,
     moments: input.moments,
     duration,
     revision: input.revision,
@@ -83,7 +97,7 @@ export function runDirectorPipeline(input: RunPipelineInput): RunPipelineResult 
     effects: input.effects,
   });
 
-  // ── 3. Review the REAL timeline and apply the safe fixes. ────────────────
+  // ── 4. Review the REAL timeline and apply the safe fixes. ────────────────
   // The review sees the executed timeline (with the new canvas already in
   // effect), so a caption safe-area check on a 9:16 reframe tests the aspect the
   // video will actually be exported at — not the one it had a moment ago.
@@ -95,14 +109,14 @@ export function runDirectorPipeline(input: RunPipelineInput): RunPipelineResult 
     : input.effects;
 
   const review = reviewDirectorResult({
-    plan: validation.plan,
+    plan: judgment.plan,
     moments: execution.moments,
     duration,
     effects: effectsForReview,
     reportedOutputDuration: execution.summary.outputDurationSeconds,
   });
 
-  // ── 4. The review's auto-fixes CHANGED the timeline, so the summary has to be
+  // ── 5. The review's auto-fixes CHANGED the timeline, so the summary has to be
   // recomputed from what actually survived. Reporting the pre-fix numbers would
   // be exactly the kind of quiet lie this feature can't afford: if the review
   // disabled 3 zooms, the summary must not still claim 9. ───────────────────
@@ -110,10 +124,14 @@ export function runDirectorPipeline(input: RunPipelineInput): RunPipelineResult 
   const map = buildTimelineMap(finalMoments, duration);
   const summary = recountSummary(execution.summary, finalMoments, map.outputDuration, map.totalRemoved);
 
-  const failures: DirectorFailure[] = [...validation.failures, ...execution.failures];
+  const failures: DirectorFailure[] = [
+    ...validation.failures,
+    ...judgment.failures,
+    ...execution.failures,
+  ];
 
   return {
-    plan: validation.plan,
+    plan: judgment.plan,
     moments: finalMoments,
     ...(execution.outputCanvas ? { outputCanvas: execution.outputCanvas } : {}),
     summary,
