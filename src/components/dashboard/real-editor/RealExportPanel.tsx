@@ -536,7 +536,7 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
         : "Export WebM";
 
   return (
-    <div className="flex flex-col gap-4 px-5 py-5">
+    <div className="flex flex-col gap-5 px-5 py-5 sm:px-7 sm:py-6">
       {showStatus && view ? (
         <StatusView
           view={view}
@@ -624,7 +624,7 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
           )}
 
           {/* ── Settings ──────────────────────────────────────────────────── */}
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
             <Field
               label="Quality"
               lockHref={!canExport1080 ? "/pricing" : undefined}
@@ -644,10 +644,27 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
                 renderLabel={(n) => `${n}fps`}
               />
             </Field>
+            <Field label="Format">
+              <Segmented
+                options={["mp4", "webm"] as const}
+                value={container}
+                onChange={setContainer}
+                renderLabel={(c) => (c === "mp4" ? "MP4" : "WebM")}
+              />
+              <p className="mt-1.5 text-[10.5px] leading-relaxed text-fog/80">
+                {container === "mp4"
+                  ? mp4NeedsUpgrade
+                    ? "MP4 is a Pro feature — upgrade, or choose WebM to export now."
+                    : engine === "server"
+                      ? "Best quality and compatibility. Prepared automatically — close the dialog and it keeps going."
+                      : "Best quality. Renders in your browser (Chrome or Edge)."
+                  : "Renders in your browser. Works everywhere; larger files."}
+              </p>
+            </Field>
           </div>
 
           {!isPaid && (
-            <p className="-mt-1 text-[10.5px] leading-relaxed text-fog/80">
+            <p className="-mt-2 text-[10.5px] leading-relaxed text-fog/80">
               {minutes.freeLimitReached
                 ? "You've used your 2 free cloud exports this month. "
                 : "Free exports at 720p. "}
@@ -661,58 +678,42 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
             </p>
           )}
 
-          <Field label="Format">
-            <Segmented
-              options={["mp4", "webm"] as const}
-              value={container}
-              onChange={setContainer}
-              renderLabel={(c) => (c === "mp4" ? "MP4" : "WebM")}
-            />
-            <p className="mt-1.5 text-[10.5px] leading-relaxed text-fog/80">
-              {container === "mp4"
-                ? mp4NeedsUpgrade
-                  ? "MP4 is a Pro feature — upgrade, or choose WebM to export now."
-                  : engine === "server"
-                    ? "Best quality and compatibility. Prepared automatically — close the dialog and it keeps going."
-                    : "Best quality. Renders in your browser (Chrome or Edge)."
-                : "Renders in your browser. Works everywhere; larger files."}
-            </p>
-          </Field>
-
-          {/* Canvas (compact) */}
-          <button
-            onClick={openCanvas}
-            className="flex w-full items-center gap-3 rounded-xl border border-white/10 bg-white/[0.02] px-3.5 py-2.5 text-left transition-colors duration-150 hover:border-white/20"
-          >
-            <span className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg border border-violet-400/20 bg-violet-500/10 text-violet-200">
-              <Frame size={14} />
-            </span>
-            <span className="min-w-0 flex-1">
-              <span className="block text-[10px] font-semibold uppercase tracking-[0.18em] text-fog/80">
-                Canvas
+          {/* Canvas + Style */}
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <button
+              onClick={openCanvas}
+              className="flex w-full items-center gap-3 rounded-xl border border-white/10 bg-white/[0.02] px-3.5 py-2.5 text-left transition-colors duration-150 hover:border-white/20"
+            >
+              <span className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg border border-violet-400/20 bg-violet-500/10 text-violet-200">
+                <Frame size={14} />
               </span>
-              <span className="block truncate text-[12.5px] font-medium capitalize text-white">
-                {canvasSummary}
+              <span className="min-w-0 flex-1">
+                <span className="block text-[10px] font-semibold uppercase tracking-[0.18em] text-fog/80">
+                  Canvas
+                </span>
+                <span className="block truncate text-[12.5px] font-medium capitalize text-white">
+                  {canvasSummary}
+                </span>
               </span>
-            </span>
-            <span className="inline-flex items-center gap-1 text-[11px] font-medium text-violet-300">
-              <Pencil size={12} />
-              Edit
-            </span>
-          </button>
+              <span className="inline-flex items-center gap-1 text-[11px] font-medium text-violet-300">
+                <Pencil size={12} />
+                Edit
+              </span>
+            </button>
 
-          {/* Style — cinematic vignette */}
-          <div className="flex items-center justify-between gap-3 rounded-xl border border-white/10 bg-white/[0.02] px-3.5 py-2.5">
-            <div className="min-w-0">
-              <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-fog/80">
-                Style
+            {/* Style — cinematic vignette */}
+            <div className="flex items-center justify-between gap-3 rounded-xl border border-white/10 bg-white/[0.02] px-3.5 py-2.5">
+              <div className="min-w-0">
+                <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-fog/80">
+                  Style
+                </div>
+                <div className="text-[12.5px] font-medium text-white">Cinematic vignette</div>
               </div>
-              <div className="text-[12.5px] font-medium text-white">Cinematic vignette</div>
+              <Toggle
+                on={!!project.effectsSettings.vignette}
+                onClick={() => updateEffects("vignette", !project.effectsSettings.vignette)}
+              />
             </div>
-            <Toggle
-              on={!!project.effectsSettings.vignette}
-              onClick={() => updateEffects("vignette", !project.effectsSettings.vignette)}
-            />
           </div>
 
           {/* Advanced (collapsed) */}
@@ -733,7 +734,7 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
               />
             </button>
             {advancedOpen && (
-              <div className="space-y-2 border-t border-white/[0.06] px-3.5 py-3">
+              <div className="grid grid-cols-1 gap-x-6 gap-y-2 border-t border-white/[0.06] px-3.5 py-3 sm:grid-cols-2">
                 <PreFlightRow icon={<Wand2 size={11} className="text-violet-300" />} label="Preset" value={presetName} />
                 <PreFlightRow
                   icon={<Film size={11} className="text-violet-300" />}
