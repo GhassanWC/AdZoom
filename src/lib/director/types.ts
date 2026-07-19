@@ -351,6 +351,23 @@ export interface DirectorEditParams {
   presetId?: string;
 }
 
+/**
+ * Why an edit earned its place, stamped by the editorial judgment stage
+ * (`editorial-judgment.ts`) on every edit that survives it. Internal — not
+ * necessarily shown to the user, but every edit that reaches the timeline has
+ * one, because an edit nobody can explain is an edit that shouldn't exist.
+ */
+export const DIRECTOR_JUSTIFICATIONS = [
+  "emphasis",
+  "pacing",
+  "attention",
+  "action",
+  "clarity",
+  "engagement",
+  "structure",
+] as const;
+export type DirectorJustification = (typeof DIRECTOR_JUSTIFICATIONS)[number];
+
 export interface DirectorEditOperation extends DirectorOperationBase {
   /** The EXACT existing Framevo effect type this compiles to. Allowlisted. */
   editType: DirectorEditType;
@@ -359,6 +376,8 @@ export interface DirectorEditOperation extends DirectorOperationBase {
   /** 0..1 camera strength. */
   intensity?: number;
   params?: DirectorEditParams;
+  /** Set by editorial judgment on every edit that survives it. */
+  justification?: DirectorJustification;
 }
 
 /**
@@ -512,6 +531,10 @@ export const DIRECTOR_FAILURE_REASONS = [
   // wearing the design the deterministic scorer picked instead.
   "unknown_preset",
   "executor_error",
+  // The edit COULD exist (validate.ts passed it) but the editorial judgment
+  // stage couldn't justify it — no real reason, no evidence, or confidence too
+  // low to trust in front of a viewer. "No edit" beat this one.
+  "not_justified",
 ] as const;
 export type DirectorFailureReason = (typeof DIRECTOR_FAILURE_REASONS)[number];
 
