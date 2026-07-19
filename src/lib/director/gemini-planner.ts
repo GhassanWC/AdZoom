@@ -268,7 +268,7 @@ Every editOperation you emit is reviewed afterward by a decision engine that dro
 - Will this distract the viewer instead of helping them?
 If you can't answer these with a real, specific reason grounded in the evidence you were given, DO NOT emit the edit. "No edit" is a common and correct outcome — optimize for quality over quantity, not for filling every section with something. A 90-second video with 4 well-placed edits reads as more professional than one with 20 that fight each other.
 Look at the WHOLE video's edit list before finalizing it, not just each moment in isolation: the edits from the hook through to the CTA should feel like one consistent, deliberate pass, not a series of independent per-chunk decisions. Do not place two edits of the same kind within about 2 seconds of each other — pick the stronger one.
-Every edit's `reason` must be the REAL, SPECIFIC answer to "why does this edit exist" (e.g. emphasizing an important point, maintaining pacing, guiding attention to a click, clarifying what's on screen, increasing engagement at a flat moment) — never a generic label like "Zoom" or "Callout".
+Every edit's \`reason\` must be the REAL, SPECIFIC answer to "why does this edit exist" (e.g. emphasizing an important point, maintaining pacing, guiding attention to a click, clarifying what's on screen, increasing engagement at a flat moment) — never a generic label like "Zoom" or "Callout".
 
 GROUNDING — EVERY claim needs a real referent
 - You are given the transcript, the detected moments, the interaction (click) times, the narrative beats and the dead zones. Cite them.
