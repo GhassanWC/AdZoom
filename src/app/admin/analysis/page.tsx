@@ -1,23 +1,50 @@
 "use client";
 
-import * as React from "react";
+/**
+ * Admin → Analysis.
+ *
+ * The headline fix: "Avg time" used to average `AnalysisJob.duration`, which is
+ * the SOURCE VIDEO'S LENGTH (schema.ts:1341), not processing time — the card
+ * reported how long users' videos were and labelled it analysis throughput.
+ * Real processing time is `completedAt − startedAt` over completed jobs, shown
+ * here as median (primary) with the mean beside it, and average video length
+ * reported separately as its own distinct metric.
+ *
+ * The page also carries a standing caveat: `analysisJobs` documents exist only
+ * for videos past the 90s chunking threshold, so this counts chunked runs, not
+ * all analyses.
+ */
+
 import { Cpu, CheckCircle2, XCircle, Timer } from "lucide-react";
-import { PageHeader } from "@/components/dashboard/PageHeader";
-import { GlassCard } from "@/components/ui/GlassCard";
-import { MetricCard } from "@/components/admin/MetricCard";
-import { DataTable, type Column } from "@/components/admin/DataTable";
-import { Tag, statusTone } from "@/components/admin/Tag";
-import { FilterSelect } from "@/components/admin/FilterSelect";
-import { BarList } from "@/components/admin/Charts";
-import { LoadMore } from "@/components/admin/LoadMore";
+import { MetricCard, MetricGrid } from "@/components/admin/MetricCard";
+import { SectionCard } from "@/components/admin/AdminCard";
+import { DataTable, CellStack, type Column } from "@/components/admin/DataTable";
 import {
-  LoadingPanel,
-  ErrorPanel,
-  EmptyPanel,
-  IndexBuildingPanel,
-} from "@/components/admin/StatePanels";
-import { useAdminList } from "@/components/admin/useAdminList";
-import { fmtDate, fmtDuration, fmtNum, truncateMiddle } from "@/components/admin/format";
+  BarList,
+  StatusBar,
+  AreaChart,
+  StatusDot,
+  type DayPoint,
+  type Slice,
+} from "@/components/admin/Charts";
+import { Pagination } from "@/components/admin/Pagination";
+import { PageFrame, ChartGrid } from "@/components/admin/PageFrame";
+import { EmptyPanel } from "@/components/admin/StatePanels";
+import {
+  Toolbar,
+  SearchInput,
+  FilterSelect,
+  DateRangeFilter,
+  RefreshButton,
+} from "@/components/admin/Toolbar";
+import { useAdminListPage, type AdminListResponse } from "@/components/admin/useAdminListPage";
+import {
+  fmtDate,
+  fmtDuration,
+  fmtElapsed,
+  fmtNum,
+  truncateMiddle,
+} from "@/components/admin/format";
 
 interface AnalysisRow {
   id: string;
@@ -25,23 +52,29 @@ interface AnalysisRow {
   projectId: string;
   projectTitle: string;
   status: string;
-  engine: string | null;
-  chunkMode: string | null;
+  engine: string;
+  chunkMode: string;
   chunkCount: number;
   completedCount: number;
   failedCount: number;
   progress: number;
-  duration: number;
+  videoSeconds: number;
+  momentsSoFar: number;
   startedAt: number;
-  completedAt: number;
+  completedAt: number | null;
+  processingMs: number | null;
 }
 
-interface AnalysisExtra {
-  statusBreakdown: Record<string, number>;
-  engineUsage: Record<string, number>;
-  chunkModes: Record<string, number>;
-  avgDurationSeconds: number;
-  avgChunksPerVideo: number;
+interface AnalysisSummary {
+  byStatus: Record<string, number>;
+  byEngine: Slice[];
+  byChunkMode: Slice[];
+  avgProcessingMs: number | null;
+  medianProcessingMs: number | null;
+  avgVideoSeconds: number | null;
+  avgChunksPerJob: number | null;
+  completedSample: number;
+  perDay: DayPoint[];
 }
 
 const STATUS_OPTIONS = ["queued", "running", "complete", "failed", "cancelled"].map((s) => ({
@@ -49,130 +82,202 @@ const STATUS_OPTIONS = ["queued", "running", "complete", "failed", "cancelled"].
   label: s,
 }));
 
+const COVERAGE_CAVEAT =
+  "Chunked jobs only — videos under 90s analyze in-place and create no job document.";
+
 export default function AdminAnalysisPage() {
-  const [status, setStatus] = React.useState("");
-  const list = useAdminList<AnalysisRow, AnalysisExtra>("/api/admin/analysis", {
-    status: status || undefined,
-  });
-  const e = list.extra;
-  const breakdown = e.statusBreakdown ?? {};
-  const total = Object.values(breakdown).reduce((a, b) => a + b, 0);
+  const q = useAdminListPage<AdminListResponse<AnalysisRow, AnalysisSummary>>(
+    "/api/admin/analysis"
+  );
+  const d = q.data;
+  const s = d?.summary;
 
   const columns: Column<AnalysisRow>[] = [
     {
       key: "project",
       header: "Project",
       render: (r) => (
-        <div className="min-w-0">
-          <div className="truncate text-white/90">{r.projectTitle}</div>
-          <div className="truncate text-xs text-fog" title={r.uid}>
-            {truncateMiddle(r.uid, 8, 4)}
-          </div>
-        </div>
+        <CellStack
+          primary={r.projectTitle}
+          secondary={truncateMiddle(r.uid, 8, 4)}
+          title={`${r.projectTitle} · ${r.uid}`}
+        />
       ),
     },
-    { key: "status", header: "Status", render: (r) => <Tag label={r.status} tone={statusTone(r.status)} /> },
-    { key: "engine", header: "Engine", render: (r) => r.engine ?? "—" },
-    { key: "mode", header: "Detail", render: (r) => r.chunkMode ?? "—" },
+    { key: "status", header: "Status", render: (r) => <StatusDot status={r.status} /> },
     {
-      key: "chunks",
+      key: "progress",
       header: "Chunks",
-      align: "right",
-      render: (r) => `${r.completedCount}/${r.chunkCount}${r.failedCount ? ` (${r.failedCount} failed)` : ""}`,
+      hideOnMobile: true,
+      render: (r) =>
+        r.chunkCount > 0 ? (
+          <span className="tabular-nums">
+            {r.completedCount}/{r.chunkCount}
+            {r.failedCount > 0 && (
+              <span className="ml-1.5 text-rose-300">({r.failedCount} failed)</span>
+            )}
+          </span>
+        ) : (
+          "—"
+        ),
     },
-    { key: "duration", header: "Video", render: (r) => fmtDuration(r.duration) },
+    { key: "engine", header: "Engine", hideOnMobile: true, render: (r) => r.engine },
+    { key: "mode", header: "Detail", hideOnMobile: true, render: (r) => r.chunkMode },
+    {
+      key: "video",
+      header: "Video",
+      align: "right",
+      hideOnMobile: true,
+      render: (r) => fmtDuration(r.videoSeconds),
+    },
+    {
+      key: "processing",
+      header: "Processing",
+      align: "right",
+      render: (r) => fmtElapsed(r.processingMs),
+    },
     { key: "started", header: "Started", align: "right", render: (r) => fmtDate(r.startedAt) },
   ];
 
   return (
-    <div className="space-y-6">
-      <PageHeader
-        eyebrow="Admin"
-        title="Analysis"
-        subtitle="Chunked analysis jobs, engines and outcomes."
-        action={
+    <PageFrame
+      title="Analysis"
+      subtitle="Chunked AI analysis jobs, throughput and failures."
+      state={{ ...q, hasData: Boolean(d) }}
+      truncated={d?.truncated}
+      scanned={d?.scanned}
+      toolbar={
+        <Toolbar>
+          <SearchInput
+            value={q.search}
+            onChange={q.setSearch}
+            label="Search analysis jobs"
+            placeholder="Project, uid, id…"
+          />
           <FilterSelect
-            value={status}
-            onChange={setStatus}
+            value={q.status}
+            onChange={q.setStatus}
             options={STATUS_OPTIONS}
             allLabel="All statuses"
-            ariaLabel="Filter by status"
+            label="Filter by status"
           />
-        }
-      />
-
-      {list.loading ? (
-        <LoadingPanel label="Loading analysis jobs…" />
-      ) : list.error ? (
-        <ErrorPanel message={list.error} />
-      ) : list.indexBuilding ? (
-        <IndexBuildingPanel />
-      ) : (
+          <DateRangeFilter
+            range={q.range}
+            from={q.from}
+            to={q.to}
+            onRangeChange={q.setRange}
+            onFromChange={q.setFrom}
+            onToChange={q.setTo}
+          />
+          <RefreshButton onClick={q.refresh} busy={q.isRefreshing} updatedAt={q.updatedAt} />
+        </Toolbar>
+      }
+    >
+      {d && s && (
         <>
-          <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
-            <MetricCard label="Total jobs" value={fmtNum(total)} icon={<Cpu size={16} />} />
+          <MetricGrid>
+            <MetricCard
+              label="Total jobs"
+              value={fmtNum(d.windowTotal)}
+              icon={<Cpu size={15} />}
+              tone="accent"
+              caveat={COVERAGE_CAVEAT}
+            />
             <MetricCard
               label="Completed"
-              value={fmtNum(breakdown.complete ?? 0)}
-              icon={<CheckCircle2 size={16} />}
+              value={fmtNum(s.byStatus.complete ?? 0)}
+              sub={`${fmtNum(s.byStatus.running ?? 0)} running · ${fmtNum(s.byStatus.queued ?? 0)} queued`}
+              icon={<CheckCircle2 size={15} />}
               tone="good"
             />
             <MetricCard
               label="Failed"
-              value={fmtNum(breakdown.failed ?? 0)}
-              icon={<XCircle size={16} />}
-              tone={breakdown.failed ? "bad" : "default"}
+              value={fmtNum(s.byStatus.failed ?? 0)}
+              sub={`${fmtNum(s.byStatus.cancelled ?? 0)} cancelled`}
+              icon={<XCircle size={15} />}
+              tone={(s.byStatus.failed ?? 0) > 0 ? "bad" : "default"}
             />
             <MetricCard
-              label="Avg time / chunks"
-              value={fmtDuration(e.avgDurationSeconds ?? 0)}
-              sub={`${fmtNum(e.avgChunksPerVideo ?? 0)} chunks/video avg`}
-              icon={<Timer size={16} />}
+              label="Median processing time"
+              value={fmtElapsed(s.medianProcessingMs)}
+              sub={`mean ${fmtElapsed(s.avgProcessingMs)} · ${fmtNum(s.completedSample)} completed`}
+              icon={<Timer size={15} />}
             />
-          </div>
+          </MetricGrid>
 
-          <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-            <GlassCard>
-              <div className="mb-4 text-sm font-medium text-white">Engine usage</div>
-              {e.engineUsage && Object.keys(e.engineUsage).length ? (
-                <BarList
-                  data={Object.entries(e.engineUsage).map(([label, value]) => ({ label, value }))}
-                />
-              ) : (
-                <EmptyInline />
-              )}
-            </GlassCard>
-            <GlassCard>
-              <div className="mb-4 text-sm font-medium text-white">Analysis detail (chunk mode)</div>
-              {e.chunkModes && Object.keys(e.chunkModes).length ? (
-                <BarList
-                  data={Object.entries(e.chunkModes).map(([label, value]) => ({ label, value }))}
-                />
-              ) : (
-                <EmptyInline />
-              )}
-            </GlassCard>
-          </div>
+          <ChartGrid>
+            <SectionCard
+              title="Jobs started per day"
+              total={fmtNum(d.windowTotal)}
+              subtitle="Bars sum to the total above — same query, same window."
+            >
+              <AreaChart data={s.perDay} label="Analysis jobs started per day" />
+            </SectionCard>
+            <SectionCard title="Status breakdown" total={fmtNum(d.windowTotal)}>
+              <StatusBar
+                counts={s.byStatus}
+                order={["queued", "running", "complete", "cancelled", "failed"]}
+              />
+            </SectionCard>
+          </ChartGrid>
 
-          {list.rows.length === 0 ? (
-            <EmptyPanel label="No analysis jobs yet" />
+          <ChartGrid>
+            <SectionCard
+              title="CV engine"
+              subtitle="Which decoder processed each job"
+              action={
+                <div className="text-right">
+                  <div className="text-[11px] text-text-muted">Avg video</div>
+                  <div className="text-sm tabular-nums text-text-primary">
+                    {fmtDuration(s.avgVideoSeconds)}
+                  </div>
+                </div>
+              }
+            >
+              <BarList data={s.byEngine} total={d.windowTotal} />
+            </SectionCard>
+            <SectionCard
+              title="Analysis detail"
+              subtitle="Chunk-size preset requested"
+              action={
+                <div className="text-right">
+                  <div className="text-[11px] text-text-muted">Avg chunks</div>
+                  <div className="text-sm tabular-nums text-text-primary">
+                    {s.avgChunksPerJob != null ? s.avgChunksPerJob.toFixed(1) : "—"}
+                  </div>
+                </div>
+              }
+            >
+              <BarList data={s.byChunkMode} total={d.windowTotal} />
+            </SectionCard>
+          </ChartGrid>
+
+          {d.rows.length === 0 ? (
+            <EmptyPanel
+              label="No analysis jobs match these filters"
+              hint="Only videos longer than 90 seconds create a job document."
+            />
           ) : (
             <>
-              <DataTable columns={columns} rows={list.rows} rowKey={(r) => r.id} minWidth={840} />
-              <LoadMore
-                hasMore={list.hasMore}
-                loading={list.loadingMore}
-                onClick={list.loadMore}
-                count={list.rows.length}
+              <DataTable
+                caption="Analysis jobs across all users, newest first"
+                columns={columns}
+                rows={d.rows}
+                rowKey={(r) => `${r.uid}:${r.id}`}
+                minWidth={960}
+              />
+              <Pagination
+                page={d.page}
+                pageCount={d.pageCount}
+                pageSize={d.pageSize}
+                total={d.filteredTotal}
+                onPageChange={q.setPage}
+                onPageSizeChange={q.setPageSize}
               />
             </>
           )}
         </>
       )}
-    </div>
+    </PageFrame>
   );
-}
-
-function EmptyInline() {
-  return <div className="grid h-24 place-items-center text-xs text-fog">No data yet.</div>;
 }

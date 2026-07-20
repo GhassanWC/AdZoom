@@ -10,6 +10,7 @@ import type { EditRecipePlan } from "@/lib/analysis/edit-recipe";
 // per-moment back-link to the plan operation that produced an edit.
 import type {
   DirectorBrief,
+  DirectorJustification,
   DirectorMomentRef,
   DirectorState,
 } from "@/lib/director/types";
@@ -829,6 +830,23 @@ export interface DetectedMoment {
   rejectedReason?: string;
   /** Candidates that competed with this moment in the same time neighbourhood and lost. */
   rejectedCandidates?: RejectedCandidateRef[];
+
+  // ── Editorial decision (the AI Editor) ───────────────────────────────────
+  /**
+   * WHY this edit earned its place, stamped by the editorial decision engine
+   * (`src/lib/analysis/editorial-decision.ts`) on every edit it keeps.
+   * Internal — not necessarily shown to the user — but every judged edit that
+   * reaches the timeline has one, because an edit nobody can explain is an
+   * edit that shouldn't exist. Shares the Director's vocabulary so a brief-led
+   * and an analysis-led edit mean the same thing by "emphasis".
+   */
+  justification?: DirectorJustification;
+  /**
+   * The specific sentence behind the verdict — on a survivor, what grounded
+   * it; on a reject (alongside `rejected` + `rejectedReason`), why a
+   * professional editor would have left it out.
+   */
+  editorialReason?: string;
 }
 
 /**

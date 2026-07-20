@@ -85,7 +85,11 @@ import {
   CvAbortError,
   CvTaintedError,
 } from "@/lib/cv/pipeline";
-import { runChunkedAnalysis } from "@/lib/analysis/chunk-orchestrator";
+import {
+  runChunkedAnalysis,
+  ChunkedAnalysisError,
+  type ChunkedRunResult,
+} from "@/lib/analysis/chunk-orchestrator";
 import {
   type AnalysisOptions,
   computeCarryOver,
@@ -687,6 +691,49 @@ async function writeChunkFailure(
     },
     { merge: true }
   ).catch(() => {});
+}
+
+/**
+ * Phase-accurate failure text for a chunked run.
+ *
+ * `runChunkedAnalysis` tags what it throws with the phase it died in, so a LATE
+ * failure is never reported as a failure to start — a finalize-stage 404 once
+ * read as "Chunked analysis failed to start", which points debugging at the
+ * setup code when the fault was at the very end of the pipeline. An untagged
+ * throw really is the start (duration resolve, engine selection, job creation);
+ * a taint is always detected mid-decode, i.e. while chunking.
+ */
+function chunkFailureText(err: unknown, verb: "start" | "resume"): string {
+  const reason = err instanceof Error ? err.message : String(err);
+  const phase =
+    err instanceof ChunkedAnalysisError
+      ? err.phase
+      : err instanceof CvTaintedError
+        ? "chunking"
+        : "start";
+  if (phase === "chunking") {
+    return `Chunked analysis failed while processing the video: ${reason}`;
+  }
+  if (phase === "finalizing") {
+    return `Chunked analysis failed while finishing up: ${reason}`;
+  }
+  return `Chunked analysis failed to ${verb}: ${reason}`;
+}
+
+/**
+ * A finalize failure is a DEGRADE, not a failure — the progressive edits are
+ * already on the timeline, so the run completed and we stay quiet. The one case
+ * worth surfacing is a run that added NOTHING: completing silently with nothing
+ * to show for the run is exactly how a real regression hides.
+ *
+ * Worded as "this run added no new edits", NOT "produced no edits" —
+ * `momentsAdded` counts only what THIS run appended, so the timeline can be
+ * full of carry-over from earlier runs while this one added zero. Claiming
+ * otherwise contradicts what the user is looking at.
+ */
+function finalizeDegradeText(result: ChunkedRunResult): string | null {
+  if (!result.finalizeError || result.momentsAdded > 0) return null;
+  return `Analysis finished, but this run added no new edits — the AI refinement step failed: ${result.finalizeError}`;
 }
 
 export function EditorRealProvider({
@@ -2090,7 +2137,7 @@ export function EditorRealProvider({
           { merge: true }
         );
         try {
-          await runChunkedAnalysis({
+          const result = await runChunkedAnalysis({
             uid,
             // Feed the resolved duration so the orchestrator never throws
             // "Unknown duration" on an old project with a missing field.
@@ -2102,6 +2149,8 @@ export function EditorRealProvider({
             options,
             carryOver,
           });
+          const degrade = finalizeDegradeText(result);
+          if (degrade) setAnalyzeError(degrade);
           return;
         } catch (chunkErr) {
           // User cancelled mid-run — not a failure (the orchestrator wrote its
@@ -2113,18 +2162,19 @@ export function EditorRealProvider({
           // plus a terminal `failed` state persisted to Firestore (errorMessage
           // + activity) so the cause is inspectable without devtools. `name`
           // distinguishes e.g. CvTaintedError (→ prod-bucket CORS).
-          const reason =
-            chunkErr instanceof Error ? chunkErr.message : String(chunkErr);
-          console.error("[analysis-mode] chunked failed to start", {
+          const message = chunkFailureText(chunkErr, "start");
+          console.error("[analysis-mode] chunked run failed", {
             projectId: project.id,
             name: chunkErr instanceof Error ? chunkErr.name : "Unknown",
-            message: reason,
+            phase:
+              chunkErr instanceof ChunkedAnalysisError ? chunkErr.phase : "start",
+            message: chunkErr instanceof Error ? chunkErr.message : String(chunkErr),
           });
           await writeChunkFailure(projectRef, {
             errorKind: "unknown",
-            errorMessage: `Chunked analysis failed to start: ${reason}`,
+            errorMessage: message,
           });
-          setAnalyzeError(`Chunked analysis failed to start: ${reason}`);
+          setAnalyzeError(message);
           return; // never fall through to the legacy direct path
         } finally {
           chunkRunningRef.current = false;
@@ -2411,7 +2461,7 @@ export function EditorRealProvider({
       const abort = new AbortController();
       cvAbortRef.current = abort;
       try {
-        await runChunkedAnalysis({
+        const result = await runChunkedAnalysis({
           uid,
           project,
           interactions,
@@ -2426,6 +2476,8 @@ export function EditorRealProvider({
             (project.analysis?.lastRunOptions as AnalysisOptions | undefined) ??
             DEFAULT_ANALYSIS_OPTIONS,
         });
+        const degrade = finalizeDegradeText(result);
+        if (degrade) setAnalyzeError(degrade);
       } catch (err) {
         // Aborted (unmount / user cancel) — not a failure.
         if (err instanceof CvAbortError || abort.signal.aborted) return;
@@ -2434,17 +2486,18 @@ export function EditorRealProvider({
         // never left stuck "analyzing", and surface the exact reason. (The
         // orchestrator's own throw marks the JOB doc; this marks the PROJECT
         // doc the overlay reads — two idempotent writers, last-write-wins.)
-        const reason = err instanceof Error ? err.message : "Resume failed.";
-        console.error("[analysis-mode] chunked failed to resume", {
+        const message = chunkFailureText(err, "resume");
+        console.error("[analysis-mode] chunked resume failed", {
           projectId: project.id,
           name: err instanceof Error ? err.name : "Unknown",
-          message: reason,
+          phase: err instanceof ChunkedAnalysisError ? err.phase : "start",
+          message: err instanceof Error ? err.message : String(err),
         });
         await writeChunkFailure(projectRef, {
           errorKind: "unknown",
-          errorMessage: `Chunked analysis failed to resume: ${reason}`,
+          errorMessage: message,
         });
-        setAnalyzeError(`Chunked analysis failed to resume: ${reason}`);
+        setAnalyzeError(message);
       } finally {
         chunkRunningRef.current = false;
         cvAbortRef.current = null;

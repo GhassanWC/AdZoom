@@ -72,6 +72,29 @@ export function fmtElapsed(ms: number | null | undefined): string {
   return `${m}m ${sec}s`;
 }
 
+/**
+ * An ALREADY-PERCENTAGE number → "12.3%". Distinct from `fmtPct`, which takes a
+ * 0..1 fraction. The admin routes return percentages directly (`conversionPct`),
+ * so mixing these up would show 1250% — hence two explicitly named helpers.
+ */
+export function fmtPctValue(pct: number | null | undefined): string {
+  if (pct == null || Number.isNaN(pct)) return "—";
+  return `${pct.toFixed(1)}%`;
+}
+
+/** Large counts → "1.2k" / "3.4M". For dense cells where full digits don't fit. */
+export function fmtCompact(n: number | null | undefined): string {
+  if (n == null || Number.isNaN(n)) return "—";
+  if (Math.abs(n) < 1000) return String(n);
+  return new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(n);
+}
+
+/** Minutes → "12.5 min". Used for cloud export quota consumption. */
+export function fmtMinutes(min: number | null | undefined): string {
+  if (min == null || Number.isNaN(min) || min <= 0) return "—";
+  return `${min.toFixed(min < 10 ? 1 : 0)} min`;
+}
+
 /** Truncate long ids/strings for table cells. */
 export function truncateMiddle(value: string, head = 6, tail = 4): string {
   if (value.length <= head + tail + 1) return value;

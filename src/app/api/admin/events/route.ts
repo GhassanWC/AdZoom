@@ -1,98 +1,139 @@
 /**
- * GET /api/admin/events?eventName=&userId=&limit=100&cursor=<docPath>
+ * GET /api/admin/events
+ *   ?eventName=&userId=&environment=&search=&range=&from=&to=&page=&pageSize=
  *
- * Raw analytics event stream + a "top events" tally from a recent sample.
- * Supports filtering by a single field server-side (eventName OR userId, via
- * the composite indexes); if both are given, eventName drives the query and
- * userId is applied in-memory for the returned page.
+ * Analytics event stream + activity aggregates from the root `analyticsEvents`
+ * collection (written by trackEvent.ts / recordEvent.ts).
+ *
+ * FIXED — "top events" was a recency-biased sample. It used to come from a
+ * separate `orderBy(timestamp desc).limit(1000)` read, unaffected by the
+ * page's own filters and unlabelled, so "top events" actually meant "top events
+ * among the most recent 1000". It is now tallied from the same scanned window
+ * that produces the table, so the chart and the table always describe the same
+ * set of events.
+ *
+ * FIXED — combined filters broke pagination. When both `eventName` and `userId`
+ * were supplied, only one became a Firestore `where` and the other was applied
+ * in memory to the already-fetched page — so a page could return zero rows
+ * while still advertising a next cursor, and the "N shown" counter drifted.
+ * All filtering now happens over the scanned window, so any combination works
+ * and the counts stay exact.
+ *
+ * ADDED — environment filter. `trackEvent` stamps `environment`
+ * (src/lib/analytics/events.ts), but no admin route ever filtered on it, so
+ * events emitted from development machines were being counted in production
+ * totals. The filter defaults to "production" for exactly that reason; pass
+ * `environment=all` to see everything.
+ *
+ * NOTE — `analyticsEvents` has no interface in schema.ts. Its shape is defined
+ * implicitly by the two writers and the firestore.rules allow-list, so every
+ * field is read defensively here.
  */
 
-import { NextResponse, type NextRequest } from "next/server";
 import { getAdmin } from "@/lib/firebase/admin";
-import { requireAdmin } from "@/lib/admin/auth";
-import { isIndexError } from "@/lib/admin/query";
+import { adminRoute } from "@/lib/admin/handler";
+import { scanWindow, paginate } from "@/lib/admin/scan";
+import { parseListParams, matchesSearch } from "@/lib/admin/params";
 import { tsToMillis } from "@/lib/admin/serialize";
+import { mapSafe, str, strOrNull, plainObject } from "@/lib/admin/validate";
+import { tally, toSlices, bucketByDay } from "@/lib/admin/aggregate";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const DEFAULT_LIMIT = 100;
-const MAX_LIMIT = 300;
-const TOP_SAMPLE = 1000;
+interface EventRow {
+  id: string;
+  eventName: string;
+  userId: string;
+  userEmail: string | null;
+  projectId: string | null;
+  plan: string | null;
+  environment: string;
+  metadata: Record<string, unknown>;
+  timestamp: number;
+}
 
-export async function GET(req: NextRequest) {
-  const admin = await requireAdmin(req);
-  if (admin instanceof NextResponse) return admin;
-
+export const GET = adminRoute("events", async (req) => {
   const { db } = getAdmin();
   const sp = req.nextUrl.searchParams;
-  const eventName = sp.get("eventName") || "";
-  const userId = sp.get("userId") || "";
-  const limit = Math.min(MAX_LIMIT, Math.max(1, Number(sp.get("limit")) || DEFAULT_LIMIT));
-  const cursor = sp.get("cursor");
+  const p = parseListParams(sp, { defaultPageSize: 50 });
+  const eventName = sp.get("eventName") ?? "";
+  const userId = sp.get("userId") ?? "";
+  // Default to production: dev-machine events must not inflate admin metrics.
+  const environment = sp.get("environment") ?? "production";
 
-  try {
-    const col = db.collection("analyticsEvents");
+  const { docs, truncated, scanned } = await scanWindow({
+    query: db.collection("analyticsEvents"),
+    orderField: "timestamp",
+    encoding: "timestamp", // trackEvent.ts:82 / recordEvent.ts:42
+    fromMs: p.fromMs,
+    toMs: p.toMs,
+    label: "events",
+  });
 
-    // Top events tally from a recent sample (best-effort).
-    const topEvents: { eventName: string; count: number }[] = [];
-    try {
-      const sample = await col.orderBy("timestamp", "desc").limit(TOP_SAMPLE).get();
-      const tally = new Map<string, number>();
-      for (const d of sample.docs) {
-        const name = (d.data().eventName as string) ?? "unknown";
-        tally.set(name, (tally.get(name) ?? 0) + 1);
-      }
-      topEvents.push(
-        ...[...tally.entries()]
-          .map(([name, count]) => ({ eventName: name, count }))
-          .sort((a, b) => b.count - a.count)
-          .slice(0, 20)
-      );
-    } catch (err) {
-      console.error("[admin/events] top sample failed", err);
-    }
-
-    // Server-side filter: prefer eventName, else userId.
-    let q: FirebaseFirestore.Query = col;
-    const serverFilter = eventName ? "eventName" : userId ? "userId" : null;
-    if (serverFilter === "eventName") q = q.where("eventName", "==", eventName);
-    else if (serverFilter === "userId") q = q.where("userId", "==", userId);
-    q = q.orderBy("timestamp", "desc");
-
-    if (cursor) {
-      const curSnap = await db.doc(cursor).get();
-      if (curSnap.exists) q = q.startAfter(curSnap);
-    }
-
-    const snap = await q.limit(limit).get();
-    let rows = snap.docs.map((d) => {
+  const { rows: scannedRows, skipped } = mapSafe(
+    docs,
+    (d): EventRow => {
       const data = d.data();
       return {
         id: d.id,
-        eventName: (data.eventName as string) ?? "unknown",
-        userId: (data.userId as string) ?? "",
-        userEmail: (data.userEmail as string | null) ?? null,
-        projectId: (data.projectId as string | null) ?? null,
-        plan: (data.plan as string | null) ?? null,
-        environment: (data.environment as string) ?? "production",
-        metadata: (data.metadata as Record<string, unknown>) ?? {},
+        eventName: str(data.eventName, "unknown"),
+        userId: str(data.userId),
+        userEmail: strOrNull(data.userEmail),
+        projectId: strOrNull(data.projectId),
+        plan: strOrNull(data.plan),
+        // No default to "production" here — an absent environment is genuinely
+        // unknown, and defaulting it into production is how dev noise gets
+        // counted as real traffic.
+        environment: str(data.environment, "unknown"),
+        metadata: plainObject(data.metadata),
         timestamp: tsToMillis(data.timestamp as never),
       };
-    });
+    },
+    "events"
+  );
 
-    // If both filters were given, narrow the page by userId in-memory.
-    if (eventName && userId) rows = rows.filter((r) => r.userId === userId);
+  // The environment filter applies BEFORE aggregation — it defines the
+  // population, unlike eventName/userId which narrow the table view.
+  const all =
+    environment === "all"
+      ? scannedRows
+      : scannedRows.filter((r) => r.environment === environment);
 
-    const nextCursor =
-      snap.docs.length === limit ? snap.docs[snap.docs.length - 1].ref.path : null;
+  const summary = {
+    total: all.length,
+    /** Tallied from the SAME window as the table — not a separate sample. */
+    topEvents: toSlices(tally(all, (r) => r.eventName), { topN: 12, dropZero: true }),
+    byPlan: toSlices(tally(all, (r) => r.plan ?? "unknown"), { topN: 6, dropZero: true }),
+    byEnvironment: toSlices(tally(scannedRows, (r) => r.environment), { dropZero: true }),
+    uniqueUsers: new Set(all.map((r) => r.userId).filter(Boolean)).size,
+    perDay: bucketByDay(all, (r) => r.timestamp, { fromMs: p.fromMs, toMs: p.toMs }),
+  };
 
-    return NextResponse.json({ rows, nextCursor, topEvents });
-  } catch (err) {
-    if (isIndexError(err)) {
-      return NextResponse.json({ rows: [], nextCursor: null, topEvents: [], indexBuilding: true });
-    }
-    console.error("[admin/events] failed", err);
-    return NextResponse.json({ error: "Failed to load events" }, { status: 500 });
-  }
-}
+  const filtered = all.filter(
+    (r) =>
+      (!eventName || r.eventName === eventName) &&
+      (!userId || r.userId === userId) &&
+      matchesSearch(p.search, r.eventName, r.userEmail, r.userId, r.projectId)
+  );
+
+  const page = paginate(filtered, p.page, p.pageSize);
+
+  return {
+    rows: page.rows,
+    page: page.page,
+    pageCount: page.pageCount,
+    pageSize: p.pageSize,
+    filteredTotal: page.total,
+    windowTotal: all.length,
+    summary,
+    /** Every distinct event name in the window — populates the filter dropdown
+     *  from real data instead of a hardcoded list that drifts from EVENTS. */
+    eventNames: [...new Set(all.map((r) => r.eventName))].sort(),
+    truncated,
+    scanned,
+    skipped,
+    range: { fromMs: p.fromMs, toMs: p.toMs, key: p.range },
+    generatedAt: Date.now(),
+  };
+});

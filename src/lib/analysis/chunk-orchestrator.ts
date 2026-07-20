@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  arrayUnion,
   doc,
   getDoc,
   serverTimestamp,
@@ -72,6 +73,45 @@ const ACTIVE_JOB_HEARTBEAT_MS = 45_000;
 /** Per-chunk minimum spacing for the CV backstop (progressive draft only). */
 const PROGRESSIVE_MIN_SPACING = 6;
 
+/**
+ * Which phase of a chunked run a failure came from.
+ *
+ * `start` is everything before the chunk pool (duration, engine selection, job
+ * creation) — those throw raw Errors, so an UNTAGGED throw is a start failure.
+ * The caller renders this verbatim: a finalize-stage 404 once surfaced as
+ * "Chunked analysis failed to start", which points debugging at the wrong end
+ * of the pipeline entirely.
+ */
+export type ChunkedPhase = "start" | "chunking" | "finalizing";
+
+/** A chunked-run failure tagged with the phase it actually happened in. */
+export class ChunkedAnalysisError extends Error {
+  readonly phase: ChunkedPhase;
+  constructor(message: string, phase: ChunkedPhase) {
+    super(message);
+    this.name = "ChunkedAnalysisError";
+    this.phase = phase;
+  }
+}
+
+/**
+ * Outcome of a chunked run. `finalizeError` is a DEGRADE, not a failure: the
+ * progressive CV timeline is the source of truth and is already on screen, so
+ * the run still completes — the caller decides whether the degrade is worth
+ * telling the user about (see `momentsAdded`).
+ */
+export interface ChunkedRunResult {
+  outcome: "completed" | "cancelled" | "mirrored";
+  /**
+   * Moments THIS run appended. Explicitly NOT the timeline total: carry-over
+   * from earlier runs is seeded straight into the project doc and never counted
+   * here, so a full-looking timeline can still report 0 added.
+   */
+  momentsAdded: number;
+  /** Set when the best-effort server refinement pass failed. */
+  finalizeError?: string;
+}
+
 export interface ChunkedRunArgs {
   uid: string;
   project: ProjectDoc;
@@ -108,7 +148,9 @@ export interface ChunkedRunArgs {
  * Resumable: completed chunks (moments already in the project doc, window-VA in
  * the chunk doc) are skipped; only `queued`/`failed`/`cv-running` chunks re-run.
  */
-export async function runChunkedAnalysis(args: ChunkedRunArgs): Promise<void> {
+export async function runChunkedAnalysis(
+  args: ChunkedRunArgs
+): Promise<ChunkedRunResult> {
   const { uid, project, interactions, idTokenGetter, signal, onJob } = args;
   const resume = args.resume === true;
   const options = args.options ?? DEFAULT_ANALYSIS_OPTIONS;
@@ -238,7 +280,7 @@ export async function runChunkedAnalysis(args: ChunkedRunArgs): Promise<void> {
       // a competing run. Logged so this isn't mistaken for a real start.
       console.info("[chunk-mirror]", { projectId: project.id, jobId: active.id });
       onJob?.(active);
-      return;
+      return { outcome: "mirrored", momentsAdded: active.momentsSoFar };
     }
   }
 
@@ -559,6 +601,10 @@ export async function runChunkedAnalysis(args: ChunkedRunArgs): Promise<void> {
   // ── Run the pool, then finalize ───────────────────────────────────────
   // Mark active so the repair effect / any compaction defers while we append.
   setAnalysisActive(pid, true);
+  // Tracks what we're doing so the outer catch can attribute a failure to the
+  // right phase instead of blaming the start of the run. Everything before this
+  // point is the "start" phase and throws untagged.
+  let phase: ChunkedPhase = "chunking";
   try {
     const pending = windows.filter(
       (w) => byIndex.get(w.index)?.status !== "completed"
@@ -618,8 +664,13 @@ export async function runChunkedAnalysis(args: ChunkedRunArgs): Promise<void> {
 
     if (ac.signal.aborted) {
       await qWrite("cancel", () => markCancelled(uid, jobId, projectRef));
-      return;
+      return { outcome: "cancelled", momentsAdded: counters.momentsSoFar };
     }
+
+    // Every chunk is in. From here on it's wrap-up (VA merge, audio, the
+    // best-effort server refinement, terminal writes) — a failure in any of it
+    // is a LATE failure, not a failure to start.
+    phase = "finalizing";
 
     // Merge window VAs → whole-video VA, persist, then the single AI pass.
     if (vaChunks.length > 0) {
@@ -650,10 +701,16 @@ export async function runChunkedAnalysis(args: ChunkedRunArgs): Promise<void> {
       totalSilenceSeconds: audioAnalysis.totalSilenceSeconds ?? 0,
     });
     // Finalize (the server-side Gemini refinement: classification, labels,
-    // gap-fill) is BEST-EFFORT — the progressive CV timeline is already the
-    // source of truth. If it fails but we already have edits, complete with them
-    // instead of nuking the whole analysis; only a zero-edit run treats a
-    // finalize failure as fatal (surfaced with the real reason).
+    // gap-fill) is BEST-EFFORT and NEVER fatal — the progressive CV timeline is
+    // already the source of truth and is already on the user's screen. A
+    // failure here costs AI labels / gap-fill, not the run, so it DEGRADES:
+    // recorded as a `warn` activity event (the same channel the analyze route
+    // uses for its own partial degrades, e.g. a failed gap-fill call) and
+    // returned to the caller. It is deliberately NOT rethrown on a zero-edit
+    // run: that made a late refinement failure look like the whole analysis had
+    // failed to start, which is the opposite of where the fault was. The caller
+    // decides whether a zero-edit outcome is worth surfacing.
+    let finalizeError: string | undefined;
     try {
       await finalizeWithAi(project.id, idTokenGetter, {
         chunkCount: windows.length,
@@ -663,11 +720,30 @@ export async function runChunkedAnalysis(args: ChunkedRunArgs): Promise<void> {
         audioAnalysis,
       });
     } catch (finalizeErr) {
-      if (counters.momentsSoFar <= 0) throw finalizeErr;
+      finalizeError =
+        finalizeErr instanceof Error ? finalizeErr.message : String(finalizeErr);
       console.warn("[chunk-finalize] refinement failed — completing with progressive edits", {
         projectId: project.id,
         momentsSoFar: counters.momentsSoFar,
-        error: finalizeErr instanceof Error ? finalizeErr.message : String(finalizeErr),
+        error: finalizeError,
+      });
+      // Persisted so the degrade is inspectable after the fact (Firestore
+      // `analysis.activity[]`) without devtools open at the time. Deep-merges
+      // onto `analysis` — it must not touch any other field of that map.
+      const warnText = `AI refinement skipped — ${finalizeError}`;
+      await qWrite("finalize-warn", () =>
+        setDoc(
+          projectRef,
+          {
+            analysis: {
+              activity: arrayUnion({ ts: Date.now(), kind: "warn", text: warnText }),
+            },
+            updatedAt: serverTimestamp(),
+          },
+          { merge: true }
+        )
+      ).catch(() => {
+        /* the warning is diagnostics — never let it fail the run it describes */
       });
     }
 
@@ -696,12 +772,19 @@ export async function runChunkedAnalysis(args: ChunkedRunArgs): Promise<void> {
       chunkMode: job.chunkMode ?? null,
       duration: Math.round(job.duration),
     });
+    return {
+      outcome: "completed",
+      momentsAdded: counters.momentsSoFar,
+      ...(finalizeError ? { finalizeError } : {}),
+    };
   } catch (err) {
     if (ac.signal.aborted) {
       await qWrite("cancel", () => markCancelled(uid, jobId, projectRef));
-      return;
+      return { outcome: "cancelled", momentsAdded: counters.momentsSoFar };
     }
     // Taint → abandon chunking; caller retries on the server-side direct path.
+    // Rethrown UNWRAPPED so `instanceof CvTaintedError` checks upstream still
+    // fire (the caller maps it to the chunking phase itself).
     if (err instanceof CvTaintedError) {
       await qWrite("cancel", () => markCancelled(uid, jobId, projectRef));
       throw err;
@@ -710,7 +793,13 @@ export async function runChunkedAnalysis(args: ChunkedRunArgs): Promise<void> {
       status: "failed",
       errorMessage: err instanceof Error ? err.message : String(err),
     });
-    throw err;
+    // Tag with the phase we died in so the caller can say WHERE it broke.
+    throw err instanceof ChunkedAnalysisError
+      ? err
+      : new ChunkedAnalysisError(
+          err instanceof Error ? err.message : String(err),
+          phase
+        );
   } finally {
     setAnalysisActive(pid, false);
     signal.removeEventListener("abort", onAbort);

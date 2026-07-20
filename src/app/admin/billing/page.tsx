@@ -1,127 +1,287 @@
 "use client";
 
-import * as React from "react";
-import { DollarSign, Users, CreditCard, TrendingUp } from "lucide-react";
-import { PageHeader } from "@/components/dashboard/PageHeader";
-import { GlassCard } from "@/components/ui/GlassCard";
-import { MetricCard } from "@/components/admin/MetricCard";
-import { DataTable, type Column } from "@/components/admin/DataTable";
-import { Tag, planTone, statusTone } from "@/components/admin/Tag";
-import { BarList } from "@/components/admin/Charts";
-import { LoadingPanel, ErrorPanel } from "@/components/admin/StatePanels";
-import { useAdminApi } from "@/components/admin/useAdminApi";
-import { fmtDate, fmtNum, fmtPct, fmtUsd, truncateMiddle } from "@/components/admin/format";
+/**
+ * Admin → Billing.
+ *
+ * Revenue here is LIST-PRICE MRR and is labelled as such everywhere it appears.
+ * `Subscription` stores no monetary amount — no charged price, currency,
+ * discount or proration — so plan tier × public price is the only revenue figure
+ * the data supports. The footnote on the card states the basis explicitly rather
+ * than presenting an estimate as booked revenue.
+ *
+ * Two correctness fixes carried from the audit:
+ *  • Trials no longer count toward MRR (they had been billed at full price).
+ *  • `paused` / `unpaid` / `expired` are reported distinctly instead of being
+ *    lumped into a single "cancelled" number.
+ */
 
-interface RecentSub {
+import * as React from "react";
+import { DollarSign, CreditCard, TrendingUp, UserMinus } from "lucide-react";
+import { MetricCard, MetricGrid } from "@/components/admin/MetricCard";
+import { SectionCard } from "@/components/admin/AdminCard";
+import { DataTable, CellStack, type Column } from "@/components/admin/DataTable";
+import { BarList, AreaChart, StatusDot, type DayPoint, type Slice } from "@/components/admin/Charts";
+import { Pagination } from "@/components/admin/Pagination";
+import { PageFrame, ChartGrid } from "@/components/admin/PageFrame";
+import { EmptyPanel } from "@/components/admin/StatePanels";
+import {
+  Toolbar,
+  SearchInput,
+  FilterSelect,
+  DateRangeFilter,
+  RefreshButton,
+} from "@/components/admin/Toolbar";
+import { useAdminListPage, type AdminListResponse } from "@/components/admin/useAdminListPage";
+import { fmtDate, fmtNum, fmtPctValue, fmtUsd, truncateMiddle } from "@/components/admin/format";
+
+interface SubscriptionRow {
   uid: string;
   plan: string;
   status: string;
-  lastPaymentAt: number;
+  monthlyUsd: number;
+  renewsAt: number | null;
+  endsAt: number | null;
+  lastPaymentAt: number | null;
+  createdAt: number;
   updatedAt: number;
 }
 
-interface BillingResponse {
-  totalUsers: number | null;
-  freeUsers: number | null;
-  paidUsers: number;
+interface BillingSummary {
+  byStatus: Record<string, number>;
+  byStatusSlices: Slice[];
+  byPlan: Slice[];
   activeSubscriptions: number;
-  cancelledSubscriptions: number;
-  mrr: number;
-  conversionRate: number;
-  planDistribution: Record<string, number>;
-  statusDistribution: Record<string, number>;
-  recent: RecentSub[];
+  trialing: number;
+  pastDue: number;
+  cancelled: number;
+  paused: number;
+  expired: number;
+  unpaid: number;
+  listPriceMrr: number;
+  listPriceArr: number;
+  totalUsers: number;
+  paidUsers: number;
+  freeUsers: number;
+  conversionPct: number;
+  newInRange: number;
+  revenueBasis: {
+    planMonthlyUsd: Record<string, number>;
+    revenueStatuses: string[];
+    activeStatuses: string[];
+  };
+  perDay: DayPoint[];
 }
 
-export default function AdminBillingPage() {
-  const { data, loading, error } = useAdminApi<BillingResponse>("/api/admin/billing");
+const STATUS_OPTIONS = [
+  "active",
+  "on_trial",
+  "past_due",
+  "paused",
+  "unpaid",
+  "cancelled",
+  "expired",
+].map((s) => ({ value: s, label: s.replace(/_/g, " ") }));
 
-  const columns: Column<RecentSub>[] = [
+const PLAN_OPTIONS = [
+  { value: "pro", label: "Pro" },
+  { value: "creator", label: "Creator" },
+];
+
+export default function AdminBillingPage() {
+  const [plan, setPlan] = React.useState("");
+  const q = useAdminListPage<AdminListResponse<SubscriptionRow, BillingSummary>>(
+    "/api/admin/billing",
+    { extraParams: { plan: plan || undefined } }
+  );
+  const d = q.data;
+  const s = d?.summary;
+
+  const priceBasis = s
+    ? Object.entries(s.revenueBasis.planMonthlyUsd)
+        .filter(([, v]) => v > 0)
+        .map(([k, v]) => `${k} $${v}`)
+        .join(" · ")
+    : "";
+
+  const columns: Column<SubscriptionRow>[] = [
     {
-      key: "uid",
-      header: "User ID",
-      mono: true,
-      render: (r) => <span title={r.uid}>{truncateMiddle(r.uid, 10, 4)}</span>,
+      key: "user",
+      header: "Subscriber",
+      render: (r) => (
+        <CellStack primary={truncateMiddle(r.uid, 10, 6)} secondary={r.plan} title={r.uid} />
+      ),
     },
-    { key: "plan", header: "Plan", render: (r) => <Tag label={r.plan} tone={planTone(r.plan)} /> },
-    { key: "status", header: "Status", render: (r) => <Tag label={r.status} tone={statusTone(r.status)} /> },
-    { key: "payment", header: "Last payment", render: (r) => fmtDate(r.lastPaymentAt) },
+    { key: "status", header: "Status", render: (r) => <StatusDot status={r.status} /> },
+    {
+      key: "mrr",
+      header: "Monthly",
+      align: "right",
+      render: (r) => (r.monthlyUsd > 0 ? fmtUsd(r.monthlyUsd) : "—"),
+    },
+    {
+      key: "lastPayment",
+      header: "Last payment",
+      align: "right",
+      hideOnMobile: true,
+      render: (r) => fmtDate(r.lastPaymentAt),
+    },
+    {
+      key: "renews",
+      header: "Renews",
+      align: "right",
+      hideOnMobile: true,
+      render: (r) => fmtDate(r.renewsAt),
+    },
+    {
+      key: "ends",
+      header: "Ends",
+      align: "right",
+      hideOnMobile: true,
+      render: (r) => fmtDate(r.endsAt),
+    },
     { key: "updated", header: "Updated", align: "right", render: (r) => fmtDate(r.updatedAt) },
   ];
 
   return (
-    <div className="space-y-6">
-      <PageHeader eyebrow="Admin" title="Billing" subtitle="Subscriptions, revenue and conversion." />
-
-      {loading && !data ? (
-        <LoadingPanel label="Loading billing…" />
-      ) : error ? (
-        <ErrorPanel message={error} />
-      ) : data ? (
+    <PageFrame
+      title="Billing"
+      subtitle="Subscriptions, plan mix and list-price revenue."
+      state={{ ...q, hasData: Boolean(d) }}
+      truncated={d?.truncated}
+      scanned={d?.scanned}
+      toolbar={
+        <Toolbar>
+          <SearchInput
+            value={q.search}
+            onChange={q.setSearch}
+            label="Search subscriptions by uid, plan or status"
+            placeholder="UID, plan, status…"
+          />
+          <FilterSelect
+            value={q.status}
+            onChange={q.setStatus}
+            options={STATUS_OPTIONS}
+            allLabel="All statuses"
+            label="Filter by subscription status"
+          />
+          <FilterSelect
+            value={plan}
+            onChange={setPlan}
+            options={PLAN_OPTIONS}
+            allLabel="All plans"
+            label="Filter by plan"
+          />
+          <DateRangeFilter
+            range={q.range}
+            from={q.from}
+            to={q.to}
+            onRangeChange={q.setRange}
+            onFromChange={q.setFrom}
+            onToChange={q.setTo}
+          />
+          <RefreshButton onClick={q.refresh} busy={q.isRefreshing} updatedAt={q.updatedAt} />
+        </Toolbar>
+      }
+    >
+      {d && s && (
         <>
-          <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
-            <MetricCard label="MRR" value={fmtUsd(data.mrr)} icon={<DollarSign size={16} />} tone="good" />
+          <MetricGrid>
             <MetricCard
-              label="Paid users"
-              value={fmtNum(data.paidUsers)}
-              sub={`${fmtNum(data.activeSubscriptions)} active subs`}
-              icon={<CreditCard size={16} />}
+              label="Est. MRR (list price)"
+              value={fmtUsd(s.listPriceMrr)}
+              sub={`${fmtUsd(s.listPriceArr)} annualized`}
+              icon={<DollarSign size={15} />}
+              tone="good"
+              caveat={`Plan price × active subs (${priceBasis}). Excludes trials; Firestore stores no charged amount.`}
             />
             <MetricCard
-              label="Free users"
-              value={fmtNum(data.freeUsers)}
-              sub={`${fmtNum(data.totalUsers)} total`}
-              icon={<Users size={16} />}
+              label="Active subscriptions"
+              value={fmtNum(s.activeSubscriptions)}
+              sub={`${fmtNum(s.trialing)} trialing · ${fmtNum(s.pastDue)} past due`}
+              icon={<CreditCard size={15} />}
             />
             <MetricCard
               label="Conversion"
-              value={fmtPct(data.conversionRate)}
-              sub="free → paid"
-              icon={<TrendingUp size={16} />}
+              value={fmtPctValue(s.conversionPct)}
+              sub={`${fmtNum(s.paidUsers)} paid of ${fmtNum(s.totalUsers)} accounts`}
+              icon={<TrendingUp size={15} />}
+              tone="accent"
             />
-          </div>
+            <MetricCard
+              label="Ended"
+              value={fmtNum(s.cancelled + s.expired)}
+              sub={`${fmtNum(s.cancelled)} cancelled · ${fmtNum(s.expired)} expired · ${fmtNum(s.paused)} paused`}
+              icon={<UserMinus size={15} />}
+              tone={s.cancelled > 0 ? "warn" : "default"}
+            />
+          </MetricGrid>
 
-          <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-            <GlassCard>
-              <div className="mb-4 text-sm font-medium text-white">Plan distribution</div>
+          <ChartGrid>
+            <SectionCard
+              title="New subscriptions per day"
+              total={fmtNum(s.newInRange)}
+              subtitle="Subscription records created inside the selected range."
+            >
+              <AreaChart data={s.perDay} label="New subscriptions per day" />
+            </SectionCard>
+            <SectionCard
+              title="Subscription status"
+              total={fmtNum(d.windowTotal)}
+              subtitle="Every subscription record, by lifecycle state."
+            >
+              <BarList data={s.byStatusSlices} total={d.windowTotal} colorByStatus />
+            </SectionCard>
+          </ChartGrid>
+
+          <ChartGrid>
+            <SectionCard
+              title="Paid plan mix"
+              total={fmtNum(s.activeSubscriptions)}
+              subtitle="Among subscriptions that currently grant access."
+            >
+              <BarList data={s.byPlan} total={s.activeSubscriptions} />
+            </SectionCard>
+            <SectionCard
+              title="Account split"
+              total={fmtNum(s.totalUsers)}
+              subtitle="From users.plan — the same source the Users page reports."
+            >
               <BarList
-                data={Object.entries(data.planDistribution).map(([label, value]) => ({
-                  label,
-                  value,
-                }))}
+                data={[
+                  { label: "free", value: s.freeUsers },
+                  { label: "paid", value: s.paidUsers },
+                ]}
+                total={s.totalUsers}
               />
-            </GlassCard>
-            <GlassCard>
-              <div className="mb-4 text-sm font-medium text-white">Subscription status</div>
-              {Object.keys(data.statusDistribution).length ? (
-                <BarList
-                  data={Object.entries(data.statusDistribution).map(([label, value]) => ({
-                    label,
-                    value,
-                  }))}
-                />
-              ) : (
-                <div className="grid h-24 place-items-center text-xs text-fog">
-                  No subscriptions yet.
-                </div>
-              )}
-            </GlassCard>
-          </div>
+            </SectionCard>
+          </ChartGrid>
 
-          <div>
-            <div className="mb-3 text-sm font-medium text-white">Recent subscription activity</div>
-            {data.recent.length ? (
-              <DataTable columns={columns} rows={data.recent} rowKey={(r) => r.uid} minWidth={680} />
-            ) : (
-              <GlassCard>
-                <div className="grid h-24 place-items-center text-xs text-fog">
-                  No subscription activity yet.
-                </div>
-              </GlassCard>
-            )}
-          </div>
+          {d.rows.length === 0 ? (
+            <EmptyPanel
+              label="No subscriptions match these filters"
+              hint="Only users who have subscribed at least once have a record here."
+            />
+          ) : (
+            <>
+              <DataTable
+                caption="Subscription records, most recently updated first"
+                columns={columns}
+                rows={d.rows}
+                rowKey={(r) => r.uid}
+                minWidth={900}
+              />
+              <Pagination
+                page={d.page}
+                pageCount={d.pageCount}
+                pageSize={d.pageSize}
+                total={d.filteredTotal}
+                onPageChange={q.setPage}
+                onPageSizeChange={q.setPageSize}
+              />
+            </>
+          )}
         </>
-      ) : null}
-    </div>
+      )}
+    </PageFrame>
   );
 }

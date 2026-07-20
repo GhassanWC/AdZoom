@@ -18,8 +18,13 @@ interface AuthContextValue {
   configured: boolean;
   signInWithGoogle: () => Promise<void>;
   signOut: () => Promise<void>;
-  /** Latest cached ID token. Use getIdToken() when you need a fresh one. */
-  getIdToken: () => Promise<string | null>;
+  /**
+   * Current ID token. Firebase refreshes it automatically when it is expired or
+   * near expiry; pass `forceRefresh` to re-mint it unconditionally — used to
+   * retry once after a server returns 401 on a token that went stale while the
+   * tab sat open.
+   */
+  getIdToken: (forceRefresh?: boolean) => Promise<string | null>;
 }
 
 const AuthContext = React.createContext<AuthContextValue | null>(null);
@@ -62,10 +67,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     await fbSignOut(auth);
   }, []);
 
-  const getIdToken = React.useCallback(async () => {
-    if (!user) return null;
-    return user.getIdToken();
-  }, [user]);
+  const getIdToken = React.useCallback(
+    async (forceRefresh = false) => {
+      if (!user) return null;
+      return user.getIdToken(forceRefresh);
+    },
+    [user]
+  );
 
   const value: AuthContextValue = {
     user,

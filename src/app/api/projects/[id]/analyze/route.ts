@@ -17,6 +17,7 @@ import {
   labelMoments,
   proposeGapFills,
   proposeVisualMoments,
+  reviewEditorialDecisions,
   uploadVideoToGemini,
   waitForGeminiFileActive,
   GeminiCancelled,
@@ -27,12 +28,23 @@ import {
   classifyError,
   estimateAnalysisSeconds,
 } from "@/lib/analysis-stages";
-import { balanceTimeline, distributionScore } from "@/lib/timeline-balancer";
+import {
+  balanceTimeline,
+  distributionScore,
+  REJECTED_POOL_CAP,
+} from "@/lib/timeline-balancer";
 import {
   normalizeSelectedVideoType,
   mapSelectedToDetectedVideoType,
 } from "@/lib/analysis/video-type";
 import { resolveEditRecipe, logEditRecipePlan } from "@/lib/analysis/edit-recipe";
+// The AI Editor — decides which candidate edits deserve to exist at all.
+import {
+  decideTimeline,
+  attentionValueAt,
+  isEditorialJustification,
+  type EditorialContext,
+} from "@/lib/analysis/editorial-decision";
 import { generateOverlayEdits } from "@/lib/analysis/overlay-generators";
 // NOTE: transcription/captions are DECOUPLED from analysis — this route never
 // starts ASR, reserves caption quota, or generates captions. All caption
@@ -1504,6 +1516,155 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       });
     }
 
+    // ── THE AI EDITOR — editorial decision stage ────────────────────────────
+    // Everything above produced the UNDERSTANDING and a pool of CANDIDATE
+    // edits. Nothing above asked whether the resulting timeline is one a
+    // professional editor would sign off on — the per-chunk engines each judge
+    // a 30-second window in isolation, and their output reaches here intact
+    // (progressive moments enter the balancer as `preserved`, bypassing its
+    // whole selection pass). That is why edits felt random and over-applied.
+    //
+    // This stage is the missing judgment: every candidate must justify itself
+    // or it does not exist, and the judgment is made across the WHOLE video so
+    // rhythm, density and the intro→end distribution are consistent rather
+    // than per-chunk.
+    //
+    // Placement is deliberate:
+    //   · AFTER the finalize-protection guard, so that guard still does its job
+    //     (catching a BALANCER regression) and never reverts a decision this
+    //     engine made on purpose.
+    //   · AFTER the layer guard, so disabled layers are already gone.
+    //   · BEFORE overlay generation, so structural overlays the user explicitly
+    //     toggled on (hook text, CTA, callouts) are never second-guessed.
+    //   · BEFORE the Director stage, so a brief-led edit layers on top and is
+    //     judged by the Director's own editorial engine instead of twice here.
+    const editorialCtx: EditorialContext = {
+      duration: dur,
+      pacing,
+      videoType: effectiveVideoType,
+      narrativeStructure: sections.narrativeStructure,
+      boringSections: sections.boringSections,
+      attentionCurve: attention.curveQ8,
+      attentionSampleRate: attention.sampleRate,
+      sceneChanges: (visualAnalysis?.sceneChanges ?? []).map((s) => s.t),
+      // Both real recorded clicks and CV-inferred ones ground an emphasis edit.
+      clickTimes: [
+        ...trustedInteractions.filter((e) => e.type === "click").map((e) => e.t),
+        ...(visualAnalysis?.clickEvents ?? []).map((c) => c.t),
+      ],
+      silenceSegments: audioAnalysis?.silenceSegments,
+    };
+    const editorial = decideTimeline(finalMoments, editorialCtx);
+    let editorialKept = editorial.kept;
+    const editorialRejects = [...editorial.rejected];
+
+    console.info("[ai-editor] deterministic", { projectId, ...editorial.log });
+
+    // ── The semantic pass ────────────────────────────────────────────────────
+    // The deterministic engine enforced grounding, rhythm and budget. This asks
+    // what no heuristic can: is this edit actually meaningful to what the video
+    // is SAYING here? It runs on the survivors and can only prune further —
+    // never resurrect, never add — so a model failure degrades to the
+    // deterministic verdict instead of changing the timeline's character.
+    // Best-effort and deadline-bounded like every other Gemini step: this must
+    // never be what pushes finalize past the platform kill.
+    const judgedIds = new Set(
+      editorial.verdicts.filter((v) => v.keep).map((v) => v.id)
+    );
+    const reviewable = editorialKept.filter((m) => judgedIds.has(m.id));
+    if (geminiVideo && allowLabeling && reviewable.length > 0 && budgetRemainingMs() > 20_000) {
+      try {
+        const decisions = await withDeadline(
+          reviewEditorialDecisions({
+            video: geminiVideo,
+            durationSeconds: dur,
+            videoType: effectiveVideoType,
+            videoSummary: sections.summary,
+            candidates: reviewable.map((m) => ({
+              id: m.id,
+              startTime: m.startTime,
+              endTime: m.endTime,
+              effectType: String(m.effectType ?? "zoom"),
+              reason: m.editorialReason ?? m.reason,
+              confidence: m.confidenceScore,
+              narrativeRole: sections.narrativeStructure?.find(
+                (s) => m.startTime >= s.startTime && m.startTime < s.endTime
+              )?.role,
+              attention: attentionValueAt(
+                attention.curveQ8,
+                attention.sampleRate,
+                m.startTime
+              ),
+            })),
+          }),
+          Math.min(90_000, Math.max(10_000, budgetRemainingMs() - 20_000)),
+          "editorial review timed out"
+        );
+        const dropped = new Map(
+          decisions.filter((d) => !d.keep).map((d) => [d.id, d.reason])
+        );
+        const rejustified = new Map(
+          decisions.filter((d) => d.keep).map((d) => [d.id, d])
+        );
+        if (dropped.size > 0 || rejustified.size > 0) {
+          const next: DetectedMoment[] = [];
+          for (const m of editorialKept) {
+            const drop = dropped.get(m.id);
+            if (drop !== undefined) {
+              editorialRejects.push({
+                ...m,
+                rejected: true,
+                rejectedReason: "editor-review",
+                editorialReason:
+                  drop || "The editorial review found no reason for this edit to exist.",
+              });
+              continue;
+            }
+            const kept = rejustified.get(m.id);
+            next.push(
+              kept?.reason
+                ? {
+                    ...m,
+                    editorialReason: kept.reason,
+                    ...(isEditorialJustification(kept.justification)
+                      ? { justification: kept.justification }
+                      : {}),
+                  }
+                : m
+            );
+          }
+          editorialKept = next;
+        }
+        console.info("[ai-editor] semantic", {
+          projectId,
+          reviewed: reviewable.length,
+          droppedByModel: dropped.size,
+          kept: editorialKept.length,
+        });
+      } catch (err) {
+        // Non-fatal by design — the deterministic verdict already stands.
+        console.warn("[ai-editor] semantic pass skipped", {
+          projectId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        await emitActivity(
+          ref,
+          "warn",
+          "Editorial review unavailable — kept the edits the decision engine approved."
+        );
+      }
+    }
+
+    const editorialRemoved = finalMoments.length - editorialKept.length;
+    finalMoments = editorialKept;
+    if (editorialRemoved > 0) {
+      await emitActivity(
+        ref,
+        "info",
+        `AI Editor kept ${finalMoments.length} of ${finalMoments.length + editorialRemoved} candidate edits — the rest couldn't be justified.`
+      );
+    }
+
     // ── Phase-3 overlay generation (deterministic, whole-video) ─────────────
     // Turn the recipe's enabled overlay categories into real edits (hook text,
     // CTA, text labels, callouts, transitions) + a smart-crop output canvas.
@@ -1650,7 +1811,14 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
 
     const cleanMoments = stripUndefined(finalMoments);
     const cleanRawPool = stripUndefined(rawPool);
-    const cleanRejectedPool = stripUndefined(balanced.rejectedPool);
+    // Editorial rejects join the recoverable pool rather than vanishing: the
+    // engine's verdict is a judgement call, and `rejectedReason` +
+    // `editorialReason` on each one is exactly the record needed to explain —
+    // or undo — that call later. Capped like the balancer's own pool so a
+    // heavily-pruned run can't bloat the document.
+    const cleanRejectedPool = stripUndefined(
+      [...balanced.rejectedPool, ...editorialRejects].slice(0, REJECTED_POOL_CAP)
+    );
 
     // Build stage-by-stage click-pipeline diagnostics. Persisted so the
     // editor's Analysis Debug panel can show *exactly* which stage

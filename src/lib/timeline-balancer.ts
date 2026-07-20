@@ -218,7 +218,7 @@ export interface BalancerResult {
 
 const MIN_MOMENTS = 3;
 const MAX_MOMENTS = 24;
-const REJECTED_POOL_CAP = 50;
+export const REJECTED_POOL_CAP = 50;
 const REJECTED_PER_MOMENT_CAP = 5;
 const BORING_OVERLAP_THRESHOLD = 0.5;
 const IDLE_MIN_SECONDS = 4;
@@ -934,7 +934,7 @@ function resolveOverlaps(
  * Drops lowest-confidence AI moments until the ratio is satisfied. Returns the
  * pruned list and the count dropped.
  */
-function enforceAiQuota(
+export function enforceAiQuota(
   moments: DetectedMoment[]
 ): { kept: DetectedMoment[]; quotaDropped: number } {
   if (moments.length === 0) return { kept: moments, quotaDropped: 0 };
@@ -944,7 +944,23 @@ function enforceAiQuota(
     const p = provenanceOf(m);
     if (p === "ai" || p === "ai-override") aiCount++;
   }
-  const allowed = Math.floor(moments.length * AI_MOMENT_QUOTA);
+  // The quota is a share of the FINAL timeline and we only ever drop AI
+  // moments, so the allowance is self-referential: keeping `a` AI moments
+  // alongside `n` non-AI ones gives a/(n+a), which must be ≤ Q. Solving for a:
+  //
+  //     a/(n+a) ≤ Q   ⇔   a ≤ n·Q/(1−Q)
+  //
+  // Measuring the allowance against the PRE-drop total (`moments.length·Q`)
+  // instead overshoots every time, because the denominator shrinks as AI
+  // moments are dropped — so "enforcement" left the timeline still over cap and
+  // `assertAiQuota` below threw the whole request away (a real 160-candidate /
+  // 90-AI run kept 24/94 = 25.5% against a 15% cap and 500'd the finalize).
+  const nonAiCount = moments.length - aiCount;
+  // Degenerate: no non-AI moments to dilute against. The quota is then
+  // unsatisfiable except by emptying the timeline entirely, which serves nobody
+  // — keep what we have (see the matching carve-out in `assertAiQuota`).
+  if (nonAiCount === 0) return { kept: moments, quotaDropped: 0 };
+  const allowed = Math.floor((nonAiCount * AI_MOMENT_QUOTA) / (1 - AI_MOMENT_QUOTA));
   if (aiCount <= allowed) return { kept: moments, quotaDropped: 0 };
   // Pick AI moments to drop, lowest confidence first.
   const aiSorted = moments
@@ -973,6 +989,16 @@ export function assertAiQuota(moments: DetectedMoment[]): void {
   for (const m of moments) {
     const p = provenanceOf(m);
     if (p === "ai" || p === "ai-override") aiCount++;
+  }
+  // An all-AI timeline can only satisfy the quota by being empty (see
+  // `enforceAiQuota`) — that's a property of the candidate pool, not the
+  // selection regression this assertion exists to catch, so don't fail the
+  // request over it. Still worth a line in the log.
+  if (aiCount === moments.length) {
+    console.warn(
+      `[balancer] timeline is 100% AI moments (${aiCount}) — no non-AI signal to dilute against; quota not applicable`
+    );
+    return;
   }
   const ratio = aiCount / moments.length;
   if (ratio > AI_MOMENT_QUOTA + 1e-6) {

@@ -63,6 +63,14 @@
         { "fieldPath": "status", "order": "ASCENDING" },
         { "fieldPath": "updatedAt", "order": "ASCENDING" }
       ]
+    },
+    {
+      "collectionGroup": "exportJobs",
+      "queryScope": "COLLECTION_GROUP",
+      "fields": [
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "createdAt", "order": "DESCENDING" }
+      ]
     }
   ],
   "fieldOverrides": [
@@ -87,6 +95,15 @@
     {
       "collectionGroup": "analysisJobs",
       "fieldPath": "startedAt",
+      "indexes": [
+        { "queryScope": "COLLECTION", "order": "ASCENDING" },
+        { "queryScope": "COLLECTION", "order": "DESCENDING" },
+        { "queryScope": "COLLECTION_GROUP", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "exportJobs",
+      "fieldPath": "createdAt",
       "indexes": [
         { "queryScope": "COLLECTION", "order": "ASCENDING" },
         { "queryScope": "COLLECTION", "order": "DESCENDING" },

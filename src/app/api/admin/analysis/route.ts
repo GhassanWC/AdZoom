@@ -1,27 +1,42 @@
 /**
- * GET /api/admin/analysis?status=<AnalysisJobStatus>&limit=50&cursor=<docPath>
+ * GET /api/admin/analysis
+ *   ?status=&search=&range=&from=&to=&page=&pageSize=
  *
- * Cross-user analysis-job list + aggregate summary (status breakdown, engine
- * usage, chunk-mode distribution, average duration). Collection-group query
- * over users/{uid}/analysisJobs. Note: AnalysisJob orders by `startedAt`
- * (it has no `createdAt`).
+ * Cross-user analysis-job list + aggregates, from `users/{uid}/analysisJobs`.
+ *
+ * TWO SCHEMA TRAPS THIS ROUTE HANDLES
+ * -----------------------------------
+ * 1. `startedAt` is written as `Date.now()` — a plain NUMBER — because the
+ *    orchestrator runs client-side (src/lib/firebase/analysis-jobs.ts:36).
+ *    Every other admin collection uses `serverTimestamp()`. Firestore sorts all
+ *    numbers before all timestamps, so a `Timestamp` range bound here matches
+ *    ZERO documents and the page silently renders empty. Hence
+ *    `encoding: "number"`.
+ *
+ * 2. `AnalysisJob.duration` is the WHOLE-VIDEO LENGTH in seconds
+ *    (schema.ts:1341), not processing time. The previous route averaged it and
+ *    labelled the result "Avg time", so the dashboard reported how long users'
+ *    videos were and called it analysis throughput. Real processing time is
+ *    `completedAt − startedAt`, computed below as `processingMs` and only for
+ *    jobs that actually completed.
+ *
+ * Cards, charts and table all derive from one `scanWindow` — see the
+ * consistency contract documented in the exports route.
  */
 
-import { NextResponse, type NextRequest } from "next/server";
 import { getAdmin } from "@/lib/firebase/admin";
-import { requireAdmin } from "@/lib/admin/auth";
-import { isIndexError, safeCount, uidFromSubDoc } from "@/lib/admin/query";
+import { adminRoute } from "@/lib/admin/handler";
+import { scanWindow, paginate, uidFromSubDoc } from "@/lib/admin/scan";
+import { parseListParams, matchesSearch } from "@/lib/admin/params";
 import { tsToMillis } from "@/lib/admin/serialize";
-import type { AnalysisJobStatus, CvEngineKind } from "@/lib/firebase/schema";
+import { mapSafe, str, num, oneOf } from "@/lib/admin/validate";
+import { tally, toSlices, averageOf, medianOf, bucketByDay } from "@/lib/admin/aggregate";
+import type { AnalysisJobStatus } from "@/lib/firebase/schema";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const DEFAULT_LIMIT = 50;
-const MAX_LIMIT = 200;
-const SUMMARY_SAMPLE = 1000;
-
-const JOB_STATUSES: AnalysisJobStatus[] = [
+const JOB_STATUSES: readonly AnalysisJobStatus[] = [
   "queued",
   "running",
   "complete",
@@ -29,112 +44,110 @@ const JOB_STATUSES: AnalysisJobStatus[] = [
   "cancelled",
 ];
 
-export async function GET(req: NextRequest) {
-  const admin = await requireAdmin(req);
-  if (admin instanceof NextResponse) return admin;
+interface AnalysisRow {
+  id: string;
+  uid: string;
+  projectId: string;
+  projectTitle: string;
+  status: AnalysisJobStatus;
+  engine: string;
+  chunkMode: string;
+  chunkCount: number;
+  completedCount: number;
+  failedCount: number;
+  progress: number;
+  /** Whole-video length in seconds — NOT processing time. */
+  videoSeconds: number;
+  momentsSoFar: number;
+  startedAt: number;
+  completedAt: number | null;
+  /** Wall-clock processing time. Null while the job is still running. */
+  processingMs: number | null;
+}
 
+export const GET = adminRoute("analysis", async (req) => {
   const { db } = getAdmin();
-  const sp = req.nextUrl.searchParams;
-  const status = sp.get("status");
-  const limit = Math.min(MAX_LIMIT, Math.max(1, Number(sp.get("limit")) || DEFAULT_LIMIT));
-  const cursor = sp.get("cursor");
+  const p = parseListParams(req.nextUrl.searchParams);
 
-  try {
-    const group = db.collectionGroup("analysisJobs");
+  const { docs, truncated, scanned } = await scanWindow({
+    query: db.collectionGroup("analysisJobs"),
+    orderField: "startedAt",
+    encoding: "number", // see the header note — this is not a Timestamp field
+    fromMs: p.fromMs,
+    toMs: p.toMs,
+    label: "analysis",
+  });
 
-    // Status breakdown via cheap counts (composite [status, startedAt] index).
-    const statusCounts = await Promise.all(
-      JOB_STATUSES.map((s) => safeCount(group.where("status", "==", s)))
-    );
-    const statusBreakdown = Object.fromEntries(
-      JOB_STATUSES.map((s, i) => [s, statusCounts[i] ?? 0])
-    ) as Record<AnalysisJobStatus, number>;
-
-    // Engine + chunk-mode distribution + avg duration from a bounded sample.
-    const engineUsage: Record<string, number> = {};
-    const chunkModes: Record<string, number> = {};
-    let durSum = 0;
-    let durN = 0;
-    let chunkSum = 0;
-    let chunkN = 0;
-    try {
-      const sample = await group.orderBy("startedAt", "desc").limit(SUMMARY_SAMPLE).get();
-      for (const d of sample.docs) {
-        const data = d.data();
-        const engine = (data.engine as CvEngineKind) ?? "unknown";
-        engineUsage[engine] = (engineUsage[engine] ?? 0) + 1;
-        const mode = (data.chunkMode as string) ?? "unknown";
-        chunkModes[mode] = (chunkModes[mode] ?? 0) + 1;
-        const dur = data.duration as number | undefined;
-        if (typeof dur === "number" && dur > 0) {
-          durSum += dur;
-          durN += 1;
-        }
-        const cc = data.chunkCount as number | undefined;
-        if (typeof cc === "number" && cc > 0) {
-          chunkSum += cc;
-          chunkN += 1;
-        }
-      }
-    } catch (err) {
-      console.error("[admin/analysis] summary sample failed", err);
-    }
-
-    // Paginated rows.
-    let q: FirebaseFirestore.Query = group;
-    if (status) q = q.where("status", "==", status);
-    q = q.orderBy("startedAt", "desc");
-    if (cursor) {
-      const curSnap = await db.doc(cursor).get();
-      if (curSnap.exists) q = q.startAfter(curSnap);
-    }
-    const snap = await q.limit(limit).get();
-    const rows = snap.docs.map((d) => {
+  const { rows: all, skipped } = mapSafe(
+    docs,
+    (d): AnalysisRow => {
       const data = d.data();
+      const startedAt = tsToMillis(data.startedAt as never);
+      const completedAt = tsToMillis(data.completedAt as never) || null;
       return {
         id: d.id,
         uid: uidFromSubDoc(d.ref),
-        projectId: (data.projectId as string) ?? "",
-        projectTitle: (data.projectTitle as string) ?? "Untitled",
-        status: (data.status as AnalysisJobStatus) ?? "queued",
-        engine: (data.engine as CvEngineKind) ?? null,
-        chunkMode: (data.chunkMode as string | null) ?? null,
-        chunkCount: (data.chunkCount as number) ?? 0,
-        completedCount: (data.completedCount as number) ?? 0,
-        failedCount: (data.failedCount as number) ?? 0,
-        progress: (data.progress as number) ?? 0,
-        duration: (data.duration as number) ?? 0,
-        startedAt: tsToMillis(data.startedAt as never),
-        completedAt: tsToMillis(data.completedAt as never),
+        projectId: str(data.projectId),
+        projectTitle: str(data.projectTitle, "Untitled"),
+        status: oneOf<AnalysisJobStatus>(data.status, JOB_STATUSES, "queued"),
+        engine: str(data.engine, "unknown"),
+        chunkMode: str(data.chunkMode, "unknown"),
+        chunkCount: num(data.chunkCount),
+        completedCount: num(data.completedCount),
+        failedCount: num(data.failedCount),
+        progress: num(data.progress),
+        videoSeconds: num(data.duration),
+        momentsSoFar: num(data.momentsSoFar),
+        startedAt,
+        completedAt,
+        processingMs:
+          completedAt && startedAt && completedAt > startedAt
+            ? completedAt - startedAt
+            : null,
       };
-    });
+    },
+    "analysis"
+  );
 
-    const nextCursor =
-      snap.docs.length === limit ? snap.docs[snap.docs.length - 1].ref.path : null;
+  const byStatus = tally(all, (r) => r.status, JOB_STATUSES);
 
-    return NextResponse.json({
-      rows,
-      nextCursor,
-      statusBreakdown,
-      engineUsage,
-      chunkModes,
-      avgDurationSeconds: durN ? Math.round(durSum / durN) : 0,
-      avgChunksPerVideo: chunkN ? Number((chunkSum / chunkN).toFixed(1)) : 0,
-    });
-  } catch (err) {
-    if (isIndexError(err)) {
-      return NextResponse.json({
-        rows: [],
-        nextCursor: null,
-        statusBreakdown: {},
-        engineUsage: {},
-        chunkModes: {},
-        avgDurationSeconds: 0,
-        avgChunksPerVideo: 0,
-        indexBuilding: true,
-      });
-    }
-    console.error("[admin/analysis] failed", err);
-    return NextResponse.json({ error: "Failed to load analysis jobs" }, { status: 500 });
-  }
-}
+  // Throughput stats over COMPLETED jobs only — a queued job has no processing
+  // time, and including running jobs would report a growing partial elapsed.
+  const completed = all.filter((r) => r.status === "complete" && r.processingMs != null);
+
+  const summary = {
+    byStatus,
+    byEngine: toSlices(tally(all, (r) => r.engine), { topN: 6 }),
+    byChunkMode: toSlices(tally(all, (r) => r.chunkMode), { topN: 6 }),
+    avgProcessingMs: averageOf(completed, (r) => r.processingMs),
+    medianProcessingMs: medianOf(completed, (r) => r.processingMs),
+    /** Average source-video length — reported separately, NOT as "avg time". */
+    avgVideoSeconds: averageOf(all, (r) => (r.videoSeconds > 0 ? r.videoSeconds : null)),
+    avgChunksPerJob: averageOf(all, (r) => (r.chunkCount > 0 ? r.chunkCount : null)),
+    completedSample: completed.length,
+    perDay: bucketByDay(all, (r) => r.startedAt, { fromMs: p.fromMs, toMs: p.toMs }),
+  };
+
+  const filtered = all.filter(
+    (r) =>
+      (!p.status || r.status === p.status) &&
+      matchesSearch(p.search, r.projectTitle, r.uid, r.projectId, r.id)
+  );
+
+  const page = paginate(filtered, p.page, p.pageSize);
+
+  return {
+    rows: page.rows,
+    page: page.page,
+    pageCount: page.pageCount,
+    pageSize: p.pageSize,
+    filteredTotal: page.total,
+    windowTotal: all.length,
+    summary,
+    truncated,
+    scanned,
+    skipped,
+    range: { fromMs: p.fromMs, toMs: p.toMs, key: p.range },
+    generatedAt: Date.now(),
+  };
+});

@@ -1,58 +1,74 @@
 "use client";
 
-import * as React from "react";
-import { GlassCard } from "@/components/ui/GlassCard";
-import { cn } from "@/lib/cn";
-import { Sparkline } from "./Charts";
+/**
+ * Compact metric tile.
+ *
+ * Two things it deliberately does that the old one did not:
+ *
+ * • `value == null` renders an em-dash, not 0. A failed count aggregation used
+ *   to be coerced to 0 and shown next to a populated chart — the single most
+ *   misleading thing the old dashboard did. "No answer" and "zero" must look
+ *   different.
+ *
+ * • `caveat` marks a number as partial (scan cap hit, derived proxy) right on
+ *   the card. Previously, sample-limited values sat in the same row as exact
+ *   counts with identical styling and no disclosure at all.
+ *
+ * The dead `spark` prop is gone: no page ever passed it, and `Sparkline`
+ * rendered without a viewBox so the stretched polyline would have been clipped.
+ */
 
-/** Single headline metric tile. */
+import * as React from "react";
+import { cn } from "@/lib/cn";
+import { AdminCard, IconChip, MicroLabel } from "./AdminCard";
+
+export type MetricTone = "default" | "accent" | "good" | "warn" | "bad";
+
 export function MetricCard({
   label,
   value,
   sub,
+  caveat,
   icon,
-  spark,
   tone = "default",
+  className,
 }: {
   label: string;
+  /** Pre-formatted value, or null for "no data" (renders "—"). */
   value: React.ReactNode;
-  sub?: React.ReactNode;
+  sub?: string;
+  caveat?: string;
   icon?: React.ReactNode;
-  spark?: number[];
-  tone?: "default" | "good" | "warn" | "bad";
+  tone?: MetricTone;
+  className?: string;
 }) {
-  const toneText =
-    tone === "good"
-      ? "text-emerald-300"
-      : tone === "warn"
-        ? "text-amber-200"
-        : tone === "bad"
-          ? "text-rose-300"
-          : "text-white";
-
   return (
-    <GlassCard padded={false} className="p-5">
-      <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0">
-          <div className="text-[11px] font-medium uppercase tracking-[0.16em] text-fog">
-            {label}
-          </div>
-          <div className={cn("mt-2 font-display text-3xl font-semibold tabular-nums", toneText)}>
-            {value}
-          </div>
-          {sub && <div className="mt-1 text-xs text-fog">{sub}</div>}
+    <AdminCard interactive className={cn("flex items-start gap-3", className)}>
+      {icon && <IconChip tone={tone}>{icon}</IconChip>}
+      <div className="min-w-0 flex-1">
+        <MicroLabel>{label}</MicroLabel>
+        <div
+          className={cn(
+            "mt-1 font-display text-2xl font-semibold leading-none tracking-tight tabular-nums",
+            tone === "bad" ? "text-rose-300" : "text-text-primary"
+          )}
+        >
+          {value ?? "—"}
         </div>
-        {icon && (
-          <span className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-white/10 bg-white/[0.03] text-violet-300">
-            {icon}
-          </span>
+        {sub && <p className="mt-1.5 truncate text-xs text-text-muted" title={sub}>{sub}</p>}
+        {caveat && (
+          <p className="mt-1 text-[11px] leading-snug text-amber-300/80">{caveat}</p>
         )}
       </div>
-      {spark && spark.length > 1 && (
-        <div className="mt-3">
-          <Sparkline values={spark} width={220} height={32} className="w-full" />
-        </div>
-      )}
-    </GlassCard>
+    </AdminCard>
   );
+}
+
+/**
+ * Responsive metric grid — steps 1 → 2 → 4 columns. The old grid jumped
+ * straight from 2 to 4 with no intermediate step, so at 375px two `text-3xl`
+ * numbers and an icon shared one row and long values wrapped.
+ */
+export function MetricGrid({ children }: { children: React.ReactNode }) {
+  return <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">{children}</div>;
 }

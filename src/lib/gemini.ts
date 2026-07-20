@@ -1110,6 +1110,185 @@ export async function labelMoments(opts: {
     .filter((x): x is MomentLabel => Boolean(x));
 }
 
+// ── 4. EDITORIAL REVIEW (the AI Editor's semantic pass) ──────────────────────
+
+const EDITORIAL_SCHEMA = {
+  type: Type.OBJECT,
+  required: ["decisions"],
+  properties: {
+    decisions: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        required: ["id", "keep", "reason"],
+        properties: {
+          id: { type: Type.STRING },
+          keep: {
+            type: Type.BOOLEAN,
+            description: "false = this edit should NOT exist in the final video.",
+          },
+          justification: {
+            type: Type.STRING,
+            enum: [
+              "emphasis",
+              "pacing",
+              "attention",
+              "action",
+              "clarity",
+              "engagement",
+              "structure",
+            ],
+            description: "Why the edit earns its place. Required when keep=true.",
+          },
+          reason: {
+            type: Type.STRING,
+            description:
+              "1 specific sentence. If keep=false, why a professional editor would leave it out.",
+          },
+        },
+      },
+    },
+  },
+} as const;
+
+const EDITORIAL_SYSTEM = `You are a professional video editor doing a final review pass. A automated system has already placed a set of edits on a timeline. Your job is to decide which of them a skilled human editor would actually keep.
+
+You are REVIEWING, not creating. You cannot add edits, move them, or change their timing. For each edit you either keep it or drop it.
+
+FOR EVERY EDIT, ASK:
+- Does this edit improve the viewer's experience?
+- Does it make the message clearer or more engaging?
+- Is this the best edit for this moment, or is NO edit the better choice?
+- Does it fit naturally with the edits immediately before and after it?
+- Will this distract the viewer instead of helping them?
+
+If you cannot answer these with a real, specific reason grounded in what the video is doing at that timestamp, set keep=false.
+
+QUALITY OVER QUANTITY
+- "No edit" is a common and correct answer. Dropping edits is the main value you add.
+- You are NOT filling a quota. Keeping 5 of 15 edits is a perfectly good review.
+- A video with a few well-placed edits reads as more professional than one with many that fight each other.
+- Never keep an edit just because it is there, or because the section would otherwise be empty. An empty section is fine.
+
+JUDGE THE WHOLE VIDEO, NOT EACH EDIT ALONE
+- You are given the edits in time order across the ENTIRE video. Read the whole list before deciding.
+- The edits from the opening through to the end should feel like ONE deliberate pass by one editor — consistent rhythm, not a series of independent local decisions.
+- If two edits do the same job close together, keep the stronger one and drop the other.
+- If a run of edits all do the same thing, keep the ones that carry the story and drop the repetition.
+- Watch the pacing arc: emphasis belongs where the content peaks, not spread evenly out of obligation.
+
+REASONS
+- Every reason must be the REAL, SPECIFIC answer to "why does this edit exist" (or why it shouldn't) — e.g. emphasising an important point, maintaining pacing, guiding attention to an action, clarifying what is on screen, lifting a flat moment.
+- Never a generic label like "Zoom" or "Good edit".
+
+RULES
+- Return exactly one decision per supplied id. Do NOT invent ids.
+- Do NOT alter timestamps, effects, or focus regions — your output is keep/drop plus the reason.
+- Output ONLY the JSON schema.`;
+
+export interface EditorialReviewCandidate {
+  id: string;
+  startTime: number;
+  endTime: number;
+  effectType: string;
+  /** Why the upstream engine created it — the claim under review. */
+  reason?: string;
+  confidence?: number;
+  /** Narrative beat this lands in, when known. */
+  narrativeRole?: string;
+  /** Whole-video attention at this timestamp, 0..1. */
+  attention?: number;
+}
+
+export interface EditorialReviewDecision {
+  id: string;
+  keep: boolean;
+  justification?: string;
+  reason: string;
+}
+
+/**
+ * The AI Editor's semantic pass over an ALREADY-PRUNED candidate set.
+ *
+ * The deterministic engine (`src/lib/analysis/editorial-decision.ts`) has
+ * already enforced grounding, rhythm and budget; this asks the question no
+ * heuristic can — is this edit actually meaningful to what the video is
+ * saying here? Because it runs second, it can only ever prune further: the
+ * caller ignores any id it wasn't given, and an omitted id keeps its
+ * deterministic verdict. That containment is deliberate — a model failure or a
+ * hallucinated id can make the timeline sparser, never spammier, and never
+ * resurrects something the deterministic bar already rejected.
+ *
+ * Returns [] when there is nothing to review or the model fails, which the
+ * caller treats as "no further pruning" rather than as an error.
+ */
+export async function reviewEditorialDecisions(opts: {
+  video: GeminiVideoRef;
+  candidates: EditorialReviewCandidate[];
+  /** Whole-video framing so the model judges flow, not isolated moments. */
+  videoSummary?: string;
+  videoType?: string;
+  durationSeconds: number;
+}): Promise<EditorialReviewDecision[]> {
+  if (opts.candidates.length === 0) return [];
+  const ai = getGemini();
+  const list = opts.candidates
+    .map(
+      (c) =>
+        `  ${c.id} | ${c.startTime.toFixed(1)}s→${c.endTime.toFixed(1)}s | ${c.effectType}` +
+        (c.narrativeRole ? ` | beat: ${c.narrativeRole}` : "") +
+        (typeof c.attention === "number" ? ` | attention: ${c.attention.toFixed(2)}` : "") +
+        (typeof c.confidence === "number" ? ` | confidence: ${c.confidence.toFixed(2)}` : "") +
+        (c.reason ? ` | claimed reason: ${c.reason}` : "")
+    )
+    .join("\n");
+  const userPrompt = [
+    `Review the edits on this ${Math.round(opts.durationSeconds)}s video${
+      opts.videoType ? ` (${opts.videoType})` : ""
+    }.`,
+    opts.videoSummary ? `\nWhat the video is about: ${opts.videoSummary}` : "",
+    `\nEdits currently on the timeline, in time order (${opts.candidates.length} total):`,
+    list,
+    `\nDecide which of these a professional editor would keep. Dropping edits that don't earn their place is the point of this pass — returning far fewer than ${opts.candidates.length} is a good outcome if that's what the video needs.`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  const response: GenerateContentResponse = await ai.models.generateContent({
+    model: ANALYSIS_MODEL,
+    contents: [{ role: "user", parts: [videoPart(opts.video), { text: userPrompt }] }],
+    config: {
+      systemInstruction: EDITORIAL_SYSTEM,
+      responseMimeType: "application/json",
+      responseSchema: EDITORIAL_SCHEMA as never,
+      // Low: editorial judgment should be stable across runs, not creative.
+      temperature: 0.2,
+    },
+  });
+  const text = response.text;
+  if (!text) return [];
+  let parsed: { decisions?: Array<Record<string, unknown>> };
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return [];
+  }
+  // Only ids we actually supplied — a hallucinated id must not become a verdict.
+  const known = new Set(opts.candidates.map((c) => c.id));
+  const out: EditorialReviewDecision[] = [];
+  for (const d of parsed.decisions ?? []) {
+    const id = typeof d.id === "string" ? d.id : "";
+    if (!id || !known.has(id)) continue;
+    out.push({
+      id,
+      keep: d.keep !== false,
+      justification: typeof d.justification === "string" ? d.justification : undefined,
+      reason: typeof d.reason === "string" ? d.reason.slice(0, 240) : "",
+    });
+  }
+  return out;
+}
+
 import type {
   AttentionFactors,
   NarrativeRole,
