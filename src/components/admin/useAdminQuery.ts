@@ -116,7 +116,18 @@ export function useAdminQuery<T>(
         }
 
         setError(null);
-        setIndexBuilding(body?.indexBuilding === true);
+
+        // `{ indexBuilding: true }` is a SENTINEL, not a payload — the route
+        // returns it INSTEAD of the page's data when a Firestore index is
+        // missing (lib/admin/handler.ts). Storing it as `data` made `hasData`
+        // true, so a page whose render reads e.g. `d.users.truncated` threw a
+        // TypeError before `PageFrame` ever got to choose the index-building
+        // view, and the whole route fell through to the error boundary. Keep it
+        // out of `data`: the state flag alone drives the panel.
+        const building = body?.indexBuilding === true;
+        setIndexBuilding(building);
+        if (building) return;
+
         setData((body as T) ?? null);
         hasDataRef.current = true;
         setUpdatedAt(Date.now());
