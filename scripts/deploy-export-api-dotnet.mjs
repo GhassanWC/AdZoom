@@ -41,7 +41,16 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, "..");
-const GCLOUD = process.platform === "win32" ? "gcloud.cmd" : "gcloud";
+const IS_WIN = process.platform === "win32";
+const GCLOUD = IS_WIN ? "gcloud.cmd" : "gcloud";
+/**
+ * Windows gcloud is a .cmd shim, and since the CVE-2024-27980 fix Node refuses
+ * to spawn .cmd/.bat directly — it throws EINVAL unless the call goes through a
+ * shell. `shell: true` does NOT quote for you and cmd.exe would split
+ * `--substitutions=A=1,B=2` at the comma, so quote every arg here.
+ */
+const gcloudArgs = (args) => (IS_WIN ? args.map((a) => `"${a}"`) : args);
+const GCLOUD_SPAWN = { shell: IS_WIN };
 const CLOUDBUILD_CONFIG = "services/export-api-dotnet/cloudbuild.yaml";
 
 // ── Config (prod defaults, all overridable from the environment) ──
@@ -260,7 +269,7 @@ function gitShortSha() {
 
 function run(args, label) {
   console.log(`\n→ ${label}: gcloud ${args.join(" ")}`);
-  const res = spawnSync(GCLOUD, args, { cwd: root, stdio: "inherit" });
+  const res = spawnSync(GCLOUD, gcloudArgs(args), { cwd: root, stdio: "inherit", ...GCLOUD_SPAWN });
   if (res.error) {
     if (res.error.code === "ENOENT") bail("gcloud not found on PATH. Install the Google Cloud CLI + run `gcloud auth login`.");
     bail(`${label} failed to start: ${res.error.message}`);
@@ -269,7 +278,7 @@ function run(args, label) {
 }
 
 function capture(args, { allowFail = false } = {}) {
-  const res = spawnSync(GCLOUD, args, { cwd: root, stdio: ["inherit", "pipe", "inherit"], encoding: "utf-8" });
+  const res = spawnSync(GCLOUD, gcloudArgs(args), { cwd: root, stdio: ["inherit", "pipe", "inherit"], encoding: "utf-8", ...GCLOUD_SPAWN });
   if (res.error || res.status !== 0) {
     if (allowFail) return "";
     bail(`gcloud ${args[0]} failed${res.error ? `: ${res.error.message}` : ` (exit ${res.status})`}.`);

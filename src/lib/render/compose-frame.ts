@@ -75,7 +75,8 @@ export function composeFrame(
   if (debugBorders) drawDebugCanvasBorder(ctx, canvasW, canvasH);
 
   // Vignette + watermark sit OUTSIDE the camera transform so they stay anchored
-  // to the output frame (not zooming with the video).
+  // to the output frame (not zooming with the video). The Remotion composition
+  // stacks its layers in this same order — keep them in step.
   if (effects.vignette) drawVignette(ctx, canvasW, canvasH);
 
   // Phase-3 output-anchored overlays (captions / hook text / text overlays /
@@ -269,11 +270,18 @@ function drawDebugCanvasBorder(
 
 /**
  * Draw the free-tier watermark in the bottom-right corner. Sized relative to the
- * canvas height so it reads at any resolution. NOTE: this is rendered by the
- * client for browser exports; a tampered client could omit it. Paid cloud
- * exports never set `applyWatermark`, so the worker never draws it.
+ * canvas height so it reads at any resolution.
+ *
+ * EXPORTED because the Remotion composition draws it too — `WatermarkLayer`
+ * (src/remotion/layers/EffectsLayer.tsx) calls this exact function on its own
+ * canvas, so the browser exporter and the server renderer can't drift on brand
+ * mark placement or styling. Free CLOUD exports set `applyWatermark`; paid plans
+ * never do (see lib/export/create-job.ts).
+ *
+ * The browser copy is client-rendered, so a tampered client could omit it — the
+ * cloud render is the trustworthy one.
  */
-function drawWatermark(
+export function drawWatermark(
   ctx: CanvasRenderingContext2D,
   canvasW: number,
   canvasH: number

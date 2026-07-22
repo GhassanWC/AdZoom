@@ -5,7 +5,8 @@ import { AlertTriangle, Check, CreditCard, Sparkles } from "lucide-react";
 import { PageHeader } from "@/components/dashboard/PageHeader";
 import { useAuth } from "@/lib/firebase/AuthProvider";
 import { useStoragePlan } from "@/lib/usage/useStoragePlan";
-import { useMonthlyUsage } from "@/lib/usage/useMonthlyUsage";
+import { useCloudMinutes } from "@/lib/usage/useCloudMinutes";
+import { useCaptionUsage } from "@/lib/usage/useCaptionUsage";
 import { fmtBytes, storageBand, type PlanTier } from "@/lib/usage/plan";
 import { subscribeSubscription } from "@/lib/firebase/subscriptions";
 import { CheckoutButton } from "@/components/billing/CheckoutButton";
@@ -50,9 +51,15 @@ function fmtDate(epochMs?: number): string | null {
 export default function BillingPage() {
   const { user } = useAuth();
   const storage = useStoragePlan();
-  const usage = useMonthlyUsage();
+  const cloud = useCloudMinutes();
+  const captions = useCaptionUsage();
   const tier = storage.plan.tier;
   const copy = PLAN_COPY[tier];
+
+  // Free buys a COUNT of cloud exports (2/month); paid plans buy MINUTES
+  // (150 / 250). One meter, two units — matching what /pricing sells.
+  const cloudUsed = tier === "free" ? cloud.monthlyExportsUsed : cloud.used;
+  const cloudLimit = tier === "free" ? cloud.monthlyExportLimit : cloud.limit;
 
   // Lemon Squeezy redirects back here with ?checkout=success after a paid
   // checkout — the client-observable "purchase" signal for GA4 (a conversion).
@@ -233,33 +240,31 @@ export default function BillingPage() {
             </div>
           </div>
 
-          {/* Exports — live, read from users/{uid}/usage/{YYYY-MM} */}
-          <div className="glass rounded-2xl p-6">
-            <div className="flex items-center justify-between">
-              <span className="text-sm font-medium text-white">Exports this month</span>
-              <span className="font-mono text-xs text-fog">
-                {usage.used} /{" "}
-                {Number.isFinite(usage.limit) ? usage.limit : "∞"}
-              </span>
-            </div>
-            <div className="mt-4 h-1.5 overflow-hidden rounded-full bg-white/[0.06]">
-              <div
-                className="h-full rounded-full bg-gradient-to-r from-cyan-400 to-violet-500 transition-[width] duration-300"
-                style={{
-                  width: Number.isFinite(usage.limit)
-                    ? `${Math.min(100, Math.round((usage.used / Math.max(1, usage.limit)) * 100))}%`
-                    : "100%",
-                }}
-              />
-            </div>
-            <div className="mt-2 text-[11px] text-fog">
-              {Number.isFinite(usage.limit)
-                ? usage.remaining > 0
-                  ? `${usage.remaining} remaining`
-                  : "Cap reached — upgrade to keep exporting"
-                : "Included with your plan"}
-            </div>
-          </div>
+          {/* Cloud exports — the allowance the pricing page actually sells.
+              Free is COUNT-gated (2/month), paid plans meter MINUTES; both
+              come from useCloudMinutes, which reads the same plan-policy /
+              cloud-minutes constants the server enforces. */}
+          <Meter
+            label={tier === "free" ? "Cloud exports this month" : "Cloud export minutes"}
+            used={cloudUsed}
+            limit={cloudLimit}
+            unit={tier === "free" ? "" : " min"}
+            emptyHint={
+              tier === "free"
+                ? "Cap reached — upgrade for 150 cloud export minutes a month"
+                : "Cap reached — upgrade for more render minutes"
+            }
+          />
+
+          {/* Auto-caption minutes — also sold on the pricing page (10/150/300)
+              and previously invisible here. */}
+          <Meter
+            label="Auto-caption minutes"
+            used={captions.usedMinutes}
+            limit={captions.allowanceMinutes}
+            unit=" min"
+            emptyHint="Cap reached — upgrade for more caption minutes"
+          />
 
           {/* Payment method — driven by live subscription state */}
           <div className="glass rounded-2xl p-6 sm:col-span-2">
@@ -287,6 +292,57 @@ export default function BillingPage() {
             </div>
           </div>
         </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * A plan allowance meter. `limit` is whatever the CURRENT plan includes — it is
+ * always passed in from the shared usage hooks, never hard-coded here, so the
+ * number on this page can't drift from the one the server enforces (which is
+ * exactly how "5 exports per month" outlived the real 2-export cap).
+ *
+ * A non-finite limit renders "∞" and a full bar: some allowances are uncapped
+ * for paid tiers, and a percentage of infinity is not a thing.
+ */
+function Meter({
+  label,
+  used,
+  limit,
+  unit = "",
+  emptyHint,
+}: {
+  label: string;
+  used: number;
+  limit: number;
+  unit?: string;
+  emptyHint: string;
+}) {
+  const capped = Number.isFinite(limit);
+  const remaining = capped ? Math.max(0, limit - used) : Number.POSITIVE_INFINITY;
+  const pct = capped ? Math.min(100, Math.round((used / Math.max(1, limit)) * 100)) : 100;
+
+  return (
+    <div className="glass rounded-2xl p-6">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-sm font-medium text-white">{label}</span>
+        <span className="font-mono text-xs tabular-nums text-fog">
+          {used} / {capped ? `${limit}${unit}` : "∞"}
+        </span>
+      </div>
+      <div className="mt-4 h-1.5 overflow-hidden rounded-full bg-white/[0.06]">
+        <div
+          className="h-full rounded-full bg-gradient-to-r from-cyan-400 to-violet-500 transition-[width] duration-300"
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+      <div className="mt-2 text-[11px] text-fog">
+        {!capped
+          ? "Included with your plan"
+          : remaining > 0
+            ? `${remaining}${unit} remaining`
+            : emptyHint}
       </div>
     </div>
   );

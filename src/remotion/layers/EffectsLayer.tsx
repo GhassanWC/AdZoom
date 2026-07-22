@@ -21,6 +21,7 @@ import {
   drawOutputOverlays,
   hasOverlayMoments,
 } from "@/lib/render/overlay-draw";
+import { drawWatermark } from "@/lib/render/compose-frame";
 import { buildOutputFrameSegments, sourceTimeForFrame } from "../camera";
 
 export function Background({ recipe }: { recipe: RenderRecipe }): React.JSX.Element | null {
@@ -165,6 +166,40 @@ export function OutputOverlaysLayer({ recipe }: { recipe: RenderRecipe }): React
   }, [frame, fps, segments, recipe, canvasW, canvasH]);
 
   if (!hasOverlayMoments(recipe.moments)) return null;
+  return (
+    <canvas
+      ref={ref}
+      width={Math.max(1, Math.round(canvasW))}
+      height={Math.max(1, Math.round(canvasH))}
+      style={{ position: "absolute", left: 0, top: 0, width: canvasW, height: canvasH }}
+    />
+  );
+}
+
+/**
+ * The free-tier "Made with Framevo" brand mark, topmost and outside the camera.
+ *
+ * Calls `drawWatermark` — the SAME function the browser exporter uses — on its
+ * own canvas, the parity trick the click-highlight and overlay layers already
+ * use. Re-implementing the pill in CSS would have let the two renderers drift on
+ * padding, radius and the violet dot.
+ *
+ * Unlike the other canvas layers this does NOT depend on `frame`: the mark is
+ * static, so it is painted once per size change rather than on every frame.
+ */
+export function WatermarkLayer({ recipe }: { recipe: RenderRecipe }): React.JSX.Element | null {
+  const ref = useRef<HTMLCanvasElement | null>(null);
+  const { canvasW, canvasH, applyWatermark } = recipe;
+
+  useLayoutEffect(() => {
+    const cv = ref.current;
+    const ctx = cv?.getContext("2d");
+    if (!cv || !ctx) return;
+    ctx.clearRect(0, 0, cv.width, cv.height);
+    drawWatermark(ctx, canvasW, canvasH);
+  }, [canvasW, canvasH]);
+
+  if (!applyWatermark) return null;
   return (
     <canvas
       ref={ref}

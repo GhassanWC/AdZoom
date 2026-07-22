@@ -25,6 +25,8 @@ export interface SettingsHashInput {
   moments: unknown;
   /** Global source-frame crop, if any. */
   sourceCrop?: unknown;
+  /** Free-tier brand mark — part of the identity because it alters the pixels. */
+  applyWatermark?: boolean;
 }
 
 /** Stable JSON: object keys sorted recursively so equal data → equal string. */
@@ -56,6 +58,7 @@ export function computeSettingsHash(input: SettingsHashInput): string {
     effects: input.effects ?? null,
     moments: input.moments ?? [],
     sourceCrop: input.sourceCrop ?? null,
+    applyWatermark: input.applyWatermark ?? false,
   });
   return createHash("sha1").update(canonical).digest("hex").slice(0, 16);
 }

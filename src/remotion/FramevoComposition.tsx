@@ -3,7 +3,8 @@
  * @remotion/player preview and the server worker's renderMedia(). It compiles the
  * serialized recipe with `buildRenderRecipe` (the SAME function the browser
  * exporter uses) and stacks the layers in `composeFrame` order:
- *   black backdrop → Canvas-Fit background → video + camera (+ click highlight) → vignette.
+ *   black backdrop → Canvas-Fit background → video + camera (+ click highlight)
+ *   → vignette → output overlays → watermark.
  */
 import { useMemo } from "react";
 import { AbsoluteFill } from "remotion";
@@ -15,6 +16,7 @@ import {
   ClickHighlightOverlay,
   InCameraOverlaysLayer,
   OutputOverlaysLayer,
+  WatermarkLayer,
 } from "./layers/EffectsLayer";
 import type { FramevoCompositionProps } from "./types";
 
@@ -42,6 +44,9 @@ export function FramevoComposition({
           transition) — outside the camera, after the vignette, matching
           composeFrame's ordering. */}
       <OutputOverlaysLayer recipe={compiled} />
+      {/* Free-tier brand mark — LAST, so nothing can paint over it. Same
+          position in the stack as composeFrame's `drawWatermark` call. */}
+      <WatermarkLayer recipe={compiled} />
     </AbsoluteFill>
   );
 }

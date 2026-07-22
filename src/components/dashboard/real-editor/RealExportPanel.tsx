@@ -281,6 +281,10 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
           moments,
           effects,
           sourceCrop: project.sourceCrop ?? null,
+          // Free renders carry the watermark, so the plan is part of the clip's
+          // identity — otherwise upgrading to Pro would offer the previously
+          // exported WATERMARKED file instead of rendering a clean one.
+          watermarked: plan.tier === "free",
         }),
       }
     : null;

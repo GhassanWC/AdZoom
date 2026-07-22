@@ -49,8 +49,16 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const root = path.resolve(__dirname, "..");
 
-// gcloud is a .cmd shim on Windows; spawn the right name so we don't need a shell.
-const GCLOUD = process.platform === "win32" ? "gcloud.cmd" : "gcloud";
+const IS_WIN = process.platform === "win32";
+const GCLOUD = IS_WIN ? "gcloud.cmd" : "gcloud";
+/**
+ * Windows gcloud is a .cmd shim, and since the CVE-2024-27980 fix Node refuses
+ * to spawn .cmd/.bat directly — it throws EINVAL unless the call goes through a
+ * shell. `shell: true` does NOT quote for you and cmd.exe would split
+ * `--substitutions=A=1,B=2` at the comma, so quote every arg here.
+ */
+const gcloudArgs = (args) => (IS_WIN ? args.map((a) => `"${a}"`) : args);
+const GCLOUD_SPAWN = { shell: IS_WIN };
 
 function need(name) {
   const v = process.env[name]?.trim();
@@ -77,7 +85,7 @@ const image = ARTIFACT_REPO
 
 function run(args) {
   console.log(`\n$ gcloud ${args.join(" ")}`);
-  const r = spawnSync(GCLOUD, args, { cwd: root, stdio: "inherit" });
+  const r = spawnSync(GCLOUD, gcloudArgs(args), { cwd: root, stdio: "inherit", ...GCLOUD_SPAWN });
   if (r.status !== 0) process.exit(r.status ?? 1);
 }
 

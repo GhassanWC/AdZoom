@@ -131,7 +131,17 @@ function gitShortSha() {
 }
 function run(args, label) {
   console.log(`\n→ ${label}: gcloud ${args.join(" ")}`);
-  const res = spawnSync(GCLOUD, args, { cwd: root, stdio: "inherit" });
+  // On Windows the gcloud CLI is a .cmd shim, and since the CVE-2024-27980 fix
+  // Node refuses to spawn .cmd/.bat directly — it throws EINVAL unless the call
+  // goes through a shell. Quote each arg ourselves, because `shell: true` does
+  // NOT quote for you and cmd.exe would otherwise split
+  // `--substitutions=_IMAGE=…,_BUILD_VERSION=…` at the comma.
+  const isWin = process.platform === "win32";
+  const res = spawnSync(
+    GCLOUD,
+    isWin ? args.map((a) => `"${a}"`) : args,
+    { cwd: root, stdio: "inherit", shell: isWin }
+  );
   if (res.error) {
     if (res.error.code === "ENOENT") bail("gcloud not found on PATH. Install the Google Cloud CLI + run `gcloud auth login`.");
     bail(`${label} failed to start: ${res.error.message}`);

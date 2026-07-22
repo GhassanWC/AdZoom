@@ -105,30 +105,11 @@ export async function getRemainingExports(uid: string): Promise<{
   return { used: usage.exportCount, limit, remaining, plan };
 }
 
-/**
- * Whether the user can export at the requested resolution. 1080p is
- * available on any plan; 4K requires a paid plan (Pro $25 and above).
- */
-export async function canExportResolution(
-  uid: string,
-  res: "1080p" | "4K"
-): Promise<boolean> {
-  if (res === "1080p") return true;
-  return planMeetsMinimum(await getUserPlan(uid), "pro");
-}
-
-/**
- * Whether the user can export at the requested frame rate. 30fps is available
- * on any plan; 60fps requires a paid plan (Pro $25 and above) — matching the
- * 4K gate above.
- */
-export async function canExportFps(
-  uid: string,
-  fps: 30 | 60
-): Promise<boolean> {
-  if (fps === 30) return true;
-  return planMeetsMinimum(await getUserPlan(uid), "pro");
-}
+// Resolution / fps gating deliberately does NOT live here. It lives in ONE
+// place — `normalizeResolution` / `normalizeFps` in src/lib/export/plan-policy.ts
+// — which both the cloud and browser export paths call. The versions that used
+// to sit here were a second, contradictory policy ("1080p is available on any
+// plan") that let Free users render the resolution /pricing sells as Pro.
 
 /**
  * Whether the user can apply the named preset.

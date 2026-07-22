@@ -5,10 +5,8 @@ import {
   EXPORT_LIMITS,
   ExportLimitError,
   PlanRequiredError,
-  canExportFps,
-  canExportResolution,
-  getUserPlan,
 } from "@/lib/usage/gating";
+import { normalizeFps, normalizeResolution } from "@/lib/export/plan-policy";
 import { currentMonthKey } from "@/lib/usage/usage";
 import { normalizePlan, planMeetsMinimum, type PlanTier } from "@/lib/usage/plan";
 import type { ExportFormat, MonthlyUsage } from "@/lib/firebase/schema";
@@ -19,7 +17,7 @@ export const dynamic = "force-dynamic";
 interface PermitBody {
   projectId?: string;
   projectTitle?: string;
-  resolution?: "1080p" | "4K";
+  resolution?: "720p" | "1080p" | "4K";
   format?: ExportFormat;
   fps?: 30 | 60;
   /** Output container — drives the upload extension. Defaults to "webm". */
@@ -81,7 +79,7 @@ export async function POST(req: NextRequest) {
     if (
       typeof projectId !== "string" ||
       typeof projectTitle !== "string" ||
-      (resolution !== "1080p" && resolution !== "4K") ||
+      (resolution !== "720p" && resolution !== "1080p" && resolution !== "4K") ||
       (format !== "Source" &&
         format !== "TikTok 9:16" &&
         format !== "YouTube 16:9" &&
@@ -91,26 +89,25 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(
         {
           error:
-            "Body must include { projectId, projectTitle, resolution: '1080p'|'4K', format, fps: 30|60 }",
+            "Body must include { projectId, projectTitle, resolution: '720p'|'1080p'|'4K', format, fps: 30|60 }",
         },
         { status: 400 }
       );
     }
 
-    // 1. Plan vs output tier. 4K and 60fps require a paid plan (Pro $25 and up);
-    //    1080p/30 is universal.
-    if (!(await canExportResolution(uid, resolution)) || !(await canExportFps(uid, fps))) {
-      const plan = await getUserPlan(uid);
-      return NextResponse.json(
-        {
-          error: "A paid plan is required for 4K and 60fps export",
-          kind: "plan_required",
-          required: "pro",
-          actual: plan,
-        },
-        { status: 402 }
-      );
-    }
+    // 1. Clamp the requested output to the plan's caps.
+    //
+    // This used to call `canExportResolution` / `canExportFps`, a SECOND
+    // resolution policy that said "1080p is available on any plan" — directly
+    // contradicting plan-policy (Free → 720p) and the /pricing page, which
+    // sells 1080p as a Pro feature. It also rejected "720p" outright, so a Free
+    // user's browser export — a feature the pricing page advertises — always
+    // failed with a 400.
+    //
+    // Both are gone: the ONE policy in plan-policy.ts now decides, exactly as it
+    // already does for cloud exports, and the clamped values are what get locked
+    // into the export doc below. The clamp happens INSIDE the transaction so it
+    // uses the same plan snapshot as the cap check and the watermark decision.
 
     // 2 + 3. Transactional: count check + counter increment + export doc create.
     const monthKey = currentMonthKey();
@@ -134,20 +131,27 @@ export async function POST(req: NextRequest) {
         );
         planAtPermit = plan;
 
-        const prev = usageSnap.exists
-          ? (usageSnap.data() as MonthlyUsage)
-          : { exportCount: 0, updatedAt: 0 };
+        // The usage doc is SHARED with the cloud-export meter, which writes
+        // `exportsUsedThisMonth` and no `exportCount`. So `usageSnap.exists` is
+        // true for users who have only ever exported to the cloud, and reading
+        // `prev.exportCount` off it yields undefined — `undefined >= limit` is
+        // false (cap silently disabled) and `undefined + 1` is NaN, which then
+        // poisons the counter permanently (NaN + 1 is NaN forever). Default the
+        // FIELD, never just the document.
+        const prevCount = Number.isFinite(usageSnap.data()?.exportCount)
+          ? (usageSnap.data() as MonthlyUsage).exportCount
+          : 0;
 
         const limit = EXPORT_LIMITS[plan];
-        if (prev.exportCount >= limit) {
-          throw new ExportLimitError(prev.exportCount, limit, plan);
+        if (prevCount >= limit) {
+          throw new ExportLimitError(prevCount, limit, plan);
         }
 
         applyWatermark = !planMeetsMinimum(plan, "pro");
 
         const now = Date.now();
         nextUsage = {
-          exportCount: prev.exportCount + 1,
+          exportCount: prevCount + 1,
           lastExportAt: now,
           updatedAt: now,
         };
@@ -160,8 +164,9 @@ export async function POST(req: NextRequest) {
           projectId,
           projectTitle,
           format,
-          resolution,
-          fps,
+          // Plan-clamped, not what the client asked for.
+          resolution: normalizeResolution(plan, resolution),
+          fps: normalizeFps(plan, fps),
           container,
           status: "permitted",
           applyWatermark,

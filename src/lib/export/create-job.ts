@@ -194,6 +194,13 @@ export async function createCloudExportJob(
   const isFree = plan === "free";
   /** Free uses a monthly COUNT limit; paid uses the minutes quota. */
   const planLimit = isFree ? FREE_MONTHLY_CLOUD_EXPORTS : CLOUD_EXPORT_MINUTES[plan];
+  /**
+   * Free cloud exports carry the brand mark — the "Watermark included" line on
+   * /pricing. This was hardcoded `false` for every plan back when cloud export
+   * was paid-only, so Free cloud MP4s shipped clean. Derived from the plan now,
+   * and the Remotion composition draws it (see WatermarkLayer).
+   */
+  const applyWatermark = isFree;
 
   const settingsHash = computeSettingsHash({
     projectId,
@@ -204,6 +211,9 @@ export async function createCloudExportJob(
     effects: input.effects,
     moments: input.moments,
     sourceCrop: effectiveCrop,
+    // In the hash because it changes the OUTPUT PIXELS: without it, a user who
+    // upgrades mid-export would dedup onto their in-flight watermarked render.
+    applyWatermark,
   });
 
   // ── Dedup + single-flight against the user's active jobs ─────────────────
@@ -384,7 +394,7 @@ export async function createCloudExportJob(
     effects: input.effects,
     visualAnalysis: input.visualAnalysis,
     sourceCrop: effectiveCrop,
-    applyWatermark: false,
+    applyWatermark,
   });
   const outputDurationSeconds = recipe.outputDuration;
   const estimate = estimateExportMinutes(outputDurationSeconds);
@@ -417,7 +427,7 @@ export async function createCloudExportJob(
     moments: input.moments,
     effects: input.effects,
     sourceCrop: effectiveCrop,
-    applyWatermark: false,
+    applyWatermark,
     ...(input.visualAnalysis != null ? { visualAnalysis: input.visualAnalysis } : {}),
   };
 

@@ -16,9 +16,11 @@ import {
 } from "@/components/editor/RemotionPreview";
 import type { SerializedRenderRecipe } from "@/lib/firebase/schema";
 import { visibleMoments } from "@/lib/timeline/layers";
+import { usePlanTier } from "@/lib/usage/useStoragePlan";
 
 export function RemotionPreviewPanel() {
   const { project, videoRef, duration } = useEditorReal();
+  const { tier } = usePlanTier();
 
   // Source geometry: prefer the project's stored dims, fall back to the live
   // <video> element, then a 16:9 default. Duration prefers the live element
@@ -57,7 +59,11 @@ export function RemotionPreviewPanel() {
       ),
       effects: project.effectsSettings,
       sourceCrop: project.sourceCrop ?? null,
-      applyWatermark: false,
+      // Free renders carry the brand mark, so the preview shows it — this panel
+      // is a parity check, and "what you preview is what ships" (docs) only
+      // holds if the watermark is derived here the same way createCloudExportJob
+      // derives it.
+      applyWatermark: tier === "free",
       ...(project.visualAnalysis != null
         ? { visualAnalysis: project.visualAnalysis }
         : {}),
@@ -66,6 +72,7 @@ export function RemotionPreviewPanel() {
       srcW,
       srcH,
       srcDuration,
+      tier,
       project.analysis?.detectedMoments,
       project.timelineLayers,
       project.effectsSettings,
