@@ -26,11 +26,9 @@ import { Button } from "@/components/ui/Button";
 import { cn } from "@/lib/cn";
 import { useEditorReal } from "./context";
 import { BUILTIN_PRESETS_BY_ID } from "@/lib/presets";
-import { pickedMimeAvailable } from "./export";
 import {
   useExport,
   type ExportJob,
-  type ExportRenderParams,
   type ExportStatusUI,
 } from "@/components/export/ExportProvider";
 import { resolveOutputCanvas } from "@/lib/timeline/canvas-layout";
@@ -50,11 +48,13 @@ import {
   availableResolutionsForPlan,
   MAX_EXPORT_RESOLUTION,
   MAX_EXPORT_FPS,
-  FREE_MONTHLY_CLOUD_EXPORTS,
 } from "@/lib/export/plan-policy";
-import { useCloudMinutes } from "@/lib/usage/useCloudMinutes";
-import { estimateExportMinutes } from "@/lib/usage/cloud-minutes";
 import { useCloudExport } from "@/components/export/useCloudExport";
+import {
+  useEditframeExport,
+  type EditframeJob,
+} from "@/components/export/EditframeExportProvider";
+import { browserSupportsEditframe } from "@/lib/export/editframe/browser-support";
 import {
   EXPORT_STAGE_LABEL,
   exportUiStage,
@@ -98,9 +98,9 @@ const FIT_LABEL: Record<FitMode, string> = {
   manual: "Manual",
 };
 
-/** Unified, engine-agnostic view of the export in flight (server VM or browser). */
+/** Unified, engine-agnostic view of the export in flight (server VM, browser, or Editframe beta). */
 type ExportView = {
-  engine: "server" | "browser";
+  engine: "server" | "browser" | "editframe";
   phase: "active" | "ready" | "failed" | "canceled";
   /** Friendly stage for the stepper (Queued → Preparing → Rendering → …). */
   stage: ExportUiStage;
@@ -137,29 +137,8 @@ function validateForCloudExport(project: ExportValidatable): ValidationResult {
   return { ok: true };
 }
 
-/**
- * BROWSER export validation — MAY reject for browser codec / recorder limits.
- * This is the ONLY place a browser-support block belongs; it must never gate a
- * cloud export.
- */
-function validateForBrowserExport(
-  project: ExportValidatable,
-  browserSupported: boolean
-): ValidationResult {
-  if (!project.originalVideoUrl) {
-    return { ok: false, error: "This project has no source video to export." };
-  }
-  if (!browserSupported) {
-    return {
-      ok: false,
-      error: "Browser export needs a Chromium browser (Chrome or Edge).",
-    };
-  }
-  return { ok: true };
-}
-
 export function RealExportPanel({ onClose }: { onClose?: () => void }) {
-  const { project, duration, updateEffects, openCanvas, clipExport, updateClipExport } =
+  const { project, duration, openCanvas, clipExport, updateClipExport } =
     useEditorReal();
   /** Set by "Re-export anyway" — bypasses the duplicate-render check once. */
   const [forceClipReexport, setForceClipReexport] = React.useState(false);
@@ -190,16 +169,26 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
 
   const { plan } = useStoragePlan();
   const isPaid = planMeetsMinimum(plan.tier, "pro");
-  // Cloud (Remotion) MP4 export is available to EVERY plan when enabled — Free is
-  // capped server-side to 720p + 2 exports/month (see plan-policy). The flag keeps
-  // it dark until the worker is verified in an environment.
+
+  // ── Export engines ─────────────────────────────────────────────────────────
+  // The user sees ONE "Export" button. Under it: a fast in-browser render is the
+  // primary path, and our server render is an automatic backup that runs only if
+  // the in-browser one can't run or fails. Both produce the same MP4 with the same
+  // edits — no engine choice, no "cloud" / "browser" wording is ever shown.
   const serverEnabled = process.env.NEXT_PUBLIC_CLOUD_EXPORT_ENABLED === "true";
   const canServerMp4 = serverEnabled;
-  const minutes = useCloudMinutes();
 
   const cloud = useCloudExport(project.id);
-  const { job: bJob, isExporting, startExport, cancelExport, clearJob, downloadCurrent } =
+  const { job: bJob, isExporting, cancelExport, clearJob, downloadCurrent } =
     useExport();
+
+  const editframe = useEditframeExport();
+  const editframeEnabled = process.env.NEXT_PUBLIC_EDITFRAME_EXPORT_ENABLED === "true";
+  const efBrowser = React.useMemo(() => browserSupportsEditframe(), []);
+  // The in-browser render is usable here (Chrome/Edge); the server render is the
+  // automatic backup. If neither is available, export can't run in this browser.
+  const canUseEditframe = editframeEnabled && efBrowser.ok;
+  const canUseCloud = canServerMp4;
 
   // Plan caps (server-enforced; mirrored here). 4K is disabled for ALL plans for
   // now; Free → 720p/30, Pro/Creator → up to 1080p/60. No "high quality" for Free.
@@ -211,9 +200,8 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
 
   const [resolution, setResolution] = React.useState<"720p" | "1080p">("1080p");
   const [fps, setFps] = React.useState<30 | 60>(30);
-  // MP4 is the headline format (server VM for paid). WebM always renders in the
-  // browser. The format choice transparently picks the engine — no "cloud" copy.
-  const [container, setContainer] = React.useState<"mp4" | "webm">("mp4");
+  // Export always produces MP4 — both the in-browser and server engines output it.
+  const container = "mp4" as const;
   const [advancedOpen, setAdvancedOpen] = React.useState(false);
   const [blockedWarning, setBlockedWarning] = React.useState<string | null>(null);
   // Captions are still transcribing in the background. Warn ONCE before export
@@ -221,15 +209,6 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
   const captionsProcessing = project.analysis?.transcript?.status === "processing";
   const [captionsPrompt, setCaptionsPrompt] = React.useState(false);
   const captionsAckRef = React.useRef(false);
-
-  const engine: "server" | "browser" =
-    container === "mp4" && canServerMp4 ? "server" : "browser";
-  // Free user who has used their 2 monthly cloud exports → block the cloud path
-  // and show an upgrade CTA. (They can still switch to WebM = browser export.)
-  const freeCloudLimitReached = engine === "server" && minutes.freeLimitReached;
-  // MP4 is available to every plan now (cloud for Free at 720p, or browser),
-  // so there's no MP4-specific upgrade nudge.
-  const mp4NeedsUpgrade = false;
 
   // Defensive: a downgrade mid-session (or the async plan load) snaps the
   // selection back to the plan caps — Free → 720p/30, 60fps → 30.
@@ -239,8 +218,6 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
   React.useEffect(() => {
     if (!canExport60 && fps === 60) setFps(30);
   }, [canExport60, fps]);
-
-  const supported = pickedMimeAvailable();
 
   // ── Duration + estimates ──────────────────────────────────────────────────
   const sourceDuration = duration || project.duration || 0;
@@ -299,7 +276,6 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
         })
       : null;
   const exportDuration = cutMap.outputDuration;
-  const estMinutes = estimateExportMinutes(exportDuration);
   const estRenderSeconds = exportDuration > 0 ? Math.ceil(exportDuration + 8) : 0;
   const presetName = project.selectedPresetId
     ? BUILTIN_PRESETS_BY_ID[project.selectedPresetId]?.name ?? "Custom preset"
@@ -307,17 +283,17 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
 
   // ── Unified in-flight view (whichever engine is running / just finished) ──
   const myBrowserJob = bJob && bJob.projectId === project.id ? bJob : null;
+  const myEditframeJob =
+    editframe.job && editframe.job.projectId === project.id ? editframe.job : null;
   const sView = serverView(cloud);
   const bView = myBrowserJob ? browserView(myBrowserJob) : null;
+  const efView = myEditframeJob ? editframeView(myEditframeJob) : null;
 
-  // Keep the two engines' UIs COMPLETELY SEPARATE. A browser job only drives this
-  // dialog when we're on the browser path, or when a browser render is genuinely
-  // still running. A TERMINAL browser job (e.g. a prior failed attempt with a
-  // browser codec/audio error) must NEVER leak into the cloud-export UI and show
-  // up as the current export's error — that's the "unsupported audio format on
-  // cloud export" bug.
-  const browserViewForUi =
-    bView && (engine === "browser" || bView.phase === "active") ? bView : null;
+  // The primary flow only uses the in-browser (editframe) + server (cloud)
+  // engines. A legacy MediaRecorder/WebM browser job may still exist from a prior
+  // session — only surface it while it's genuinely ACTIVE, never as a stale
+  // terminal error that could leak into the current export's UI.
+  const browserViewForUi = bView && bView.phase === "active" ? bView : null;
 
   // Prefer an ACTIVE export. Otherwise surface a FRESH result: a server job we
   // STARTED/watched this session, or this session's browser job. An OLD completed
@@ -326,12 +302,21 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
   const activeView =
     sView?.phase === "active"
       ? sView
-      : browserViewForUi?.phase === "active"
-        ? browserViewForUi
-        : null;
+      : efView?.phase === "active"
+        ? efView
+        : browserViewForUi?.phase === "active"
+          ? browserViewForUi
+          : null;
   const serverResult =
     sView && sView.phase !== "active" && cloud.isSessionResult ? sView : null;
-  const resultView = serverResult ?? browserViewForUi ?? null;
+  // A FAILED in-browser render is never surfaced when a server backup is available
+  // — the backup starts automatically (see the fallback effect) and replaces it,
+  // so the user never sees a transient "Export failed" before the retry. Other
+  // in-browser results (ready / canceled) surface normally.
+  const efResult = efView && !(efView.phase === "failed" && canUseCloud) ? efView : null;
+  // Editframe's job is always this session's (provider state) — surface its
+  // terminal result ahead of a stale browser job.
+  const resultView = serverResult ?? efResult ?? browserViewForUi ?? null;
   const view: ExportView | null = activeView ?? resultView;
   const showStatus = !!view;
   const exportingNow = view?.phase === "active";
@@ -364,8 +349,9 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
     }
   }, [clipId, view?.phase, view?.jobId, view?.errorText, clipDownloadUrl, updateClipExport, view]);
 
-  // ONE active export per user: any active server job OR the browser single-flight.
-  const blockedByActive = cloud.hasActiveExport || isExporting;
+  // ONE active export per user: any active server job, the browser single-flight,
+  // OR an in-flight Editframe beta render.
+  const blockedByActive = cloud.hasActiveExport || isExporting || editframe.isExporting;
   // In the settings view, a block means ANOTHER export (this project's active one
   // would be showing the status view instead).
   const anotherExporting = blockedByActive && !exportingNow;
@@ -385,15 +371,86 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
     visualAnalysis: project.visualAnalysis,
   };
 
-  // Explicit, logged export path. The engine is the single source of truth for
-  // which validation + submit pipeline runs — there is no implicit fallback from
-  // one to the other.
-  const exportPath: "cloud" | "browser" = engine === "server" ? "cloud" : "browser";
+  // ── Export handlers ────────────────────────────────────────────────────────
+  // Submit the SERVER (backup) render. Runs when the in-browser engine isn't
+  // available here, and automatically as the fallback when it fails mid-render.
+  const runCloudExport = () => {
+    const v = validateForCloudExport(project);
+    if (!v.ok) {
+      setBlockedWarning(v.error!);
+      return Promise.resolve<{ ok: boolean }>({ ok: false });
+    }
+    // Drop any stale browser job so a prior failure can't bleed into the UI.
+    if (myBrowserJob) clearJob();
+    return cloud.startCloudExport(serverInput).then((r) => {
+      if (r.ok) {
+        console.log("[export-ui:cloud-submit]", { jobId: r.jobId });
+        // Stamp the clip as queued WITH the identity that produced it, so the card
+        // shows progress even if the dialog is closed, and so a later identical
+        // request is recognized as a duplicate.
+        if (clipExport && clipIdentity) {
+          void updateClipExport(clipExport.id, {
+            status: "queued",
+            jobId: r.jobId,
+            identity: clipIdentity,
+          });
+        }
+      } else {
+        console.log("[export-ui:error]", { source: "cloud", code: r.kind ?? "start_failed" });
+        const msg = friendlyExportError(r.kind, r.error);
+        if (msg) setBlockedWarning(msg);
+      }
+      return r;
+    });
+  };
+  // Keep the fallback effect pointed at the latest closure (fresh serverInput/clip).
+  // Updated in an effect (never during render) so the fallback effect below — which
+  // is defined later and therefore runs after this one — always sees the current one.
+  const runCloudExportRef = React.useRef(runCloudExport);
+  React.useEffect(() => {
+    runCloudExportRef.current = runCloudExport;
+  });
 
-  const start = () => {
-    // Client-side lock: a create request is already in flight — ignore extra
-    // clicks so a double-click can't spawn two jobs (the server dedups too).
-    if (cloud.starting) return;
+  // Start the in-browser render (the PRIMARY engine). Same resolution / fps /
+  // moments / effects / range as the server render — it just renders locally and
+  // touches no billing/usage/Firestore job.
+  const runEditframeExport = () =>
+    editframe.startExport({
+      project: {
+        id: project.id,
+        title: project.title,
+        originalVideoUrl: project.originalVideoUrl!,
+        width: project.width ?? 0,
+        height: project.height ?? 0,
+        effects,
+        sourceCrop: project.sourceCrop,
+        visualAnalysis: project.visualAnalysis,
+        // Free-tier watermark, drawn by the shared composeFrame layer (no billing).
+        applyWatermark: plan.tier === "free",
+      },
+      timeline: {
+        moments,
+        sourceDuration,
+        resolution,
+        fps,
+        format,
+        outputFormat: `${canvasSummary} · ${resolution} · ${fps}fps · MP4`,
+      },
+      plan: plan.tier,
+      // When a server backup is available, stay quiet on failure — the fallback
+      // runs automatically and only the final result is surfaced to the user.
+      notifyOnFailure: !canUseCloud,
+    });
+
+  // ── Primary "Export" action ────────────────────────────────────────────────
+  // One button, one intent. Prefer the fast in-browser render; if it can't run or
+  // fails, fall back to the server render automatically. No engine choice shown.
+  const cloudFallbackArmedRef = React.useRef(false);
+  const fallbackHandledRef = React.useRef<string | null>(null);
+
+  const startPrimary = () => {
+    // Ignore extra clicks while a create/start is already in flight.
+    if (cloud.starting || editframe.starting || editframe.isExporting) return;
     // Captions still transcribing → confirm once. Export NEVER creates captions;
     // it only renders caption ops that already exist, so exporting now simply
     // ships without them (they can be re-exported once transcription finishes).
@@ -403,101 +460,75 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
     }
     setBlockedWarning(null);
     cloud.clearError();
-    console.log("[export-ui:path]", { path: exportPath });
 
     // A clip that's already rendering (or already rendered with these exact
-    // settings) must not spawn a second job — the banner offers Download /
-    // Re-export instead.
+    // settings) must not spawn a second job — the banner offers Download / Re-export.
     if (clipExport && clipDecision && clipDecision.kind !== "start") {
       if (clipDecision.kind === "blocked") setBlockedWarning(clipDecision.reason);
       return;
     }
-
-    if (exportPath === "cloud") {
-      // Cloud export is INDEPENDENT of browser codec limitations. We never run
-      // MediaRecorder / canPlayType / audio-decode checks here — the VM worker
-      // ffprobes, normalizes, and decides support. Auth/plan/minutes/active are
-      // enforced server-side (and surfaced from the job/route response).
-      console.log("[export-ui:browser-validation-skipped]", { reason: "cloud-export" });
-      const v = validateForCloudExport(project);
-      if (!v.ok) {
-        console.log("[export-ui:error]", { source: "cloud", code: "precondition" });
-        setBlockedWarning(v.error!);
-        return;
-      }
-      if (blockedByActive) {
-        setBlockedWarning(cloud.alreadyRunningMessage);
-        return;
-      }
-      // Drop any stale browser job so a prior browser failure (e.g. a codec/audio
-      // error) can't bleed into the cloud-export UI for the new job.
-      if (myBrowserJob) clearJob();
-      void cloud.startCloudExport(serverInput).then((r) => {
-        if (r.ok) {
-          console.log("[export-ui:cloud-submit]", { jobId: r.jobId });
-          // Stamp the clip as queued WITH the identity that produced it, so the
-          // card shows progress even if the dialog is closed, and so a later
-          // identical request is recognized as a duplicate.
-          if (clipExport && clipIdentity) {
-            void updateClipExport(clipExport.id, {
-              status: "queued",
-              jobId: r.jobId,
-              identity: clipIdentity,
-            });
-          }
-        } else {
-          console.log("[export-ui:error]", { source: "cloud", code: r.kind ?? "start_failed" });
-          const msg = friendlyExportError(r.kind, r.error);
-          if (msg) setBlockedWarning(msg);
-        }
-      });
-      return;
-    }
-
-    // Browser engine — renders the SELECTED container in the browser. MP4 uses
-    // WebCodecs (Chrome/Edge) and auto-falls back to WebM where unsupported.
-    // Browser codec checks live ONLY on this path.
-    const v = validateForBrowserExport(project, supported);
-    if (!v.ok) {
-      console.log("[export-ui:error]", { source: "browser", code: "precondition" });
-      setBlockedWarning(v.error!);
+    if (!project.originalVideoUrl) {
+      setBlockedWarning("This project has no source video to export.");
       return;
     }
     if (blockedByActive) {
       setBlockedWarning(cloud.alreadyRunningMessage);
       return;
     }
-    const params: ExportRenderParams = {
-      projectId: project.id,
-      projectTitle: project.title,
-      originalVideoUrl: project.originalVideoUrl!,
-      duration: sourceDuration,
-      moments,
-      effects,
-      visualAnalysis: project.visualAnalysis,
-      sourceCrop: project.sourceCrop,
-      resolution,
-      fps,
-      format,
-      container,
-      outputFormat: `${canvasSummary} · ${resolution} · ${fps}fps · ${container === "mp4" ? "MP4" : "WebM"}`,
-    };
-    if (!startExport(params)) {
-      setBlockedWarning(cloud.alreadyRunningMessage);
+
+    if (canUseEditframe) {
+      // Primary path — render in the browser, with the server render armed as an
+      // automatic backup (see the fallback effect below).
+      console.log("[export-ui:path]", {
+        path: "editframe",
+        fallback: canUseCloud ? "cloud" : "none",
+      });
+      cloudFallbackArmedRef.current = canUseCloud;
+      fallbackHandledRef.current = null;
+      const ok = runEditframeExport();
+      if (!ok) {
+        cloudFallbackArmedRef.current = false;
+        setBlockedWarning("An export is already running.");
+      }
       return;
     }
-    if (clipExport && clipIdentity) {
-      void updateClipExport(clipExport.id, {
-        status: "rendering",
-        identity: clipIdentity,
-      });
+
+    if (canUseCloud) {
+      // No in-browser engine here → go straight to the server render.
+      console.log("[export-ui:path]", { path: "cloud" });
+      void runCloudExport();
+      return;
     }
+
+    setBlockedWarning("Export isn't available in this browser. Try Chrome or Edge.");
   };
+
+  // Automatic server backup: when the in-browser render FAILS (not a user cancel),
+  // start the server render once. A completed/canceled render disarms it.
+  React.useEffect(() => {
+    if (!cloudFallbackArmedRef.current) return;
+    const j = myEditframeJob;
+    if (!j) return;
+    if (j.status === "failed") {
+      if (fallbackHandledRef.current === j.id) return;
+      fallbackHandledRef.current = j.id;
+      cloudFallbackArmedRef.current = false;
+      if (canUseCloud) {
+        console.log("[export-ui:fallback]", { from: "editframe", to: "cloud", reason: j.error });
+        editframe.clearJob(); // hide the failed in-browser job; the server render takes over
+        void runCloudExportRef.current();
+      }
+    } else if (j.status === "completed" || j.status === "canceled") {
+      cloudFallbackArmedRef.current = false;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [myEditframeJob?.status, myEditframeJob?.id, canUseCloud]);
 
   const exportAgain = () => {
     cloud.dismiss();
     cloud.clearError();
     clearJob();
+    editframe.clearJob();
     setBlockedWarning(null);
   };
 
@@ -531,13 +562,31 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
     if (!already) downloadCurrent();
   }, [myBrowserJob?.status, myBrowserJob?.id, downloadCurrent]);
 
-  const primaryLabel = cloud.starting
-    ? "Starting export…"
-    : engine === "server"
-      ? "Cloud Export"
-      : container === "mp4"
-        ? "Export MP4"
-        : "Export WebM";
+  // Auto-download the Editframe (MP4) result ONCE — parity with the other engines.
+  const efAutoDl = React.useRef<string | null>(null);
+  const efStatus = editframe.job?.status;
+  const efJobId = editframe.job?.id;
+  const efBlobUrl = editframe.job?.localBlobUrl;
+  const efJobProject = editframe.job?.projectId;
+  const efDownload = editframe.downloadCurrent;
+  React.useEffect(() => {
+    if (efJobProject !== project.id) return;
+    if (efStatus !== "completed" || !efBlobUrl || !efJobId) return;
+    if (efAutoDl.current === efJobId) return;
+    efAutoDl.current = efJobId;
+    let already = false;
+    try {
+      already = window.sessionStorage.getItem(`framevo.editframe.autodl.${efJobId}`) === "1";
+      if (!already) window.sessionStorage.setItem(`framevo.editframe.autodl.${efJobId}`, "1");
+    } catch {
+      /* ignore */
+    }
+    if (!already) efDownload();
+  }, [efStatus, efJobId, efBlobUrl, efJobProject, project.id, efDownload]);
+
+  const primaryBusy = editframe.starting || cloud.starting;
+  const canExportHere = canUseEditframe || canUseCloud;
+  const primaryLabel = primaryBusy ? "Starting export…" : "Export";
 
   return (
     <div className="flex flex-col gap-4 px-5 py-5">
@@ -551,10 +600,18 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
           downloading={view.engine === "server" ? cloud.downloading : false}
           downloadError={view.engine === "server" ? cloud.downloadError : null}
           onDownloadAgain={
-            view.engine === "server" ? cloud.downloadAgain : downloadCurrent
+            view.engine === "server"
+              ? cloud.downloadAgain
+              : view.engine === "editframe"
+                ? editframe.downloadCurrent
+                : downloadCurrent
           }
           onCancel={
-            view.engine === "server" ? () => void cloud.cancelCloudExport() : cancelExport
+            view.engine === "server"
+              ? () => void cloud.cancelCloudExport()
+              : view.engine === "editframe"
+                ? editframe.cancelExport
+                : cancelExport
           }
           onExportAgain={exportAgain}
           onClose={onClose}
@@ -652,36 +709,16 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
 
           {!isPaid && (
             <p className="-mt-1 text-[10.5px] leading-relaxed text-fog/80">
-              {minutes.freeLimitReached
-                ? "You've used your 2 free cloud exports this month. "
-                : "Free exports at 720p. "}
+              Free exports render at 720p with a small watermark.{" "}
               <a
                 href="/pricing"
                 className="font-medium text-violet-300 transition-colors hover:text-violet-200"
               >
                 Upgrade to Pro
               </a>{" "}
-              {minutes.freeLimitReached ? "to export more." : "for 1080p and more."}
+              for 1080p, 60fps, and no watermark.
             </p>
           )}
-
-          <Field label="Format">
-            <Segmented
-              options={["mp4", "webm"] as const}
-              value={container}
-              onChange={setContainer}
-              renderLabel={(c) => (c === "mp4" ? "MP4" : "WebM")}
-            />
-            <p className="mt-1.5 text-[10.5px] leading-relaxed text-fog/80">
-              {container === "mp4"
-                ? mp4NeedsUpgrade
-                  ? "MP4 is a Pro feature — upgrade, or choose WebM to export now."
-                  : engine === "server"
-                    ? "Best quality and compatibility. Prepared automatically — close the dialog and it keeps going."
-                    : "Best quality. Renders in your browser (Chrome or Edge)."
-                : "Renders in your browser. Works everywhere; larger files."}
-            </p>
-          </Field>
 
           {/* Canvas (compact) */}
           <button
@@ -704,20 +741,6 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
               Edit
             </span>
           </button>
-
-          {/* Style — cinematic vignette */}
-          <div className="flex items-center justify-between gap-3 rounded-xl border border-white/10 bg-white/[0.02] px-3.5 py-2.5">
-            <div className="min-w-0">
-              <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-fog/80">
-                Style
-              </div>
-              <div className="text-[12.5px] font-medium text-white">Cinematic vignette</div>
-            </div>
-            <Toggle
-              on={!!project.effectsSettings.vignette}
-              onClick={() => updateEffects("vignette", !project.effectsSettings.vignette)}
-            />
-          </div>
 
           {/* Advanced (collapsed) */}
           <div className="rounded-xl border border-white/10 bg-white/[0.02]">
@@ -763,7 +786,6 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
                   label="Visual effects"
                   value={
                     describeExportEffects(
-                      project.effectsSettings.vignette === true,
                       project.effectsSettings.clickHighlights === true
                     ) || "Clean — no extra effects"
                   }
@@ -771,21 +793,6 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
               </div>
             )}
           </div>
-
-          {/* Block / upgrade messaging */}
-          {mp4NeedsUpgrade && (
-            <div className="flex items-center justify-between gap-2 rounded-xl border border-violet-400/25 bg-violet-500/[0.07] px-4 py-3 text-[12px]">
-              <span className="text-violet-100">
-                MP4 export runs on our servers — a Pro feature.
-              </span>
-              <Link
-                href="/pricing"
-                className="inline-flex shrink-0 items-center gap-1 rounded-full border border-violet-400/30 bg-violet-500/10 px-2.5 py-1 text-[11px] font-semibold text-violet-200 hover:bg-violet-500/20"
-              >
-                Upgrade
-              </Link>
-            </div>
-          )}
 
           {anotherExporting && (
             <Notice tone="amber">{cloud.alreadyRunningMessage}</Notice>
@@ -806,7 +813,7 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
                   onClick={() => {
                     captionsAckRef.current = true;
                     setCaptionsPrompt(false);
-                    start();
+                    startPrimary();
                   }}
                   className="inline-flex items-center rounded-lg border border-amber-300/50 bg-amber-400/20 px-3 py-1.5 text-[12px] font-semibold text-amber-50 transition-colors hover:bg-amber-400/30"
                 >
@@ -823,14 +830,13 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
             </div>
           )}
 
-          {/* Cloud export expectation-setting — it runs server-side and the user
-              is free to leave the page while it renders. */}
-          {engine === "server" && !mp4NeedsUpgrade && (
-            <p className="text-[11px] leading-relaxed text-fog/80">
-              Cloud export renders on our servers and may take a few minutes. You can
-              leave this page — it keeps running and appears under Exports when ready.
-            </p>
-          )}
+          {/* Expectation-setting — the export renders in the background. */}
+          <p className="text-[11px] leading-relaxed text-fog/80">
+            Your export renders in the background — keep editing while it finishes.
+            {canUseEditframe && canUseCloud
+              ? " If it can’t render in this browser, we’ll finish it on our servers automatically."
+              : ""}
+          </p>
 
           {/* ── Bottom action area ────────────────────────────────────────── */}
           <div className="mt-1 flex items-center justify-between gap-3 border-t border-white/[0.06] pt-4">
@@ -841,55 +847,26 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
                   ~{fmtDuration(estRenderSeconds)} to export
                 </div>
               )}
-              {engine === "server" && isPaid && Number.isFinite(minutes.limit) && (
-                <div className="mt-0.5 text-fog/80">
-                  <span className="font-mono tabular-nums text-white/85">{minutes.remaining}</span>
-                  {" / "}
-                  {minutes.limit} min left · ~{estMinutes} this export
-                </div>
-              )}
-              {engine === "server" && !isPaid && (
-                <div className="mt-0.5 text-fog/80">
-                  <span
-                    className={cn(
-                      "font-mono tabular-nums",
-                      minutes.freeLimitReached ? "text-rose-300" : "text-white/85"
-                    )}
-                  >
-                    {minutes.monthlyExportsUsed}
-                  </span>{" "}
-                  of {FREE_MONTHLY_CLOUD_EXPORTS} cloud exports used this month · 720p
-                </div>
-              )}
             </div>
             <div className="flex shrink-0 items-center gap-2">
               <Button onClick={() => onClose?.()} variant="ghost" size="lg">
                 Cancel
               </Button>
-              {mp4NeedsUpgrade || freeCloudLimitReached ? (
-                <Link
-                  href="/pricing"
-                  className="inline-flex h-11 items-center justify-center gap-2 rounded-xl bg-violet-500 px-5 text-sm font-semibold text-white hover:bg-violet-400"
-                >
-                  Upgrade to export more
-                </Link>
-              ) : (
-                <Button
-                  onClick={start}
-                  variant="primary"
-                  size="lg"
-                  leftIcon={
-                    cloud.starting ? (
-                      <Loader2 size={15} className="animate-spin" />
-                    ) : (
-                      <Download size={15} />
-                    )
-                  }
-                  disabled={blockedByActive || cloud.starting || (engine === "browser" && !supported)}
-                >
-                  {primaryLabel}
-                </Button>
-              )}
+              <Button
+                onClick={startPrimary}
+                variant="primary"
+                size="lg"
+                leftIcon={
+                  primaryBusy ? (
+                    <Loader2 size={15} className="animate-spin" />
+                  ) : (
+                    <Download size={15} />
+                  )
+                }
+                disabled={blockedByActive || primaryBusy || !canExportHere}
+              >
+                {primaryLabel}
+              </Button>
             </div>
           </div>
         </>
@@ -977,7 +954,7 @@ function StatusView({
           ) : (
             <p className="text-[11px] text-fog">
               {view.engine === "server"
-                ? "Cloud export runs on our servers — it can take a few minutes. You can close this or leave the page; it keeps going and appears under Exports when ready."
+                ? "This is rendering on our servers — it can take a few minutes. You can close this or leave the page; it keeps going and appears under Exports when ready."
                 : "Runs in the background — you can close this and keep editing."}
             </p>
           )}
@@ -1261,6 +1238,39 @@ function browserView(j: ExportJob): ExportView {
   };
 }
 
+/** Adapt an Editframe beta job to the shared engine-agnostic view. */
+function editframeView(j: EditframeJob): ExportView {
+  const active = j.status === "preparing" || j.status === "rendering";
+  const phase: ExportView["phase"] = active
+    ? "active"
+    : j.status === "completed"
+      ? "ready"
+      : j.status === "failed"
+        ? "failed"
+        : "canceled";
+  const stage: ExportUiStage =
+    j.status === "preparing" ? "preparing" : active ? "rendering" : "ready";
+  const rawPct = Math.round((j.progress ?? 0) * 100);
+  return {
+    engine: "editframe",
+    phase,
+    stage,
+    stageLabel:
+      j.status === "preparing"
+        ? "Preparing"
+        : active
+          ? "Rendering video"
+          : EXPORT_STAGE_LABEL[stage],
+    percent: phase === "ready" ? 100 : stageDisplayPercent(stage, rawPct),
+    indeterminate: isIndeterminateStage(stage),
+    queuePosition: null,
+    isStale: false,
+    jobId: j.id,
+    errorText: j.error,
+    warningText: j.warning,
+  };
+}
+
 // ── Small building blocks ──────────────────────────────────────────────────
 
 /** Compact labels for the progress stepper. */
@@ -1388,28 +1398,6 @@ function Field({
   );
 }
 
-function Toggle({ on, onClick }: { on: boolean; onClick: () => void }) {
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={on}
-      onClick={onClick}
-      className={cn(
-        "relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors duration-150",
-        on ? "bg-violet-500" : "bg-white/[0.08] hover:bg-white/[0.14]"
-      )}
-    >
-      <span
-        className={cn(
-          "inline-block size-4 rounded-full bg-white shadow-sm transition-transform duration-150",
-          on ? "translate-x-[18px]" : "translate-x-[2px]"
-        )}
-      />
-    </button>
-  );
-}
-
 function Notice({ tone, children }: { tone: "amber" | "rose"; children: React.ReactNode }) {
   const c =
     tone === "amber"
@@ -1476,11 +1464,8 @@ function ExportFailureDetails({ job, projectId }: { job: ExportJob; projectId: s
   );
 }
 
-function describeExportEffects(vignette: boolean, clickHighlights: boolean): string {
-  const on: string[] = [];
-  if (vignette) on.push("vignette");
-  if (clickHighlights) on.push("click highlights");
-  return on.join(" · ");
+function describeExportEffects(clickHighlights: boolean): string {
+  return clickHighlights ? "click highlights" : "";
 }
 
 function fmtDuration(seconds: number): string {

@@ -2184,17 +2184,33 @@ export type ExportStatus =
   | "permitted"
   | "exporting"
   | "ready"
-  | "failed";
+  | "failed"
+  | "canceled";
 
 export interface ExportDoc {
   id: string;
   projectId: string;
   projectTitle: string;
   format: ExportFormat;
-  resolution: "1080p" | "4K";
+  resolution: "720p" | "1080p" | "4K";
   fps: 30 | 60;
   /** Output container — "webm" (default) or "mp4". Absent on pre-MP4 docs. */
   container?: "webm" | "mp4";
+  /**
+   * Render engine that produced this record. "editframe" / "browser" render in
+   * the browser; "cloud" is the server worker. Absent on legacy permit-flow docs
+   * (treated as browser).
+   */
+  engine?: "browser" | "editframe" | "cloud";
+  /**
+   * False for in-browser (editframe) renders — the file downloads the moment it
+   * finishes and is NOT kept in storage, so there's no re-download from history.
+   * True/absent for stored renders (permit-flow browser uploads, cloud).
+   */
+  stored?: boolean;
+  /** Output pixel size when known — in-browser records carry it for the format cell. */
+  outputWidth?: number;
+  outputHeight?: number;
   exportUrl?: string;
   storagePath?: string;
   fileSize?: number;

@@ -42,6 +42,8 @@
     "asr:deploy": "node scripts/deploy-asr-worker.mjs"
   },
   "dependencies": {
+    "@editframe/elements": "^0.58.4",
+    "@editframe/react": "^0.58.4",
     "@google-cloud/batch": "^2.3.1",
     "@google-cloud/run": "^3.3.0",
     "@google-cloud/tasks": "^6.2.3",
@@ -52,6 +54,7 @@
     "firebase-admin": "^13.9.0",
     "framer-motion": "^12.38.0",
     "lucide-react": "^1.14.0",
+    "mediabunny": "^1.51.0",
     "mp4-muxer": "^5.2.2",
     "mp4box": "^2.3.0",
     "next": "16.2.6",

@@ -7,6 +7,7 @@ import { Topbar } from "./Topbar";
 import { RecordingProvider } from "@/components/recording/RecordingProvider";
 import { RecordingChrome } from "@/components/recording/RecordingChrome";
 import { ExportProvider } from "@/components/export/ExportProvider";
+import { EditframeExportProvider } from "@/components/export/EditframeExportProvider";
 import { ExportPill } from "@/components/export/ExportPill";
 import { NotificationProvider } from "@/lib/notifications/store";
 import { isEditorRoute } from "@/components/dashboard/real-editor/editor-shell-behavior";
@@ -27,6 +28,7 @@ export function Shell({ children }: { children: React.ReactNode }) {
     <NotificationProvider>
       <RecordingProvider>
         <ExportProvider>
+          <EditframeExportProvider>
           {fullBleed ? (
             <div className="min-h-screen bg-ink">{children}</div>
           ) : (
@@ -40,6 +42,7 @@ export function Shell({ children }: { children: React.ReactNode }) {
           )}
           <RecordingChrome />
           <ExportPill />
+          </EditframeExportProvider>
         </ExportProvider>
       </RecordingProvider>
     </NotificationProvider>

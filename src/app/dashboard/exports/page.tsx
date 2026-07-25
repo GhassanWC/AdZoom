@@ -11,7 +11,9 @@ import {
   AlertCircle,
   Ban,
   Cloud,
+  Monitor,
   Zap,
+  Clock,
   RefreshCw,
 } from "lucide-react";
 import { PageHeader } from "@/components/dashboard/PageHeader";
@@ -30,27 +32,19 @@ import type { ExportDoc } from "@/lib/firebase/schema";
 import { downloadFile, startServerDownload } from "@/lib/download";
 import { cn } from "@/lib/cn";
 
-const TONE: Record<string, string> = {
-  ready: "border-emerald-400/30 bg-emerald-400/10 text-emerald-300",
-  exporting: "border-violet-400/30 bg-violet-400/10 text-violet-300",
-  rendering: "border-violet-400/30 bg-violet-400/10 text-violet-300",
-  uploading: "border-cyan-400/30 bg-cyan-400/10 text-cyan-300",
-  permitted: "border-violet-400/20 bg-violet-400/[0.06] text-fog",
-  queued: "border-white/10 bg-white/[0.03] text-fog",
-  batch_submitted: "border-white/10 bg-white/[0.03] text-fog",
-  failed: "border-rose-400/30 bg-rose-400/10 text-rose-300",
-  canceled: "border-white/10 bg-white/[0.03] text-fog/70",
-};
-
-/** Friendly label for the status pill (raw status → human text). */
-const STATUS_LABEL: Record<string, string> = {
-  batch_submitted: "preparing",
-};
-
-/** A browser export or a cloud export job, normalized for the unified table. */
+/**
+ * The unified engine-agnostic view of one export, whatever produced it:
+ *   • "cloud"     — a server render job (`exportJobs`).
+ *   • "editframe" — an in-browser render, logged for visibility. Not stored, so
+ *                   the row is a record of the activity with no re-download.
+ *   • "browser"   — a legacy permit-flow browser upload (has a stored file).
+ */
 interface UnifiedRow {
   id: string;
   source: "browser" | "cloud";
+  engine?: "browser" | "editframe" | "cloud";
+  /** In-browser renders aren't kept in storage — the row shows no download. */
+  stored?: boolean;
   projectId: string;
   projectTitle: string;
   format: string;
@@ -66,7 +60,7 @@ interface UnifiedRow {
   cancelable: boolean;
   /** Cloud terminal failures can be retried into a fresh job. */
   retryable: boolean;
-  /** Deferred waiting for a global Batch export slot (status pill shows it). */
+  /** Deferred waiting for a global export slot (status pill shows it). */
   waitingForSlot?: boolean;
   // ── Failure diagnostics (cloud) ──
   errorCode?: string;
@@ -74,6 +68,74 @@ interface UnifiedRow {
   failedAt?: number;
   buildVersion?: string;
   workerId?: string;
+}
+
+/**
+ * One visual identity per status: the left glyph, the pill tone, and the label.
+ * Keeping it in one place is what makes every row read the same at a glance.
+ */
+type StatusKind = "ready" | "active" | "queued" | "failed" | "canceled";
+
+function statusKind(status: string): StatusKind {
+  if (status === "ready" || status === "completed") return "ready";
+  if (status === "failed") return "failed";
+  if (status === "canceled") return "canceled";
+  if (status === "queued" || status === "permitted") return "queued";
+  return "active"; // exporting | rendering | uploading | batch_submitted
+}
+
+const STATUS_STYLE: Record<
+  StatusKind,
+  { label: string; pill: string; dot: string; glyph: string; Icon: typeof CheckCircle2; spin?: boolean }
+> = {
+  ready: {
+    label: "Ready",
+    pill: "border-emerald-400/30 bg-emerald-400/10 text-emerald-300",
+    dot: "bg-emerald-400",
+    glyph: "bg-emerald-500/15 text-emerald-300 ring-emerald-400/20",
+    Icon: CheckCircle2,
+  },
+  active: {
+    label: "Rendering",
+    pill: "border-violet-400/30 bg-violet-400/10 text-violet-200",
+    dot: "animate-pulse bg-violet-400",
+    glyph: "bg-violet-500/15 text-violet-300 ring-violet-400/20",
+    Icon: Loader2,
+    spin: true,
+  },
+  queued: {
+    label: "Queued",
+    pill: "border-white/10 bg-white/[0.04] text-fog",
+    dot: "bg-fog/70",
+    glyph: "bg-white/[0.05] text-fog ring-white/10",
+    Icon: Clock,
+  },
+  failed: {
+    label: "Failed",
+    pill: "border-rose-400/30 bg-rose-400/10 text-rose-300",
+    dot: "bg-rose-400",
+    glyph: "bg-rose-500/15 text-rose-300 ring-rose-400/20",
+    Icon: AlertCircle,
+  },
+  canceled: {
+    label: "Canceled",
+    pill: "border-white/10 bg-white/[0.03] text-fog/70",
+    dot: "bg-fog/50",
+    glyph: "bg-white/[0.04] text-fog/70 ring-white/10",
+    Icon: Ban,
+  },
+};
+
+/** Per-status pill text, honoring the "queued for a slot" and "saving" nuances. */
+function pillLabel(row: UnifiedRow): string {
+  if (row.waitingForSlot) return WAITING_FOR_SLOT_MESSAGE;
+  if (row.status === "uploading") return "Saving";
+  if (row.status === "batch_submitted") return "Preparing";
+  const base = STATUS_STYLE[statusKind(row.status)].label;
+  if (row.active && row.source === "cloud" && row.progress > 0) {
+    return `${base} · ${progressPercent(row)}%`;
+  }
+  return base;
 }
 
 /** Build a safe download filename from a project title + extension. */
@@ -93,7 +155,7 @@ function relTime(ms?: number) {
 }
 
 function fmtBytes(bytes?: number) {
-  if (!bytes) return "—";
+  if (!bytes) return null;
   const mb = bytes / (1024 * 1024);
   if (mb >= 1024) return `${(mb / 1024).toFixed(1)} GB`;
   return `${mb.toFixed(1)} MB`;
@@ -106,14 +168,22 @@ function containerLabel(row: ExportDoc): string {
 }
 
 function browserRow(r: ExportDoc): UnifiedRow {
+  const isEditframe = r.engine === "editframe";
   const ext = containerLabel(r);
+  const dims =
+    r.outputWidth && r.outputHeight ? `${r.outputWidth}×${r.outputHeight}` : r.resolution;
+  const format = isEditframe
+    ? `${ext || "MP4"} · ${dims} · ${r.fps}fps`
+    : `${r.format} · ${r.resolution} · ${r.fps}fps${ext ? ` · ${ext}` : ""}`;
   return {
     id: r.id,
     source: "browser",
+    engine: r.engine,
+    stored: r.stored,
     projectId: r.projectId,
     projectTitle: r.projectTitle,
-    format: `${r.format} · ${r.resolution} · ${r.fps}fps${ext ? ` · ${ext}` : ""}`,
-    ext: (ext || "webm").toLowerCase(),
+    format,
+    ext: (ext || "mp4").toLowerCase(),
     size: r.fileSize,
     createdAt: r.createdAt,
     status: r.status,
@@ -123,6 +193,8 @@ function browserRow(r: ExportDoc): UnifiedRow {
     priority: false,
     cancelable: false,
     retryable: false,
+    errorMessage: r.errorMessage,
+    failedAt: r.status === "failed" ? r.completedAt : undefined,
   };
 }
 
@@ -131,6 +203,8 @@ function cloudRow(j: ExportJobView): UnifiedRow {
   return {
     id: j.id,
     source: "cloud",
+    engine: "cloud",
+    stored: true,
     projectId: j.projectId,
     projectTitle: j.projectTitle,
     format: `MP4 · ${j.outputWidth}×${j.outputHeight} · ${j.fps}fps`,
@@ -234,7 +308,6 @@ export default function ExportsPage() {
           return;
         } catch (err) {
           console.warn("[exports] cloud download failed", err);
-          // Fall back to the stored URL if present (best-effort).
           if (row.downloadUrl) window.open(row.downloadUrl, "_blank", "noreferrer");
           return;
         }
@@ -257,155 +330,58 @@ export default function ExportsPage() {
     };
   }, [rows, cloudJobs, job]);
 
+  const readyCount = history.filter((r) => statusKind(r.status) === "ready").length;
+
   return (
     <div className="space-y-6">
       <PageHeader
         eyebrow="Exports"
         title="Export history"
-        subtitle="Every render kept in your workspace. Download anytime."
+        subtitle="Every render you've started — in-browser or on our servers — kept in one place."
       />
 
-      {job && (
-        <div
-          className={cn(
-            "glass flex items-center gap-3 rounded-2xl p-4",
-            job.status === "completed" && "border-emerald-400/20",
-            job.status === "failed" && "border-rose-400/20"
-          )}
-        >
-          <span
-            className={cn(
-              "inline-flex size-9 shrink-0 items-center justify-center rounded-lg",
-              job.status === "completed"
-                ? "bg-emerald-500/15 text-emerald-300"
-                : job.status === "failed"
-                  ? "bg-rose-500/15 text-rose-300"
-                  : job.status === "canceled"
-                    ? "bg-white/[0.06] text-fog"
-                    : "bg-violet-500/15 text-violet-300"
-            )}
-          >
-            {job.status === "completed" ? (
-              <CheckCircle2 size={15} />
-            ) : job.status === "failed" ? (
-              <AlertCircle size={15} />
-            ) : job.status === "canceled" ? (
-              <Ban size={15} />
-            ) : (
-              <Loader2 size={15} className="animate-spin" />
-            )}
-          </span>
-
-          <div className="min-w-0 flex-1">
-            <div className="flex items-center justify-between gap-2">
-              <span className="truncate text-sm font-medium text-white">{job.projectTitle}</span>
-              <span className="font-mono text-[11px] tabular-nums text-fog">
-                {isExporting ? `${Math.round((job.progress || 0) * 100)}%` : ""}
-              </span>
-            </div>
-            <div className="mt-0.5 text-[11px] text-fog">
-              {job.outputFormat} ·{" "}
-              {job.status === "preparing"
-                ? "preparing"
-                : job.status === "rendering"
-                  ? "rendering"
-                  : job.status === "uploading"
-                    ? "saving"
-                    : job.status}{" "}
-              · {relTime(job.startedAt)}
-            </div>
-            {isExporting && (
-              <div className="mt-1.5 h-1 overflow-hidden rounded-full bg-white/[0.06]">
-                <div
-                  className="h-full rounded-full bg-gradient-to-r from-violet-500 to-cyan-400 transition-[width] duration-200"
-                  style={{ width: `${Math.max(2, (job.progress || 0) * 100)}%` }}
-                />
-              </div>
-            )}
-          </div>
-
-          <div className="flex shrink-0 items-center gap-1.5">
-            {isExporting ? (
-              <button
-                onClick={cancelExport}
-                className="rounded-md border border-white/10 bg-white/[0.02] px-2.5 py-1.5 text-[11px] font-medium text-fog transition-colors hover:border-rose-300/40 hover:text-rose-200"
-              >
-                Cancel
-              </button>
-            ) : job.status === "completed" ? (
-              <>
-                <button
-                  onClick={downloadCurrent}
-                  aria-label="Download"
-                  className="inline-flex size-8 items-center justify-center rounded-md border border-emerald-400/30 bg-emerald-400/10 text-emerald-300 transition-colors hover:bg-emerald-400/20"
-                >
-                  <Download size={13} />
-                </button>
-                <button
-                  onClick={clearJob}
-                  aria-label="Dismiss"
-                  className="inline-flex size-8 items-center justify-center rounded-md border border-white/10 bg-white/[0.02] text-fog transition-colors hover:text-white"
-                >
-                  <X size={13} />
-                </button>
-              </>
-            ) : (
-              <button
-                onClick={clearJob}
-                aria-label="Dismiss"
-                className="inline-flex size-8 items-center justify-center rounded-md border border-white/10 bg-white/[0.02] text-fog transition-colors hover:text-white"
-              >
-                <X size={13} />
-              </button>
-            )}
-          </div>
-        </div>
-      )}
+      {job && <LiveJobCard
+        job={job}
+        isExporting={isExporting}
+        onCancel={cancelExport}
+        onDownload={downloadCurrent}
+        onDismiss={clearJob}
+      />}
 
       {!loaded ? (
-        <div className="glass grid place-items-center rounded-2xl p-12 text-sm text-fog">
-          <Loader2 size={14} className="mr-2 inline animate-spin text-violet-300" />
-          Loading exports…
+        <div className="glass grid place-items-center rounded-2xl p-16 text-sm text-fog">
+          <Loader2 size={16} className="mb-3 animate-spin text-violet-300" />
+          Loading your exports…
         </div>
       ) : active.length === 0 && history.length === 0 ? (
-        !job && (
-          <div className="glass rounded-2xl p-12 text-center text-sm text-fog">
-            No exports yet. Open a project and click{" "}
-            <strong className="text-white">Export</strong> to render one.
-          </div>
-        )
+        !job && <EmptyState />
       ) : (
-        <div className="space-y-6">
+        <div className="space-y-8">
           {active.length > 0 && (
-            <Section title="Active" hint="Currently rendering">
-              {active.map((row, i) => (
-                <RowItem
-                  key={`${row.source}:${row.id}`}
-                  row={row}
-                  last={i === active.length - 1}
-                  retryingId={retryingId}
-                  onCancel={cancelCloud}
-                  onRetry={retryCloud}
-                  onDownload={downloadRow}
-                />
-              ))}
-            </Section>
+            <Section
+              title="In progress"
+              hint={`${active.length} rendering now`}
+              rows={active}
+              retryingId={retryingId}
+              onCancel={cancelCloud}
+              onRetry={retryCloud}
+              onDownload={downloadRow}
+            />
           )}
-
           {history.length > 0 && (
-            <Section title="History" hint="Previous exports">
-              {history.map((row, i) => (
-                <RowItem
-                  key={`${row.source}:${row.id}`}
-                  row={row}
-                  last={i === history.length - 1}
-                  retryingId={retryingId}
-                  onCancel={cancelCloud}
-                  onRetry={retryCloud}
-                  onDownload={downloadRow}
-                />
-              ))}
-            </Section>
+            <Section
+              title="History"
+              hint={
+                readyCount > 0
+                  ? `${history.length} total · ${readyCount} ready to download`
+                  : `${history.length} total`
+              }
+              rows={history}
+              retryingId={retryingId}
+              onCancel={cancelCloud}
+              onRetry={retryCloud}
+              onDownload={downloadRow}
+            />
           )}
         </div>
       )}
@@ -413,36 +389,140 @@ export default function ExportsPage() {
   );
 }
 
+// ── Live session card (legacy browser render) ───────────────────────────────
+function LiveJobCard({
+  job,
+  isExporting,
+  onCancel,
+  onDownload,
+  onDismiss,
+}: {
+  job: NonNullable<ReturnType<typeof useExport>["job"]>;
+  isExporting: boolean;
+  onCancel: () => void;
+  onDownload: () => void;
+  onDismiss: () => void;
+}) {
+  const kind = statusKind(job.status === "completed" ? "ready" : job.status);
+  const s = STATUS_STYLE[kind];
+  return (
+    <div
+      className={cn(
+        "glass flex items-center gap-4 rounded-2xl p-4",
+        kind === "ready" && "border-emerald-400/20",
+        kind === "failed" && "border-rose-400/20"
+      )}
+    >
+      <span
+        className={cn(
+          "inline-flex size-10 shrink-0 items-center justify-center rounded-xl ring-1",
+          s.glyph
+        )}
+      >
+        <s.Icon size={17} className={cn(s.spin && "animate-spin")} />
+      </span>
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center justify-between gap-2">
+          <span className="truncate text-sm font-semibold text-white">{job.projectTitle}</span>
+          {isExporting && (
+            <span className="font-mono text-[11px] tabular-nums text-fog">
+              {Math.round((job.progress || 0) * 100)}%
+            </span>
+          )}
+        </div>
+        <div className="mt-0.5 truncate text-[11.5px] text-fog">
+          {job.outputFormat} · {relTime(job.startedAt)}
+        </div>
+        {isExporting && (
+          <div className="mt-2 h-1 overflow-hidden rounded-full bg-white/[0.06]">
+            <div
+              className="h-full rounded-full bg-gradient-to-r from-violet-500 to-cyan-400 transition-[width] duration-200"
+              style={{ width: `${Math.max(2, (job.progress || 0) * 100)}%` }}
+            />
+          </div>
+        )}
+      </div>
+      <div className="flex shrink-0 items-center gap-1.5">
+        {isExporting ? (
+          <ActionBtn label="Cancel export" onClick={onCancel} tone="danger" text="Cancel" />
+        ) : job.status === "completed" ? (
+          <>
+            <ActionBtn label="Download" onClick={onDownload} tone="primary" icon={<Download size={14} />} />
+            <ActionBtn label="Dismiss" onClick={onDismiss} icon={<X size={14} />} />
+          </>
+        ) : (
+          <ActionBtn label="Dismiss" onClick={onDismiss} icon={<X size={14} />} />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function EmptyState() {
+  return (
+    <div className="glass rounded-2xl px-6 py-16 text-center">
+      <span className="mx-auto mb-4 inline-flex size-12 items-center justify-center rounded-2xl bg-violet-500/10 text-violet-300 ring-1 ring-violet-400/20">
+        <Download size={20} />
+      </span>
+      <h3 className="text-base font-semibold text-white">No exports yet</h3>
+      <p className="mx-auto mt-1.5 max-w-sm text-sm text-fog">
+        Open a project and click <strong className="font-medium text-white">Export</strong> — your
+        renders will show up here, ready to download.
+      </p>
+      <Link
+        href="/dashboard/projects"
+        className="mt-5 inline-flex h-10 items-center justify-center rounded-xl bg-violet-500 px-4 text-sm font-semibold text-white transition-colors hover:bg-violet-400"
+      >
+        Go to projects
+      </Link>
+    </div>
+  );
+}
+
+// ── Section (a titled group of rows) ─────────────────────────────────────────
 function Section({
   title,
   hint,
-  children,
+  rows,
+  retryingId,
+  onCancel,
+  onRetry,
+  onDownload,
 }: {
   title: string;
   hint: string;
-  children: React.ReactNode;
+  rows: UnifiedRow[];
+  retryingId: string | null;
+  onCancel: (jobId: string) => void;
+  onRetry: (jobId: string) => void;
+  onDownload: (row: UnifiedRow) => void;
 }) {
   return (
-    <div>
-      <div className="mb-2 flex items-baseline gap-2 px-1">
-        <h3 className="text-[11px] font-semibold uppercase tracking-[0.18em] text-fog">{title}</h3>
+    <section>
+      <div className="mb-3 flex items-baseline gap-2.5 px-1">
+        <h2 className="text-[11px] font-semibold uppercase tracking-[0.2em] text-white/80">
+          {title}
+        </h2>
         <span className="text-[11px] text-fog/60">{hint}</span>
       </div>
       <div className="glass overflow-hidden rounded-2xl">
-        <div className="hidden grid-cols-[1fr_140px_120px_120px_140px_120px] gap-4 border-b border-white/[0.06] px-5 py-3 text-[10px] font-semibold uppercase tracking-[0.18em] text-fog md:grid">
-          <div>Project</div>
-          <div>Format</div>
-          <div>Size</div>
-          <div>Date</div>
-          <div>Status</div>
-          <div />
-        </div>
-        {children}
+        {rows.map((row, i) => (
+          <RowItem
+            key={`${row.source}:${row.id}`}
+            row={row}
+            last={i === rows.length - 1}
+            retryingId={retryingId}
+            onCancel={onCancel}
+            onRetry={onRetry}
+            onDownload={onDownload}
+          />
+        ))}
       </div>
-    </div>
+    </section>
   );
 }
 
+// ── One export row ───────────────────────────────────────────────────────────
 function RowItem({
   row,
   last,
@@ -458,92 +538,108 @@ function RowItem({
   onRetry: (jobId: string) => void;
   onDownload: (row: UnifiedRow) => void;
 }) {
-  const isFailed = row.status === "failed";
+  const kind = statusKind(row.status);
+  const s = STATUS_STYLE[kind];
+  const size = fmtBytes(row.size);
+  const inBrowser = row.engine === "editframe";
+  const canDownload = !!row.downloadUrl || (row.source === "cloud" && row.status === "ready");
+  const isFailed = kind === "failed";
+
   return (
-    <div className={cn(!last && "border-b border-white/[0.04]")}>
-      <div className="grid grid-cols-1 gap-3 px-5 py-4 text-sm md:grid-cols-[1fr_140px_120px_120px_140px_120px] md:items-center md:gap-4 md:py-3">
-        <Link
-          href={`/dashboard/projects/${row.projectId}`}
-          className="truncate font-medium text-white hover:text-violet-300"
+    <div className={cn("transition-colors duration-150 hover:bg-white/[0.015]", !last && "border-b border-white/[0.05]")}>
+      <div className="flex items-center gap-3.5 px-4 py-3.5 sm:px-5">
+        {/* Status glyph */}
+        <span
+          className={cn(
+            "hidden size-9 shrink-0 items-center justify-center rounded-xl ring-1 sm:inline-flex",
+            s.glyph
+          )}
+          aria-hidden
         >
-          {row.projectTitle}
-        </Link>
-        <div className="flex flex-wrap items-center gap-1.5 text-fog">
-          <span>{row.format}</span>
-          {row.source === "cloud" && (
-            <span className="inline-flex items-center gap-1 rounded-full border border-violet-400/25 bg-violet-500/10 px-1.5 py-0.5 text-[9.5px] font-semibold text-violet-200">
-              <Cloud size={9} /> Cloud
-            </span>
-          )}
-          {row.priority && (
-            <span className="inline-flex items-center gap-1 rounded-full border border-amber-300/30 bg-amber-400/10 px-1.5 py-0.5 text-[9.5px] font-semibold text-amber-200">
-              <Zap size={9} /> Priority
-            </span>
-          )}
-        </div>
-        <div className="font-mono text-xs tabular-nums text-fog">{fmtBytes(row.size)}</div>
-        <div className="text-fog">{relTime(row.createdAt)}</div>
-        <div>
-          <span
-            className={cn(
-              "inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-medium",
-              TONE[row.status] ?? TONE.queued
-            )}
-          >
-            <span
-              className={cn(
-                "size-1.5 rounded-full",
-                row.status === "ready" && "bg-emerald-400",
-                (row.status === "exporting" ||
-                  row.status === "rendering" ||
-                  row.status === "uploading" ||
-                  row.status === "batch_submitted") &&
-                  "animate-pulse bg-violet-400",
-                (row.status === "queued" || row.status === "canceled") && "bg-fog",
-                row.status === "failed" && "bg-rose-400"
-              )}
-            />
-            {row.waitingForSlot ? WAITING_FOR_SLOT_MESSAGE : STATUS_LABEL[row.status] ?? row.status}
-            {row.active && row.source === "cloud" && row.progress > 0
-              ? ` ${progressPercent(row)}%`
-              : ""}
-          </span>
-        </div>
-        <div className="flex justify-end gap-1.5">
-          {row.cancelable && (
-            <button
-              onClick={() => void onCancel(row.id)}
-              aria-label="Cancel"
-              className="inline-flex size-8 items-center justify-center rounded-md border border-white/10 bg-white/[0.02] text-fog transition-colors duration-200 hover:border-rose-300/40 hover:text-rose-200"
+          <s.Icon size={15} className={cn(s.spin && "animate-spin")} />
+        </span>
+
+        {/* Title + meta */}
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+            <Link
+              href={`/dashboard/projects/${row.projectId}`}
+              className="truncate text-sm font-semibold text-white transition-colors hover:text-violet-300"
+              dir="auto"
             >
-              <X size={13} />
-            </button>
+              {row.projectTitle || "Untitled"}
+            </Link>
+            {row.source === "cloud" ? (
+              <Badge tone="violet" icon={<Cloud size={9} />}>Cloud</Badge>
+            ) : inBrowser ? (
+              <Badge tone="sky" icon={<Monitor size={9} />}>In-browser</Badge>
+            ) : null}
+            {row.priority && (
+              <Badge tone="amber" icon={<Zap size={9} />}>Priority</Badge>
+            )}
+          </div>
+          <div className="mt-1 flex flex-wrap items-center gap-x-1.5 text-[11.5px] text-fog">
+            <span className="tabular-nums">{row.format}</span>
+            <Dot />
+            <span>{relTime(row.createdAt)}</span>
+            {size && (
+              <>
+                <Dot />
+                <span className="font-mono tabular-nums">{size}</span>
+              </>
+            )}
+            {inBrowser && kind === "ready" && (
+              <>
+                <Dot />
+                <span className="text-fog/60">downloaded when it finished</span>
+              </>
+            )}
+          </div>
+        </div>
+
+        {/* Status pill */}
+        <span
+          className={cn(
+            "hidden shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-medium sm:inline-flex",
+            s.pill
+          )}
+        >
+          <span className={cn("size-1.5 rounded-full", s.dot)} />
+          {pillLabel(row)}
+        </span>
+
+        {/* Actions */}
+        <div className="flex shrink-0 items-center gap-1.5">
+          {row.cancelable && (
+            <ActionBtn
+              label="Cancel export"
+              onClick={() => void onCancel(row.id)}
+              tone="danger"
+              icon={<X size={14} />}
+            />
           )}
           {row.retryable && row.source === "cloud" && (
-            <button
+            <ActionBtn
+              label="Retry export"
               onClick={() => void onRetry(row.id)}
+              tone="primary"
               disabled={retryingId === row.id}
-              aria-label="Retry export"
-              title="Retry export"
-              className="inline-flex size-8 items-center justify-center rounded-md border border-violet-400/30 bg-violet-500/10 text-violet-200 transition-colors duration-200 hover:bg-violet-500/20 disabled:opacity-50"
-            >
-              {retryingId === row.id ? (
-                <Loader2 size={13} className="animate-spin" />
-              ) : (
-                <RefreshCw size={13} />
-              )}
-            </button>
+              icon={
+                retryingId === row.id ? (
+                  <Loader2 size={14} className="animate-spin" />
+                ) : (
+                  <RefreshCw size={14} />
+                )
+              }
+            />
           )}
-          {(row.downloadUrl || (row.source === "cloud" && row.status === "ready")) && (
-            <button
-              type="button"
+          {canDownload && (
+            <ActionBtn
+              label="Download export"
               onClick={() => onDownload(row)}
-              aria-label="Download export"
-              title="Download export"
-              className="inline-flex size-8 items-center justify-center rounded-md border border-white/10 bg-white/[0.02] text-fog transition-colors duration-200 hover:border-white/20 hover:text-white"
-            >
-              <Download size={13} />
-            </button>
+              tone="ready"
+              icon={<Download size={14} />}
+            />
           )}
           {row.downloadUrl && (
             <a
@@ -551,30 +647,120 @@ function RowItem({
               target="_blank"
               rel="noreferrer"
               aria-label="Open in new tab"
-              className="inline-flex size-8 items-center justify-center rounded-md border border-white/10 bg-white/[0.02] text-fog transition-colors duration-200 hover:border-white/20 hover:text-white"
+              title="Open in new tab"
+              className="inline-flex size-8 items-center justify-center rounded-lg border border-white/10 bg-white/[0.02] text-fog transition-colors duration-150 hover:border-white/20 hover:text-white"
             >
-              <ExternalLink size={13} />
+              <ExternalLink size={14} />
             </a>
           )}
         </div>
       </div>
 
-      {/* Failed-row diagnostics — exact reason, not just "failed". */}
+      {/* Mobile status pill (glyph column is hidden on small screens) */}
+      <div className="flex items-center gap-2 px-4 pb-3 sm:hidden">
+        <span
+          className={cn(
+            "inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-medium",
+            s.pill
+          )}
+        >
+          <span className={cn("size-1.5 rounded-full", s.dot)} />
+          {pillLabel(row)}
+        </span>
+      </div>
+
+      {/* Failed-row diagnostics — the exact reason, not just "failed". */}
       {isFailed && (row.errorMessage || row.errorCode) && (
-        <div className="border-t border-rose-400/10 bg-rose-500/[0.03] px-5 py-3">
+        <div className="border-t border-rose-400/10 bg-rose-500/[0.03] px-4 py-3 sm:px-5">
           <div className="flex items-start gap-2 text-[12px] text-rose-100/90">
             <AlertCircle size={13} className="mt-0.5 shrink-0 text-rose-300" />
             <span className="min-w-0">{row.errorMessage || "Export failed."}</span>
           </div>
-          <dl className="mt-2 grid grid-cols-2 gap-x-6 gap-y-1 text-[11px] sm:grid-cols-4">
-            <Meta label="Error code" value={row.errorCode} mono />
-            <Meta label="Failed" value={row.failedAt ? relTime(row.failedAt) : undefined} />
-            <Meta label="Build" value={row.buildVersion} mono />
-            <Meta label="Worker" value={row.workerId} mono />
-          </dl>
+          {(row.errorCode || row.failedAt || row.buildVersion || row.workerId) && (
+            <dl className="mt-2 grid grid-cols-2 gap-x-6 gap-y-1 text-[11px] sm:grid-cols-4">
+              <Meta label="Error code" value={row.errorCode} mono />
+              <Meta label="Failed" value={row.failedAt ? relTime(row.failedAt) : undefined} />
+              <Meta label="Build" value={row.buildVersion} mono />
+              <Meta label="Worker" value={row.workerId} mono />
+            </dl>
+          )}
         </div>
       )}
     </div>
+  );
+}
+
+// ── Small building blocks ────────────────────────────────────────────────────
+function Dot() {
+  return <span className="text-fog/30">·</span>;
+}
+
+function Badge({
+  tone,
+  icon,
+  children,
+}: {
+  tone: "violet" | "sky" | "amber";
+  icon: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  const tones = {
+    violet: "border-violet-400/25 bg-violet-500/10 text-violet-200",
+    sky: "border-sky-400/25 bg-sky-500/10 text-sky-200",
+    amber: "border-amber-300/30 bg-amber-400/10 text-amber-200",
+  } as const;
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[9.5px] font-semibold uppercase tracking-wide",
+        tones[tone]
+      )}
+    >
+      {icon}
+      {children}
+    </span>
+  );
+}
+
+function ActionBtn({
+  label,
+  onClick,
+  icon,
+  text,
+  tone,
+  disabled,
+}: {
+  label: string;
+  onClick: () => void;
+  icon?: React.ReactNode;
+  text?: string;
+  tone?: "primary" | "ready" | "danger";
+  disabled?: boolean;
+}) {
+  const toneCls =
+    tone === "ready"
+      ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-300 hover:bg-emerald-400/20"
+      : tone === "primary"
+        ? "border-violet-400/30 bg-violet-500/10 text-violet-200 hover:bg-violet-500/20"
+        : tone === "danger"
+          ? "border-white/10 bg-white/[0.02] text-fog hover:border-rose-300/40 hover:text-rose-200"
+          : "border-white/10 bg-white/[0.02] text-fog hover:border-white/20 hover:text-white";
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      aria-label={label}
+      title={label}
+      className={cn(
+        "inline-flex h-8 items-center justify-center gap-1.5 rounded-lg border text-[12px] font-medium transition-colors duration-150 disabled:opacity-50",
+        text ? "px-3" : "size-8",
+        toneCls
+      )}
+    >
+      {icon}
+      {text}
+    </button>
   );
 }
 

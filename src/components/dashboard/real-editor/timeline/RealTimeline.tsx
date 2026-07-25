@@ -803,7 +803,10 @@ export function RealTimeline() {
       rows.push({
         id: def.id,
         label: hidden ? `${def.label} (hidden)` : def.label,
-        height: isCamera ? TRACK_HEIGHTS.ai : TRACK_HEIGHTS.overlay,
+        // Camera/zoom pills render at the SAME compact height as every other edit
+        // lane — so a short zoom reads as a horizontal chip (like a cut/speed pill)
+        // instead of a tall vertical bar stretched to fill an 84px lane.
+        height: TRACK_HEIGHTS.overlay,
         count: lane.count,
         interactive: true,
         layerHidden: hidden,
@@ -817,7 +820,7 @@ export function RealTimeline() {
                   <AttentionWaveform
                     curve={attentionCurve}
                     duration={total}
-                    height={TRACK_HEIGHTS.ai}
+                    height={TRACK_HEIGHTS.overlay}
                     variant="full"
                     className="opacity-70"
                   />

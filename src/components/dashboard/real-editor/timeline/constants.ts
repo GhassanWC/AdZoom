@@ -358,14 +358,15 @@ export const MIN_RENDER_DURATION = 0.5;
  * Cinematic track heights.
  *
  * Vertical space is the timeline's scarcest resource — every pixel spent on
- * chrome is a pixel not spent on an edit lane. The camera lane stays tall
- * because it earns it (thumbnail strip + title + intensity bar); everything else
- * is a compact row. There is deliberately NO group-header height any more: lane
- * groups are a data concept (see laneModel.ts), not a row that eats 30px in both
- * columns.
+ * chrome is a pixel not spent on an edit lane. EVERY edit lane — camera/zoom
+ * included — is now a single compact row of the same height, so a short zoom
+ * reads as a horizontal chip like every other edit rather than a tall vertical
+ * bar. There is deliberately NO group-header height any more: lane groups are a
+ * data concept (see laneModel.ts), not a row that eats 30px in both columns.
  */
 export const TRACK_HEIGHTS = {
-  /** Camera / zoom lane — the only lane whose pills show a thumbnail strip. */
+  /** Legacy tall-lane height. The camera/zoom lane now uses `overlay` like every
+   *  other edit lane; kept for reference / any future opt-in tall view. */
   ai: 84,
   user: 84,
   /** Compact height for the cut/speed + per-type overlay lanes (keeps the taller

@@ -71,6 +71,15 @@ export const EVENTS = {
   EXPORT_DOWNLOADED: "export_downloaded",
   EXPORT_CANCELLED: "export_cancelled",
 
+  // ── Editframe beta export (browser-side; SEPARATE lifecycle from the
+  // cloud/browser EXPORT_* events above — never touches cloud minutes/usage) ─
+  EDITFRAME_EXPORT_STARTED: "editframe_export_started",
+  EDITFRAME_EXPORT_COMPLETED: "editframe_export_completed",
+  EDITFRAME_EXPORT_FAILED: "editframe_export_failed",
+  EDITFRAME_EXPORT_CANCELLED: "editframe_export_cancelled",
+  EDITFRAME_UNSUPPORTED_BROWSER: "editframe_unsupported_browser",
+  EDITFRAME_UNSUPPORTED_EDIT: "editframe_unsupported_edit",
+
   // ── Billing ──────────────────────────────────────────────────────────
   UPGRADE_CLICKED: "upgrade_clicked",
   CHECKOUT_STARTED: "checkout_started",
