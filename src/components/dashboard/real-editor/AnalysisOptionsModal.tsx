@@ -35,7 +35,12 @@ import {
 } from "./DirectorBriefFields";
 import type { DirectorBrief } from "@/lib/director/types";
 import type { DirectorRequestForm } from "@/lib/director/request";
-import type { SelectedVideoType } from "@/lib/firebase/schema";
+import type { SelectedVideoType, ZoomPresetId } from "@/lib/firebase/schema";
+import {
+  DEFAULT_ZOOM_PRESET,
+  ZOOM_PRESETS,
+  ZOOM_PRESET_IDS,
+} from "@/lib/timeline/zoom-presets";
 import {
   type ChunkMode,
   CHUNK_MODE_SIZES,
@@ -78,6 +83,22 @@ const EXISTING_EDIT_OPTIONS: SegmentOption<ExistingEditMode>[] = [
       "Remove every AI-generated edit (your manual edits are kept), then generate the selected layers fresh.",
   },
 ];
+
+/**
+ * Zoom style — a PROJECT-level choice, not a per-run one, so it applies to the
+ * edits this run generates AND to every edit already on the timeline (and to the
+ * preview, and to all three exports: they share one camera resolver). It lives
+ * here because "how hard should the camera push?" is the same question as "what
+ * should Framevo generate?", and this is the one dialog that asks it.
+ */
+const ZOOM_STYLE_OPTIONS: SegmentOption<ZoomPresetId>[] = ZOOM_PRESET_IDS.map(
+  (id) => ({
+    value: id,
+    label: ZOOM_PRESETS[id].label,
+    ...(id === DEFAULT_ZOOM_PRESET ? { badge: "Recommended" } : {}),
+    description: ZOOM_PRESETS[id].hint,
+  })
+);
 
 const DETAIL_OPTIONS: SegmentOption<ChunkMode>[] = [
   { value: "fast", label: "Fast", description: `Faster analysis with fewer chunks. · ${CHUNK_MODE_SIZES.fast}s chunks` },
@@ -122,6 +143,8 @@ export function AnalysisOptionsModal({
   onConfirm,
   directorBrief,
   onSaveDirectorBrief,
+  zoomPreset,
+  onSelectZoomPreset,
 }: {
   open: boolean;
   onClose: () => void;
@@ -148,6 +171,13 @@ export function AnalysisOptionsModal({
    * is a brief this run never saw.
    */
   onSaveDirectorBrief: (prompt: string, form: DirectorRequestForm) => Promise<void>;
+  /** The project's zoom style (`effectsSettings.zoomPreset`). */
+  zoomPreset: ZoomPresetId;
+  /**
+   * Persist the zoom style. Applied immediately, like the video type — it
+   * changes what the preview shows, not just what the next run generates.
+   */
+  onSelectZoomPreset: (p: ZoomPresetId) => void;
 }) {
   const [videoType, setVideoType] = React.useState<SelectedVideoType>(initialVideoType);
   // The chosen type's recipe defaults (for "Reset to recipe" + re-seed on switch).
@@ -326,6 +356,28 @@ export function AnalysisOptionsModal({
             a type resets the toggles below to that recipe&apos;s defaults.
           </p>
           <VideoTypePicker value={videoType} onChange={onPickVideoType} />
+        </section>
+
+        {/* ── Zoom style ────────────────────────────────────────────────────
+            One choice, four surfaces: the editor preview, the browser export,
+            the desktop export and the cloud render all resolve the camera
+            through the same table this picks. Individual edits can still
+            override it from the inspector. */}
+        <section className="space-y-3 border-t border-white/[0.06] pt-6">
+          <h3 className="text-[11px] font-semibold uppercase tracking-[0.14em] text-fog">
+            Zoom style
+          </h3>
+          <p className="text-[11.5px] leading-relaxed text-fog/80">
+            How far the camera pushes in and how long it takes to get there.
+            Applies to every zoom in this project — preview and export alike —
+            unless you override a single edit in the inspector.
+          </p>
+          <SegmentedControl
+            value={zoomPreset}
+            onChange={onSelectZoomPreset}
+            options={ZOOM_STYLE_OPTIONS}
+            ariaLabel="How the camera should zoom"
+          />
         </section>
 
         {/* Captions are generated separately via "Generate AI Captions" — no

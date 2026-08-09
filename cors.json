@@ -4,9 +4,17 @@
       "https://framevo.app",
       "https://www.framevo.app",
       "https://adzoom-prod--adzoom-prod.us-east4.hosted.app",
-      "http://localhost:3000"
+      "http://localhost:3000",
+      "framevo://app"
     ],
-    "method": ["GET", "HEAD", "PUT", "POST", "DELETE", "OPTIONS"],
+    "method": [
+      "GET",
+      "HEAD",
+      "PUT",
+      "POST",
+      "DELETE",
+      "OPTIONS"
+    ],
     "responseHeader": [
       "Content-Type",
       "Content-Length",

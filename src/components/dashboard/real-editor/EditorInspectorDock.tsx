@@ -8,6 +8,8 @@ import { readPersistedNumber, writePersistedNumber } from "./timeline/utils";
 import { RealCanvasPanel } from "./RealCanvasPanel";
 import { RealCaptionsPanel } from "./RealCaptionsPanel";
 import { ClipsPanel } from "./ClipsPanel";
+import { DirectorChatPanel } from "./DirectorChatPanel";
+import type { ChatMode } from "@/lib/director/chat";
 import { PresetBrowserPanel } from "./PresetBrowserPanel";
 import { RecipeSummary } from "./RecipeSummary";
 import { AIConfidencePanel } from "./AIConfidencePanel";
@@ -31,6 +33,7 @@ const DEFAULT_FRACTION = 0.6;
 const RAIL_WIDTH = 56;
 
 const TOOL_TITLE: Record<RightTool, string> = {
+  "ai-chat": "Edit with AI",
   canvas: "Canvas",
   captions: "Captions",
   // One presets surface: the library AND the whole-recording Looks (a tab in it).
@@ -72,7 +75,26 @@ function defaultWidthPx(): number {
 /** How long the exit animation runs — must match `.fv-panel-out` in globals.css. */
 const CLOSE_MS = 140;
 
-export function EditorInspectorDock() {
+export function EditorInspectorDock({
+  aiMode = "instant",
+  onAiModeChange,
+  onOpenAnalysisOptions,
+  canAnalyze = true,
+  analyzeBlockedReason,
+}: {
+  /** Instant / Plan for the AI chat — owned by the editor page. */
+  aiMode?: ChatMode;
+  onAiModeChange?: (m: ChatMode) => void;
+  /**
+   * Open the full analysis options dialog. Owned by the editor page (it owns
+   * the dialog), reached from the AI chat's ⚙ — the chat is the front door for
+   * AI edits, and those controls are the room behind it.
+   */
+  onOpenAnalysisOptions?: () => void;
+  /** Whether a first analysis can start — the chat's opening message needs one. */
+  canAnalyze?: boolean;
+  analyzeBlockedReason?: string;
+} = {}) {
   const { activeTool, setActiveTool, project } = useEditorReal();
   const [width, setWidth] = React.useState<number>(() =>
     clampW(readPersistedNumber(WIDTH_KEY, defaultWidthPx()))
@@ -204,8 +226,25 @@ export function EditorInspectorDock() {
         </button>
       </div>
 
-      {/* Body — scrolls internally. */}
-      <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
+      {/* Body — scrolls internally.
+          `ai-chat` opts OUT of that scroll: it pins a composer to the bottom and
+          scrolls only its transcript, which a scrolling ancestor would break by
+          carrying the composer off-screen with the conversation. */}
+      <div
+        className={cn(
+          "min-h-0 flex-1 overscroll-contain",
+          shownTool === "ai-chat" ? "overflow-hidden" : "overflow-y-auto"
+        )}
+      >
+        {shownTool === "ai-chat" && (
+          <DirectorChatPanel
+            mode={aiMode}
+            onModeChange={onAiModeChange ?? (() => {})}
+            onOpenOptions={onOpenAnalysisOptions ?? (() => {})}
+            canAnalyze={canAnalyze}
+            analyzeBlockedReason={analyzeBlockedReason}
+          />
+        )}
         {shownTool === "clips" && <ClipsPanel />}
         {shownTool === "canvas" && <RealCanvasPanel />}
         {shownTool === "captions" && <RealCaptionsPanel />}

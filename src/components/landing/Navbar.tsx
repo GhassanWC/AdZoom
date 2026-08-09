@@ -9,6 +9,7 @@ import { Button } from "@/components/ui/Button";
 import { navLinks } from "@/lib/mockData";
 import { Logo } from "./Logo";
 import { useAuth } from "@/lib/firebase/AuthProvider";
+import { DownloadCta } from "@/components/desktop/DownloadCta";
 
 export function Navbar() {
   const [scrolled, setScrolled] = React.useState(false);
@@ -60,6 +61,9 @@ export function Navbar() {
         </nav>
 
         <div className="hidden items-center gap-3 md:flex">
+          {/* The app is the product; the primary nav action is getting it.
+              Renders nothing on mobile, on Linux, or inside the app itself. */}
+          <DownloadCta placement="navbar" />
           {signedIn ? (
             <Link
               href="/dashboard"
@@ -120,7 +124,14 @@ export function Navbar() {
                   {l.label}
                 </Link>
               ))}
-              <div className="flex gap-3 pt-3">
+              <div className="flex flex-col gap-2 pt-3">
+                <DownloadCta
+                  placement="navbar-mobile-menu"
+                  className="w-full"
+                  onNavigate={() => setOpen(false)}
+                />
+              </div>
+              <div className="flex gap-3 pt-1">
                 {signedIn ? (
                   <Button
                     href="/dashboard"

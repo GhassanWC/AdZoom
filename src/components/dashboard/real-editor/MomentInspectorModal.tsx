@@ -3,7 +3,7 @@
 import * as React from "react";
 import { createPortal } from "react-dom";
 import { X as XIcon, Eye, Trash2, Check } from "lucide-react";
-import { useEditorReal } from "./context";
+import { useActiveMoment, useEditorReal } from "./context";
 import { MomentInspector } from "./MomentInspector";
 import { EditorDialogShell, EditorDialogFooter } from "./EditorDialog";
 import { useMomentReview } from "./useMomentReview";
@@ -46,11 +46,11 @@ export function MomentInspectorModal() {
     inspectorOpen,
     closeInspector,
     selectedMomentId,
-    activeMoment,
     project,
     deleteMoment,
     setCompareBypassId,
   } = useEditorReal();
+  const activeMoment = useActiveMoment();
   const review = useMomentReview();
 
   const moments = project.analysis?.detectedMoments ?? [];

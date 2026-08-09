@@ -5,27 +5,41 @@ import Link from "next/link";
 import { ArrowLeft, Menu, Pencil, Upload } from "lucide-react";
 import { cn } from "@/lib/cn";
 import type { ProjectDoc } from "@/lib/firebase/schema";
-import { updateProject } from "@/lib/firebase/projects";
+import { isCloudOnlyVideo, serverTimestamp, usePlatform, type DocPatch } from "@/lib/platform";
 import { useToast } from "@/components/ui/Toast";
 import { Logo } from "@/components/landing/Logo";
 import { Button } from "@/components/ui/Button";
+import { CloudTransferControl } from "@/components/dashboard/CloudTransferControl";
+import { SyncStatusBadge } from "@/components/dashboard/SyncStatusBadge";
+import { useProjectSyncStatus, useSync } from "@/components/desktop/SyncProvider";
+import { useNavShell } from "@/components/dashboard/nav-shell";
 import { useEditorReal } from "./context";
 
 /**
  * Compact editor-specific top bar for the fullscreen editing workspace —
  * replaces the dashboard Topbar (search / record / notifications stay out of
- * the editor; they're reachable through the nav drawer). Left: menu + logo +
- * back + editable title + status. Right: the single primary Export action.
- * Undo/redo live in the timeline control bar, next to the edits they affect.
+ * the editor). Left: back + editable title + status. Right: the single primary
+ * Export action. Undo/redo live in the timeline control bar, next to the edits
+ * they affect.
+ *
+ * Framevo's navigation is the shell's fixed rail immediately to the left of
+ * this bar, so the logo and the menu button here are the BELOW-`lg` fallback
+ * only — that is the one width at which the rail collapses into a drawer.
  */
 export function EditorTopBar({
-  onOpenNav,
   onExport,
+  onReviewConflict,
 }: {
-  onOpenNav: () => void;
   onExport: () => void;
+  /** Open the conflict resolution sheet. Absent on shells without sync. */
+  onReviewConflict?: (projectId: string) => void;
 }) {
-  const { project, uid } = useEditorReal();
+  const { project, writeProject } = useEditorReal();
+  const platform = usePlatform();
+  const toast = useToast();
+  const sync = useSync();
+  const syncStatus = useProjectSyncStatus(project.id);
+  const navShell = useNavShell();
   const hasAnalysis = (project.analysis?.detectedMoments?.length ?? 0) > 0;
 
   return (
@@ -34,23 +48,36 @@ export function EditorTopBar({
     // above every in-page layer (player controls z-50, pill toolbars z-50)
     // and below the overlay drawers/dialogs (z-118+).
     <header className="sticky top-0 z-[60] flex h-14 shrink-0 items-center gap-2 border-b border-white/[0.06] bg-surface/80 px-3 backdrop-blur-xl sm:gap-3 sm:px-4">
-      {/* Menu — opens the Framevo navigation drawer over the editor. */}
-      <button
-        type="button"
-        onClick={onOpenNav}
-        aria-label="Open Framevo navigation"
-        title="Menu"
-        className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-white/10 bg-white/[0.03] text-fog transition-colors duration-150 hover:border-white/25 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/60"
-      >
-        <Menu size={16} />
-      </button>
+      {/* Menu + logo — hidden from `lg` up, where the shell's rail is showing
+          both a couple of pixels to the left. Rendered only when a shell is
+          actually around us: a menu button that opens nothing is worse than no
+          menu button. */}
+      {navShell && (
+        <>
+          <button
+            type="button"
+            onClick={navShell.openNav}
+            aria-label="Open Framevo navigation"
+            title="Menu"
+            className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-white/10 bg-white/[0.03] text-fog transition-colors duration-150 hover:border-white/25 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/60 lg:hidden"
+          >
+            <Menu size={16} />
+          </button>
 
-      <Link href="/" aria-label="Framevo home" className="hidden shrink-0 sm:block">
-        <Logo />
-      </Link>
+          <Link
+            href={navShell.homeHref}
+            aria-label="Framevo home"
+            className="hidden shrink-0 sm:block lg:hidden"
+          >
+            <Logo />
+          </Link>
+        </>
+      )}
 
+      {/* The website routes to /dashboard/projects; the desktop shell switches
+          screens through the URL hash. The platform owns that difference. */}
       <Link
-        href="/dashboard/projects"
+        href={platform.libraryHref}
         className="inline-flex shrink-0 items-center gap-1.5 rounded-lg px-2 py-1.5 text-[12.5px] font-medium text-fog transition-colors duration-200 hover:bg-white/[0.03] hover:text-white"
       >
         <ArrowLeft size={13} />
@@ -58,8 +85,35 @@ export function EditorTopBar({
       </Link>
 
       <div className="flex min-w-0 flex-1 items-center gap-2.5">
-        <EditableProjectTitle uid={uid} projectId={project.id} title={project.title} />
+        <EditableProjectTitle title={project.title} writeProject={writeProject} />
         <StatusBadge status={headerStatus(project, hasAnalysis)} />
+        {/* Sync sits NEXT TO the analysis status, not merged into it: one is
+            about what the AI did to this video, the other about where the file
+            lives. Collapsing them would make "Exported" and "Sync failed"
+            compete for the same slot. Hidden while up to date — a permanent
+            green tick teaches people to stop reading it. */}
+        <SyncStatusBadge
+          status={syncStatus}
+          hideWhenSynced
+          onRetry={(id: string) => void sync.retry(id)}
+          onReview={onReviewConflict}
+        />
+        {/* And the OTHER half of "where does this live": the recording itself.
+            The badge above is about the timeline, which syncs unasked; this is
+            about gigabytes, which move only when the user says so. */}
+        {/* Shown at EVERY width. It was hidden below `lg`, which took the only
+            way to bring a cloud project's video onto this computer off the
+            screen exactly when the window was small — and a narrow window is
+            not a reason to make a feature unreachable. `shrink-0` keeps it
+            whole; the title beside it truncates instead. Its compact labels
+            ("Download", "Save to cloud") are short enough to sit in an h-14
+            bar without crowding. */}
+        <CloudTransferControl
+          projectId={project.id}
+          cloudOnly={isCloudOnlyVideo(project)}
+          className="shrink-0"
+          onNotice={(message) => toast.info(message)}
+        />
       </div>
 
       <Button
@@ -126,18 +180,18 @@ export function StatusBadge({ status }: { status: HeaderStatus }) {
 /**
  * Inline-editable project title. Renders as a heading-styled button; clicking
  * it (or its pencil affordance) swaps in an input that visually matches the
- * heading, so renaming happens in place. Enter / blur commits via
- * `updateProject`; Escape reverts. The realtime `subscribeProject` listener
- * pushes the saved title back down as `project.title`.
+ * heading, so renaming happens in place. Enter / blur commits through the
+ * editor's platform writer (Firestore on the web, the local library on the
+ * desktop); Escape reverts. The realtime document subscription pushes the saved
+ * title back down as `project.title`.
  */
 export function EditableProjectTitle({
-  uid,
-  projectId,
   title,
+  writeProject,
 }: {
-  uid: string;
-  projectId: string;
   title: string;
+  /** Backend-agnostic writer from the editor context (cloud or local). */
+  writeProject: (patch: DocPatch) => Promise<void>;
 }) {
   const toast = useToast();
   const [editing, setEditing] = React.useState(false);
@@ -167,7 +221,7 @@ export function EditableProjectTitle({
     }
     setSaving(true);
     try {
-      await updateProject(uid, projectId, { title: trimmed });
+      await writeProject({ title: trimmed, updatedAt: serverTimestamp() });
       setEditing(false);
     } catch (err) {
       toast.error(
@@ -179,7 +233,7 @@ export function EditableProjectTitle({
     } finally {
       setSaving(false);
     }
-  }, [value, title, uid, projectId, toast]);
+  }, [value, title, writeProject, toast]);
 
   // Compact type scale — this now lives in the h-14 editor top bar.
   const titleType =

@@ -66,7 +66,11 @@ export function ClickHighlightOverlay({ recipe }: { recipe: RenderRecipe }): Rea
     ctx.clearRect(0, 0, cv.width, cv.height);
     if (!effects.clickHighlights) return;
     const sourceTime = sourceTimeForFrame(segments, frame, fps, recipe.sourceDuration);
-    const { moment } = resolveCameraFrame(recipe.moments, sourceTime, { autoZoom: effects.autoZoom });
+    const { moment } = resolveCameraFrame(recipe.moments, sourceTime, {
+      autoZoom: effects.autoZoom,
+      preset: effects.zoomPreset,
+      speed: effects.zoomSpeed,
+    });
     // Same resolver as compose-frame and the editor preview: this click's own
     // style/size when it has them, the project's otherwise, and null when it
     // shouldn't draw at all.

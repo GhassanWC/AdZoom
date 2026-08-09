@@ -32,6 +32,7 @@ import type { ExportDoc } from "@/lib/firebase/schema";
 import { downloadFile, startServerDownload } from "@/lib/download";
 import { cn } from "@/lib/cn";
 
+import { apiFetch } from "@/lib/platform/api";
 /**
  * The unified engine-agnostic view of one export, whatever produced it:
  *   • "cloud"     — a server render job (`exportJobs`).
@@ -42,7 +43,7 @@ import { cn } from "@/lib/cn";
 interface UnifiedRow {
   id: string;
   source: "browser" | "cloud";
-  engine?: "browser" | "editframe" | "cloud";
+  engine?: "browser" | "editframe" | "cloud" | "desktop";
   /** In-browser renders aren't kept in storage — the row shows no download. */
   stored?: boolean;
   projectId: string;
@@ -228,6 +229,27 @@ function cloudRow(j: ExportJobView): UnifiedRow {
 }
 
 export default function ExportsPage() {
+  return (
+    <div className="space-y-7">
+      <PageHeader
+        eyebrow="Exports"
+        title="Export history"
+        subtitle="Every render you've started — in-browser or on our servers — kept in one place."
+      />
+      <ExportsHistory />
+    </div>
+  );
+}
+
+/**
+ * The history itself, WITHOUT the page header.
+ *
+ * The desktop app puts its own "On this computer" section above this one, and a
+ * page cannot have two titles — before this split, the desktop route rendered
+ * the local files first and the words "Export history" landed halfway down the
+ * screen, under content they did not describe.
+ */
+export function ExportsHistory() {
   const { user, getIdToken } = useAuth();
   const { job, isExporting, cancelExport, downloadCurrent, clearJob } = useExport();
   const [rows, setRows] = React.useState<ExportDoc[]>([]);
@@ -258,7 +280,7 @@ export default function ExportsPage() {
       try {
         const token = await getIdToken();
         if (!token) return;
-        await fetch("/api/export/cancel", {
+        await apiFetch("/api/export/cancel", {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
           body: JSON.stringify({ jobId }),
@@ -279,7 +301,7 @@ export default function ExportsPage() {
       try {
         const token = await getIdToken();
         if (!token) return;
-        const res = await fetch("/api/export/retry", {
+        const res = await apiFetch("/api/export/retry", {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
           body: JSON.stringify({ jobId }),
@@ -334,12 +356,6 @@ export default function ExportsPage() {
 
   return (
     <div className="space-y-6">
-      <PageHeader
-        eyebrow="Exports"
-        title="Export history"
-        subtitle="Every render you've started — in-browser or on our servers — kept in one place."
-      />
-
       {job && <LiveJobCard
         job={job}
         isExporting={isExporting}
@@ -447,11 +463,11 @@ function LiveJobCard({
           <ActionBtn label="Cancel export" onClick={onCancel} tone="danger" text="Cancel" />
         ) : job.status === "completed" ? (
           <>
-            <ActionBtn label="Download" onClick={onDownload} tone="primary" icon={<Download size={14} />} />
-            <ActionBtn label="Dismiss" onClick={onDismiss} icon={<X size={14} />} />
+            <ActionBtn label="Download" onClick={onDownload} tone="primary" icon={<Download size={15} />} />
+            <ActionBtn label="Dismiss" onClick={onDismiss} icon={<X size={15} />} />
           </>
         ) : (
-          <ActionBtn label="Dismiss" onClick={onDismiss} icon={<X size={14} />} />
+          <ActionBtn label="Dismiss" onClick={onDismiss} icon={<X size={15} />} />
         )}
       </div>
     </div>
@@ -499,11 +515,11 @@ function Section({
 }) {
   return (
     <section>
-      <div className="mb-3 flex items-baseline gap-2.5 px-1">
+      <div className="mb-3 flex flex-wrap items-baseline gap-x-3 gap-y-1 px-1">
         <h2 className="text-[11px] font-semibold uppercase tracking-[0.2em] text-white/80">
           {title}
         </h2>
-        <span className="text-[11px] text-fog/60">{hint}</span>
+        <span className="text-[11.5px] text-fog/60">{hint}</span>
       </div>
       <div className="glass overflow-hidden rounded-2xl">
         {rows.map((row, i) => (
@@ -542,26 +558,30 @@ function RowItem({
   const s = STATUS_STYLE[kind];
   const size = fmtBytes(row.size);
   const inBrowser = row.engine === "editframe";
+  // A desktop render is STORED (the app uploads it after rendering), so it is
+  // downloadable like a cloud export — it just did the work on the user's own
+  // machine. Distinguished from "In-browser", which keeps nothing.
+  const onDesktop = row.engine === "desktop";
   const canDownload = !!row.downloadUrl || (row.source === "cloud" && row.status === "ready");
   const isFailed = kind === "failed";
 
   return (
     <div className={cn("transition-colors duration-150 hover:bg-white/[0.015]", !last && "border-b border-white/[0.05]")}>
-      <div className="flex items-center gap-3.5 px-4 py-3.5 sm:px-5">
+      <div className="flex items-center gap-4 px-4 py-4 sm:px-5">
         {/* Status glyph */}
         <span
           className={cn(
-            "hidden size-9 shrink-0 items-center justify-center rounded-xl ring-1 sm:inline-flex",
+            "hidden size-10 shrink-0 items-center justify-center rounded-xl ring-1 sm:inline-flex",
             s.glyph
           )}
           aria-hidden
         >
-          <s.Icon size={15} className={cn(s.spin && "animate-spin")} />
+          <s.Icon size={16} className={cn(s.spin && "animate-spin")} />
         </span>
 
         {/* Title + meta */}
         <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+          <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1.5">
             <Link
               href={`/dashboard/projects/${row.projectId}`}
               className="truncate text-sm font-semibold text-white transition-colors hover:text-violet-300"
@@ -570,15 +590,17 @@ function RowItem({
               {row.projectTitle || "Untitled"}
             </Link>
             {row.source === "cloud" ? (
-              <Badge tone="violet" icon={<Cloud size={9} />}>Cloud</Badge>
+              <Badge tone="violet" icon={<Cloud size={11} />}>Cloud</Badge>
             ) : inBrowser ? (
-              <Badge tone="sky" icon={<Monitor size={9} />}>In-browser</Badge>
+              <Badge tone="sky" icon={<Monitor size={11} />}>In-browser</Badge>
+            ) : onDesktop ? (
+              <Badge tone="sky" icon={<Monitor size={11} />}>Desktop app</Badge>
             ) : null}
             {row.priority && (
-              <Badge tone="amber" icon={<Zap size={9} />}>Priority</Badge>
+              <Badge tone="amber" icon={<Zap size={11} />}>Priority</Badge>
             )}
           </div>
-          <div className="mt-1 flex flex-wrap items-center gap-x-1.5 text-[11.5px] text-fog">
+          <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11.5px] text-fog">
             <span className="tabular-nums">{row.format}</span>
             <Dot />
             <span>{relTime(row.createdAt)}</span>
@@ -600,22 +622,22 @@ function RowItem({
         {/* Status pill */}
         <span
           className={cn(
-            "hidden shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-medium sm:inline-flex",
+            "hidden shrink-0 items-center gap-2 rounded-full border px-3 py-1.5 text-[11.5px] font-medium sm:inline-flex",
             s.pill
           )}
         >
-          <span className={cn("size-1.5 rounded-full", s.dot)} />
+          <span className={cn("size-1.5 shrink-0 rounded-full", s.dot)} />
           {pillLabel(row)}
         </span>
 
         {/* Actions */}
-        <div className="flex shrink-0 items-center gap-1.5">
+        <div className="flex shrink-0 items-center gap-2">
           {row.cancelable && (
             <ActionBtn
               label="Cancel export"
               onClick={() => void onCancel(row.id)}
               tone="danger"
-              icon={<X size={14} />}
+              icon={<X size={15} />}
             />
           )}
           {row.retryable && row.source === "cloud" && (
@@ -626,9 +648,9 @@ function RowItem({
               disabled={retryingId === row.id}
               icon={
                 retryingId === row.id ? (
-                  <Loader2 size={14} className="animate-spin" />
+                  <Loader2 size={15} className="animate-spin" />
                 ) : (
-                  <RefreshCw size={14} />
+                  <RefreshCw size={15} />
                 )
               }
             />
@@ -638,7 +660,7 @@ function RowItem({
               label="Download export"
               onClick={() => onDownload(row)}
               tone="ready"
-              icon={<Download size={14} />}
+              icon={<Download size={15} />}
             />
           )}
           {row.downloadUrl && (
@@ -648,9 +670,9 @@ function RowItem({
               rel="noreferrer"
               aria-label="Open in new tab"
               title="Open in new tab"
-              className="inline-flex size-8 items-center justify-center rounded-lg border border-white/10 bg-white/[0.02] text-fog transition-colors duration-150 hover:border-white/20 hover:text-white"
+              className="inline-flex size-9 items-center justify-center rounded-lg border border-white/10 bg-white/[0.02] text-fog transition-colors duration-150 hover:border-white/20 hover:text-white"
             >
-              <ExternalLink size={14} />
+              <ExternalLink size={15} />
             </a>
           )}
         </div>
@@ -671,13 +693,16 @@ function RowItem({
 
       {/* Failed-row diagnostics — the exact reason, not just "failed". */}
       {isFailed && (row.errorMessage || row.errorCode) && (
-        <div className="border-t border-rose-400/10 bg-rose-500/[0.03] px-4 py-3 sm:px-5">
-          <div className="flex items-start gap-2 text-[12px] text-rose-100/90">
-            <AlertCircle size={13} className="mt-0.5 shrink-0 text-rose-300" />
+        // Indented to start where the row's title starts (glyph + gap + padding),
+        // so the reason reads as belonging to the export above it rather than as
+        // a second, unrelated row.
+        <div className="border-t border-rose-400/10 bg-rose-500/[0.03] px-4 py-3.5 sm:pl-[76px] sm:pr-5">
+          <div className="flex items-start gap-2.5 text-[12.5px] leading-relaxed text-rose-100/90">
+            <AlertCircle size={14} className="mt-[2px] shrink-0 text-rose-300" />
             <span className="min-w-0">{row.errorMessage || "Export failed."}</span>
           </div>
           {(row.errorCode || row.failedAt || row.buildVersion || row.workerId) && (
-            <dl className="mt-2 grid grid-cols-2 gap-x-6 gap-y-1 text-[11px] sm:grid-cols-4">
+            <dl className="mt-3 grid grid-cols-2 gap-x-8 gap-y-2.5 text-[11px] sm:grid-cols-4">
               <Meta label="Error code" value={row.errorCode} mono />
               <Meta label="Failed" value={row.failedAt ? relTime(row.failedAt) : undefined} />
               <Meta label="Build" value={row.buildVersion} mono />
@@ -710,13 +735,18 @@ function Badge({
     amber: "border-amber-300/30 bg-amber-400/10 text-amber-200",
   } as const;
   return (
+    // The icon gets its own breathing room on BOTH sides: `gap-1.5` separates it
+    // from the label, `px-2` keeps it off the pill's edge. At this size a 9px
+    // icon jammed against 9px uppercase text reads as a smudge, not a symbol.
     <span
       className={cn(
-        "inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[9.5px] font-semibold uppercase tracking-wide",
+        "inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2 py-[3px] text-[10px] font-semibold uppercase leading-none tracking-wide",
         tones[tone]
       )}
     >
-      {icon}
+      <span className="shrink-0 [&>svg]:block" aria-hidden>
+        {icon}
+      </span>
       {children}
     </span>
   );
@@ -746,6 +776,10 @@ function ActionBtn({
           ? "border-white/10 bg-white/[0.02] text-fog hover:border-rose-300/40 hover:text-rose-200"
           : "border-white/10 bg-white/[0.02] text-fog hover:border-white/20 hover:text-white";
   return (
+    // Two shapes, one rule: an icon-only button is a 36px square so the glyph
+    // sits centred with equal padding all round; a labelled one gets `px-3.5`
+    // and a `gap-2`, which is the smallest gap at which a 15px icon stops
+    // looking stuck to the first letter of its label.
     <button
       type="button"
       onClick={onClick}
@@ -753,12 +787,16 @@ function ActionBtn({
       aria-label={label}
       title={label}
       className={cn(
-        "inline-flex h-8 items-center justify-center gap-1.5 rounded-lg border text-[12px] font-medium transition-colors duration-150 disabled:opacity-50",
-        text ? "px-3" : "size-8",
+        "inline-flex h-9 items-center justify-center gap-2 rounded-lg border text-[12.5px] font-medium transition-colors duration-150 disabled:opacity-50",
+        text ? "px-3.5" : "size-9",
         toneCls
       )}
     >
-      {icon}
+      {icon && (
+        <span className="shrink-0 [&>svg]:block" aria-hidden>
+          {icon}
+        </span>
+      )}
       {text}
     </button>
   );
@@ -767,8 +805,8 @@ function ActionBtn({
 function Meta({ label, value, mono }: { label: string; value?: string; mono?: boolean }) {
   if (!value) return null;
   return (
-    <div className="flex flex-col">
-      <dt className="text-rose-200/50">{label}</dt>
+    <div className="flex min-w-0 flex-col gap-0.5">
+      <dt className="text-[10.5px] uppercase tracking-wide text-rose-200/45">{label}</dt>
       <dd className={cn("truncate text-rose-100/90", mono && "font-mono")}>{value}</dd>
     </div>
   );

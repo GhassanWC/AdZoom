@@ -7,7 +7,8 @@ interface TooltipProps {
   content: string;
   children: React.ReactNode;
   className?: string;
-  side?: "top" | "bottom";
+  /** `right` is what a vertical icon rail wants — the label sits beside the icon. */
+  side?: "top" | "bottom" | "right";
 }
 
 export function Tooltip({ content, children, className, side = "top" }: TooltipProps) {
@@ -26,9 +27,11 @@ export function Tooltip({ content, children, className, side = "top" }: TooltipP
         <span
           role="tooltip"
           className={cn(
-            "pointer-events-none absolute left-1/2 z-50 -translate-x-1/2 whitespace-nowrap rounded-md border border-white/10 bg-surface/95 px-2.5 py-1.5 text-xs text-white/90 shadow-cinematic backdrop-blur-xl",
-            side === "top" && "bottom-full mb-2",
-            side === "bottom" && "top-full mt-2"
+            "pointer-events-none absolute z-50 whitespace-nowrap rounded-md border border-white/10 bg-surface/95 px-2.5 py-1.5 text-xs text-white/90 shadow-cinematic backdrop-blur-xl",
+            // Vertical sides centre on X; `right` centres on Y instead.
+            side === "top" && "bottom-full left-1/2 mb-2 -translate-x-1/2",
+            side === "bottom" && "left-1/2 top-full mt-2 -translate-x-1/2",
+            side === "right" && "left-full top-1/2 ml-2 -translate-y-1/2"
           )}
         >
           {content}

@@ -11,6 +11,7 @@ import { getFirebase } from "./client";
 import { useAuth } from "./AuthProvider";
 import type { ApiKeyDoc } from "./schema";
 
+import { apiFetch } from "@/lib/platform/api";
 /**
  * Client-side helpers for the API keys section of Settings.
  *
@@ -143,7 +144,7 @@ export async function createApiKeyClient(
   idTokenGetter: () => Promise<string | null>,
   input: { name: string; type: "test" | "live" }
 ): Promise<CreatedApiKey> {
-  const res = await fetch("/api/settings/api-keys", {
+  const res = await apiFetch("/api/settings/api-keys", {
     method: "POST",
     headers: await bearerHeaders(idTokenGetter),
     body: JSON.stringify(input),
@@ -160,7 +161,7 @@ export async function renameApiKeyClient(
   keyId: string,
   name: string
 ): Promise<void> {
-  const res = await fetch(`/api/settings/api-keys/${keyId}`, {
+  const res = await apiFetch(`/api/settings/api-keys/${keyId}`, {
     method: "PATCH",
     headers: await bearerHeaders(idTokenGetter),
     body: JSON.stringify({ name }),
@@ -175,7 +176,7 @@ export async function revokeApiKeyClient(
   idTokenGetter: () => Promise<string | null>,
   keyId: string
 ): Promise<void> {
-  const res = await fetch(`/api/settings/api-keys/${keyId}`, {
+  const res = await apiFetch(`/api/settings/api-keys/${keyId}`, {
     method: "DELETE",
     headers: await bearerHeaders(idTokenGetter),
   });

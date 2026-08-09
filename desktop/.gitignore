@@ -1,0 +1,18 @@
+# Desktop build artifacts — all reproducible from source, none committed.
+node_modules/
+
+# esbuild output (main, preload, render CLI, migrations copy)
+.vite/
+
+# Packaging: staged resources, the packaged app, and the installer
+.resources/
+.asar-src/
+out/
+
+# The renderer's Next build + static export
+renderer/.next/
+renderer/out/
+
+# Playwright
+test-results/
+playwright-report/

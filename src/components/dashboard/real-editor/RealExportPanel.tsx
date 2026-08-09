@@ -21,6 +21,8 @@ import {
   RefreshCw,
   X,
   CheckCircle2,
+  FolderOpen,
+  CloudDownload,
 } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { cn } from "@/lib/cn";
@@ -54,6 +56,14 @@ import {
   useEditframeExport,
   type EditframeJob,
 } from "@/components/export/EditframeExportProvider";
+import {
+  useDesktopExport,
+  type DesktopExportJob,
+} from "@/components/export/DesktopExportProvider";
+import { localMediaId } from "@/lib/platform/desktop/ipc";
+import { useSync } from "@/components/desktop/SyncProvider";
+import { CloudTransferControl } from "@/components/dashboard/CloudTransferControl";
+import type { MediaTransferSnapshot } from "@/lib/platform/types";
 import { browserSupportsEditframe } from "@/lib/export/editframe/browser-support";
 import {
   EXPORT_STAGE_LABEL,
@@ -98,9 +108,9 @@ const FIT_LABEL: Record<FitMode, string> = {
   manual: "Manual",
 };
 
-/** Unified, engine-agnostic view of the export in flight (server VM, browser, or Editframe beta). */
+/** Unified, engine-agnostic view of the export in flight (desktop, server VM, browser, or Editframe beta). */
 type ExportView = {
-  engine: "server" | "browser" | "editframe";
+  engine: "server" | "browser" | "editframe" | "desktop";
   phase: "active" | "ready" | "failed" | "canceled";
   /** Friendly stage for the stepper (Queued → Preparing → Rendering → …). */
   stage: ExportUiStage;
@@ -181,6 +191,36 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
   const cloud = useCloudExport(project.id);
   const { job: bJob, isExporting, cancelExport, clearJob, downloadCurrent } =
     useExport();
+
+  // The desktop app renders LOCALLY with the machine's GPU: same recipe, same
+  // compositor, no upload and no quota. When it's present it is the only engine
+  // that runs — `desktop` is null in a browser, so the web paths below are
+  // untouched.
+  const desktop = useDesktopExport();
+  const canUseDesktop = desktop !== null;
+
+  // ── The file the local render needs ───────────────────────────────────────
+  // A local render reads a file on THIS disk, found through the two-copy rule
+  // (see desktop/src/main/library.ts): a project with a copy here always READS
+  // as the local protocol URL, so an https URL means the copy isn't here yet.
+  //
+  // That is a DOWNLOAD, not a failure. A project synced from another machine
+  // arrives as a timeline in a second and gigabytes never; the dialog says so
+  // up front and offers the transfer, instead of refusing after the click.
+  const sync = useSync();
+  const localMedia = localMediaId(project.originalVideoUrl);
+  const needsLocalMedia = canUseDesktop && !!project.originalVideoUrl && !localMedia;
+  const mediaTransfer = sync.transferFor(project.id);
+  // Read by a click handler after an await, where the rendered value is stale.
+  const mediaTransferRef = React.useRef<MediaTransferSnapshot | null>(mediaTransfer);
+  React.useEffect(() => {
+    mediaTransferRef.current = mediaTransfer;
+  }, [mediaTransfer]);
+  // Pending counts as moving: the job is queued and a worker is about to claim
+  // it, so asking again would only be told "already in progress".
+  const mediaMoving =
+    mediaTransfer?.direction === "download" &&
+    (mediaTransfer.state === "active" || mediaTransfer.state === "pending");
 
   const editframe = useEditframeExport();
   const editframeEnabled = process.env.NEXT_PUBLIC_EDITFRAME_EXPORT_ENABLED === "true";
@@ -288,6 +328,9 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
   const sView = serverView(cloud);
   const bView = myBrowserJob ? browserView(myBrowserJob) : null;
   const efView = myEditframeJob ? editframeView(myEditframeJob) : null;
+  const myDesktopJob =
+    desktop?.job && desktop.job.projectId === project.id ? desktop.job : null;
+  const dView = myDesktopJob ? desktopView(myDesktopJob) : null;
 
   // The primary flow only uses the in-browser (editframe) + server (cloud)
   // engines. A legacy MediaRecorder/WebM browser job may still exist from a prior
@@ -300,13 +343,15 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
   // server export is NOT a result here — it's offered as a manual "previous
   // export" in the settings view, never an auto-downloading "Export ready".
   const activeView =
-    sView?.phase === "active"
-      ? sView
-      : efView?.phase === "active"
-        ? efView
-        : browserViewForUi?.phase === "active"
-          ? browserViewForUi
-          : null;
+    dView?.phase === "active"
+      ? dView
+      : sView?.phase === "active"
+        ? sView
+        : efView?.phase === "active"
+          ? efView
+          : browserViewForUi?.phase === "active"
+            ? browserViewForUi
+            : null;
   const serverResult =
     sView && sView.phase !== "active" && cloud.isSessionResult ? sView : null;
   // A FAILED in-browser render is never surfaced when a server backup is available
@@ -316,7 +361,9 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
   const efResult = efView && !(efView.phase === "failed" && canUseCloud) ? efView : null;
   // Editframe's job is always this session's (provider state) — surface its
   // terminal result ahead of a stale browser job.
-  const resultView = serverResult ?? efResult ?? browserViewForUi ?? null;
+  // The local render owns the result whenever it ran — it is the only engine
+  // active in the desktop app, and its file is already on the user's disk.
+  const resultView = dView ?? serverResult ?? efResult ?? browserViewForUi ?? null;
   const view: ExportView | null = activeView ?? resultView;
   const showStatus = !!view;
   const exportingNow = view?.phase === "active";
@@ -351,7 +398,8 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
 
   // ONE active export per user: any active server job, the browser single-flight,
   // OR an in-flight Editframe beta render.
-  const blockedByActive = cloud.hasActiveExport || isExporting || editframe.isExporting;
+  const blockedByActive =
+    cloud.hasActiveExport || isExporting || editframe.isExporting || !!desktop?.isExporting;
   // In the settings view, a block means ANOTHER export (this project's active one
   // would be showing the status view instead).
   const anotherExporting = blockedByActive && !exportingNow;
@@ -447,10 +495,106 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
   // fails, fall back to the server render automatically. No engine choice shown.
   const cloudFallbackArmedRef = React.useRef(false);
   const fallbackHandledRef = React.useRef<string | null>(null);
+  /** An "Export" click that is waiting on the source video to arrive here. */
+  const exportAfterDownloadRef = React.useRef(false);
+
+  /**
+   * The video is still only in the cloud. Ask for it, and REMEMBER that an
+   * export is waiting on the other side — the effect below starts the render
+   * the moment the file lands, so one click on "Export" means one export.
+   */
+  const requestSourceDownload = () => {
+    if (!sync.available) {
+      setBlockedWarning(
+        "This project's video isn't stored on this computer, so it can't be exported locally."
+      );
+      return;
+    }
+    exportAfterDownloadRef.current = true;
+    setBlockedWarning(null);
+    // Already moving → nothing to ask for; the arm above is the whole job.
+    if (mediaMoving) return;
+    void (async () => {
+      try {
+        const result = await sync.downloadMedia(project.id);
+        if (result.queued) return;
+        // A refusal is information ("never uploaded", "not signed in", "already
+        // in progress"). Only the first kind means no file is coming — and only
+        // then must the arm be dropped, or the dialog would wait forever.
+        const live = mediaTransferRef.current;
+        const stillComing =
+          live?.direction === "download" && (live.state === "active" || live.state === "pending");
+        if (stillComing) return;
+        exportAfterDownloadRef.current = false;
+        setBlockedWarning(
+          result.reason ?? "This project's video couldn't be copied to this computer."
+        );
+      } catch (err) {
+        exportAfterDownloadRef.current = false;
+        setBlockedWarning(
+          err instanceof Error ? err.message : "That didn't work. Please try again."
+        );
+      }
+    })();
+  };
+
+  /**
+   * The LOCAL render (desktop app). Same moments, same effects, same resolution
+   * and fps as every other engine — `serializeRecipeInput` produces exactly the
+   * snapshot the cloud job stores, and the main process feeds it to the shared
+   * render core. The user picks where the file goes; nothing is uploaded.
+   */
+  const runDesktopExport = async (): Promise<boolean> => {
+    if (!desktop) return false;
+    const mediaId = localMediaId(project.originalVideoUrl);
+    if (!mediaId) {
+      requestSourceDownload();
+      return false;
+    }
+    return desktop.startExport({
+      projectId: project.id,
+      projectTitle: project.title,
+      mediaId,
+      sourceWidth: project.width ?? 0,
+      sourceHeight: project.height ?? 0,
+      sourceDuration,
+      moments,
+      effects,
+      visualAnalysis: project.visualAnalysis,
+      sourceCrop: project.sourceCrop,
+      // The local render is the user's own machine and their own file; the
+      // free-tier watermark rule still follows the plan, exactly as the
+      // in-browser engine does.
+      applyWatermark: plan.tier === "free",
+      resolution,
+      fps,
+      format,
+    });
+  };
+
+  // The download landed: main attached the file and re-broadcast the document,
+  // so `originalVideoUrl` now reads as the local protocol URL. Finish the export
+  // the user already asked for.
+  React.useEffect(() => {
+    if (!exportAfterDownloadRef.current || !localMedia) return;
+    exportAfterDownloadRef.current = false;
+    setBlockedWarning(null);
+    void runDesktopExport();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [localMedia]);
+
+  // ...and the other ending: the transfer parked. DERIVED, not stored — the
+  // reason belongs to the transfer, and the pending export stays armed, so the
+  // "Try again" the banner already offers finishes what the user started.
+  const mediaDownloadError =
+    mediaTransfer?.direction === "download" && mediaTransfer.state === "failed"
+      ? (mediaTransfer.lastError ?? "The download didn't finish.")
+      : null;
 
   const startPrimary = () => {
     // Ignore extra clicks while a create/start is already in flight.
     if (cloud.starting || editframe.starting || editframe.isExporting) return;
+    if (desktop?.starting || desktop?.isExporting) return;
     // Captions still transcribing → confirm once. Export NEVER creates captions;
     // it only renders caption ops that already exist, so exporting now simply
     // ships without them (they can be re-exported once transcription finishes).
@@ -473,6 +617,15 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
     }
     if (blockedByActive) {
       setBlockedWarning(cloud.alreadyRunningMessage);
+      return;
+    }
+
+    if (canUseDesktop) {
+      // Desktop app — render locally with the machine's GPU. There is no cloud
+      // fallback to arm: a local render needs no account, no quota and no
+      // network, so falling back to the server would be a downgrade.
+      console.log("[export-ui:path]", { path: "desktop" });
+      void runDesktopExport();
       return;
     }
 
@@ -529,6 +682,7 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
     cloud.clearError();
     clearJob();
     editframe.clearJob();
+    desktop?.clearJob();
     setBlockedWarning(null);
   };
 
@@ -584,9 +738,19 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
     if (!already) efDownload();
   }, [efStatus, efJobId, efBlobUrl, efJobProject, project.id, efDownload]);
 
-  const primaryBusy = editframe.starting || cloud.starting;
-  const canExportHere = canUseEditframe || canUseCloud;
-  const primaryLabel = primaryBusy ? "Starting export…" : "Export";
+  // A transfer in flight is a busy state like any other start: the render is
+  // genuinely under way, it is just moving bytes before it can move frames.
+  const waitingOnSource = needsLocalMedia && mediaMoving;
+  const primaryBusy =
+    editframe.starting || cloud.starting || !!desktop?.starting || waitingOnSource;
+  // The desktop app renders locally, so it needs neither the browser codec
+  // support the in-browser engine requires nor the cloud feature flag.
+  const canExportHere = canUseDesktop || canUseEditframe || canUseCloud;
+  const primaryLabel = waitingOnSource
+    ? "Downloading video…"
+    : primaryBusy
+      ? "Starting export…"
+      : "Export";
 
   return (
     <div className="flex flex-col gap-4 px-5 py-5">
@@ -599,19 +763,26 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
           downloadStarted={view.engine === "server" ? cloud.downloadStarted : true}
           downloading={view.engine === "server" ? cloud.downloading : false}
           downloadError={view.engine === "server" ? cloud.downloadError : null}
+          // A local export is already a file on disk — "download" becomes
+          // "show me where it went".
+          downloadLabel={view.engine === "desktop" ? "Show in folder" : undefined}
           onDownloadAgain={
-            view.engine === "server"
-              ? cloud.downloadAgain
-              : view.engine === "editframe"
-                ? editframe.downloadCurrent
-                : downloadCurrent
+            view.engine === "desktop"
+              ? () => desktop?.revealOutput()
+              : view.engine === "server"
+                ? cloud.downloadAgain
+                : view.engine === "editframe"
+                  ? editframe.downloadCurrent
+                  : downloadCurrent
           }
           onCancel={
-            view.engine === "server"
-              ? () => void cloud.cancelCloudExport()
-              : view.engine === "editframe"
-                ? editframe.cancelExport
-                : cancelExport
+            view.engine === "desktop"
+              ? () => desktop?.cancelExport()
+              : view.engine === "server"
+                ? () => void cloud.cancelCloudExport()
+                : view.engine === "editframe"
+                  ? editframe.cancelExport
+                  : cancelExport
           }
           onExportAgain={exportAgain}
           onClose={onClose}
@@ -797,6 +968,45 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
           {anotherExporting && (
             <Notice tone="amber">{cloud.alreadyRunningMessage}</Notice>
           )}
+
+          {/* ── The video is still in the cloud ───────────────────────────────
+              Stated BEFORE the click, not as the result of one: the transfer
+              can take minutes, so "press Export and find out" is the wrong
+              order. Pressing Export from here starts the download and the
+              render follows automatically once the file is on this disk. */}
+          {needsLocalMedia && (
+            <div className="rounded-xl border border-white/10 bg-white/[0.02] px-3.5 py-3 text-[12px]">
+              <div className="flex items-start gap-2">
+                <CloudDownload size={13} className="mt-0.5 shrink-0 text-violet-300" />
+                <div className="min-w-0 flex-1">
+                  <p className="font-medium text-white">
+                    This project’s video is only in the cloud.
+                  </p>
+                  <p className="mt-0.5 leading-relaxed text-fog">
+                    {sync.available
+                      ? "Framevo copies it to this computer first, then renders here — nothing is uploaded and no export minutes are used."
+                      : "Sign in to bring it onto this computer, then export."}
+                  </p>
+                  {mediaDownloadError && (
+                    <p className="mt-1 leading-relaxed text-rose-200/90">
+                      {mediaDownloadError}
+                    </p>
+                  )}
+                  {sync.available && (
+                    <div className="mt-2">
+                      <CloudTransferControl
+                        projectId={project.id}
+                        cloudOnly
+                        variant="bar"
+                        onNotice={(message) => setBlockedWarning(message)}
+                      />
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+
           {blockedWarning && <Notice tone="rose">{blockedWarning}</Notice>}
 
           {/* Captions still transcribing — confirm before exporting without them. */}
@@ -884,6 +1094,7 @@ function StatusView({
   downloadStarted,
   downloading,
   downloadError,
+  downloadLabel,
   onDownloadAgain,
   onCancel,
   onExportAgain,
@@ -896,6 +1107,8 @@ function StatusView({
   downloadStarted: boolean;
   downloading: boolean;
   downloadError?: string | null;
+  /** Overrides the primary action's label (the desktop reveals, not downloads). */
+  downloadLabel?: string;
   onDownloadAgain: () => void;
   onCancel: () => void;
   onExportAgain: () => void;
@@ -981,9 +1194,11 @@ function StatusView({
             Export ready
           </div>
           <p className="text-[11.5px] text-emerald-100/85">
-            {downloadStarted
-              ? "Download started. If it didn’t begin, use Download again."
-              : "Your video is ready."}
+            {downloadLabel
+              ? "Your video was saved to the folder you chose."
+              : downloadStarted
+                ? "Download started. If it didn’t begin, use Download again."
+                : "Your video is ready."}
           </p>
           {view.warningText && <Notice tone="amber">{view.warningText}</Notice>}
           {downloadError && <Notice tone="amber">{downloadError}</Notice>}
@@ -993,13 +1208,22 @@ function StatusView({
               variant="primary"
               size="lg"
               disabled={downloading}
-              leftIcon={downloading ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
+              leftIcon={
+                downloading ? (
+                  <Loader2 size={14} className="animate-spin" />
+                ) : downloadLabel ? (
+                  <FolderOpen size={14} />
+                ) : (
+                  <Download size={14} />
+                )
+              }
             >
-              {downloading
-                ? "Starting download…"
-                : downloadStarted
-                  ? "Download again"
-                  : "Download MP4"}
+              {downloadLabel ??
+                (downloading
+                  ? "Starting download…"
+                  : downloadStarted
+                    ? "Download again"
+                    : "Download MP4")}
             </Button>
             <Button onClick={onExportAgain} variant="ghost" size="lg">
               Export again
@@ -1239,6 +1463,45 @@ function browserView(j: ExportJob): ExportView {
 }
 
 /** Adapt an Editframe beta job to the shared engine-agnostic view. */
+/**
+ * The LOCAL (desktop) render, mapped onto the same view model as every other
+ * engine so the panel's stepper, progress bar, error block and cancel button
+ * work unchanged. `encoding` is reported as "rendering" for the stepper — the
+ * two overlap continuously in a piped render, and a separate step would show a
+ * progress bar snapping backwards.
+ */
+function desktopView(j: DesktopExportJob): ExportView {
+  const active = j.status === "preparing" || j.status === "rendering" || j.status === "encoding";
+  const phase: ExportView["phase"] = active
+    ? "active"
+    : j.status === "completed"
+      ? "ready"
+      : j.status === "failed"
+        ? "failed"
+        : "canceled";
+  const stage: ExportUiStage =
+    j.status === "preparing" ? "preparing" : active ? "rendering" : "ready";
+  const rawPct = Math.round((j.progress ?? 0) * 100);
+  return {
+    engine: "desktop",
+    phase,
+    stage,
+    stageLabel:
+      j.status === "preparing"
+        ? "Preparing"
+        : active
+          ? `Rendering video${j.encoder && j.encoder !== "libx264" ? " (GPU)" : ""}`
+          : EXPORT_STAGE_LABEL[stage],
+    percent: phase === "ready" ? 100 : stageDisplayPercent(stage, rawPct),
+    indeterminate: isIndeterminateStage(stage) && rawPct === 0,
+    queuePosition: null,
+    isStale: false,
+    jobId: j.id,
+    errorText: j.error,
+    warningText: j.warning,
+  };
+}
+
 function editframeView(j: EditframeJob): ExportView {
   const active = j.status === "preparing" || j.status === "rendering";
   const phase: ExportView["phase"] = active

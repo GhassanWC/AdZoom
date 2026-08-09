@@ -41,8 +41,13 @@ export function materializeProject(
     selectedVideoType: (data.selectedVideoType as ProjectDoc["selectedVideoType"]) ?? undefined,
     analysis: (data.analysis as ProjectDoc["analysis"]) ?? undefined,
     visualAnalysis: (data.visualAnalysis as ProjectDoc["visualAnalysis"]) ?? undefined,
-    effectsSettings:
-      (data.effectsSettings as ProjectDoc["effectsSettings"]) ?? DEFAULT_EFFECTS_SETTINGS,
+    // Merged onto the defaults, not substituted for them: a doc written before a
+    // field existed (e.g. `zoomPreset`) must still read back the current default
+    // rather than `undefined`, or every renderer silently falls back on its own.
+    effectsSettings: {
+      ...DEFAULT_EFFECTS_SETTINGS,
+      ...((data.effectsSettings as Partial<ProjectDoc["effectsSettings"]>) ?? {}),
+    },
     selectedPresetId: (data.selectedPresetId as string) ?? undefined,
     exportUrl: (data.exportUrl as string) ?? undefined,
     interactionScope: (data.interactionScope as ProjectDoc["interactionScope"]) ?? undefined,
@@ -68,6 +73,13 @@ export function materializeProject(
     // layer visible, which is what every project written before this field had.
     timelineLayers:
       (data.timelineLayers as ProjectDoc["timelineLayers"]) ?? undefined,
+    // Sync bookkeeping. These MUST be carried through: the desktop's
+    // compare-and-set push reads `rev` off the materialized document, so
+    // dropping it here would make every push look like it was composed against
+    // revision 0 and turn every concurrent edit into a false conflict.
+    rev: typeof data.rev === "number" ? data.rev : undefined,
+    lastWriterDeviceId: (data.lastWriterDeviceId as string) ?? undefined,
+    lastOpId: (data.lastOpId as string) ?? undefined,
     createdAt: tsMs(data.createdAt) ?? Date.now(),
     updatedAt: tsMs(data.updatedAt) ?? Date.now(),
   };

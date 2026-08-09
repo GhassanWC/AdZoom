@@ -8,6 +8,8 @@ import { Button } from "@/components/ui/Button";
 import { cn } from "@/lib/cn";
 import { useEditorReal } from "./context";
 import { useDebugParam } from "./use-debug-param";
+import { useLiveValue } from "./useLiveValue";
+import { COMMIT_PROFILES } from "./live-commit";
 import {
   resolveOutputCanvas,
   resolveCanvasDims,
@@ -247,24 +249,16 @@ export function RealCanvasPanel() {
               ))}
             </div>
             {bgEnabled && current.backgroundMode === "solid" && (
-              <div className="mt-2 flex items-center gap-2">
-                <input
-                  type="color"
-                  aria-label="Background color"
-                  value={current.backgroundColor ?? "#000000"}
-                  onChange={(e) =>
-                    writeOc({
-                      ...current,
-                      backgroundMode: "solid",
-                      backgroundColor: e.target.value,
-                    })
-                  }
-                  className="h-8 w-12 cursor-pointer rounded-md border border-white/10 bg-transparent"
-                />
-                <span className="font-mono text-[11px] text-fog">
-                  {(current.backgroundColor ?? "#000000").toUpperCase()}
-                </span>
-              </div>
+              <BackgroundColorField
+                value={current.backgroundColor ?? "#000000"}
+                onChange={(hex) =>
+                  writeOc({
+                    ...current,
+                    backgroundMode: "solid",
+                    backgroundColor: hex,
+                  })
+                }
+              />
             )}
             {!bgEnabled && (
               <p className="mt-2 text-[10.5px] leading-relaxed text-fog/80">
@@ -461,5 +455,39 @@ function FitDiagram({ mode, active }: { mode: FitMode; active: boolean }) {
         </>
       )}
     </svg>
+  );
+}
+
+/**
+ * Canvas background colour. The OS colour picker streams `change` events as the
+ * user drags through the gradient, and this one persists to the project — so a
+ * raw controlled input wrote the document dozens of times per second and the
+ * swatch lagged the cursor. Local while dragging, persisted on the drag cadence.
+ */
+function BackgroundColorField({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (hex: string) => void;
+}) {
+  const live = useLiveValue(value, onChange, COMMIT_PROFILES.drag);
+  return (
+    <div className="mt-2 flex items-center gap-2">
+      <input
+        type="color"
+        aria-label="Background color"
+        value={live.value}
+        onChange={(e) => live.set(e.target.value)}
+        onPointerDown={live.begin}
+        onPointerUp={live.end}
+        onPointerCancel={live.end}
+        onBlur={live.end}
+        className="h-8 w-12 cursor-pointer rounded-md border border-white/10 bg-transparent"
+      />
+      <span className="font-mono text-[11px] text-fog">
+        {live.value.toUpperCase()}
+      </span>
+    </div>
   );
 }

@@ -27,13 +27,22 @@ import {
   Shuffle,
   BadgeCheck,
 } from "lucide-react";
-import { useEditorReal } from "./context";
+import { useActiveMoment, useEditorReal } from "./context";
+import { useClockRef } from "./playback-clock";
+import { useRenderCount } from "@/lib/perf/render-probe";
 import { MenuPopover, useMenuPopover } from "./MenuPopover";
 import { DirectionalPresetRow } from "./DirectionalPresetRow";
 import { Slider } from "@/components/ui/Slider";
 import { Toggle } from "@/components/ui/Toggle";
+import { LiveValueScope, useLiveValue } from "./useLiveValue";
+import { COMMIT_PROFILES } from "./live-commit";
 import { cn } from "@/lib/cn";
 import { seedKeyframes, CAMERA_SPEED_DEFAULT } from "@/lib/timeline/camera";
+import {
+  DEFAULT_ZOOM_PRESET,
+  ZOOM_PRESETS,
+  ZOOM_PRESET_IDS,
+} from "@/lib/timeline/zoom-presets";
 import {
   cropBoxFor,
   outputDurationFor,
@@ -267,22 +276,22 @@ function disabledHint(t: EffectType): string {
 }
 
 export function MomentInspector({ nav }: { nav?: MomentReviewNav } = {}) {
+  useRenderCount("inspector");
   const {
     project,
     selectedMomentId,
-    activeMoment,
     updateMoment,
     deleteMoment,
     duplicateMoment,
     setMomentEnabled,
     layers,
     setLayerVisible,
-    currentTime,
     duration,
     seek,
     interactions,
     interactionsLoading,
   } = useEditorReal();
+  const activeMoment = useActiveMoment();
 
   const moments = project.analysis?.detectedMoments ?? [];
   const sourceAspect =
@@ -346,7 +355,17 @@ export function MomentInspector({ nav }: { nav?: MomentReviewNav } = {}) {
     // No own surface — the floating dialog provides the solid background,
     // border + shadow. Keeping this transparent avoids a translucent
     // card-on-panel "washed out" look.
-    <div>
+    //
+    // SCOPED BY EDIT ID — load-bearing, not cosmetic. The controls below hold
+    // local drafts and persist them a beat later (see useLiveValue). When the
+    // selection changes without the user touching the control — the review nav,
+    // or the playhead crossing into another edit during playback — a draft still
+    // in flight would otherwise be committed against the edit that got selected
+    // NEXT. The scope makes each control flush to its own edit first.
+    //
+    // Deliberately NOT `key={moment.id}`: remounting also fixes the write, but
+    // it destroys focus and the caret mid-word, which is the worse bug.
+    <LiveValueScope id={moment.id}>
       {/* ── Compact header ─────────────────────────────────────────────── */}
       <Header
         moment={moment}
@@ -500,7 +519,6 @@ export function MomentInspector({ nav }: { nav?: MomentReviewNav } = {}) {
             >
               <KeyframeEditor
                 moment={moment}
-                currentTime={currentTime}
                 onChange={(keyframes) => updateMoment(moment.id, { keyframes })}
                 onSeek={seek}
               />
@@ -551,7 +569,7 @@ export function MomentInspector({ nav }: { nav?: MomentReviewNav } = {}) {
         )}
         </div>
       </div>
-    </div>
+    </LiveValueScope>
   );
 }
 
@@ -593,12 +611,7 @@ function Header({
           {EFFECT_FULL_NAME[moment.effectType]}
         </div>
         {/* Editable label as a quiet subtitle (rename without stealing the title). */}
-        <input
-          value={moment.label}
-          onChange={(e) => onTitleChange(e.target.value)}
-          placeholder="Add a label…"
-          className="-mx-1 mt-0.5 block w-full truncate rounded px-1 py-0.5 text-[11.5px] leading-tight text-fog outline-none transition-colors duration-150 placeholder:text-fog/50 focus:bg-white/[0.05] focus:text-white"
-        />
+        <MomentTitleInput value={moment.label} onChange={onTitleChange} />
       </div>
       {/* Previous / Next edit review — walk every timeline edit without
           closing the dialog; content swaps in place. */}
@@ -746,6 +759,9 @@ function SegmentedEffect({
   value: EffectType;
   onChange: (e: EffectType) => void;
 }) {
+  // Optimistic, like the other segmented controls — the effect tab must light up
+  // on the click, not after the document write returns.
+  const live = useLiveValue<EffectType>(value, onChange, COMMIT_PROFILES.discrete);
   return (
     <div
       role="radiogroup"
@@ -753,14 +769,14 @@ function SegmentedEffect({
       className="inline-flex w-full items-center rounded-lg border border-white/[0.08] bg-white/[0.02] p-1"
     >
       {CAMERA_EFFECTS.map((e) => {
-        const active = value === e.id;
+        const active = live.value === e.id;
         return (
           <button
             key={e.id}
             type="button"
             role="radio"
             aria-checked={active}
-            onClick={() => onChange(e.id)}
+            onClick={() => live.set(e.id)}
             className={cn(
               "inline-flex flex-1 items-center justify-center gap-1.5 rounded-md px-2.5 py-1.5 text-[12px] font-medium transition-colors duration-150",
               active
@@ -967,6 +983,10 @@ function Segmented<T extends string>({
   onChange: (v: T) => void;
   disabled?: boolean;
 }) {
+  // Optimistic selection: the segment highlights on click instead of after the
+  // write lands. Rapidly clicking between options no longer shows the previous
+  // choice still selected, which is what made these feel like missed clicks.
+  const live = useLiveValue<T>(value, onChange, COMMIT_PROFILES.discrete);
   return (
     <div className="space-y-1.5">
       <span className="text-[10px] font-medium uppercase tracking-[0.12em] text-fog">
@@ -981,7 +1001,7 @@ function Segmented<T extends string>({
         )}
       >
         {options.map((o) => {
-          const active = value === o.id;
+          const active = live.value === o.id;
           return (
             <button
               key={o.id}
@@ -989,7 +1009,7 @@ function Segmented<T extends string>({
               role="radio"
               aria-checked={active}
               disabled={disabled}
-              onClick={() => onChange(o.id)}
+              onClick={() => live.set(o.id)}
               className={cn(
                 "inline-flex flex-1 items-center justify-center whitespace-nowrap rounded-md px-2 py-1.5 text-[11.5px] font-medium transition-colors duration-150",
                 active
@@ -1049,7 +1069,7 @@ const CLICK_STYLES: ClickHighlightSettings["style"][] = ["ring", "pulse", "burst
  * only change every zoom in the video at once. They live on the selected edit
  * now, and each one is rendered ONLY for the effect type it actually applies to:
  *
- *   zoom / cursor-focus  → camera speed (the ramp in and out)
+ *   zoom / cursor-focus  → zoom style (Subtle/Standard/Emphasis) + camera speed
  *   click-highlight      → style, size, and whether this click shows at all
  *
  * The project's `effectsSettings` survive as the DEFAULTS these fall back to —
@@ -1067,23 +1087,63 @@ function EffectMotionControls({
   const effects = project.effectsSettings;
 
   if (moment.effectType === "zoom" || moment.effectType === "cursor-focus") {
-    const speed = moment.cameraMotion?.speed ?? CAMERA_SPEED_DEFAULT;
+    // Both fall back to the PROJECT's setting, so an untouched edit follows the
+    // project (that's what a Look sets) and a touched one keeps its own.
+    const projectPreset = effects.zoomPreset ?? DEFAULT_ZOOM_PRESET;
+    const preset = moment.cameraMotion?.preset ?? projectPreset;
+    const speed = moment.cameraMotion?.speed ?? effects.zoomSpeed ?? CAMERA_SPEED_DEFAULT;
     return (
-      <div className="space-y-1.5">
-        <Slider
-          label="Camera speed"
-          value={speed}
-          min={0}
-          max={100}
-          onChange={(v) => onUpdate({ cameraMotion: { speed: v } })}
-        />
-        <p className="text-[11px] leading-relaxed text-fog/70">
-          {speed >= 75
-            ? "Snaps into frame — punchy, good for fast social cuts."
-            : speed <= 25
-              ? "Glides in slowly — cinematic, needs a longer edit to breathe."
-              : "How quickly the camera moves into this edit and back out again."}
-        </p>
+      <div className="space-y-3">
+        <div>
+          <div className="mb-2 text-xs font-medium text-fog">Zoom style</div>
+          <div className="grid grid-cols-3 gap-1 rounded-lg border border-white/10 bg-white/[0.02] p-1">
+            {ZOOM_PRESET_IDS.map((id) => (
+              <button
+                key={id}
+                type="button"
+                onClick={() =>
+                  onUpdate({
+                    cameraMotion: {
+                      ...moment.cameraMotion,
+                      // Choosing the project's own style again clears the
+                      // override rather than pinning a copy of it — so later
+                      // changing the project style still moves this edit.
+                      preset: id === projectPreset ? undefined : id,
+                    },
+                  })
+                }
+                className={cn(
+                  "rounded-md px-2 py-2 text-xs font-medium transition-colors duration-150",
+                  preset === id
+                    ? "bg-white/[0.12] text-white"
+                    : "text-fog hover:bg-white/[0.05] hover:text-white"
+                )}
+              >
+                {ZOOM_PRESETS[id].label}
+              </button>
+            ))}
+          </div>
+          <p className="mt-1.5 text-[11px] leading-relaxed text-fog/70">
+            {ZOOM_PRESETS[preset].hint}
+            {moment.cameraMotion?.preset ? "" : " (following the project)"}
+          </p>
+        </div>
+        <div className="space-y-1.5">
+          <Slider
+            label="Camera speed"
+            value={speed}
+            min={0}
+            max={100}
+            onChange={(v) => onUpdate({ cameraMotion: { ...moment.cameraMotion, speed: v } })}
+          />
+          <p className="text-[11px] leading-relaxed text-fog/70">
+            {speed >= 75
+              ? "Snaps into frame — punchy, good for fast social cuts."
+              : speed <= 25
+                ? "Glides in slowly — cinematic, needs a longer edit to breathe."
+                : "How quickly the camera moves into this edit and back out again."}
+          </p>
+        </div>
       </div>
     );
   }
@@ -1450,6 +1510,31 @@ const CTA_POS_OPTS: { id: BrandingPosition; label: string }[] = [
   { id: "bottom-left", label: "Left" },
 ];
 
+/**
+ * The edit's rename field in the dialog header. Local-first for the same reason
+ * as TextField: renaming an edit used to write the whole document per keystroke.
+ */
+function MomentTitleInput({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+}) {
+  const live = useLiveValue(value, onChange, COMMIT_PROFILES.text);
+  return (
+    <input
+      value={live.value}
+      onFocus={live.begin}
+      onChange={(e) => live.set(e.target.value)}
+      onBlur={live.end}
+      placeholder="Add a label…"
+      aria-label="Edit label"
+      className="-mx-1 mt-0.5 block w-full truncate rounded px-1 py-0.5 text-[11.5px] leading-tight text-fog outline-none transition-colors duration-150 placeholder:text-fog/50 focus:bg-white/[0.05] focus:text-white"
+    />
+  );
+}
+
 function TextField({
   label,
   value,
@@ -1463,21 +1548,37 @@ function TextField({
   multiline?: boolean;
   onChange: (v: string) => void;
 }) {
+  // TYPING. This was the worst offender in the editor: the field was controlled
+  // directly by persisted state, so every keystroke serialized the whole
+  // analysis document, queued a write, and the character only appeared once that
+  // write echoed back — which is exactly how characters get dropped when someone
+  // types at speed. The field is now local and commits on the typing cadence, so
+  // a burst of typing is one write and the caret never fights the store.
+  const live = useLiveValue(value, onChange, COMMIT_PROFILES.text);
   const cls =
     "w-full rounded-lg border border-white/[0.1] bg-white/[0.03] px-2.5 py-1.5 text-[12.5px] text-white outline-none transition-colors placeholder:text-fog/50 focus:border-violet-400/50";
+  const common = {
+    value: live.value,
+    placeholder,
+    // The visible label is a plain <span> (it styles as a caption, not a form
+    // label), so without this the field had NO accessible name — invisible to a
+    // screen reader and unaddressable by name in a test.
+    "aria-label": label,
+    onFocus: live.begin,
+    onChange: (
+      e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>
+    ) => live.set(e.target.value),
+    // Leaving the field is a definite end-of-edit — persist immediately rather
+    // than waiting out the debounce, so closing the dialog can't beat the write.
+    onBlur: live.end,
+  };
   return (
     <div className="space-y-1.5">
       <span className="text-[10px] font-medium uppercase tracking-[0.12em] text-fog">{label}</span>
       {multiline ? (
-        <textarea
-          rows={2}
-          value={value}
-          placeholder={placeholder}
-          onChange={(e) => onChange(e.target.value)}
-          className={cn(cls, "resize-none")}
-        />
+        <textarea rows={2} {...common} className={cn(cls, "resize-none")} />
       ) : (
-        <input value={value} placeholder={placeholder} onChange={(e) => onChange(e.target.value)} className={cls} />
+        <input {...common} className={cls} />
       )}
     </div>
   );
@@ -1783,17 +1884,52 @@ function round3(v: number): number {
   return Math.round(v * 1000) / 1000;
 }
 
+/**
+ * The per-keyframe zoom slider. A bare range input here would rewrite the whole
+ * keyframe array on every pixel of the drag; this keeps the handle local and
+ * persists on the drag cadence, like every other slider in the editor.
+ */
+function KeyframeZoomSlider({
+  value,
+  onChange,
+}: {
+  value: number;
+  onChange: (pct: number) => void;
+}) {
+  const live = useLiveValue(value, onChange, COMMIT_PROFILES.drag);
+  return (
+    <input
+      type="range"
+      min={20}
+      max={130}
+      value={live.value}
+      onChange={(e) => live.set(Number(e.target.value))}
+      onPointerDown={live.begin}
+      onPointerUp={live.end}
+      onPointerCancel={live.end}
+      onKeyDown={live.begin}
+      onKeyUp={live.end}
+      onBlur={live.end}
+      aria-label="Keyframe zoom"
+      className="range-thumb h-1 flex-1"
+      title={`Zoom ${live.value}%`}
+    />
+  );
+}
+
 function KeyframeEditor({
   moment,
-  currentTime,
   onChange,
   onSeek,
 }: {
   moment: DetectedMoment;
-  currentTime: number;
   onChange: (keyframes: MomentKeyframe[] | undefined) => void;
   onSeek: (t: number) => void;
 }) {
+  // The playhead is needed only when "add keyframe here" is CLICKED, so it is
+  // read from the ref. Taking it as a prop made the entire inspector — every
+  // slider, field and tab in it — re-render on every clock tick.
+  const clockRef = useClockRef();
   const kfs = moment.keyframes ?? [];
   const dur = Math.max(0.1, moment.endTime - moment.startTime);
   const hasKfs = kfs.length > 0;
@@ -1802,7 +1938,7 @@ function KeyframeEditor({
   const toAbs = (lt: number) => moment.startTime + lt * dur;
 
   const addAtPlayhead = () => {
-    const lt = toLocal(currentTime);
+    const lt = toLocal(clockRef.current);
     const cx = moment.focusRegion.x + moment.focusRegion.width / 2;
     const cy = moment.focusRegion.y + moment.focusRegion.height / 2;
     const scale = clamp01(
@@ -1874,15 +2010,9 @@ function KeyframeEditor({
             <Crosshair size={10} />
             {Math.round(k.t * 100)}%
           </button>
-          <input
-            type="range"
-            min={20}
-            max={130}
+          <KeyframeZoomSlider
             value={Math.round(k.scale * 100)}
-            onChange={(e) => patchKf(i, { scale: Number(e.target.value) / 100 })}
-            aria-label="Keyframe zoom"
-            className="range-thumb h-1 flex-1"
-            title={`Zoom ${Math.round(k.scale * 100)}%`}
+            onChange={(pct) => patchKf(i, { scale: pct / 100 })}
           />
           <select
             value={k.ease ?? "ease-in-out"}

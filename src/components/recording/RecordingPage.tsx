@@ -74,7 +74,7 @@ function RecordingLive({
     >
       <div
         aria-hidden
-        className="pointer-events-none absolute left-1/2 top-1/2 -z-10 h-[640px] w-[640px] -translate-x-1/2 -translate-y-1/2 bg-[radial-gradient(ellipse_at_center,rgba(244,63,94,0.10),transparent_65%)] blur-3xl transition-opacity duration-300"
+        className="pointer-events-none absolute left-1/2 top-1/2 -z-10 h-[640px] w-[640px] -translate-x-1/2 -translate-y-1/2 bg-[radial-gradient(ellipse_at_center,rgba(178,99,112,0.10),transparent_65%)] blur-3xl transition-opacity duration-300"
         style={{ opacity: 0.6 + pulse * 0.4 }}
       />
       <div className="inline-flex items-center gap-2 rounded-full border border-rose-400/30 bg-rose-500/10 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-rose-200">

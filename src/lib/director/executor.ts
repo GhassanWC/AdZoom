@@ -30,6 +30,7 @@ import type {
 } from "../firebase/schema";
 import { generateCaptionMoments } from "../analysis/caption-generator";
 import { buildTimelineMap } from "../timeline/crop-speed";
+import { clampZoomWindow, zoomPreset } from "../timeline/zoom-presets";
 import { resolveCanvasDims } from "../timeline/canvas-layout";
 import {
   CATEGORY_SLOT,
@@ -215,8 +216,27 @@ function compileEditOperation(
 
   switch (op.editType) {
     case "zoom":
+    case "cursor-focus": {
+      // Hold the Director to the same duration window every other generator
+      // obeys — a planner that asks for a 14-second push gets a zoom that
+      // breathes instead. Click highlights are a beat pinned to an instant, so
+      // they keep their own timing (below).
+      const w = clampZoomWindow(
+        base.startTime,
+        base.endTime,
+        zoomPreset(undefined),
+        Infinity
+      );
+      return {
+        ...base,
+        startTime: round(w.startTime),
+        endTime: round(w.endTime),
+        intensity: clamp01(op.intensity ?? 0.7),
+        targetRegionSource: op.focusRegion ? "ai-proposal" : "default",
+      };
+    }
+
     case "click-highlight":
-    case "cursor-focus":
       return {
         ...base,
         intensity: clamp01(op.intensity ?? 0.7),

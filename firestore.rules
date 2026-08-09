@@ -94,11 +94,20 @@ service cloud.firestore {
         allow create: if false;
         // One-shot completion patch: permitted → ready, plus upload-result
         // fields. Anything else is denied.
+        //
+        // `duration` / `outputWidth` / `outputHeight` describe the FILE that was
+        // produced and are only knowable after rendering, so the permit cannot
+        // pre-set them. They are safe to let the client write: none of them
+        // gates a paid feature, and every field that DOES — resolution, format,
+        // fps, applyWatermark, engine, projectId, projectTitle — stays absent
+        // from this list and therefore immutable from the moment the permit was
+        // issued.
         allow update: if isOwner(uid)
           && resource.data.status == 'permitted'
           && request.resource.data.status == 'ready'
           && request.resource.data.diff(resource.data).affectedKeys()
-              .hasOnly(['status', 'storagePath', 'exportUrl', 'fileSize', 'completedAt']);
+              .hasOnly(['status', 'storagePath', 'exportUrl', 'fileSize', 'completedAt',
+                        'duration', 'outputWidth', 'outputHeight']);
         allow delete: if false;
       }
 

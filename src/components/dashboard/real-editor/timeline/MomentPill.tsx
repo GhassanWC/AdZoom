@@ -31,7 +31,11 @@ import {
 } from "./constants";
 import type { DragMode } from "./utils";
 import { captureFrame } from "./thumbnails";
-import { useEditorReal } from "../context";
+import { useClockSelector } from "../playback-clock";
+import { draftFor, type DragStore } from "./drag-store";
+import { useRenderCount } from "@/lib/perf/render-probe";
+import { canSplit as canSplitAtTime } from "@/lib/timeline/split";
+import type { SourceCrop } from "@/lib/firebase/schema";
 import { AttentionWaveform } from "./AttentionWaveform";
 import { cropAspectLabel } from "@/lib/timeline/crop-speed";
 
@@ -284,14 +288,36 @@ function PillToolbar({
  *
  * Drag contract (onBeginDrag) is unchanged from the previous design.
  */
-export function MomentPill({
-  moment: m,
+/**
+ * PERF CONTRACT — read before adding a prop or a hook here.
+ *
+ * A timeline can hold hundreds of these, so this component is `React.memo`'d
+ * (see the export at the bottom) and must stay cheap to skip:
+ *
+ *  • It does NOT read `useEditorReal()`. A context read would re-render every
+ *    pill on every editor change no matter what memo says, which is exactly
+ *    what it used to do. The three project fields it needs come in as props
+ *    from the lane, which reads the context once.
+ *
+ *  • Its callbacks take the moment id rather than being pre-bound closures.
+ *    Pre-bound `() => onDelete(m.id)` props were rebuilt for every pill on
+ *    every render of the timeline, so no pill could ever be skipped.
+ *
+ *  • It subscribes to the playhead itself, as a BOOLEAN (`canSplitNow`). The
+ *    lane used to pass `canSplit(m, currentTime)` down, which meant the whole
+ *    timeline re-rendered on every clock tick to keep one button's disabled
+ *    state honest. Now a tick re-renders a pill only when its own answer flips.
+ */
+function MomentPillImpl({
+  moment,
   total,
   selected,
   multiSelected,
-  dragging,
-  canSplit,
+  dragStore,
   layerHidden = false,
+  videoUrl,
+  sourceCrop,
+  attentionCurve,
   onBeginDrag,
   onDuplicate,
   onSplit,
@@ -303,19 +329,50 @@ export function MomentPill({
   total: number;
   selected: boolean;
   multiSelected: boolean;
-  dragging: boolean;
-  /** The playhead is inside this edit and both halves would be long enough. */
-  canSplit: boolean;
+  /** Live drag geometry for the whole timeline; this pill reads only its own. */
+  dragStore: DragStore;
   /** This edit's whole LAYER is switched off (distinct from its own `enabled`). */
   layerHidden?: boolean;
+  /** Source for the hover thumbnail — passed in so the pill reads no context. */
+  videoUrl?: string;
+  sourceCrop?: SourceCrop;
+  attentionCurve?: number[];
   onBeginDrag: (e: React.PointerEvent, m: DetectedMoment, mode: DragMode) => void;
-  onDuplicate: () => void;
-  onSplit: () => void;
-  onToggleEnabled: () => void;
-  onDelete: () => void;
-  onEdit: () => void;
+  onDuplicate: (id: string) => void;
+  onSplit: (id: string) => void;
+  onToggleEnabled: (id: string) => void;
+  onDelete: (id: string) => void;
+  onEdit: (id: string) => void;
 }) {
-  const { project } = useEditorReal();
+  useRenderCount("pill");
+  /**
+   * This pill's live drag geometry, or null.
+   *
+   * Subscribed per-pill ON PURPOSE. The timeline used to inject the dragged
+   * geometry from above, which handed every lane a new function prop on every
+   * frame and re-rendered all of them to move one pill. `draftFor` returns a
+   * stable `null` for every pill that isn't being dragged, so `useSyncExternalStore`
+   * skips them entirely — one pill re-renders per frame, not forty.
+   */
+  const draft = React.useSyncExternalStore(
+    dragStore.subscribe,
+    () => draftFor(dragStore, moment.id),
+    () => null
+  );
+  const dragging = draft !== null;
+  // The rest of the component reads `m`, so resolve the live override once here
+  // rather than threading `draft` through 300 lines of layout.
+  const m = React.useMemo(
+    () =>
+      draft
+        ? { ...moment, startTime: draft.startTime, endTime: draft.endTime }
+        : moment,
+    [moment, draft]
+  );
+  // Same pure predicate the context uses to decide whether the split will
+  // actually happen, so the button's enabled state can never disagree with what
+  // pressing it does — but evaluated against the live clock without a re-render.
+  const canSplitNow = useClockSelector((t) => canSplitAtTime(m, t));
   const rootRef = React.useRef<HTMLDivElement | null>(null);
   // Duration drives the clip width. Guard against missing/zero/NaN end times so
   // a moment never collapses to a zero-width sliver — it still renders as a
@@ -396,7 +453,6 @@ export function MomentPill({
 
   // ── Thumbnail capture ──────────────────────────────────────────────────
   const [thumb, setThumb] = React.useState<string | null>(null);
-  const videoUrl = project.originalVideoUrl;
   React.useEffect(() => {
     if (tier !== "thumb" || !videoUrl) {
       setThumb(null);
@@ -406,17 +462,21 @@ export function MomentPill({
     // Sample at startTime + 5% of the moment so we don't always show a
     // transition frame — usually the first frame is mid-cut.
     const sampleAt = m.startTime + (m.endTime - m.startTime) * 0.05;
-    void captureFrame(videoUrl, sampleAt, project.sourceCrop).then((d) => {
+    void captureFrame(videoUrl, sampleAt, sourceCrop).then((d) => {
       if (!cancelled && d) setThumb(d);
     });
     return () => {
       cancelled = true;
     };
-  }, [videoUrl, m.startTime, m.endTime, tier, project.sourceCrop]);
+  }, [videoUrl, m.startTime, m.endTime, tier, sourceCrop]);
 
   return (
     <div
       ref={rootRef}
+      // Identity in the DOM — the same role `data-timeline-scroll` plays for the
+      // toolbar's clipping box. It is what lets a measurement or an integration
+      // test address ONE edit without matching on its label text.
+      data-moment-pill={m.id}
       className={cn(
         "group absolute touch-none transition-[opacity,filter] duration-200",
         dragging ? "z-40" : selected ? "z-30" : "hover:z-20",
@@ -443,15 +503,15 @@ export function MomentPill({
         anchorRef={rootRef}
         active={selected && !dragging}
         geometry={`${left}:${widthPct}`}
-        canSplit={canSplit}
+        canSplit={canSplitNow}
         // The eye toggles THIS EDIT's switch, never the layer's — a per-edit
         // control that silently flipped a whole lane would be a trap.
         enabled={!selfDisabled}
-        onEdit={onEdit}
-        onSplit={onSplit}
-        onDuplicate={onDuplicate}
-        onToggleEnabled={onToggleEnabled}
-        onDelete={onDelete}
+        onEdit={() => onEdit(m.id)}
+        onSplit={() => onSplit(m.id)}
+        onDuplicate={() => onDuplicate(m.id)}
+        onToggleEnabled={() => onToggleEnabled(m.id)}
+        onDelete={() => onDelete(m.id)}
       />
 
       {multiSelected && (
@@ -493,7 +553,7 @@ export function MomentPill({
         // being on-screen.
         onDoubleClick={(e) => {
           e.stopPropagation();
-          onEdit();
+          onEdit(m.id);
         }}
         title={`${m.label}${
           layerHidden
@@ -634,7 +694,7 @@ export function MomentPill({
             </span>
             <AttentionSpark
               moment={m}
-              project={project.analysis?.attentionCurve}
+              project={attentionCurve}
               total={total}
             />
             <span className="font-mono text-[9px] uppercase tracking-wider leading-none text-white/65">
@@ -688,6 +748,15 @@ export function MomentPill({
     </div>
   );
 }
+
+/**
+ * Memoized: a timeline routinely holds hundreds of pills, and before this every
+ * one of them re-rendered on every clock tick, every drag pointermove and every
+ * edit to any OTHER moment. The default shallow prop comparison is exactly right
+ * here — `moment` keeps its identity unless that specific edit changed, and the
+ * callbacks are id-taking and stable (see the perf contract above).
+ */
+export const MomentPill = React.memo(MomentPillImpl);
 
 function ThumbCell({
   thumb,

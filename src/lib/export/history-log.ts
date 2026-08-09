@@ -2,6 +2,7 @@
 
 import { getFirebase } from "@/lib/firebase/client";
 
+import { apiFetch } from "@/lib/platform/api";
 /**
  * Best-effort logging of an IN-BROWSER (editframe) export to the user's Export
  * history. In-browser renders create no cloud job and are never stored, so
@@ -35,7 +36,7 @@ export async function logExportHistory(payload: ExportHistoryLog): Promise<void>
     const { auth } = getFirebase();
     const token = await auth.currentUser?.getIdToken();
     if (!token) return;
-    await fetch("/api/export/history", {
+    await apiFetch("/api/export/history", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",

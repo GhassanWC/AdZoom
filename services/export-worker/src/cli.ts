@@ -76,6 +76,13 @@ interface JobSpec {
   normalizePreset?: string;
   normalizeEnabled?: boolean;
   audioAlreadyDropped?: boolean;
+  /**
+   * Hardware encoder override (DESKTOP only — the Framevo desktop app renders
+   * locally and can use the machine's GPU). Absent ⇒ libx264, the cloud path.
+   * Compositing is untouched either way: the same `composeFrame` draws every
+   * frame, so this changes the codec implementation, not the picture.
+   */
+  videoEncoder?: { codec: string; args: string[] };
   /** Chunked render: RENDER [renderStartSec, renderEndSec) but EMIT only
    *  [trimStartSec, trimEndSec) (see RenderOptions.chunk). Output time is mapped to
    *  source time via the timeline map, so cuts/speed work. Chunks are silent —
@@ -682,6 +689,7 @@ async function main(): Promise<void> {
       outputPath: spec.outputPath,
       crf,
       preset,
+      videoEncoder: spec.videoEncoder,
       signal: controller.signal,
       audioAlreadyDropped: audioDropped,
       chunk: spec.chunk,

@@ -2,6 +2,7 @@
 
 import * as React from "react";
 
+import { apiFetch } from "@/lib/platform/api";
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
@@ -84,7 +85,7 @@ export function useChatStream() {
       abortRef.current = abort;
 
       try {
-        const res = await fetch("/api/chat", {
+        const res = await apiFetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ messages: toSend }),

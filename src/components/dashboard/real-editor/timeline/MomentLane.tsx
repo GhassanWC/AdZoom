@@ -2,8 +2,9 @@
 
 import * as React from "react";
 import type { DetectedMoment } from "@/lib/firebase/schema";
-import { canSplit } from "@/lib/timeline/split";
+import { useRenderCount } from "@/lib/perf/render-probe";
 import type { DragMode } from "./utils";
+import type { DragStore } from "./drag-store";
 import { MomentPill } from "./MomentPill";
 
 /**
@@ -11,16 +12,24 @@ import { MomentPill } from "./MomentPill";
  * and User tracks (and any future moment-backed track) share one render path.
  * Pills self-position via `left%` / `width%`, so the lane is just an absolute
  * container.
+ *
+ * PERF — this lane takes NO playhead time. It used to receive `currentTime` and
+ * compute `canSplit(m, currentTime)` for every pill, which forced the entire
+ * timeline to re-render several times a second during playback (and on every
+ * pointermove while scrubbing) just to keep one button's disabled state honest.
+ * Each pill now subscribes to that single boolean itself. The lane is memoized
+ * so an edit in one lane doesn't re-render the others.
  */
-export function MomentLane({
+function MomentLaneImpl({
   moments,
   total,
-  currentTime,
   selectedMomentId,
   multiSelectIds,
-  draftId,
-  withDraft,
+  dragStore,
   layerHidden = false,
+  videoUrl,
+  sourceCrop,
+  attentionCurve,
   onBeginDrag,
   onDuplicate,
   onSplit,
@@ -30,14 +39,20 @@ export function MomentLane({
 }: {
   moments: DetectedMoment[];
   total: number;
-  /** Playhead position — decides whether each pill's Split action is available. */
-  currentTime: number;
   selectedMomentId: string | null;
   multiSelectIds: string[];
-  draftId: string | null;
-  withDraft: (m: DetectedMoment) => DetectedMoment;
+  /**
+   * Live drag geometry. Passed straight through to the pills, which subscribe
+   * individually — this lane never reads it, so a drag does not re-render it.
+   * Its identity is stable for the life of the timeline.
+   */
+  dragStore: DragStore;
   /** This lane's LAYER is switched off — every pill in it renders nowhere. */
   layerHidden?: boolean;
+  /** Project fields the pills need, read from context ONCE by the timeline. */
+  videoUrl?: string;
+  sourceCrop?: React.ComponentProps<typeof MomentPill>["sourceCrop"];
+  attentionCurve?: number[];
   onBeginDrag: (e: React.PointerEvent, m: DetectedMoment, mode: DragMode) => void;
   onDuplicate: (id: string) => void;
   onSplit: (id: string) => void;
@@ -46,32 +61,31 @@ export function MomentLane({
   onDelete: (id: string) => void;
   onEdit: (id: string) => void;
 }) {
+  useRenderCount("lane");
   return (
     <div className="absolute inset-0 z-10">
-      {moments.map((m0) => {
-        const m = withDraft(m0);
-        return (
-          <MomentPill
-            key={m0.id}
-            moment={m}
-            total={total}
-            selected={selectedMomentId === m0.id}
-            multiSelected={multiSelectIds.includes(m0.id)}
-            dragging={draftId === m0.id}
-            // Computed from the SAME pure predicate the context uses to decide
-            // whether the split will actually happen — so the button's enabled
-            // state can never disagree with what pressing it does.
-            canSplit={canSplit(m, currentTime)}
-            layerHidden={layerHidden}
-            onBeginDrag={onBeginDrag}
-            onDuplicate={() => onDuplicate(m0.id)}
-            onSplit={() => onSplit(m0.id)}
-            onToggleEnabled={() => onToggleEnabled(m0.id)}
-            onDelete={() => onDelete(m0.id)}
-            onEdit={() => onEdit(m0.id)}
-          />
-        );
-      })}
+      {moments.map((m0) => (
+        <MomentPill
+          key={m0.id}
+          moment={m0}
+          total={total}
+          selected={selectedMomentId === m0.id}
+          multiSelected={multiSelectIds.includes(m0.id)}
+          dragStore={dragStore}
+          layerHidden={layerHidden}
+          videoUrl={videoUrl}
+          sourceCrop={sourceCrop}
+          attentionCurve={attentionCurve}
+          onBeginDrag={onBeginDrag}
+          onDuplicate={onDuplicate}
+          onSplit={onSplit}
+          onToggleEnabled={onToggleEnabled}
+          onDelete={onDelete}
+          onEdit={onEdit}
+        />
+      ))}
     </div>
   );
 }
+
+export const MomentLane = React.memo(MomentLaneImpl);

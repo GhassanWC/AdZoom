@@ -14,7 +14,9 @@ import {
   Bug,
   Activity,
 } from "lucide-react";
-import { useEditorReal } from "../context";
+import { useCanSplitSelection, useEditorReal } from "../context";
+import { useClockRef } from "../playback-clock";
+import { useRenderCount } from "@/lib/perf/render-probe";
 import { cn } from "@/lib/cn";
 import { scrollBehavior } from "@/lib/motion";
 import { distributionScore } from "@/lib/timeline-balancer";
@@ -48,6 +50,7 @@ import { DensityBar } from "./DensityBar";
 import { AttentionWaveform } from "./AttentionWaveform";
 import { useTimelineMetrics } from "./useTimelineMetrics";
 import { MomentLane } from "./MomentLane";
+import { createDragStore, type DragStore } from "./drag-store";
 import { InteractionsLane } from "./InteractionsLane";
 import { AudioLane } from "./AudioLane";
 import { ClipsLane } from "./ClipsLane";
@@ -71,10 +74,15 @@ import { planTimelineLanes } from "./laneModel";
  * track row (and as the ordering data in `laneModel`), never as pixels.
  */
 export function RealTimeline() {
+  useRenderCount("timeline");
+  // The playhead is read through a REF, never as reactive state. The timeline is
+  // the most expensive subtree in the editor, and it needs the time only inside
+  // event handlers (snap magnets during a drag) — subscribing to it re-rendered
+  // the whole track stack on every tick and on every pointermove of a scrub.
+  const clockRef = useClockRef();
   const {
     project,
     videoRef,
-    currentTime,
     playing,
     duration,
     seek,
@@ -96,7 +104,7 @@ export function RealTimeline() {
     setLayerVisible,
     showAllLayers,
     splitAtPlayhead,
-    canSplitSelection,
+
     addMomentAtPlayhead,
     undo,
     redo,
@@ -113,6 +121,11 @@ export function RealTimeline() {
     exitClip,
     requestClipExport,
   } = useEditorReal();
+  // Subscribed HERE rather than read off the context value: as a provider field
+  // this boolean re-rendered every editor consumer whenever the playhead crossed
+  // the selected edit's boundary. With nothing selected it is a constant `false`,
+  // so playback now costs this component nothing.
+  const canSplitSelection = useCanSplitSelection();
 
   const focusedClip = focusedClipId
     ? clips.find((c) => c.id === focusedClipId) ?? null
@@ -166,13 +179,22 @@ export function RealTimeline() {
    * Show/hide one edit. Declared HERE (not further down) because the keyboard
    * effect lists it as a dependency — see the note on `splitNote` below.
    */
+  // The moment list, readable from an event handler without being a dependency.
+  // Closing over `moments` here gave this callback — and therefore the lane's
+  // `onToggleEnabled` prop — a new identity on every project echo, which broke
+  // `React.memo` for EVERY pill: one slider nudge re-rendered all 40 of them.
+  const momentsRef = React.useRef(moments);
+  React.useEffect(() => {
+    momentsRef.current = moments;
+  });
+
   const toggleMomentEnabled = React.useCallback(
     async (id: string) => {
-      const m = moments.find((x) => x.id === id);
+      const m = momentsRef.current.find((x) => x.id === id);
       if (!m) return;
       await setMomentEnabled(id, m.enabled === false);
     },
-    [moments, setMomentEnabled]
+    [setMomentEnabled]
   );
 
   // Engine selection from the most recent analysis — decides whether an empty
@@ -317,13 +339,18 @@ export function RealTimeline() {
     );
   }, [moments, total, pxPerSec]);
 
-  const [draft, setDraft] = React.useState<{
-    id: string;
-    startTime: number;
-    endTime: number;
-  } | null>(null);
+  /**
+   * Live drag geometry — an external store, NOT state.
+   *
+   * This used to be `useState`, written on every raw pointermove. This component
+   * renders the unified control bar, the ruler, every lane and the playhead, so
+   * one pointermove re-rendered all of it (measured: 40 moves ⇒ 43 timeline, 43
+   * control-bar, 43 playhead and 172 lane renders, to move one pill). The store
+   * publishes at most once per animation frame and only the dragged pill
+   * subscribes — this component now renders ZERO times during a drag.
+   */
+  const [dragStore] = React.useState(() => createDragStore());
   const dragRef = React.useRef<DragState | null>(null);
-  const [snapGuide, setSnapGuide] = React.useState<number | null>(null);
 
   const distScore = React.useMemo(
     () => distributionScore(moments, total),
@@ -345,7 +372,7 @@ export function RealTimeline() {
     ): { t: number; snapped: number | null } => {
       if (pxPerSec <= 0) return { t, snapped: null };
       const tol = SNAP_PX / pxPerSec;
-      const magnets: number[] = [currentTime, 0, total];
+      const magnets: number[] = [clockRef.current, 0, total];
       for (const m of moments) {
         if (m.id === excludeId) continue;
         magnets.push(m.startTime, m.endTime);
@@ -362,8 +389,42 @@ export function RealTimeline() {
       }
       return best !== null ? { t: best, snapped: best } : { t, snapped: null };
     },
-    [currentTime, total, moments]
+    [clockRef, total, moments]
   );
+
+  /**
+   * The values `beginDrag` needs at pointer-time, not at render-time.
+   *
+   * Reading them through a ref is what lets `beginDrag` keep ONE identity for the
+   * life of the timeline. Listed as `useCallback` dependencies instead, it would
+   * be rebuilt whenever any of them changed — and since several are context
+   * callbacks that change on every provider render, that handed every lane and
+   * every pill a new `onBeginDrag` prop and defeated their `React.memo`.
+   */
+  const dragDeps = React.useRef({
+    total,
+    snapTime,
+    updateMoment,
+    setSelectedMomentId,
+    toggleMultiSelect,
+    clearMultiSelect,
+    seek,
+  });
+  React.useEffect(() => {
+    dragDeps.current = {
+      total,
+      snapTime,
+      updateMoment,
+      setSelectedMomentId,
+      toggleMultiSelect,
+      clearMultiSelect,
+      seek,
+    };
+  });
+
+  /** Detach an in-flight drag — held so unmounting mid-drag can't leak listeners. */
+  const dragTeardown = React.useRef<(() => void) | null>(null);
+  React.useEffect(() => () => dragTeardown.current?.(), []);
 
   const beginDrag = React.useCallback(
     (e: React.PointerEvent, m: DetectedMoment, mode: DragMode) => {
@@ -377,16 +438,15 @@ export function RealTimeline() {
         moved: false,
         multiKey: e.shiftKey || e.metaKey || e.ctrlKey,
       };
-      setDraft({ id: m.id, startTime: m.startTime, endTime: m.endTime });
-    },
-    []
-  );
+      dragStore.setDraft({ id: m.id, startTime: m.startTime, endTime: m.endTime });
 
-  React.useEffect(() => {
-    if (!draft) return;
-    const onMove = (e: PointerEvent) => {
+      // Listeners are attached HERE, once per gesture. They used to live in an
+      // effect keyed on the draft state, so every pointermove tore them down and
+      // re-attached them — a second cost on top of the re-render.
+      const onMove = (e: PointerEvent) => {
       const drag = dragRef.current;
       const track = trackRef.current;
+      const { total, snapTime } = dragDeps.current;
       if (!drag || !track || total <= 0) return;
       const pxPerSec = track.getBoundingClientRect().width / total;
       const deltaPx = e.clientX - drag.pointerStartX;
@@ -431,52 +491,52 @@ export function RealTimeline() {
         nextEnd = en;
       }
 
-      setDraft({ id: drag.id, startTime: nextStart, endTime: nextEnd });
-      setSnapGuide(guide);
-    };
+      dragStore.setDraft({ id: drag.id, startTime: nextStart, endTime: nextEnd });
+      dragStore.setSnapGuide(guide);
+      };
 
-    const onUp = () => {
-      const drag = dragRef.current;
-      const d = draft;
-      dragRef.current = null;
-      setSnapGuide(null);
-      if (!drag) {
-        setDraft(null);
-        return;
-      }
-      if (drag.moved && d) {
-        void updateMoment(drag.id, {
-          startTime: Number(d.startTime.toFixed(3)),
-          endTime: Number(d.endTime.toFixed(3)),
-        });
-      } else if (drag.multiKey) {
-        toggleMultiSelect(drag.id);
-      } else {
-        setSelectedMomentId(drag.id);
-        clearMultiSelect();
-        seek(Math.min(drag.origEnd - 0.01, drag.origStart + 0.05));
-      }
-      setDraft(null);
-    };
+      const onUp = () => {
+        dragTeardown.current?.();
+        const drag = dragRef.current;
+        // The final geometry comes from the STORE, not from a state variable that
+        // a stale closure might still be holding a frame-old copy of.
+        const d = dragStore.getDraft();
+        dragRef.current = null;
+        dragStore.setDraft(null);
+        dragStore.setSnapGuide(null);
+        // Publish the release now: the commit below re-renders the pill from the
+        // project, and a draft left standing for one more frame would show the
+        // old geometry over the new one.
+        dragStore.flush();
+        if (!drag) return;
 
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onUp);
-    window.addEventListener("pointercancel", onUp);
-    return () => {
-      window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", onUp);
-      window.removeEventListener("pointercancel", onUp);
-    };
-  }, [
-    draft,
-    total,
-    snapTime,
-    updateMoment,
-    setSelectedMomentId,
-    toggleMultiSelect,
-    clearMultiSelect,
-    seek,
-  ]);
+        const deps = dragDeps.current;
+        if (drag.moved && d) {
+          void deps.updateMoment(drag.id, {
+            startTime: Number(d.startTime.toFixed(3)),
+            endTime: Number(d.endTime.toFixed(3)),
+          });
+        } else if (drag.multiKey) {
+          deps.toggleMultiSelect(drag.id);
+        } else {
+          deps.setSelectedMomentId(drag.id);
+          deps.clearMultiSelect();
+          deps.seek(Math.min(drag.origEnd - 0.01, drag.origStart + 0.05));
+        }
+      };
+
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onUp);
+      window.addEventListener("pointercancel", onUp);
+      dragTeardown.current = () => {
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onUp);
+        window.removeEventListener("pointercancel", onUp);
+        dragTeardown.current = null;
+      };
+    },
+    [dragStore]
+  );
 
   /**
    * Split, with an explanation when it can't happen.
@@ -633,10 +693,31 @@ export function RealTimeline() {
     seekBy,
   ]);
 
-  const withDraft = (m: DetectedMoment): DetectedMoment =>
-    draft && draft.id === m.id
-      ? { ...m, startTime: draft.startTime, endTime: draft.endTime }
-      : m;
+  // NOTE: there is no `withDraft` here any more. Injecting the live geometry from
+  // this level meant the lanes took a new function prop on every frame of a drag,
+  // so all of them re-rendered to move one pill. Each pill now reads the drag
+  // store itself and overrides its OWN geometry — see MomentPill.
+
+  // Stable per-pill handlers. These were inline arrows on the lane, so every
+  // pill received a brand-new callback on every timeline render and no pill
+  // could ever be skipped by React.memo. They take the id instead of closing
+  // over it, which is what makes one identity serve every pill.
+  const onPillDuplicate = React.useCallback(
+    (id: string) => void duplicateMoment(id),
+    [duplicateMoment]
+  );
+  const onPillSplit = React.useCallback(
+    (id: string) => void runSplit([id]),
+    [runSplit]
+  );
+  const onPillToggleEnabled = React.useCallback(
+    (id: string) => void toggleMomentEnabled(id),
+    [toggleMomentEnabled]
+  );
+  const onPillDelete = React.useCallback(
+    (id: string) => void deleteMoment(id),
+    [deleteMoment]
+  );
 
   // ── Insights state ───────────────────────────────────────────────────
   // The whole analytics block — attention waveform, balance/density/quiet
@@ -698,10 +779,13 @@ export function RealTimeline() {
 
   // "Edit" = select the moment; the docked inspector reflects it, and the
   // modal fallback (small screens) opens off `inspectorOpen`.
-  const onEditMoment = (id: string) => {
-    setSelectedMomentId(id);
-    openInspector();
-  };
+  const onEditMoment = React.useCallback(
+    (id: string) => {
+      setSelectedMomentId(id);
+      openInspector();
+    },
+    [setSelectedMomentId, openInspector]
+  );
 
   // Count of discrete cursor events for the interactions-lane label.
   const interactionClickCount = interactions
@@ -738,20 +822,21 @@ export function RealTimeline() {
     <MomentLane
       moments={laneMoments}
       total={total}
-      currentTime={currentTime}
       selectedMomentId={selectedMomentId}
       multiSelectIds={multiSelectIds}
-      draftId={draft?.id ?? null}
-      withDraft={withDraft}
+      dragStore={dragStore}
       // The lane keeps rendering every pill while its layer is off — you can
       // still select, drag, retime and inspect them. They just don't render in
       // the video, and they say so.
       layerHidden={layerHidden}
+      videoUrl={project.originalVideoUrl}
+      sourceCrop={project.sourceCrop}
+      attentionCurve={project.analysis?.attentionCurve}
       onBeginDrag={beginDrag}
-      onDuplicate={(id) => void duplicateMoment(id)}
-      onSplit={(id) => void runSplit([id])}
-      onToggleEnabled={(id) => void toggleMomentEnabled(id)}
-      onDelete={(id) => void deleteMoment(id)}
+      onDuplicate={onPillDuplicate}
+      onSplit={onPillSplit}
+      onToggleEnabled={onPillToggleEnabled}
+      onDelete={onPillDelete}
       onEdit={onEditMoment}
     />
   );
@@ -1066,7 +1151,6 @@ export function RealTimeline() {
           <NarrativeBand
             segments={narrativeSegments}
             duration={total}
-            currentTime={currentTime}
             onSeek={seek}
           />
         </div>
@@ -1175,16 +1259,10 @@ export function RealTimeline() {
                 );
               })}
 
-              {snapGuide !== null && total > 0 && (
-                <span
-                  className="pointer-events-none absolute inset-y-0 z-20 w-px bg-cyan-300/80 shadow-[0_0_6px_rgba(34,211,238,0.8)]"
-                  style={{ left: `${(snapGuide / total) * 100}%` }}
-                />
-              )}
+              <SnapGuide store={dragStore} total={total} />
 
               <Playhead
                 videoRef={videoRef}
-                currentTime={currentTime}
                 playing={playing}
                 total={total}
                 rulerHeight={TRACK_HEIGHTS.ruler}
@@ -1239,7 +1317,6 @@ export function RealTimeline() {
           <CvSignalTracks
             visualAnalysis={va}
             duration={total}
-            currentTime={currentTime}
             onSeek={seek}
           />
         </div>
@@ -1491,5 +1568,28 @@ function EmptyTimelineHint({ analyzed }: { analyzed: boolean }) {
           : "Run AI analysis for a first-draft edit, or use the Add button above to place edits manually."}
       </p>
     </div>
+  );
+}
+
+/**
+ * The cyan snap-magnet line shown while a drag is latched to a boundary.
+ *
+ * Its own component, subscribed to the drag store, so the guide appearing and
+ * moving costs one tiny render instead of a render of the entire timeline. It
+ * lived in `RealTimeline` state, which is what made every pointermove that
+ * changed the snap target re-render the ruler, the lanes and the control bar.
+ */
+function SnapGuide({ store, total }: { store: DragStore; total: number }) {
+  const guide = React.useSyncExternalStore(
+    store.subscribe,
+    store.getSnapGuide,
+    () => null
+  );
+  if (guide === null || total <= 0) return null;
+  return (
+    <span
+      className="pointer-events-none absolute inset-y-0 z-20 w-px bg-cyan-300/80 shadow-[0_0_6px_rgba(34,211,238,0.8)]"
+      style={{ left: `${(guide / total) * 100}%` }}
+    />
   );
 }

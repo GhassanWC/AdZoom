@@ -8,10 +8,14 @@ import {
   Sparkles,
   AlertCircle,
   Loader2,
+  Video,
+  CloudUpload,
 } from "lucide-react";
 import { PageHeader } from "@/components/dashboard/PageHeader";
 import { Button } from "@/components/ui/Button";
 import { useAuth } from "@/lib/firebase/AuthProvider";
+import { usePlatform } from "@/lib/platform";
+import { useLocalImport } from "@/lib/import/useLocalImport";
 import { createProjectFromFile, isVideoAccepted } from "@/lib/firebase/projects";
 import { usePlanTier } from "@/lib/usage/useStoragePlan";
 import {
@@ -53,7 +57,23 @@ async function probeVideoMeta(file: File): Promise<VideoMeta> {
   });
 }
 
+/**
+ * Two ways to bring a video in, chosen by what the platform can actually do.
+ *
+ * The desktop app can hold a durable reference to a file on disk, so it
+ * IMPORTS: the OS picker, no copy, no upload, and a project in the local
+ * library. The browser cannot (a File handle dies with the tab), so it UPLOADS
+ * to Firebase Storage exactly as it always has.
+ *
+ * Which one runs is a capability question, never a "am I in Electron?" one —
+ * and the split is at the top so each panel keeps its own hooks.
+ */
 export default function UploadPage() {
+  const platform = usePlatform();
+  return platform.media.canPickLocalFiles ? <LocalImportPanel /> : <CloudUploadPanel />;
+}
+
+function CloudUploadPanel() {
   const router = useRouter();
   const { user } = useAuth();
   const { tier, loading: planLoading } = usePlanTier();
@@ -164,60 +184,75 @@ export default function UploadPage() {
       />
 
       {!file ? (
-        <button
-          onDragOver={(e) => {
-            e.preventDefault();
-            setDragOver(true);
-          }}
-          onDragLeave={() => setDragOver(false)}
-          onDrop={(e) => {
-            e.preventDefault();
-            setDragOver(false);
-            onPick(e.dataTransfer.files?.[0]);
-          }}
-          onClick={() => inputRef.current?.click()}
-          type="button"
-          className={cn(
-            "relative w-full overflow-hidden rounded-2xl border border-dashed bg-white/[0.015] p-16 text-center transition-all duration-300",
-            dragOver
-              ? "border-violet-400/60 bg-violet-500/[0.08] ring-2 ring-violet-400/30"
-              : "border-white/15 hover:border-white/25 hover:bg-white/[0.03]"
-          )}
-        >
-          <input
-            ref={inputRef}
-            type="file"
-            accept="video/mp4,video/quicktime,video/webm,video/x-matroska,video/*"
-            className="hidden"
-            onChange={(e) => onPick(e.target.files?.[0])}
-          />
-          <div
-            aria-hidden
-            className="pointer-events-none absolute left-1/2 top-0 -z-10 h-80 w-[680px] -translate-x-1/2 bg-[radial-gradient(ellipse_at_top,rgba(139,92,246,0.18),transparent_60%)] blur-2xl"
-          />
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_320px]">
+          <button
+            onDragOver={(e) => {
+              e.preventDefault();
+              setDragOver(true);
+            }}
+            onDragLeave={() => setDragOver(false)}
+            onDrop={(e) => {
+              e.preventDefault();
+              setDragOver(false);
+              onPick(e.dataTransfer.files?.[0]);
+            }}
+            onClick={() => inputRef.current?.click()}
+            type="button"
+            className={cn(
+              "relative flex min-h-[340px] w-full flex-col items-center justify-center overflow-hidden rounded-2xl border border-dashed bg-white/[0.015] p-10 text-center transition-all duration-300",
+              dragOver
+                ? "border-violet-400/60 bg-violet-500/[0.08] ring-2 ring-violet-400/30"
+                : "border-white/15 hover:border-white/25 hover:bg-white/[0.03]"
+            )}
+          >
+            <input
+              ref={inputRef}
+              type="file"
+              accept="video/mp4,video/quicktime,video/webm,video/x-matroska,video/*"
+              className="hidden"
+              onChange={(e) => onPick(e.target.files?.[0])}
+            />
+            <div
+              aria-hidden
+              className="pointer-events-none absolute left-1/2 top-0 -z-10 h-80 w-[680px] -translate-x-1/2 bg-[radial-gradient(ellipse_at_top,rgba(139,92,246,0.18),transparent_60%)] blur-2xl"
+            />
 
-          <div className="mx-auto inline-flex size-16 items-center justify-center rounded-2xl border border-violet-400/30 bg-violet-500/10 text-violet-300 shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]">
-            <Upload size={26} />
-          </div>
-          <h3 className="mt-6 font-display text-xl font-semibold tracking-tight text-white">
-            Drag a recording here
-          </h3>
-          <p className="mx-auto mt-2 max-w-md text-sm text-fog">
-            or click to browse. Up to 2 GB. Your file stays in your workspace.
-          </p>
+            <div
+              className={cn(
+                "inline-flex size-16 items-center justify-center rounded-2xl border text-violet-300 shadow-[inset_0_1px_0_rgba(255,255,255,0.06)] transition-transform duration-300",
+                dragOver
+                  ? "scale-110 border-violet-400/50 bg-violet-500/20"
+                  : "border-violet-400/30 bg-violet-500/10"
+              )}
+            >
+              <Upload size={26} />
+            </div>
+            <h3 className="mt-6 font-display text-xl font-semibold tracking-tight text-white">
+              {dragOver ? "Drop to upload it" : "Drag a recording here"}
+            </h3>
+            <p className="mx-auto mt-2 max-w-sm text-sm text-fog">
+              or click to browse. Up to 2 GB.
+            </p>
 
-          <div className="mt-6 flex flex-wrap items-center justify-center gap-2">
-            {formats.map((f) => (
-              <span
-                key={f}
-                className="inline-flex items-center gap-1 rounded-md border border-white/10 bg-white/[0.03] px-2 py-0.5 text-[11px] font-medium text-fog"
-              >
-                <FileVideo size={10} />
-                {f}
-              </span>
-            ))}
-          </div>
-        </button>
+            <div className="mt-6 flex flex-wrap items-center justify-center gap-2">
+              {formats.map((f) => (
+                <span
+                  key={f}
+                  className="inline-flex items-center gap-1 rounded-md border border-white/10 bg-white/[0.03] px-2 py-0.5 text-[11px] font-medium text-fog"
+                >
+                  <FileVideo size={10} />
+                  {f}
+                </span>
+              ))}
+            </div>
+
+            <p className="mt-6 text-[11px] text-fog">
+              Your file stays private to your workspace
+            </p>
+          </button>
+
+          <ImportSideRail />
+        </div>
       ) : (
         <div className="glass space-y-5 rounded-2xl p-6">
           <div className="grid grid-cols-1 gap-5 lg:grid-cols-[1fr_280px]">
@@ -309,13 +344,19 @@ export default function UploadPage() {
         </div>
       )}
 
-      <p className="text-xs text-fog">
-        Your file is uploaded to{" "}
-        <code className="rounded bg-white/[0.04] px-1 py-0.5 font-mono text-[10px] text-white/85">
-          users/&#123;uid&#125;/projects/&#123;projectId&#125;/original/
-        </code>{" "}
-        in Firebase Storage, with a matching project document in Firestore.
-      </p>
+      {/* The old copy here printed the raw Firebase Storage path. It answered a
+          question no one asked and read like a stack trace; what people
+          actually want to know at this moment is who can see the file. */}
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-xl border border-white/[0.06] bg-white/[0.02] px-4 py-3">
+        <span className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg bg-violet-500/15 text-violet-300">
+          <CloudUpload size={14} />
+        </span>
+        <p className="min-w-0 flex-1 text-[12.5px] text-fog">
+          <span className="font-medium text-white">Private to your account.</span> Your recording
+          is stored in your own workspace and is only used to build your edit — never shared, and
+          deleted with the project.
+        </p>
+      </div>
     </div>
   );
 }
@@ -328,5 +369,235 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
       </dt>
       <dd className="min-w-0 truncate text-right text-white/85">{children}</dd>
     </div>
+  );
+}
+
+/**
+ * Desktop import.
+ *
+ * Two gestures, one outcome: drop a file on the zone, or click it and use the
+ * OS picker. Either way the file is validated and probed in the main process,
+ * a local project is created around the handle, and we go straight into the
+ * editor. Nothing is uploaded and nothing is copied — the source video stays
+ * exactly where the user keeps it, which is why there is no progress bar and no
+ * size limit here.
+ *
+ * The drop half is offered ONLY when the platform can actually accept one
+ * (`importDropped`). This screen spent a while drawing a dashed drop target
+ * that silently ignored every file dropped on it; a border that promises a
+ * gesture is part of the interface, and has to be earned.
+ */
+function LocalImportPanel() {
+  const { importing, error, openPicker, importDropped } = useLocalImport();
+  const [dragOver, setDragOver] = React.useState(false);
+  const canDrop = importDropped !== null;
+
+  // `dragleave` also fires when the pointer crosses onto a CHILD element, which
+  // makes the highlight flicker over the icon and the format chips. Counting
+  // enter/leave pairs is what keeps it lit for the whole hover.
+  const depth = React.useRef(0);
+
+  const dragProps = canDrop
+    ? {
+        onDragEnter: (e: React.DragEvent) => {
+          e.preventDefault();
+          depth.current += 1;
+          setDragOver(true);
+        },
+        onDragOver: (e: React.DragEvent) => {
+          e.preventDefault();
+          // Without this Windows shows the "can't drop here" cursor over a
+          // target that will in fact accept the file.
+          e.dataTransfer.dropEffect = "copy";
+        },
+        onDragLeave: (e: React.DragEvent) => {
+          e.preventDefault();
+          depth.current = Math.max(0, depth.current - 1);
+          if (depth.current === 0) setDragOver(false);
+        },
+        onDrop: (e: React.DragEvent) => {
+          e.preventDefault();
+          depth.current = 0;
+          setDragOver(false);
+          // Only the first file: one drop opens one editor, and silently
+          // creating five projects would be a surprise, not a shortcut.
+          const file = e.dataTransfer.files?.[0];
+          if (file) importDropped?.(file);
+        },
+      }
+    : {};
+
+  return (
+    <div className="space-y-5">
+      <PageHeader
+        eyebrow="Import"
+        title="Open a recording"
+        subtitle={
+          canDrop
+            ? "Drop a video onto the panel below, or browse for one. Framevo edits it in place — nothing is uploaded or copied."
+            : "Pick a video already on this computer. Framevo edits it in place — nothing is uploaded or copied."
+        }
+      />
+
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_320px]">
+        <button
+          type="button"
+          onClick={openPicker}
+          disabled={importing}
+          aria-label={canDrop ? "Choose a video, or drop one here" : "Choose a video"}
+          {...dragProps}
+          className={cn(
+            "relative flex min-h-[340px] w-full flex-col items-center justify-center overflow-hidden rounded-2xl p-10 text-center transition-all duration-300",
+            // Dashed only when a drop actually works — see the note above.
+            canDrop ? "border border-dashed" : "border border-solid",
+            dragOver
+              ? "border-violet-400/60 bg-violet-500/[0.08] ring-2 ring-violet-400/30"
+              : "border-white/15 bg-white/[0.015] hover:border-white/25 hover:bg-white/[0.03]",
+            importing && "cursor-wait opacity-70"
+          )}
+        >
+          <div
+            aria-hidden
+            className="pointer-events-none absolute left-1/2 top-0 -z-10 h-80 w-[680px] -translate-x-1/2 bg-[radial-gradient(ellipse_at_top,rgba(139,92,246,0.18),transparent_60%)] blur-2xl"
+          />
+          <div
+            className={cn(
+              "inline-flex size-16 items-center justify-center rounded-2xl border text-violet-300 shadow-[inset_0_1px_0_rgba(255,255,255,0.06)] transition-transform duration-300",
+              dragOver
+                ? "scale-110 border-violet-400/50 bg-violet-500/20"
+                : "border-violet-400/30 bg-violet-500/10"
+            )}
+          >
+            {importing ? <Loader2 size={26} className="animate-spin" /> : <Upload size={26} />}
+          </div>
+
+          <h3 className="mt-6 font-display text-xl font-semibold tracking-tight text-white">
+            {importing
+              ? "Reading your video…"
+              : dragOver
+                ? "Drop to open it"
+                : canDrop
+                  ? "Drop a video here"
+                  : "Choose a video"}
+          </h3>
+          <p className="mx-auto mt-2 max-w-sm text-sm text-fog">
+            {importing
+              ? "Checking the file and setting up your project."
+              : canDrop
+                ? "or click to browse this computer"
+                : "Framevo opens it straight from disk."}
+          </p>
+
+          <div className="mt-6 flex flex-wrap items-center justify-center gap-2">
+            {formats.map((f) => (
+              <span
+                key={f}
+                className="inline-flex items-center gap-1 rounded-md border border-white/10 bg-white/[0.03] px-2 py-0.5 text-[11px] font-medium text-fog"
+              >
+                <FileVideo size={10} />
+                {f}
+              </span>
+            ))}
+          </div>
+
+          <p className="mt-6 text-[11px] text-fog">
+            No upload · no copy · no size limit
+          </p>
+        </button>
+
+        <ImportSideRail local />
+      </div>
+
+      {error && (
+        <div
+          role="alert"
+          className="flex items-start gap-2 rounded-xl border border-rose-400/30 bg-rose-500/[0.06] px-4 py-3 text-sm text-rose-200"
+        >
+          <AlertCircle size={14} className="mt-0.5 shrink-0" />
+          <span>{error}</span>
+        </div>
+      )}
+
+      {/* The AI/cloud limitation, stated as a real thing you can act on. It used
+          to be grey 12px at the bottom of the page telling people to go to
+          framevo.com — which stopped being true when the editor grew its own
+          "turn on cloud sync" button. */}
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-xl border border-white/[0.06] bg-white/[0.02] px-4 py-3">
+        <span className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg bg-violet-500/15 text-violet-300">
+          <CloudUpload size={14} />
+        </span>
+        <p className="min-w-0 flex-1 text-[12.5px] text-fog">
+          <span className="font-medium text-white">Your video stays on this computer.</span>{" "}
+          AI analysis and cloud export run on Framevo&apos;s servers — turn on cloud sync from
+          inside the editor when you want them for a project.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The column beside the drop zone.
+ *
+ * It exists because this screen is one control on an otherwise empty page, and
+ * a single button floating in a half-empty window reads as unfinished. What
+ * fills it has to be true and useful, not decoration: what happens after you
+ * pick a file, and the other way to get a video in.
+ */
+function ImportSideRail({ local = false }: { local?: boolean }) {
+  const steps = local
+    ? [
+        { title: "Opens in place", detail: "Framevo reads the file where it is. No copy, no upload, no waiting." },
+        { title: "You edit it", detail: "Zooms, crops, captions, cuts and speed on the timeline." },
+        { title: "Export an MP4", detail: "Rendered by this computer, straight to a folder you choose." },
+      ]
+    : [
+        { title: "Uploads to your workspace", detail: "The recording lands in your Framevo account." },
+        { title: "AI plans the cut", detail: "Cursor movement, clicks and focus regions become zooms you can adjust." },
+        { title: "Export an MP4", detail: "Render in the browser, or in the cloud on a paid plan." },
+      ];
+
+  return (
+    <aside className="flex flex-col gap-3">
+      <div className="glass rounded-2xl p-5">
+        <h4 className="text-[10px] font-semibold uppercase tracking-[0.18em] text-fog">
+          What happens next
+        </h4>
+        <ol className="mt-4 space-y-4">
+          {steps.map((step, i) => (
+            <li key={step.title} className="flex gap-3">
+              <span
+                aria-hidden
+                className="mt-0.5 inline-flex size-5 shrink-0 items-center justify-center rounded-full border border-white/10 bg-white/[0.04] font-mono text-[10px] text-fog"
+              >
+                {i + 1}
+              </span>
+              <div className="min-w-0">
+                <div className="text-[13px] font-medium text-white">{step.title}</div>
+                <p className="mt-0.5 text-[12px] leading-relaxed text-fog">{step.detail}</p>
+              </div>
+            </li>
+          ))}
+        </ol>
+      </div>
+
+      <div className="glass rounded-2xl p-5">
+        <div className="flex items-center gap-2">
+          <span className="inline-flex size-7 items-center justify-center rounded-lg bg-cyan-500/15 text-cyan-300">
+            <Video size={14} />
+          </span>
+          <h4 className="text-[13px] font-medium text-white">Nothing to import yet?</h4>
+        </div>
+        <p className="mt-2 text-[12px] leading-relaxed text-fog">
+          Capture a window, a screen or a browser tab and Framevo turns it into a project the
+          moment you stop.
+        </p>
+        <div className="mt-3">
+          <Button href="/dashboard/record" variant="ghost" size="sm" leftIcon={<Video size={13} />}>
+            Record your screen
+          </Button>
+        </div>
+      </div>
+    </aside>
   );
 }

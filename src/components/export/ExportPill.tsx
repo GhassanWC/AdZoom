@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import { createPortal } from "react-dom";
-import { useRouter } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Loader2,
@@ -24,8 +24,15 @@ export function ExportPill() {
   const { job, isExporting, cancelExport, clearJob, downloadCurrent } =
     useExport();
   const router = useRouter();
+  const pathname = usePathname();
   const [mounted, setMounted] = React.useState(false);
   React.useEffect(() => setMounted(true), []);
+
+  // The workspace pins the theme dock to the bottom edge (components/ui/
+  // ThemeDock); a notification must not land on a control the user can always
+  // see. The editor has no dock, so the pill keeps the corner there.
+  const isEditor = /^\/dashboard\/projects\/[^/]+$/.test(pathname ?? "");
+  const bottom = isEditor ? "bottom-5" : "bottom-16";
 
   if (!mounted || !job) return null;
 
@@ -81,7 +88,7 @@ export function ExportPill() {
         onClick={() => router.push("/dashboard/exports")}
         role="button"
         tabIndex={0}
-        className={`fixed bottom-5 right-5 z-[116] flex w-80 cursor-pointer items-center gap-3 rounded-xl border bg-surface/95 p-3 text-left shadow-cinematic backdrop-blur-xl transition-colors duration-200 ${tone}`}
+        className={`fixed ${bottom} right-5 z-[116] flex w-80 cursor-pointer items-center gap-3 rounded-xl border bg-surface/95 p-3 text-left shadow-cinematic backdrop-blur-xl transition-colors duration-200 ${tone}`}
         aria-label="Open exports"
       >
         <span

@@ -4,6 +4,7 @@ import { MotionConfig } from "framer-motion";
 import "./globals.css";
 import { NoiseOverlay } from "@/components/ui/NoiseOverlay";
 import { AuthProvider } from "@/lib/firebase/AuthProvider";
+import { PlatformProvider } from "@/lib/platform";
 import { ToastProvider } from "@/components/ui/Toast";
 import { ConfirmProvider } from "@/components/ui/ConfirmDialog";
 import { ThemeProvider, themeInitScript } from "@/lib/theme";
@@ -96,6 +97,10 @@ export default function RootLayout({
         </a>
         <ThemeProvider>
           <AuthProvider>
+            {/* Resolves the storage / media / export backends ONCE (cloud in the
+                browser, local in the desktop app) — see lib/platform. Inside
+                AuthProvider because the cloud backend is scoped to the user. */}
+            <PlatformProvider>
             <AnalyticsProvider>
               <ToastProvider>
                 <ConfirmProvider>
@@ -108,6 +113,7 @@ export default function RootLayout({
                 </ConfirmProvider>
               </ToastProvider>
             </AnalyticsProvider>
+            </PlatformProvider>
           </AuthProvider>
         </ThemeProvider>
       </body>

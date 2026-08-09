@@ -85,6 +85,7 @@ import {
   type ProjectStatus,
   type Transcript,
   type VisualAnalysis,
+  type ZoomPresetId,
 } from "@/lib/firebase/schema";
 // The Director runs as the FINAL STAGE of analysis (see the stage below) — the
 // user's brief, applied to the understanding this run just produced.
@@ -848,6 +849,11 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
 
     const existingPacing = (project.effectsSettings as { pacing?: Pacing } | undefined)?.pacing;
     const pacing: Pacing = existingPacing ?? "moderate";
+    // The project's zoom style bounds how long a generated zoom may run (see
+    // timeline/zoom-normalize). Absent ⇒ the balancer's "standard" default.
+    const zoomPreset = (
+      project.effectsSettings as { zoomPreset?: ZoomPresetId } | undefined
+    )?.zoomPreset;
     const visualAnalysis = project.visualAnalysis as VisualAnalysis | undefined;
 
     // ── Transcript (READ-ONLY during analysis; captions are DECOUPLED) ──────
@@ -1014,6 +1020,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       boringSections: sections.boringSections,
       interactions,
       preserved: preservedMoments,
+      zoomPreset,
     });
 
     await ensureNotCancelled(ref);
@@ -1206,6 +1213,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       boringSections: sections.boringSections,
       interactions,
       preserved: preservedMoments,
+      zoomPreset,
     });
 
     await ensureNotCancelled(ref);
@@ -1789,6 +1797,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
         moments: finalMoments,
         effects: effectsForDirector,
         prior: project.director as DirectorState | undefined,
+        planOnly: analysisOptions.directorPlanOnly === true,
       });
 
       for (const line of directed.log) await emitActivity(ref, line.kind, line.text);

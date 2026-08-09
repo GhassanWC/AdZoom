@@ -100,6 +100,8 @@ export function VideoLayer({
   const sourceTime = sourceTimeForFrame(segments, frame, fps, recipe.sourceDuration);
   const { camera } = resolveCameraFrame(recipe.moments, sourceTime, {
     autoZoom: recipe.effects.autoZoom,
+    preset: recipe.effects.zoomPreset,
+    speed: recipe.effects.zoomSpeed,
   });
   const groupStyle = useMemo(() => cameraGroupStyle(recipe, camera), [recipe, camera]);
 

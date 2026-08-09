@@ -1,16 +1,15 @@
 "use client";
 
 import * as React from "react";
-import {
-  arrayRemove,
-  arrayUnion,
-  deleteField,
-  doc,
-  serverTimestamp,
-  setDoc,
-} from "firebase/firestore";
-import type { DocumentReference } from "firebase/firestore";
+import { doc, getDoc } from "firebase/firestore";
 import { getFirebase } from "@/lib/firebase/client";
+// Document writes go through the platform port, NOT the Firestore SDK directly:
+// on the web it is the same `setDoc(ref, patch, {merge:true})` as before, on the
+// desktop it is the local SQLite library. The sentinels below are the shared
+// vocabulary both backends understand (see lib/platform/field-value.ts).
+import { usePlatform } from "@/lib/platform";
+import { arrayRemove, arrayUnion, deleteField, serverTimestamp } from "@/lib/platform";
+import type { DocPatch, ProjectWriteOptions } from "@/lib/platform";
 import type {
   AiSuggestion,
   Analysis,
@@ -72,7 +71,6 @@ import {
   clampSplitFraction,
 } from "./workspace-split";
 import type { Interaction } from "@/lib/recording/types";
-import { getDoc } from "firebase/firestore";
 import {
   normalizePlan,
   planMeetsMinimum,
@@ -117,6 +115,7 @@ import {
   splitMomentsAt,
   splitReason,
 } from "@/lib/timeline/split";
+import { clampZoomWindow, zoomPreset } from "@/lib/timeline/zoom-presets";
 import {
   resolveSourceRect,
   remapRegion,
@@ -137,7 +136,16 @@ import type {
   VisualAnalysis,
 } from "@/lib/firebase/schema";
 import { useNotifications } from "@/lib/notifications/store";
+import { useRenderCount } from "@/lib/perf/render-probe";
+import {
+  createClockStore,
+  PlaybackClockProvider,
+  useClockSelector,
+} from "./playback-clock";
+import { activeMomentIdAt, canSplitAt } from "./clock-selectors";
 
+
+import { apiFetch } from "@/lib/platform/api";
 // ── Frame-crop coordinate remap (best-effort) ────────────────────────────────
 // Downstream coords (focusRegion, keyframes, CV cursor/centroid) are normalized
 // to the EFFECTIVE (cropped) frame. When the crop changes, re-express existing
@@ -214,6 +222,8 @@ function remapVisualAnalysisForCrop(
  * (no side panel needed); the rail's Crop button toggles `cropEditing` instead.
  */
 export type RightTool =
+  /** The AI chat — the primary way edits get asked for. */
+  | "ai-chat"
   | "canvas"
   | "captions"
   /**
@@ -243,10 +253,34 @@ interface EditorSnapshot {
 
 interface EditorRealContextValue {
   project: ProjectDoc;
-  uid: string;
+  /**
+   * Firebase uid, or null when no one is signed in. A LOCAL desktop project is
+   * editable and exportable signed-out; the cloud-only actions (AI analysis,
+   * captions, reframe, plan-gated presets) check `cloudAvailable` first.
+   */
+  uid: string | null;
+  /** True when cloud features can run: signed in AND the project lives in the cloud. */
+  cloudAvailable: boolean;
+  /**
+   * Persist a merge patch to whichever backend owns this project. The ONE write
+   * path — components must never build a Firestore reference themselves.
+   */
+  writeProject: (patch: DocPatch, options?: ProjectWriteOptions) => Promise<void>;
   videoRef: React.RefObject<HTMLVideoElement | null>;
-  currentTime: number;
-  setCurrentTime: (t: number) => void;
+  /**
+   * NOTE: the playhead time is deliberately NOT on this context.
+   *
+   * It changes several times a second during playback and on every pointermove
+   * while scrubbing; keeping it here meant every tick produced a new context
+   * value and re-rendered all ~30 consumers (the whole timeline, the inspector,
+   * the export panel). Read it from the dedicated clock instead:
+   *
+   *   usePlaybackTime()   — reactive, for components that RENDER the time
+   *   useClockSelector()  — reactive on a derived value (e.g. "active chapter")
+   *   useClockRef()       — non-reactive, for drag/snap math in event handlers
+   *
+   * See playback-clock.tsx.
+   */
   playing: boolean;
   setPlaying: (p: boolean) => void;
   /** True while a client-side export render is running. The preview pauses its
@@ -380,7 +414,6 @@ interface EditorRealContextValue {
   /** Developer overlay: CV signal curves, scene markers, centroid path. */
   cvDebug: boolean;
   setCvDebug: (v: boolean) => void;
-  activeMoment: DetectedMoment | null;
   updateMoment: (id: string, patch: Partial<DetectedMoment>) => Promise<void>;
   deleteMoment: (id: string) => Promise<void>;
   addMoment: (m: DetectedMoment) => Promise<void>;
@@ -424,8 +457,6 @@ interface EditorRealContextValue {
    * it rather than leaving the user with a button that silently does nothing.
    */
   splitAtPlayhead: (ids?: string[]) => Promise<string | null>;
-  /** True when the current selection can actually be split where the playhead is. */
-  canSplitSelection: boolean;
   /** Manually insert an edit of the given effect at the current playhead. */
   addMomentAtPlayhead: (effectType: EffectType) => Promise<void>;
   /** Mint a stable unique id for a user-created moment. */
@@ -663,6 +694,14 @@ function selectAnalysisMode(
 }
 
 /**
+ * How the editor persists: one merge patch at a time, through the platform's
+ * `ProjectStorage`. Cloud (Firestore) and local (SQLite) both accept the same
+ * patch — including the ./field-value sentinels — so nothing below this line
+ * knows which backend it is writing to.
+ */
+type ProjectWriter = (patch: DocPatch, options?: ProjectWriteOptions) => Promise<void>;
+
+/**
  * Write a terminal "failed" state for a chunked run. Mirrors the analyze
  * route's `bail()` shape so the overlay's existing `status: "failed"` handling
  * renders `errorMessage` verbatim — no schema change needed. This is used
@@ -671,12 +710,10 @@ function selectAnalysisMode(
  * (Firestore `analysis.errorMessage` + `activity[]`) without devtools.
  */
 async function writeChunkFailure(
-  projectRef: DocumentReference,
+  writeProject: ProjectWriter,
   { errorKind, errorMessage }: { errorKind: AnalysisErrorKind; errorMessage: string }
 ): Promise<void> {
-  await setDoc(
-    projectRef,
-    {
+  await writeProject({
       status: "failed",
       analysis: {
         status: "failed",
@@ -688,9 +725,7 @@ async function writeChunkFailure(
         activity: arrayUnion({ ts: Date.now(), kind: "error", text: errorMessage }),
       },
       updatedAt: serverTimestamp(),
-    },
-    { merge: true }
-  ).catch(() => {});
+    }).catch(() => {});
 }
 
 /**
@@ -742,14 +777,28 @@ export function EditorRealProvider({
   idTokenGetter,
   children,
 }: {
-  uid: string;
+  /** Null when signed out — legal for a local desktop project. */
+  uid: string | null;
   project: ProjectDoc;
   idTokenGetter: () => Promise<string | null>;
   children: React.ReactNode;
 }) {
+  useRenderCount("provider");
+
   const videoRef = React.useRef<HTMLVideoElement | null>(null);
   const { tier: planTier } = usePlanTier();
-  const [currentTime, setCurrentTime] = React.useState(0);
+  // ── Playhead clock ────────────────────────────────────────────────────────
+  // NOT React state. It ticks several times a second during playback and on
+  // every pointermove while scrubbing; as provider state it re-rendered the
+  // entire editor at that rate. As an external store the tick re-renders only
+  // the components that subscribe (see playback-clock.tsx), and this provider
+  // reads it through `clock.get()` inside callbacks — no subscription, no
+  // re-render, and no stale-closure dependency to thread through useCallback.
+  const [clock] = React.useState(() => createClockStore(0));
+  const setCurrentTime = React.useMemo(
+    () => (t: number) => clock.set(t),
+    [clock]
+  );
   const [playing, setPlaying] = React.useState(false);
   const [exporting, setExporting] = React.useState(false);
   const [duration, setDuration] = React.useState(project.duration ?? 0);
@@ -903,22 +952,16 @@ export function EditorRealProvider({
     notifications,
   ]);
 
-  // Compute the currently-active moment based on currentTime.
-  const activeMoment = React.useMemo<DetectedMoment | null>(() => {
-    const moments = project.analysis?.detectedMoments ?? [];
-    // If user has explicitly selected one, prefer that.
-    if (selectedMomentId) {
-      const sel = moments.find((m) => m.id === selectedMomentId);
-      if (sel && currentTime >= sel.startTime && currentTime <= sel.endTime) {
-        return sel;
-      }
-    }
-    // Otherwise pick the moment whose range contains currentTime.
-    const within = moments.find(
-      (m) => currentTime >= m.startTime && currentTime <= m.endTime
-    );
-    return within ?? null;
-  }, [project.analysis?.detectedMoments, selectedMomentId, currentTime]);
+  // NOTE: "the moment under the playhead" and "can the selection be split here"
+  // deliberately do NOT live in this provider — see `useActiveMoment` and
+  // `useCanSplitSelection` at the bottom of this file. Both were
+  // `useSyncExternalStore(clock.subscribe, …)` HERE, which meant that crossing an
+  // edit boundary re-rendered the provider, rebuilt the one context value, and
+  // re-rendered all ~30 consumers — the timeline with every pill, the export
+  // panel, the control bar — to update an overlay and one button's disabled
+  // state. Measured: 3s of playback cost 15 provider renders and 9 apiece of the
+  // timeline, the preview and the control bar. As hooks, the subscription lands
+  // only in the handful of components that actually read the value.
 
   const seek = React.useCallback((t: number) => {
     const v = videoRef.current;
@@ -928,7 +971,7 @@ export function EditorRealProvider({
     const snapped = snapOutOfActiveCut(momentsRef.current, t);
     v.currentTime = Math.max(0, Math.min(v.duration || snapped, snapped));
     setCurrentTime(v.currentTime);
-  }, []);
+  }, [setCurrentTime]);
 
   const togglePlay = React.useCallback(() => {
     const v = videoRef.current;
@@ -946,15 +989,19 @@ export function EditorRealProvider({
     } else {
       v.pause();
     }
-  }, []);
+  }, [setCurrentTime]);
 
+  // Reads the clock at call time rather than closing over it, so this keeps ONE
+  // identity for the life of the editor. Arrow-key seeking used to rebuild this
+  // callback on every tick, which invalidated every keyboard handler that
+  // depended on it.
   const seekBy = React.useCallback(
     (delta: number) => {
       const v = videoRef.current;
-      const base = v ? v.currentTime : currentTime;
+      const base = v ? v.currentTime : clock.get();
       seek(base + delta);
     },
-    [seek, currentTime]
+    [seek, clock]
   );
 
   // ── Preview volume + fullscreen (local playback prefs, shared by the
@@ -986,10 +1033,46 @@ export function EditorRealProvider({
     else void el.requestFullscreen?.();
   }, []);
 
-  const projectRef = React.useMemo(() => {
-    const { db } = getFirebase();
-    return doc(db, "users", uid, "projects", project.id);
-  }, [uid, project.id]);
+  // THE write path. `storage` is Firestore in the browser; in the desktop app
+  // it is whichever backend owns THIS document — the local SQLite library for a
+  // project imported here, Firestore for one that came from the account. The
+  // document names its own home (`userId`), so this cannot disagree with where
+  // the editor read it from. The patches below are identical either way.
+  const platform = usePlatform();
+  const storage = platform.storageFor(project);
+  // Live handle on the current document for callbacks that need to READ it at
+  // call time. Depending on `project` directly (as several mutators used to)
+  // gave every one of them a new identity on every write, which defeated
+  // memoization all the way down the tree — the write echoes back a new
+  // `project`, so the callbacks rebuilt on exactly the path that most needed
+  // them to be stable.
+  // Mirrored in an effect (not during render) to match `momentsRef`/`layersRef`
+  // below. Effects flush before the next user interaction, so a callback fired
+  // from an event always sees the current document.
+  const projectRef = React.useRef(project);
+  React.useEffect(() => {
+    projectRef.current = project;
+  }, [project]);
+  const writeProject = React.useCallback<ProjectWriter>(
+    (patch, options) => storage.write(projectRef.current.id, patch, options),
+    [storage]
+  );
+  // AI analysis, transcription and reframe run on Framevo's servers against the
+  // uploaded source, so they need BOTH a signed-in user and a cloud project. A
+  // local desktop project has neither — every other editing tool still works.
+  const cloudAvailable = storage.kind === "cloud" && !!uid;
+  const requireCloud = React.useCallback(
+    (action: string): string => {
+      if (!uid) throw new Error(`Sign in to ${action}.`);
+      if (storage.kind !== "cloud") {
+        throw new Error(
+          `${action[0].toUpperCase()}${action.slice(1)} runs in the cloud — turn on cloud sync for this project first.`
+        );
+      }
+      return uid;
+    },
+    [uid, storage.kind]
+  );
 
   // ── Smart Clip Generation ───────────────────────────────────────────────
   /**
@@ -1062,13 +1145,9 @@ export function EditorRealProvider({
 
   const writeClips = React.useCallback(
     async (next: GeneratedClip[]) => {
-      await setDoc(
-        projectRef,
-        { clips: next, updatedAt: serverTimestamp() },
-        { merge: true }
-      );
+      await writeProject({ clips: next, updatedAt: serverTimestamp() });
     },
-    [projectRef]
+    [writeProject]
   );
 
   const clipGenInput = React.useCallback(
@@ -1302,26 +1381,28 @@ export function EditorRealProvider({
       // deep-merges maps: a sparse map can add a `false` but can never take one
       // away, so re-showing a layer — or undoing a hide — would write a map that
       // merges to no change at all. See normalizeLayerVisibility.
+      // Reads the live document from the ref rather than closing over it: this
+      // callback is the root of every moment mutator, so a dependency on
+      // `project.analysis` (a fresh object after each write) rebuilt
+      // updateMoment/addMoment/split/… on every single edit. Now the whole
+      // mutator surface keeps one identity for the life of the editor.
+      const current = projectRef.current;
       await enqueueProjectWrite(
-        project.id,
+        current.id,
         "user-moments-write",
         () =>
-          setDoc(
-            projectRef,
-            {
+          writeProject({
               analysis: stripUndefined({
-                ...(project.analysis ?? {}),
+                ...(projectRef.current.analysis ?? {}),
                 detectedMoments: snap.moments,
               }),
               timelineLayers: normalizeLayerVisibility(snap.layers),
               updatedAt: serverTimestamp(),
-            },
-            { merge: true }
-          ),
+            }),
         coalesce ? { coalesceTag: "user-moments-write" } : undefined
       );
     },
-    [project.analysis, project.id, projectRef]
+    [writeProject]
   );
 
   // Group rapid successive edits (a single slider/colour drag) into ONE undo
@@ -1454,14 +1535,18 @@ export function EditorRealProvider({
     [commitMoments]
   );
 
+  // `selectedMomentId` is read through the functional setter rather than closed
+  // over, so this keeps ONE identity across selection changes. Closing over it
+  // rebuilt `deleteMoment` on every selection, which rebuilt the lane's
+  // `onDelete` prop, which re-rendered every pill on the timeline — for a click.
   const deleteMoment: EditorRealContextValue["deleteMoment"] = React.useCallback(
     async (id) => {
       const next = momentsRef.current.filter((m) => m.id !== id);
       await commitMoments(next);
-      if (selectedMomentId === id) setSelectedMomentId(null);
+      setSelectedMomentId((current) => (current === id ? null : current));
       setMultiSelectIds((ids) => ids.filter((x) => x !== id));
     },
-    [commitMoments, selectedMomentId]
+    [commitMoments]
   );
 
   // Per-edit show/hide. Deliberately NOT routed through `updateMoment`: that one
@@ -1603,18 +1688,6 @@ export function EditorRealProvider({
     [multiSelectIds, selectedMomentId]
   );
 
-  // Depends on the PROJECT's moments, not `momentsRef`: the ref is a mutable
-  // mirror, so reading it in a memo would leave the Split button stale after an
-  // edit moved the pill out from under the playhead.
-  const projectMoments = project.analysis?.detectedMoments;
-  const canSplitSelection = React.useMemo(() => {
-    if (splitTargetIds.length === 0) return false;
-    const ids = new Set(splitTargetIds);
-    return (projectMoments ?? []).some(
-      (m) => ids.has(m.id) && canSplit(m, currentTime)
-    );
-  }, [splitTargetIds, currentTime, projectMoments]);
-
   const splitAtPlayhead: EditorRealContextValue["splitAtPlayhead"] =
     React.useCallback(
       async (ids) => {
@@ -1625,14 +1698,15 @@ export function EditorRealProvider({
         if (targets.length === 0) return "Select an edit to split.";
 
         const current = momentsRef.current;
-        const res = splitMomentsAt(current, targets, currentTime, newMomentId);
+        const at = clock.get();
+        const res = splitMomentsAt(current, targets, at, newMomentId);
 
         if (!res) {
           // Nothing split — say WHY. A Split button that silently does nothing
           // when the playhead is a hair outside the pill is the most confusing
           // possible outcome, so we surface the actual reason.
           const first = current.find((m) => targets.includes(m.id));
-          const reason = first ? splitReason(first, currentTime) : null;
+          const reason = first ? splitReason(first, at) : null;
           return reason
             ? splitBlockedMessage(reason)
             : "Move the playhead inside the edit to split it.";
@@ -1645,7 +1719,7 @@ export function EditorRealProvider({
         clearMultiSelect();
         return null;
       },
-      [splitTargetIds, currentTime, newMomentId, commitMoments, clearMultiSelect]
+      [splitTargetIds, clock, newMomentId, commitMoments, clearMultiSelect]
     );
 
   const addMomentAtPlayhead: EditorRealContextValue["addMomentAtPlayhead"] =
@@ -1671,7 +1745,8 @@ export function EditorRealProvider({
                       ? 2.4
                       : 1.8;
         const total = duration || project.duration || 0;
-        const start = total > 0 ? Math.min(currentTime, Math.max(0, total - span)) : currentTime;
+        const at = clock.get();
+        const start = total > 0 ? Math.min(at, Math.max(0, total - span)) : at;
         // Source aspect drives the initial crop box shape — use the EFFECTIVE
         // (Frame Crop) dims so a manual crop box starts at the same aspect the
         // preview + export frame the source at.
@@ -1690,10 +1765,22 @@ export function EditorRealProvider({
               sourceAspect
             )
           : { x: 0.3, y: 0.3, width: 0.4, height: 0.4 };
+        const rawEnd = total > 0 ? Math.min(total, start + span) : start + span;
+        // A hand-placed zoom lands inside the same duration window the AI pass
+        // obeys, so a manual edit and a generated one feel like the same tool.
+        const window =
+          effectType === "zoom" || effectType === "cursor-focus"
+            ? clampZoomWindow(
+                start,
+                rawEnd,
+                zoomPreset(project.effectsSettings?.zoomPreset),
+                total > 0 ? total : Infinity
+              )
+            : { startTime: start, endTime: rawEnd };
         const m: DetectedMoment = {
           id: newMomentId(),
-          startTime: start,
-          endTime: total > 0 ? Math.min(total, start + span) : start + span,
+          startTime: window.startTime,
+          endTime: window.endTime,
           label: DEFAULT_EFFECT_LABEL[effectType],
           reason: "Manually added.",
           focusRegion,
@@ -1748,22 +1835,25 @@ export function EditorRealProvider({
         setSelectedMomentId(m.id);
         setInspectorOpen(true);
       },
-      [commitMoments, project.duration, currentTime, duration, newMomentId]
+      [
+        commitMoments,
+        project.duration,
+        project.effectsSettings,
+        clock,
+        duration,
+        newMomentId,
+      ]
     );
 
   const dismissSuggestion: EditorRealContextValue["dismissSuggestion"] =
     React.useCallback(
       async (id) => {
-        await setDoc(
-          projectRef,
-          {
+        await writeProject({
             analysis: { dismissedSuggestionIds: arrayUnion(id) },
             updatedAt: serverTimestamp(),
-          },
-          { merge: true }
-        );
+          });
       },
-      [projectRef]
+      [writeProject]
     );
 
   const acceptSuggestion: EditorRealContextValue["acceptSuggestion"] =
@@ -1793,37 +1883,29 @@ export function EditorRealProvider({
         }
 
         // One write: apply the change AND record the dismissal together.
-        await setDoc(
-          projectRef,
-          {
+        await writeProject({
             analysis: {
               ...(project.analysis ?? {}),
               detectedMoments: nextMoments,
               dismissedSuggestionIds: arrayUnion(s.id),
             },
             updatedAt: serverTimestamp(),
-          },
-          { merge: true }
-        );
+          });
         if (focusId) setSelectedMomentId(focusId);
       },
-      [project.analysis, projectRef, newMomentId]
+      [project.analysis, writeProject, newMomentId]
     );
 
   const updateEffects: EditorRealContextValue["updateEffects"] = React.useCallback(
     async (key, value) => {
-      await setDoc(
-        projectRef,
-        {
+      await writeProject({
           effectsSettings: { ...project.effectsSettings, [key]: value },
           // Editing any slider/toggle drops the "applied" tie to the preset.
           selectedPresetId: null,
           updatedAt: serverTimestamp(),
-        },
-        { merge: true }
-      );
+        });
     },
-    [project.effectsSettings, projectRef]
+    [project.effectsSettings, writeProject]
   );
 
   /**
@@ -1862,16 +1944,12 @@ export function EditorRealProvider({
   // drop a single nested key under a `{merge:true}` write.
   const clearOutputCanvas: EditorRealContextValue["clearOutputCanvas"] =
     React.useCallback(async () => {
-      await setDoc(
-        projectRef,
-        {
+      await writeProject({
           effectsSettings: { outputCanvas: deleteField() },
           selectedPresetId: null,
           updatedAt: serverTimestamp(),
-        },
-        { merge: true }
-      );
-    }, [projectRef]);
+        });
+    }, [writeProject]);
 
   // Persist a global source crop. Writes the top-level `sourceCrop` field (a
   // property of the source bytes — NOT an effects setting, so it must not touch
@@ -1911,9 +1989,9 @@ export function EditorRealProvider({
             crop
           );
         }
-        await setDoc(projectRef, patch, { merge: true });
+        await writeProject(patch);
       },
-      [projectRef, project.sourceCrop, project.visualAnalysis, project.analysis]
+      [writeProject, project.sourceCrop, project.visualAnalysis, project.analysis]
     );
 
   const clearSourceCrop: EditorRealContextValue["clearSourceCrop"] =
@@ -1943,8 +2021,8 @@ export function EditorRealProvider({
           undefined
         );
       }
-      await setDoc(projectRef, patch, { merge: true });
-    }, [projectRef, project.sourceCrop, project.visualAnalysis, project.analysis]);
+      await writeProject(patch);
+    }, [writeProject, project.sourceCrop, project.visualAnalysis, project.analysis]);
 
   // Flip the browser-tab sharing-bar removal — a convenience for the
   // auto-detected crop. Only acts on a `browser-bar-cleanup` crop so it can't
@@ -1966,8 +2044,9 @@ export function EditorRealProvider({
       // direct programmatic calls and surface bugs. Reads the live plan from
       // Firestore so a recent webhook upgrade is honoured.
       if (preset.requiredPlan) {
+        const planUid = requireCloud(`apply the ${preset.name} preset`);
         const { db } = getFirebase();
-        const userSnap = await getDoc(doc(db, "users", uid));
+        const userSnap = await getDoc(doc(db, "users", planUid));
         const plan = normalizePlan(
           (userSnap.data() as { plan?: unknown } | undefined)?.plan
         );
@@ -1994,27 +2073,19 @@ export function EditorRealProvider({
       // Pacing is still captured in `effectsSettings.pacing`. A future
       // explicit "Re-balance timeline" action can consume it; that path
       // must be a deliberate user choice, not a side-effect of style apply.
-      await setDoc(
-        projectRef,
-        {
+      await writeProject({
           effectsSettings: nextSettings,
           selectedPresetId: preset.id,
           updatedAt: serverTimestamp(),
-        },
-        { merge: true }
-      );
+        });
     },
-    [project.effectsSettings, projectRef, uid]
+    [project.effectsSettings, writeProject, uid]
   );
 
   const clearSelectedPreset: EditorRealContextValue["clearSelectedPreset"] =
     React.useCallback(async () => {
-      await setDoc(
-        projectRef,
-        { selectedPresetId: null, updatedAt: serverTimestamp() },
-        { merge: true }
-      );
-    }, [projectRef]);
+      await writeProject({ selectedPresetId: null, updatedAt: serverTimestamp() });
+    }, [writeProject]);
 
   // Persist the pre-analysis video-type choice. Optimistic local update so the
   // picker highlights instantly; the doc write makes it survive reloads + feeds
@@ -2023,16 +2094,22 @@ export function EditorRealProvider({
     React.useCallback(
       async (t) => {
         setSelectedVideoTypeState(t);
-        await setDoc(
-          projectRef,
-          { selectedVideoType: t, updatedAt: serverTimestamp() },
-          { merge: true }
-        );
+        await writeProject({ selectedVideoType: t, updatedAt: serverTimestamp() });
       },
-      [projectRef]
+      [writeProject]
     );
 
   const startAnalyze = React.useCallback(async (rawOptions: AnalysisOptions) => {
+    // AI analysis reads the source from Framevo's servers, so it needs a signed
+    // in user and a cloud project. Fails with a plain explanation rather than a
+    // permission error from deep inside the orchestrator.
+    let analyzeUid: string;
+    try {
+      analyzeUid = requireCloud("run AI analysis");
+    } catch (err) {
+      setAnalyzeError(err instanceof Error ? err.message : "AI analysis is unavailable.");
+      return;
+    }
     // Attach the user's video type so the whole pipeline (orchestrator →
     // finalize route → balancer/prompt) applies the matching edit recipe. The
     // dialog now owns the type picker and passes its choice in `rawOptions` —
@@ -2124,21 +2201,17 @@ export function EditorRealProvider({
         // so future loads route correctly, and (b) flips the overlay to
         // "Analyzing in chunks" immediately so the old "Uploading to Gemini"
         // stages never flash.
-        await setDoc(
-          projectRef,
-          {
+        await writeProject({
             ...(isGoodDuration(project.duration)
               ? {}
               : { duration: resolvedDuration }),
             status: "analyzing",
             analysis: { status: "analyzing", stage: "Analyzing in chunks" },
             updatedAt: serverTimestamp(),
-          },
-          { merge: true }
-        );
+          });
         try {
           const result = await runChunkedAnalysis({
-            uid,
+            uid: analyzeUid,
             // Feed the resolved duration so the orchestrator never throws
             // "Unknown duration" on an old project with a missing field.
             project: { ...project, duration: resolvedDuration },
@@ -2170,7 +2243,7 @@ export function EditorRealProvider({
               chunkErr instanceof ChunkedAnalysisError ? chunkErr.phase : "start",
             message: chunkErr instanceof Error ? chunkErr.message : String(chunkErr),
           });
-          await writeChunkFailure(projectRef, {
+          await writeChunkFailure(writeProject, {
             errorKind: "unknown",
             errorMessage: message,
           });
@@ -2198,7 +2271,7 @@ export function EditorRealProvider({
             : null,
           videoReadyState: videoRef.current?.readyState ?? null,
         });
-        await writeChunkFailure(projectRef, {
+        await writeChunkFailure(writeProject, {
           errorKind: "unknown",
           errorMessage:
             "Chunked analysis failed to start: could not resolve the video's duration.",
@@ -2222,9 +2295,7 @@ export function EditorRealProvider({
       const cvDuration = resolvedDuration;
       if (video && cvDuration > 0) {
         try {
-          await setDoc(
-            projectRef,
-            {
+          await writeProject({
               status: "scanning_frames",
               analysis: {
                 status: "analyzing",
@@ -2242,9 +2313,7 @@ export function EditorRealProvider({
                 errorMessage: null,
               },
               updatedAt: serverTimestamp(),
-            },
-            { merge: true }
-          );
+            });
           setCvProgress(0);
           const va = await runVisualAnalysis(video, {
             duration: cvDuration,
@@ -2252,9 +2321,7 @@ export function EditorRealProvider({
             sourceCrop: project.sourceCrop,
             onProgress: (p) => setCvProgress(p.done),
           });
-          await setDoc(
-            projectRef,
-            {
+          await writeProject({
               visualAnalysis: va,
               analysis: {
                 activity: arrayUnion({
@@ -2268,15 +2335,11 @@ export function EditorRealProvider({
                 }),
               },
               updatedAt: serverTimestamp(),
-            },
-            { merge: true }
-          );
+            });
         } catch (cvErr) {
           if (cvErr instanceof CvAbortError) {
             // Cancelled mid-scan — mark cancelled and stop here.
-            await setDoc(
-              projectRef,
-              {
+            await writeProject({
                 status: "cancelled",
                 analysis: {
                   status: "cancelled",
@@ -2284,9 +2347,7 @@ export function EditorRealProvider({
                   cancelRequested: false,
                 },
                 updatedAt: serverTimestamp(),
-              },
-              { merge: true }
-            );
+              });
             return;
           }
           // Tainted canvas or any other CV failure → degrade gracefully and
@@ -2295,16 +2356,12 @@ export function EditorRealProvider({
             cvErr instanceof CvTaintedError
               ? "Frame scan skipped — video not readable on-device (CORS). Continuing with Gemini only."
               : "Frame scan skipped — CV pass failed. Continuing with Gemini only.";
-          await setDoc(
-            projectRef,
-            {
+          await writeProject({
               analysis: {
                 activity: arrayUnion({ ts: Date.now(), kind: "warn", text: msg }),
               },
               updatedAt: serverTimestamp(),
-            },
-            { merge: true }
-          );
+            });
         } finally {
           setCvProgress(null);
         }
@@ -2313,7 +2370,7 @@ export function EditorRealProvider({
       // ── Phase 1+: server analysis (Gemini + balancer fusion) ───────────
       const token = await idTokenGetter();
       if (!token) throw new Error("Not signed in.");
-      const res = await fetch(`/api/projects/${project.id}/analyze`, {
+      const res = await apiFetch(`/api/projects/${project.id}/analyze`, {
         method: "POST",
         headers: {
           authorization: `Bearer ${token}`,
@@ -2340,17 +2397,27 @@ export function EditorRealProvider({
       setCvProgress(null);
       setAnalyzing(false);
     }
-  }, [idTokenGetter, uid, project, projectRef, videoRef, interactions, planTier, selectedVideoType]);
+  }, [idTokenGetter, uid, project, writeProject, videoRef, interactions, planTier, selectedVideoType]);
 
   // Client → the DEDICATED captions endpoint. Captions are generated ONLY here
   // (analysis never touches them). Returns the server's structured outcome so
   // the dialog can react (exists / processing / blocked / …).
   const postCaptions = React.useCallback(
     async (body: Record<string, unknown>): Promise<CaptionActionResult> => {
+      // Transcription runs server-side against the uploaded source, so a local
+      // (desktop) project has nothing for it to read. Say that instead of
+      // returning an opaque 404 from the route.
+      if (!cloudAvailable) {
+        return {
+          status: "error",
+          message:
+            "Automatic captions run in the cloud — turn on cloud sync for this project first.",
+        };
+      }
       const token = await idTokenGetter();
       if (!token) return { status: "error", message: "Not signed in." };
       try {
-        const res = await fetch(`/api/projects/${project.id}/captions`, {
+        const res = await apiFetch(`/api/projects/${project.id}/captions`, {
           method: "POST",
           headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
           body: JSON.stringify(body),
@@ -2365,7 +2432,7 @@ export function EditorRealProvider({
         return { status: "error", message: err instanceof Error ? err.message : "Caption request failed." };
       }
     },
-    [idTokenGetter, project.id]
+    [idTokenGetter, project.id, cloudAvailable]
   );
 
   // "Generate AI Captions" — the ONE automatic caption entry point. Reuses an
@@ -2429,18 +2496,14 @@ export function EditorRealProvider({
           project.id,
           "director-brief",
           () =>
-            setDoc(
-              projectRef,
-              {
+            writeProject({
                 directorBrief: stripUndefined(brief),
                 updatedAt: serverTimestamp(),
-              },
-              { merge: true }
-            ),
+              }),
           { coalesceTag: "director-brief" }
         );
       },
-      [project.id, projectRef]
+      [project.id, writeProject]
     );
 
   // ── Resume an in-flight chunked job after a refresh ─────────────────────
@@ -2450,10 +2513,14 @@ export function EditorRealProvider({
   const resumeAttemptedRef = React.useRef(false);
   React.useEffect(() => {
     if (resumeAttemptedRef.current || interactionsLoading) return;
+    // Nothing to resume without a cloud project — chunked analysis only ever
+    // runs there.
+    if (!cloudAvailable || !uid) return;
+    const resumeUid = uid;
     resumeAttemptedRef.current = true;
     let cancelled = false;
     (async () => {
-      const job = await getActiveJobForProject(uid, project.id);
+      const job = await getActiveJobForProject(resumeUid, project.id);
       if (cancelled || !job || analyzing || chunkRunningRef.current) return;
       chunkRunningRef.current = true;
       setAnalyzing(true);
@@ -2462,7 +2529,7 @@ export function EditorRealProvider({
       cvAbortRef.current = abort;
       try {
         const result = await runChunkedAnalysis({
-          uid,
+          uid: resumeUid,
           project,
           interactions,
           idTokenGetter,
@@ -2493,7 +2560,7 @@ export function EditorRealProvider({
           phase: err instanceof ChunkedAnalysisError ? err.phase : "start",
           message: err instanceof Error ? err.message : String(err),
         });
-        await writeChunkFailure(projectRef, {
+        await writeChunkFailure(writeProject, {
           errorKind: "unknown",
           errorMessage: message,
         });
@@ -2534,9 +2601,9 @@ export function EditorRealProvider({
       // Don't repair while the orchestrator is still actively writing — its own
       // terminal write will land. Repair is only for orphaned/stuck runs.
       if (isAnalysisActive(project.id)) return;
-      const snap = await getDoc(projectRef);
-      const analysis = (snap.data() as ProjectDoc | undefined)?.analysis;
-      const statusNow = (snap.data() as ProjectDoc | undefined)?.status;
+      const snap = await storage.get(project.id);
+      const analysis = snap?.analysis;
+      const statusNow = snap?.status;
       if (!analysis) return;
       if (analysis.status === "complete" || statusNow === "analyzed") return; // self-healed
       const moments = analysis.detectedMoments?.length ?? 0;
@@ -2547,15 +2614,11 @@ export function EditorRealProvider({
         repairedRef.current = repairKey;
         // Route the repair through the serialized queue too.
         await enqueueProjectWrite(project.id, "repair-terminal", () =>
-          setDoc(
-            projectRef,
-            {
+          writeProject({
               status: "analyzed",
               analysis: { status: "complete", stage: "Complete", cancelRequested: false },
               updatedAt: serverTimestamp(),
-            },
-            { merge: true }
-          )
+            })
         );
       }
     }, 10_000);
@@ -2566,7 +2629,8 @@ export function EditorRealProvider({
     project.status,
     project.analysis?.status,
     project.analysis?.detectedMoments?.length,
-    projectRef,
+    writeProject,
+    storage,
   ]);
 
   /**
@@ -2588,9 +2652,7 @@ export function EditorRealProvider({
     setAnalyzing(false);
     setCvProgress(null);
     setProcessingMinimized(false);
-    await setDoc(
-      projectRef,
-      {
+    await writeProject({
         status: "cancelled",
         analysis: {
           status: "cancelled",
@@ -2599,10 +2661,8 @@ export function EditorRealProvider({
           completedAt: Date.now(),
         },
         updatedAt: serverTimestamp(),
-      },
-      { merge: true }
-    );
-  }, [projectRef]);
+      });
+  }, [writeProject]);
 
   const [refiningFraming, setRefiningFraming] = React.useState(false);
 
@@ -2615,11 +2675,12 @@ export function EditorRealProvider({
    */
   const refineFraming: EditorRealContextValue["refineFraming"] =
     React.useCallback(async () => {
+      requireCloud("refine framing");
       const token = await idTokenGetter();
       if (!token) throw new Error("Not signed in.");
       setRefiningFraming(true);
       try {
-        const res = await fetch(`/api/projects/${project.id}/reframe`, {
+        const res = await apiFetch(`/api/projects/${project.id}/reframe`, {
           method: "POST",
           headers: { authorization: `Bearer ${token}` },
         });
@@ -2638,18 +2699,32 @@ export function EditorRealProvider({
       } finally {
         setRefiningFraming(false);
       }
-    }, [idTokenGetter, project.id]);
+    }, [idTokenGetter, project.id, requireCloud]);
 
   // unused helpers exposed for callers that bulk-edit
   void arrayUnion;
   void arrayRemove;
 
-  const value: EditorRealContextValue = {
+  // MEMOIZED, and it must stay that way.
+  //
+  // This was a bare object literal, so it got a new identity on EVERY provider
+  // render and re-rendered all ~30 consumers — the timeline and every pill, the
+  // inspector and every control, the export panel, the preview — no matter how
+  // unrelated the change was. Combined with a clock that ticked in this same
+  // provider, that meant a full-editor re-render several times a second during
+  // playback and on every pointermove of a drag. It is the single biggest reason
+  // the editor felt unresponsive.
+  //
+  // Every entry below is either state that genuinely should propagate, or a
+  // callback with a stable identity (see `writeProject`/`writeSnapshot`, which
+  // read the live project from a ref precisely so they don't churn here).
+  const value = React.useMemo<EditorRealContextValue>(
+    () => ({
     project,
     uid,
+    cloudAvailable,
+    writeProject,
     videoRef,
-    currentTime,
-    setCurrentTime,
     playing,
     setPlaying,
     exporting,
@@ -2705,7 +2780,7 @@ export function EditorRealProvider({
     setPreviewMode,
     cvDebug,
     setCvDebug,
-    activeMoment,
+
     updateMoment,
     deleteMoment,
     addMoment,
@@ -2717,7 +2792,7 @@ export function EditorRealProvider({
     deleteLane,
     duplicateMoment,
     splitAtPlayhead,
-    canSplitSelection,
+
     addMomentAtPlayhead,
     newMomentId,
     acceptSuggestion,
@@ -2761,15 +2836,98 @@ export function EditorRealProvider({
     interactions,
     interactionsLoading,
     chunkedJob,
-  };
+    }),
+    [
+      project, uid, cloudAvailable, writeProject, playing, exporting, duration,
+      selectedMomentId, multiSelectIds, toggleMultiSelect, clearMultiSelect,
+      deleteMultiSelected, inspectorOpen, openInspector, closeInspector,
+      compareBypassId, activeTool, splitFraction, setSplitFraction, scenesOpen,
+      toggleScenes, clips, clipsStoredCount, clipsDropped, clipsGenerating,
+      clipsLastRun, generateClips, regenerateClip, renameClip, deleteClip,
+      focusedClipId, focusedClip, openClip, exitClip, previewMoments,
+      previewEffects, applyClipToTimeline, clipExport, requestClipExport,
+      updateClipExport, exportModalOpen, openExportModal, closeExportModal,
+      canvasOpen, openCanvas, closeCanvas, cropEditing, openCropEditor,
+      closeCropEditor, previewMode, cvDebug, updateMoment,
+      deleteMoment, addMoment, setMomentEnabled, layers, setLayerVisible,
+      showAllLayers, applyTextStyleToType, deleteLane, duplicateMoment,
+      splitAtPlayhead, addMomentAtPlayhead, newMomentId,
+      acceptSuggestion, dismissSuggestion, updateEffects, clearOutputCanvas,
+      selectedVideoType, setSelectedVideoType, setSourceCrop, clearSourceCrop,
+      setRemoveSharingBar, applyPreset, clearSelectedPreset, startAnalyze,
+      generateCaptions, retranscribe, deleteAiCaptions, saveDirectorBrief,
+      cancelAnalyze, refineFraming, refiningFraming, analyzing, analyzeError,
+      cvProgress, processingMinimized, seek, togglePlay, seekBy, muted, volume,
+      toggleMute, setPreviewVolume, isFullscreen, toggleFullscreen, undo, redo,
+      canUndo, canRedo, interactions, interactionsLoading, chunkedJob,
+      // `videoRef`/`previewFullscreenRef` are refs and `set*` from useState are
+      // identity-stable by contract, so they are deliberately not listed.
+    ]
+  );
 
-  return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
+  // The clock provider sits INSIDE this one: components subscribe to the
+  // playhead independently of the editor value, which is what lets time tick
+  // without re-rendering anything that doesn't display it.
+  return (
+    <Ctx.Provider value={value}>
+      <PlaybackClockProvider store={clock}>{children}</PlaybackClockProvider>
+    </Ctx.Provider>
+  );
 }
 
 export function useEditorReal() {
   const ctx = React.useContext(Ctx);
   if (!ctx) throw new Error("useEditorReal must be used inside EditorRealProvider");
   return ctx;
+}
+
+/**
+ * The edit the playhead is currently inside, or null.
+ *
+ * A HOOK rather than a context field, and that distinction is the whole point.
+ * As a field it was computed in the provider from a clock subscription, so every
+ * boundary the playhead crossed rebuilt the context value and re-rendered every
+ * consumer — including the entire timeline, which does not care which edit is
+ * active. As a hook the subscription lives in the component that reads it, and
+ * the selector returns a STRING id, so a tick that doesn't change the answer
+ * (almost all of them) costs nothing at all.
+ *
+ * Call it as low in the tree as possible: it re-renders its caller on every
+ * boundary crossing, so a large component should push it into the small child
+ * that draws the result (see `ActiveMomentOverlays` in RealVideoPlayer).
+ */
+export function useActiveMoment(): DetectedMoment | null {
+  const { project, selectedMomentId } = useEditorReal();
+  const moments = project.analysis?.detectedMoments ?? EMPTY_MOMENTS;
+  const activeId = useClockSelector((t) =>
+    activeMomentIdAt(moments, selectedMomentId, t)
+  );
+  return React.useMemo(
+    () => moments.find((m) => m.id === activeId) ?? null,
+    [moments, activeId]
+  );
+}
+
+/**
+ * Whether the current selection can actually be split where the playhead is.
+ *
+ * Same reasoning as `useActiveMoment`: a BOOLEAN selector, so the caller
+ * re-renders only when the answer flips — and with nothing selected the answer
+ * is a constant `false`, so playback costs zero renders here.
+ */
+export function useCanSplitSelection(): boolean {
+  const { project, selectedMomentId, multiSelectIds } = useEditorReal();
+  const moments = project.analysis?.detectedMoments ?? EMPTY_MOMENTS;
+  const targetIds = React.useMemo(
+    () =>
+      multiSelectIds.length > 0
+        ? multiSelectIds
+        : selectedMomentId
+          ? [selectedMomentId]
+          : [],
+    [multiSelectIds, selectedMomentId]
+  );
+  return useClockSelector((t) => canSplitAt(moments, targetIds, t));
 }
 
 export function emptyAnalysis(): Analysis {

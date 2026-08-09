@@ -29,6 +29,7 @@ import type {
 import { trackEvent } from "@/lib/analytics/trackEvent";
 import { EVENTS } from "@/lib/analytics/events";
 
+import { apiFetch } from "@/lib/platform/api";
 /**
  * Session-level export lifecycle owner.
  *
@@ -308,7 +309,7 @@ export function ExportProvider({ children }: { children: React.ReactNode }) {
           if (!token) throw new ExportError("permit", "Sign in to export.");
           let permitRes: Response;
           try {
-            permitRes = await fetch("/api/billing/export-permit", {
+            permitRes = await apiFetch("/api/billing/export-permit", {
               method: "POST",
               headers: {
                 "Content-Type": "application/json",

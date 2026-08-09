@@ -22,7 +22,21 @@ interface PermitBody {
   fps?: 30 | 60;
   /** Output container — drives the upload extension. Defaults to "webm". */
   container?: "webm" | "mp4";
+  /**
+   * Which renderer will produce the bytes. Recorded on the doc so export history
+   * can say where a file came from, and so a desktop render is distinguishable
+   * from a browser one in support and analytics.
+   *
+   * Declared by the client but IMMUTABLE once written (the rules' completion
+   * whitelist excludes it), so it is a claim the server records rather than one
+   * the client can revise after the fact. It carries no entitlement — plan
+   * gating below is identical whichever engine renders.
+   */
+  engine?: "browser" | "editframe" | "desktop";
 }
+
+/** Engines a client may declare. Anything else is recorded as "browser". */
+const CLIENT_ENGINES = new Set(["browser", "editframe", "desktop"]);
 
 /**
  * POST /api/billing/export-permit
@@ -76,6 +90,12 @@ export async function POST(req: NextRequest) {
     // Container is optional + defaulted (older clients omit it). Anything other
     // than "mp4" → "webm".
     const container: "webm" | "mp4" = body.container === "mp4" ? "mp4" : "webm";
+    // Unknown/absent engine records as "browser", matching how legacy docs are
+    // already interpreted elsewhere.
+    const engine =
+      typeof body.engine === "string" && CLIENT_ENGINES.has(body.engine)
+        ? body.engine
+        : "browser";
     if (
       typeof projectId !== "string" ||
       typeof projectTitle !== "string" ||
@@ -168,6 +188,7 @@ export async function POST(req: NextRequest) {
           resolution: normalizeResolution(plan, resolution),
           fps: normalizeFps(plan, fps),
           container,
+          engine,
           status: "permitted",
           applyWatermark,
           expectedStoragePath,

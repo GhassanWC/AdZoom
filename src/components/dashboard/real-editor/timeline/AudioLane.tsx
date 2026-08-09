@@ -370,7 +370,7 @@ function SpanBand({
           className="absolute inset-0 overflow-hidden rounded-[4px] border border-rose-400/40 bg-rose-950/55"
           style={{
             backgroundImage:
-              "repeating-linear-gradient(135deg, rgba(244,63,94,0.28) 0 2px, transparent 2px 7px)",
+              "repeating-linear-gradient(135deg, rgba(178,99,112,0.28) 0 2px, transparent 2px 7px)",
           }}
         >
           {/* Strikethrough — the audio on this span does not survive export. */}

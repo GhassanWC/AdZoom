@@ -44,6 +44,7 @@ import { useDebugParam } from "./use-debug-param";
 import { Stat, Field, Stage } from "./diag-bits";
 import type { ClickPipelineDiagnostics } from "@/lib/firebase/schema";
 
+import { apiFetch } from "@/lib/platform/api";
 type DiagnoseResult = {
   storedClickPipeline: ClickPipelineDiagnostics | null;
   capture: {
@@ -88,7 +89,7 @@ type DiagnoseResult = {
 };
 
 export function ClickPipelinePanel() {
-  const { project, uid, startAnalyze, analyzing } = useEditorReal();
+  const { project, writeProject, startAnalyze, analyzing } = useEditorReal();
   const debugEnabled = useDebugParam();
   const { getIdToken } = useAuth();
   const toast = useToast();
@@ -106,7 +107,7 @@ export function ClickPipelinePanel() {
     try {
       const token = await getIdToken();
       if (!token) throw new Error("Not signed in");
-      const res = await fetch(`/api/projects/${project.id}/diagnose`, {
+      const res = await apiFetch(`/api/projects/${project.id}/diagnose`, {
         headers: { authorization: `Bearer ${token}` },
       });
       const body = await res.json();
@@ -138,7 +139,7 @@ export function ClickPipelinePanel() {
     try {
       const token = await getIdToken();
       if (!token) throw new Error("Not signed in");
-      const res = await fetch(`/api/projects/${project.id}/zooms-from-clicks`, {
+      const res = await apiFetch(`/api/projects/${project.id}/zooms-from-clicks`, {
         method: "POST",
         headers: { authorization: `Bearer ${token}` },
       });
@@ -167,11 +168,7 @@ export function ClickPipelinePanel() {
     if (!ok) return;
     setForceLoading(true);
     try {
-      const { db } = getFirebase();
-      const projectRef = doc(db, "users", uid, "projects", project.id);
-      await setDoc(
-        projectRef,
-        {
+      await writeProject({
           analysis: {
             detectedMoments: [],
             rawMoments: [],
@@ -179,9 +176,7 @@ export function ClickPipelinePanel() {
             clickPipeline: null,
           },
           updatedAt: serverTimestamp(),
-        },
-        { merge: true }
-      );
+        });
       // Debug "force re-analyze": the doc was just cleared above, so a full
       // all-engines run regenerates everything from scratch.
       await startAnalyze(DEFAULT_ANALYSIS_OPTIONS);

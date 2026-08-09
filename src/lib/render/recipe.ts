@@ -25,6 +25,7 @@ import type {
   FitMode,
   SourceCrop,
   VisualAnalysis,
+  ZoomPresetId,
 } from "@/lib/firebase/schema";
 import {
   resolveOutputCanvas,
@@ -56,6 +57,10 @@ export interface BasePlacement {
  */
 export interface RenderEffects {
   autoZoom: number;
+  /** Project zoom style — Subtle / Standard / Emphasis. Absent ⇒ "standard". */
+  zoomPreset?: ZoomPresetId;
+  /** Project camera speed 0..100 (50 = the preset's own ramp). */
+  zoomSpeed: number;
   clickHighlights: boolean;
   clickHighlightStyle: "ring" | "pulse" | "burst";
   clickHighlightSize: number;
@@ -270,6 +275,12 @@ export function buildRenderRecipe(input: RenderRecipeInput): RenderRecipe {
     moments,
     effects: {
       autoZoom: effects.autoZoom,
+      // Camera feel travels WITH the recipe: the worker and the Remotion
+      // renderer never see `effectsSettings`, so a zoom style chosen in the
+      // editor would silently fall back to the default in the cloud without
+      // these two.
+      zoomPreset: effects.zoomPreset,
+      zoomSpeed: effects.zoomSpeed,
       clickHighlights: effects.clickHighlights === true,
       clickHighlightStyle: effects.clickHighlightStyle,
       clickHighlightSize: effects.clickHighlightSize,

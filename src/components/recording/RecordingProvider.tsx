@@ -4,6 +4,7 @@ import * as React from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/lib/firebase/AuthProvider";
 import { createProjectFromFile } from "@/lib/firebase/projects";
+import { usePlatform } from "@/lib/platform";
 import { usePlanTier } from "@/lib/usage/useStoragePlan";
 import {
   exceedsUploadDuration,
@@ -72,6 +73,7 @@ const Ctx = React.createContext<RecordingContextValue | null>(null);
 export function RecordingProvider({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const { user } = useAuth();
+  const platform = usePlatform();
   const { tier } = usePlanTier();
   const notifications = useNotifications();
 
@@ -188,7 +190,47 @@ export function RecordingProvider({ children }: { children: React.ReactNode }) {
   };
 
   const useResult: RecordingContextValue["useResult"] = async () => {
-    if (!result || !user) return;
+    if (!result) return;
+
+    const ext = mimeToExtension(result.mimeType);
+    const filename = `screen-recording-${new Date()
+      .toISOString()
+      .replace(/[:.]/g, "-")}.${ext}`;
+
+    /**
+     * Desktop: the take is written into the library folder and becomes a local
+     * project. There is no plan limit to enforce and no upload to meter — the
+     * file never leaves the machine, and local projects don't consume cloud
+     * storage. (Uploading it for AI analysis stays available from the website.)
+     */
+    const saveRecording = platform.media.saveRecording;
+    if (saveRecording && platform.projects.create) {
+      setUploading(true);
+      setUploadPct(null);
+      setError(null);
+      try {
+        const bytes = await result.blob.arrayBuffer();
+        const media = await saveRecording(bytes, filename);
+        const doc = await platform.projects.create(media.mediaId, "Untitled recording");
+        notifications.push({
+          id: `recording-saved:${doc.id}`,
+          kind: "upload-completed",
+          title: "Recording saved",
+          body: `${media.fileName} is ready to edit`,
+          href: `/dashboard/projects/${doc.id}`,
+        });
+        setResult(null);
+        setUploading(false);
+        router.push(`/dashboard/projects/${doc.id}`);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "That recording couldn't be saved.");
+        setUploading(false);
+        setUploadPct(null);
+      }
+      return;
+    }
+
+    if (!user) return;
     // Free plan caps uploads at 3 minutes — block the take before any upload.
     if (exceedsUploadDuration(tier, result.durationSeconds)) {
       setError(FREE_VIDEO_DURATION_LIMIT_MESSAGE);
@@ -198,10 +240,6 @@ export function RecordingProvider({ children }: { children: React.ReactNode }) {
     setUploadPct(0);
     setError(null);
     try {
-      const ext = mimeToExtension(result.mimeType);
-      const filename = `screen-recording-${new Date()
-        .toISOString()
-        .replace(/[:.]/g, "-")}.${ext}`;
       const file = new File([result.blob], filename, { type: result.mimeType });
       const { projectId } = await createProjectFromFile({
         uid: user.uid,

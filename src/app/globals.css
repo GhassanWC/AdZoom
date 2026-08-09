@@ -13,6 +13,44 @@
   --color-cyan-400: #22D3EE;
   --color-cyan-500: #06B6D4;
 
+  /* ── Status palette — muted sage (success) and clay (error) ───────────────
+     These REPLACE Tailwind's stock emerald and rose ramps rather than sitting
+     beside them. Every status surface in the app already reaches for
+     `emerald-*` / `rose-*` (~118 files), so redefining the two ramps here is
+     what makes the recolor total: there is no second, brighter definition left
+     for a component to pick up by accident.
+
+     Stock emerald-300 (#6EE7B7) and rose-400 (#FB7185) read as electric mint
+     and hot pink on near-black. The replacements are the same two hues pulled
+     far down in saturation — sage and clay — so status still reads instantly
+     as "good" / "bad" without shouting.
+
+     The DARK values below are the light palette lifted for a #08090C surface:
+     the authored colours (#3F6F55 sage, #9F4550 clay) sit at ~2:1 against ink,
+     which is unreadable, so each is raised to land between 6:1 and 11:1 while
+     keeping its hue and its desaturation. `html.light` restores the authored
+     values verbatim. Both ramps stay monotonic (50 lightest → 950 darkest)
+     because dark-theme banners use the 50–200 rows as near-white text. */
+  --color-emerald-50: #F1F6F3;
+  --color-emerald-100: #E2EDE7;
+  --color-emerald-200: #C8DBD0;
+  --color-emerald-300: #A8C4B4; /* success text on dark — 10.6:1 */
+  --color-emerald-400: #7FA890; /* success icon / dot / border — 7.5:1 */
+  --color-emerald-500: #628E77;
+  --color-emerald-600: #4E7660;
+  --color-emerald-700: #3F6F55;
+  --color-emerald-950: #16241C;
+
+  --color-rose-50: #FAF2F3;
+  --color-rose-100: #F3E3E5;
+  --color-rose-200: #E7C9CD;
+  --color-rose-300: #D9A9AF; /* error text on dark — 9.7:1 */
+  --color-rose-400: #C97F89; /* error icon / dot / border — 6.5:1 */
+  --color-rose-500: #B26370;
+  --color-rose-600: #9C4E5C;
+  --color-rose-700: #843F4B;
+  --color-rose-950: #241417;
+
   /* Surface aliases */
   --color-app: #08090C;
   --color-surface: #0E1014;
@@ -27,6 +65,11 @@
   --color-text-secondary: #C2C7D0;
   --color-text-muted: #9BA1AD;
   --color-text-disabled: rgba(255, 255, 255, 0.42);
+  /* Card surface — the neutral half of the status palette. Dark theme keeps
+     the existing panel treatment; `html.light` uses the authored #FFFFFF on
+     #E4E4E7. */
+  --color-card-bg: #0E1014;
+  --color-card-border: rgba(255, 255, 255, 0.08);
   --color-border-soft: rgba(255, 255, 255, 0.06);
   --color-border-strong: rgba(255, 255, 255, 0.14);
   --color-button-bg-soft: rgba(255, 255, 255, 0.04);
@@ -81,12 +124,40 @@ html.light {
   --color-surface: #F8FAFC;
   --color-hairline: rgba(15, 23, 42, 0.08);
 
+  /* Status palette — the AUTHORED values, used verbatim on white.
+     `--color-*-300` carries status TEXT, `--color-*-400` carries status ICONS
+     and borders, and the near-transparent `bg-*-400/10`-style fills resolve to
+     the intended soft tints (sage at 10% over white ≈ #ECF1EE, clay ≈ #F7EFF0).
+     The exact authored bg/border pairs are pinned on the banner utilities in
+     the status-surface block further down. */
+  --color-emerald-50: #2C4E3C;
+  --color-emerald-100: #355E48;
+  --color-emerald-200: #355E48;
+  --color-emerald-300: #355E48; /* success text — 7.4:1 on white */
+  --color-emerald-400: #3F6F55; /* success icon — 5.8:1 on white */
+  --color-emerald-500: #3F6F55;
+  --color-emerald-600: #345944;
+  --color-emerald-700: #2C4E3C;
+  --color-emerald-950: #1B3126;
+
+  --color-rose-50: #7A3039;
+  --color-rose-100: #873944;
+  --color-rose-200: #873944;
+  --color-rose-300: #873944; /* error text — 7.8:1 on white */
+  --color-rose-400: #9F4550; /* error icon — 6.1:1 on white */
+  --color-rose-500: #9F4550;
+  --color-rose-600: #8A3A45;
+  --color-rose-700: #77323C;
+  --color-rose-950: #4A1F26;
+
   /* Semantic tokens — light counterparts. Same names, theme-appropriate
      values. New code: prefer these over `text-fog` / `text-white`. */
-  --color-text-primary: #0F172A;
-  --color-text-secondary: #475569;
+  --color-text-primary: #18181B;
+  --color-text-secondary: #71717A;
   --color-text-muted: #64748B;
   --color-text-disabled: #94A3B8;
+  --color-card-bg: #FFFFFF;
+  --color-card-border: #E4E4E7;
   --color-border-soft: rgba(15, 23, 42, 0.08);
   --color-border-strong: rgba(15, 23, 42, 0.16);
   --color-button-bg-soft: rgba(15, 23, 42, 0.04);
@@ -119,20 +190,50 @@ html.light {
     color: #ffffff;
   }
 
-  /* Custom scrollbar — restrained */
+  /**
+   * Scrollbars — restrained, but a control rather than a rumour.
+   *
+   * The thumb used to be white at 6% on a near-black page: present, hit-testable
+   * and effectively invisible, so long screens read as "there is no scrollbar"
+   * and nobody knew there was anything below the fold. 20% is still quiet
+   * against the UI and unmistakably a scrollbar.
+   *
+   * The transparent border + `background-clip: padding-box` is what makes a
+   * 12px lane carry a 6px pill: the thumb keeps a comfortable grab area while
+   * looking like a hairline.
+   */
   ::-webkit-scrollbar {
-    width: 10px;
-    height: 10px;
+    width: 12px;
+    height: 12px;
   }
   ::-webkit-scrollbar-track {
-    background: transparent;
+    background: rgba(255, 255, 255, 0.03);
   }
   ::-webkit-scrollbar-thumb {
-    background: rgba(255, 255, 255, 0.06);
+    background: rgba(255, 255, 255, 0.2);
+    border: 3px solid transparent;
+    background-clip: padding-box;
     border-radius: 999px;
   }
   ::-webkit-scrollbar-thumb:hover {
-    background: rgba(255, 255, 255, 0.12);
+    background: rgba(255, 255, 255, 0.32);
+    background-clip: padding-box;
+  }
+  ::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+
+  /**
+   * Reserve the lane permanently. Without it the page jumps sideways every time
+   * you move between a screen that scrolls (Projects) and one that doesn't
+   * (Dashboard) — the whole layout shifting by the scrollbar's width.
+   */
+  html,
+  body {
+    /* BOTH: `<html>` is `visible`, so the viewport's scrolling box is actually
+       `<body>` — putting this only on the root reserved nothing on the screens
+       that don't scroll, which is exactly where the jump comes from. */
+    scrollbar-gutter: stable;
   }
 
   h1,
@@ -191,6 +292,27 @@ html.light {
     -webkit-backdrop-filter: blur(28px);
     border: 1px solid rgba(255, 255, 255, 0.06);
     box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  }
+
+  /* ── Usage meter fill ───────────────────────────────────────────────────
+     The bar on /dashboard/billing. One class with a `data-tone` band rather
+     than `bg-gradient-to-r from-* to-*` utilities, because gradient STOPS
+     have no `html.light` overrides in this file: amber-400→amber-300 reads
+     as a warning on near-black and as a highlighter smear on a white track.
+     Stating both themes here keeps "you're nearly out of minutes" legible on
+     either surface. Light values come from the same ramps as the status
+     banners (clay for danger, authored amber for warn).
+
+     `width` is the only animated property — transforming the fill would
+     stretch its rounded cap. */
+  .usage-bar {
+    background-image: linear-gradient(90deg, #8B5CF6 0%, #22D3EE 100%);
+  }
+  .usage-bar[data-tone="warn"] {
+    background-image: linear-gradient(90deg, #F59E0B 0%, #FBBF24 100%);
+  }
+  .usage-bar[data-tone="danger"] {
+    background-image: linear-gradient(90deg, #9C4E5C 0%, #C97F89 100%);
   }
 
   /* Soft floating shadow preset */
@@ -475,11 +597,16 @@ html.light ::selection {
   color: #0F172A;
 }
 
+html.light ::-webkit-scrollbar-track {
+  background: rgba(15, 23, 42, 0.04);
+}
 html.light ::-webkit-scrollbar-thumb {
-  background: rgba(15, 23, 42, 0.12);
+  background: rgba(15, 23, 42, 0.28);
+  background-clip: padding-box;
 }
 html.light ::-webkit-scrollbar-thumb:hover {
-  background: rgba(15, 23, 42, 0.2);
+  background: rgba(15, 23, 42, 0.42);
+  background-clip: padding-box;
 }
 
 /* Text — white → near-ink */
@@ -544,6 +671,19 @@ html.light .glass-strong {
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.6);
 }
 
+/* Usage meter fill — darken every band for a white track (see the authored
+   class in the components layer above). Cyan-400 and amber-300 both fall under
+   2:1 against a near-white track; the 600/700 rows keep each band's meaning. */
+html.light .usage-bar {
+  background-image: linear-gradient(90deg, #7C3AED 0%, #0891B2 100%);
+}
+html.light .usage-bar[data-tone="warn"] {
+  background-image: linear-gradient(90deg, #B45309 0%, #D97706 100%);
+}
+html.light .usage-bar[data-tone="danger"] {
+  background-image: linear-gradient(90deg, #843F4B 0%, #9F4550 100%);
+}
+
 /* Cinematic shadow — too heavy on light surfaces */
 html.light .shadow-cinematic {
   box-shadow: 0 20px 50px -28px rgba(15, 23, 42, 0.18), 0 6px 16px -12px rgba(15, 23, 42, 0.12);
@@ -592,12 +732,16 @@ html.light .bg-white\/12 { background-color: rgba(15, 23, 42, 0.1); }
 html.light .bg-white\/15 { background-color: rgba(15, 23, 42, 0.12); }
 
 /* ----------------------------------------------------------------------------
-   Status banners — amber (warn) and rose (danger).
+   Status banners — amber (warn) and the CLAY ramp (danger; `rose-*` is the
+   utility name, not the hue — see the status palette in `@theme`).
    Dark theme uses ultra-light text (amber-50/100/200, rose-50/100/200) on
    near-transparent fills (bg-amber-500/[0.06], etc.) for a soft glassy look.
-   On a white page those become illegible — pale yellow on white, pale pink on
+   On a white page those become illegible — pale yellow on white, pale clay on
    white. Darken the text to the 700/800 range, and slightly strengthen the
    fill and border so the banner still reads as a tinted surface.
+
+   The clay fills and outlines below are superseded for banner-sized surfaces
+   by the pinned authored values at the end of this file.
 ---------------------------------------------------------------------------- */
 
 /* Amber — warn tones */
@@ -630,33 +774,33 @@ html.light .border-amber-400\/40 { border-color: rgba(217, 119, 6, 0.6); }
 html.light .border-amber-200\/60 { border-color: rgba(217, 119, 6, 0.55); }
 
 /* Rose — danger tones */
-html.light .text-rose-50 { color: #881337; }
-html.light .text-rose-100 { color: #9F1239; }
-html.light .text-rose-200 { color: #BE123C; }
-html.light .text-rose-200\/70 { color: rgba(190, 18, 60, 0.78); }
-html.light .text-rose-300 { color: #BE123C; }
-html.light .text-rose-300\/80 { color: rgba(190, 18, 60, 0.85); }
-html.light .text-rose-400 { color: #E11D48; }
+html.light .text-rose-50 { color: #7A3039; }
+html.light .text-rose-100 { color: #873944; }
+html.light .text-rose-200 { color: #873944; }
+html.light .text-rose-200\/70 { color: rgba(135, 57, 68, 0.78); }
+html.light .text-rose-300 { color: #873944; }
+html.light .text-rose-300\/80 { color: rgba(135, 57, 68, 0.85); }
+html.light .text-rose-400 { color: #9F4550; }
 
-html.light .bg-rose-500\/\[0\.06\] { background-color: rgba(244, 63, 94, 0.14); }
-html.light .bg-rose-500\/\[0\.08\] { background-color: rgba(244, 63, 94, 0.16); }
-html.light .bg-rose-500\/\[0\.12\] { background-color: rgba(244, 63, 94, 0.2); }
-html.light .bg-rose-500\/10 { background-color: rgba(244, 63, 94, 0.16); }
-html.light .bg-rose-500\/15 { background-color: rgba(244, 63, 94, 0.2); }
-html.light .bg-rose-500\/20 { background-color: rgba(244, 63, 94, 0.24); }
-html.light .bg-rose-500\/30 { background-color: rgba(244, 63, 94, 0.3); }
-html.light .bg-rose-400\/10 { background-color: rgba(244, 63, 94, 0.16); }
-html.light .bg-rose-400\/15 { background-color: rgba(244, 63, 94, 0.2); }
-html.light .bg-rose-400\/40 { background-color: rgba(244, 63, 94, 0.42); }
-html.light .bg-rose-400\/60 { background-color: rgba(244, 63, 94, 0.62); }
-html.light .bg-rose-400\/80 { background-color: rgba(244, 63, 94, 0.85); }
-html.light .bg-rose-400\/85 { background-color: rgba(244, 63, 94, 0.88); }
+html.light .bg-rose-500\/\[0\.06\] { background-color: rgba(159, 69, 80, 0.14); }
+html.light .bg-rose-500\/\[0\.08\] { background-color: rgba(159, 69, 80, 0.16); }
+html.light .bg-rose-500\/\[0\.12\] { background-color: rgba(159, 69, 80, 0.2); }
+html.light .bg-rose-500\/10 { background-color: rgba(159, 69, 80, 0.16); }
+html.light .bg-rose-500\/15 { background-color: rgba(159, 69, 80, 0.2); }
+html.light .bg-rose-500\/20 { background-color: rgba(159, 69, 80, 0.24); }
+html.light .bg-rose-500\/30 { background-color: rgba(159, 69, 80, 0.3); }
+html.light .bg-rose-400\/10 { background-color: rgba(159, 69, 80, 0.16); }
+html.light .bg-rose-400\/15 { background-color: rgba(159, 69, 80, 0.2); }
+html.light .bg-rose-400\/40 { background-color: rgba(159, 69, 80, 0.42); }
+html.light .bg-rose-400\/60 { background-color: rgba(159, 69, 80, 0.62); }
+html.light .bg-rose-400\/80 { background-color: rgba(159, 69, 80, 0.85); }
+html.light .bg-rose-400\/85 { background-color: rgba(159, 69, 80, 0.88); }
 
-html.light .border-rose-400\/25 { border-color: rgba(225, 29, 72, 0.5); }
-html.light .border-rose-400\/30 { border-color: rgba(225, 29, 72, 0.5); }
-html.light .border-rose-400\/40 { border-color: rgba(225, 29, 72, 0.55); }
-html.light .border-rose-400\/45 { border-color: rgba(225, 29, 72, 0.6); }
-html.light .border-rose-400\/70 { border-color: rgba(225, 29, 72, 0.75); }
+html.light .border-rose-400\/25 { border-color: rgba(159, 69, 80, 0.5); }
+html.light .border-rose-400\/30 { border-color: rgba(159, 69, 80, 0.5); }
+html.light .border-rose-400\/40 { border-color: rgba(159, 69, 80, 0.55); }
+html.light .border-rose-400\/45 { border-color: rgba(159, 69, 80, 0.6); }
+html.light .border-rose-400\/70 { border-color: rgba(159, 69, 80, 0.75); }
 
 /* Fuchsia — used for the "click highlight" effect tone (editor + landing
    timeline pills). Same shape as rose: darken text, strengthen tint + border
@@ -672,15 +816,19 @@ html.light .border-fuchsia-400\/40 { border-color: rgba(192, 38, 211, 0.45); }
    Brand accent palettes — violet / emerald / cyan
    Dark theme uses the ultra-light end of each ramp (`text-violet-200`,
    `text-emerald-300`, `text-cyan-200` …) for badge / chip / step / sidebar
-   accent text. Those values are #C4B5FD / #6EE7B7 / #67E8F9 — fine glow on
-   ink, but they collapse to 1.5–2.1:1 contrast on white. Mirror the
-   amber/rose pattern below: darken text down the ramp, strengthen border
-   alpha so the chip outline still reads, and bump the bg tint alpha so the
-   chip surface still feels like a colored tint instead of a wash.
+   accent text. Violet and cyan sit at #C4B5FD / #67E8F9 — fine glow on ink,
+   but they collapse to 1.5–2.1:1 contrast on white. Mirror the amber pattern
+   above: darken text down the ramp, strengthen border alpha so the chip
+   outline still reads, and bump the bg tint alpha so the chip surface still
+   feels like a colored tint instead of a wash.
 
    Values picked for AA (≥ 4.5:1) on white at the most common pairing
    ("text on tinted bg of the same hue at ≤ 20% alpha"). The dark-mode
    tokens at the top of this file are untouched.
+
+   The emerald rows here are the SAGE ramp, not stock emerald — see the status
+   palette in `@theme`. Their banner fills and outlines are pinned to the
+   authored values in the status-surface block at the end of this file.
 ---------------------------------------------------------------------------- */
 
 /* Violet — primary brand accent. The 50/100 row is used for prominent
@@ -751,29 +899,29 @@ html.light .ring-violet-500\/60 { --tw-ring-color: rgba(124, 58, 237, 0.65); }
 
 /* Emerald — success / status (recording "Ready", "Bottom bar cropped",
    exported-project chips, AI confidence "high"). Same shape as violet. */
-html.light .text-emerald-50 { color: #064E3B; }
-html.light .text-emerald-100 { color: #047857; }
-html.light .text-emerald-100\/80 { color: rgba(4, 120, 87, 0.88); }
-html.light .text-emerald-200 { color: #047857; }
-html.light .text-emerald-300 { color: #059669; }
-html.light .text-emerald-300\/70 { color: rgba(5, 150, 105, 0.82); }
-html.light .text-emerald-300\/80 { color: rgba(5, 150, 105, 0.88); }
-html.light .text-emerald-400 { color: #059669; }
+html.light .text-emerald-50 { color: #2C4E3C; }
+html.light .text-emerald-100 { color: #355E48; }
+html.light .text-emerald-100\/80 { color: rgba(53, 94, 72, 0.88); }
+html.light .text-emerald-200 { color: #355E48; }
+html.light .text-emerald-300 { color: #3F6F55; }
+html.light .text-emerald-300\/70 { color: rgba(63, 111, 85, 0.82); }
+html.light .text-emerald-300\/80 { color: rgba(63, 111, 85, 0.88); }
+html.light .text-emerald-400 { color: #3F6F55; }
 
-html.light .bg-emerald-400\/\[0\.08\] { background-color: rgba(16, 185, 129, 0.12); }
-html.light .bg-emerald-400\/10 { background-color: rgba(16, 185, 129, 0.14); }
-html.light .bg-emerald-400\/15 { background-color: rgba(16, 185, 129, 0.18); }
-html.light .bg-emerald-400\/40 { background-color: rgba(16, 185, 129, 0.42); }
-html.light .bg-emerald-500\/15 { background-color: rgba(5, 150, 105, 0.18); }
-html.light .bg-emerald-500\/20 { background-color: rgba(5, 150, 105, 0.22); }
-html.light .bg-emerald-400\/80 { background-color: rgba(16, 185, 129, 0.82); }
-html.light .bg-emerald-400\/85 { background-color: rgba(16, 185, 129, 0.88); }
+html.light .bg-emerald-400\/\[0\.08\] { background-color: rgba(63, 111, 85, 0.12); }
+html.light .bg-emerald-400\/10 { background-color: rgba(63, 111, 85, 0.14); }
+html.light .bg-emerald-400\/15 { background-color: rgba(63, 111, 85, 0.18); }
+html.light .bg-emerald-400\/40 { background-color: rgba(63, 111, 85, 0.42); }
+html.light .bg-emerald-500\/15 { background-color: rgba(63, 111, 85, 0.18); }
+html.light .bg-emerald-500\/20 { background-color: rgba(63, 111, 85, 0.22); }
+html.light .bg-emerald-400\/80 { background-color: rgba(63, 111, 85, 0.82); }
+html.light .bg-emerald-400\/85 { background-color: rgba(63, 111, 85, 0.88); }
 
-html.light .border-emerald-400\/20 { border-color: rgba(5, 150, 105, 0.25); }
-html.light .border-emerald-400\/30 { border-color: rgba(5, 150, 105, 0.4); }
-html.light .border-emerald-400\/35 { border-color: rgba(5, 150, 105, 0.45); }
-html.light .border-emerald-400\/40 { border-color: rgba(5, 150, 105, 0.48); }
-html.light .ring-emerald-400\/30 { --tw-ring-color: rgba(5, 150, 105, 0.45); }
+html.light .border-emerald-400\/20 { border-color: rgba(63, 111, 85, 0.25); }
+html.light .border-emerald-400\/30 { border-color: rgba(63, 111, 85, 0.4); }
+html.light .border-emerald-400\/35 { border-color: rgba(63, 111, 85, 0.45); }
+html.light .border-emerald-400\/40 { border-color: rgba(63, 111, 85, 0.48); }
+html.light .ring-emerald-400\/30 { --tw-ring-color: rgba(63, 111, 85, 0.45); }
 
 /* Cyan — secondary brand accent (webcam toggle, AI-suggestion icons,
    timeline keyframe markers, "auto-captions" chip). Cyan-700/800 keep
@@ -829,3 +977,292 @@ html.light button:disabled.bg-white\/\[0\.03\],
 html.light button:disabled.bg-white\/\[0\.04\] {
   background-color: rgba(15, 23, 42, 0.06);
 }
+
+/* ----------------------------------------------------------------------------
+   Accent colours the blocks above missed — swept, not spotted
+   ----------------------------------------------------------------------------
+   Everything above was written hue-by-hue as problems were reported, so the
+   coverage had holes: an `/85` opacity variant of a colour whose `/80` and `/90`
+   siblings were handled, a `hover:` or `focus-visible:` variant of a token whose
+   base was handled, a hue (teal, lime, orange, pink, blue, indigo, purple) used
+   only in the editor's per-effect legend. Each hole renders as its DARK-theme
+   value — pale rose-100 text on a white page, an invisible focus ring — which is
+   exactly how "Couldn't queue the export for rendering" ended up unreadable on
+   the Exports screen while the row around it looked fine.
+
+   These rules were generated by scanning every `text-/ring-/decoration-/fill-`
+   colour class in src/ at shade 50–400 and diffing against the rules already
+   present, so the set is complete as of this sweep rather than as far as anyone
+   happened to look. Same conventions as above: exact compiled class names, the
+   700/800 end of each ramp for text, `--tw-ring-color` for rings.
+
+   Two deliberate asymmetries in the values:
+     • TEXT alpha never goes below 0.72. A label meant to be quiet on ink (say
+       `/45`) is illegible at that alpha on white; it stays the quietest thing in
+       its block without dropping out of the page.
+     • RING alpha goes UP by ~0.15. A ring is a 1px outline — the tint that reads
+       as a soft glow on black disappears entirely on white.
+---------------------------------------------------------------------------- */
+html.light .decoration-violet-300\/40 { text-decoration-color: rgba(124, 58, 237, 0.72); }
+html.light .fill-emerald-300 { fill: #355E48; }
+html.light .focus-visible\:ring-amber-300\/60:focus-visible { --tw-ring-color: rgba(180, 83, 9, 0.75); }
+html.light .focus-visible\:ring-rose-300\/60:focus-visible { --tw-ring-color: rgba(135, 57, 68, 0.75); }
+html.light .focus-visible\:ring-rose-400\/40:focus-visible { --tw-ring-color: rgba(159, 69, 80, 0.55); }
+html.light .focus-visible\:ring-violet-300:focus-visible { --tw-ring-color: #7C3AED; }
+html.light .focus-visible\:ring-violet-400\/40:focus-visible { --tw-ring-color: rgba(124, 58, 237, 0.55); }
+html.light .focus-visible\:ring-violet-400\/50:focus-visible { --tw-ring-color: rgba(124, 58, 237, 0.65); }
+html.light .focus-visible\:ring-violet-400\/60:focus-visible { --tw-ring-color: rgba(124, 58, 237, 0.75); }
+html.light .group:hover .group-hover\:text-violet-300 { color: #7C3AED; }
+html.light .hover\:ring-violet-200\/60:hover { --tw-ring-color: rgba(109, 40, 217, 0.75); }
+html.light .hover\:text-rose-100:hover { color: #873944; }
+html.light .hover\:text-rose-200:hover { color: #873944; }
+html.light .hover\:text-rose-300:hover { color: #873944; }
+html.light .hover\:text-violet-200:hover { color: #6D28D9; }
+html.light .hover\:text-violet-300:hover { color: #7C3AED; }
+html.light .marker\:text-violet-400::marker { color: #7C3AED; }
+html.light .ring-amber-300\/40 { --tw-ring-color: rgba(180, 83, 9, 0.55); }
+html.light .ring-amber-300\/70 { --tw-ring-color: rgba(180, 83, 9, 0.85); }
+html.light .ring-amber-300\/80 { --tw-ring-color: rgba(180, 83, 9, 0.95); }
+html.light .ring-cyan-300\/70 { --tw-ring-color: rgba(14, 116, 144, 0.85); }
+html.light .ring-emerald-300\/70 { --tw-ring-color: rgba(53, 94, 72, 0.85); }
+html.light .ring-emerald-400\/20 { --tw-ring-color: rgba(63, 111, 85, 0.35); }
+html.light .ring-fuchsia-200\/50 { --tw-ring-color: rgba(162, 28, 175, 0.65); }
+html.light .ring-fuchsia-300\/55 { --tw-ring-color: rgba(192, 38, 211, 0.7); }
+html.light .ring-rose-400\/20 { --tw-ring-color: rgba(159, 69, 80, 0.35); }
+html.light .ring-rose-400\/80 { --tw-ring-color: rgba(159, 69, 80, 0.95); }
+html.light .ring-violet-100\/90 { --tw-ring-color: rgba(91, 33, 182, 1); }
+html.light .ring-violet-200\/30 { --tw-ring-color: rgba(109, 40, 217, 0.45); }
+html.light .ring-violet-300\/70 { --tw-ring-color: rgba(124, 58, 237, 0.85); }
+html.light .ring-violet-400\/85 { --tw-ring-color: rgba(124, 58, 237, 1); }
+html.light .text-amber-100\/90 { color: rgba(120, 53, 15, 0.9); }
+html.light .text-amber-200\/90 { color: rgba(146, 64, 14, 0.9); }
+html.light .text-amber-300\/80 { color: rgba(180, 83, 9, 0.8); }
+html.light .text-blue-200 { color: #1D4ED8; }
+html.light .text-blue-300 { color: #1D4ED8; }
+html.light .text-emerald-100\/85 { color: rgba(44, 78, 60, 0.85); }
+html.light .text-emerald-200\/40 { color: rgba(53, 94, 72, 0.72); }
+html.light .text-emerald-200\/90 { color: rgba(53, 94, 72, 0.9); }
+html.light .text-fuchsia-50 { color: #86198F; }
+html.light .text-indigo-100 { color: #3730A3; }
+html.light .text-indigo-300 { color: #4338CA; }
+html.light .text-lime-100 { color: #3F6212; }
+html.light .text-lime-200 { color: #4D7C0F; }
+html.light .text-lime-300 { color: #4D7C0F; }
+html.light .text-orange-100 { color: #9A3412; }
+html.light .text-orange-200 { color: #C2410C; }
+html.light .text-orange-300 { color: #C2410C; }
+html.light .text-pink-100 { color: #9D174D; }
+html.light .text-pink-200 { color: #BE185D; }
+html.light .text-pink-300 { color: #BE185D; }
+html.light .text-purple-200 { color: #7E22CE; }
+html.light .text-purple-300 { color: #7E22CE; }
+html.light .text-rose-100\/70 { color: rgba(135, 57, 68, 0.72); }
+html.light .text-rose-100\/85 { color: rgba(135, 57, 68, 0.85); }
+html.light .text-rose-100\/90 { color: rgba(135, 57, 68, 0.9); }
+html.light .text-rose-200\/45 { color: rgba(135, 57, 68, 0.72); }
+html.light .text-rose-200\/60 { color: rgba(135, 57, 68, 0.72); }
+html.light .text-rose-200\/80 { color: rgba(135, 57, 68, 0.8); }
+html.light .text-rose-200\/90 { color: rgba(135, 57, 68, 0.9); }
+html.light .text-sky-100 { color: #075985; }
+html.light .text-sky-200 { color: #0369A1; }
+html.light .text-sky-200\/90 { color: rgba(3, 105, 161, 0.9); }
+html.light .text-sky-300 { color: #0369A1; }
+html.light .text-teal-100 { color: #115E59; }
+html.light .text-teal-200 { color: #0F766E; }
+html.light .text-teal-300 { color: #0F766E; }
+html.light .text-violet-100\/80 { color: rgba(91, 33, 182, 0.8); }
+html.light .text-violet-100\/85 { color: rgba(91, 33, 182, 0.85); }
+html.light .text-violet-200\/70 { color: rgba(109, 40, 217, 0.72); }
+html.light .text-violet-200\/80 { color: rgba(109, 40, 217, 0.8); }
+
+/* ----------------------------------------------------------------------------
+   Accent SURFACES and OUTLINES — the same sweep, for fills and borders
+   ----------------------------------------------------------------------------
+   Text was only half the problem. A status dot at `bg-emerald-400`, a progress
+   bar at `bg-violet-400`, a chip outline at `border-rose-400/25` — all of them
+   are the light end of their ramp, chosen to glow against near-black. On a white
+   page the dot goes pastel and the hairline disappears, which is what made light
+   mode read as "washed out and too bright" next to the same screen in dark.
+
+   Every fill and border here steps to the 600 end of its hue. Borders also gain
+   ~0.2 alpha: a 1px line at 25% has nothing to sit against on white, while a
+   fill at the same alpha is already a visible wash and only needs a nudge.
+---------------------------------------------------------------------------- */
+html.light .bg-amber-200\/40 { background-color: rgba(217, 119, 6, 0.44); }
+html.light .bg-amber-300 { background-color: #D97706; }
+html.light .bg-amber-300\/70 { background-color: rgba(217, 119, 6, 0.74); }
+html.light .bg-amber-400 { background-color: #D97706; }
+html.light .bg-amber-400\/70 { background-color: rgba(217, 119, 6, 0.74); }
+html.light .bg-amber-400\/80 { background-color: rgba(217, 119, 6, 0.84); }
+html.light .bg-blue-300 { background-color: #2563EB; }
+html.light .bg-cyan-200 { background-color: #0891B2; }
+html.light .bg-cyan-300 { background-color: #0891B2; }
+html.light .bg-cyan-300\/80 { background-color: rgba(8, 145, 178, 0.84); }
+html.light .bg-cyan-400 { background-color: #0891B2; }
+html.light .bg-emerald-300 { background-color: #3F6F55; }
+html.light .bg-emerald-400 { background-color: #3F6F55; }
+html.light .bg-emerald-400\/70 { background-color: rgba(63, 111, 85, 0.74); }
+html.light .bg-fuchsia-200 { background-color: #C026D3; }
+html.light .bg-fuchsia-300 { background-color: #C026D3; }
+html.light .bg-fuchsia-400 { background-color: #C026D3; }
+html.light .bg-indigo-300 { background-color: #4F46E5; }
+html.light .bg-lime-300 { background-color: #65A30D; }
+html.light .bg-orange-300 { background-color: #EA580C; }
+html.light .bg-pink-300 { background-color: #DB2777; }
+html.light .bg-purple-300 { background-color: #9333EA; }
+html.light .bg-rose-300 { background-color: #9F4550; }
+html.light .bg-rose-300\/80 { background-color: rgba(159, 69, 80, 0.84); }
+html.light .bg-rose-400 { background-color: #9F4550; }
+html.light .bg-sky-300 { background-color: #0284C7; }
+html.light .bg-sky-400 { background-color: #0284C7; }
+html.light .bg-sky-400\/15 { background-color: rgba(2, 132, 199, 0.19); }
+html.light .bg-teal-300 { background-color: #0D9488; }
+html.light .bg-violet-200 { background-color: #7C3AED; }
+html.light .bg-violet-300 { background-color: #7C3AED; }
+html.light .bg-violet-300\/60 { background-color: rgba(124, 58, 237, 0.64); }
+html.light .bg-violet-300\/85 { background-color: rgba(124, 58, 237, 0.89); }
+html.light .bg-violet-400 { background-color: #7C3AED; }
+html.light .bg-violet-400\/15 { background-color: rgba(124, 58, 237, 0.19); }
+html.light .bg-violet-400\/20 { background-color: rgba(124, 58, 237, 0.24); }
+html.light .bg-violet-400\/40 { background-color: rgba(124, 58, 237, 0.44); }
+html.light .bg-violet-400\/50 { background-color: rgba(124, 58, 237, 0.54); }
+html.light .bg-violet-400\/60 { background-color: rgba(124, 58, 237, 0.64); }
+html.light .bg-violet-400\/70 { background-color: rgba(124, 58, 237, 0.74); }
+html.light .bg-violet-400\/85 { background-color: rgba(124, 58, 237, 0.89); }
+html.light .border-amber-200\/50 { border-color: rgba(217, 119, 6, 0.7); }
+html.light .border-amber-300\/25 { border-color: rgba(217, 119, 6, 0.45); }
+html.light .border-amber-300\/30 { border-color: rgba(217, 119, 6, 0.5); }
+html.light .border-amber-300\/35 { border-color: rgba(217, 119, 6, 0.55); }
+html.light .border-amber-400\/15 { border-color: rgba(217, 119, 6, 0.35); }
+html.light .border-amber-400\/20 { border-color: rgba(217, 119, 6, 0.4); }
+html.light .border-amber-400\/25 { border-color: rgba(217, 119, 6, 0.45); }
+html.light .border-blue-200\/40 { border-color: rgba(37, 99, 235, 0.6); }
+html.light .border-blue-200\/50 { border-color: rgba(37, 99, 235, 0.7); }
+html.light .border-blue-400\/15 { border-color: rgba(37, 99, 235, 0.35); }
+html.light .border-emerald-200\/40 { border-color: rgba(63, 111, 85, 0.6); }
+html.light .border-emerald-200\/50 { border-color: rgba(63, 111, 85, 0.7); }
+html.light .border-emerald-400\/15 { border-color: rgba(63, 111, 85, 0.35); }
+html.light .border-emerald-400\/25 { border-color: rgba(63, 111, 85, 0.45); }
+html.light .border-emerald-400\/45 { border-color: rgba(63, 111, 85, 0.65); }
+html.light .border-fuchsia-300\/40 { border-color: rgba(192, 38, 211, 0.6); }
+html.light .border-fuchsia-400\/45 { border-color: rgba(192, 38, 211, 0.65); }
+html.light .border-fuchsia-400\/50 { border-color: rgba(192, 38, 211, 0.7); }
+html.light .border-indigo-200\/40 { border-color: rgba(79, 70, 229, 0.6); }
+html.light .border-lime-200\/40 { border-color: rgba(101, 163, 13, 0.6); }
+html.light .border-lime-200\/50 { border-color: rgba(101, 163, 13, 0.7); }
+html.light .border-lime-400\/15 { border-color: rgba(101, 163, 13, 0.35); }
+html.light .border-lime-400\/30 { border-color: rgba(101, 163, 13, 0.5); }
+html.light .border-orange-200\/40 { border-color: rgba(234, 88, 12, 0.6); }
+html.light .border-orange-200\/50 { border-color: rgba(234, 88, 12, 0.7); }
+html.light .border-orange-400\/15 { border-color: rgba(234, 88, 12, 0.35); }
+html.light .border-orange-400\/30 { border-color: rgba(234, 88, 12, 0.5); }
+html.light .border-pink-300\/40 { border-color: rgba(219, 39, 119, 0.6); }
+html.light .border-pink-300\/50 { border-color: rgba(219, 39, 119, 0.7); }
+html.light .border-pink-400\/15 { border-color: rgba(219, 39, 119, 0.35); }
+html.light .border-pink-400\/30 { border-color: rgba(219, 39, 119, 0.5); }
+html.light .border-purple-200\/40 { border-color: rgba(147, 51, 234, 0.6); }
+html.light .border-purple-200\/50 { border-color: rgba(147, 51, 234, 0.7); }
+html.light .border-purple-400\/15 { border-color: rgba(147, 51, 234, 0.35); }
+html.light .border-rose-300\/30 { border-color: rgba(159, 69, 80, 0.5); }
+html.light .border-rose-300\/40 { border-color: rgba(159, 69, 80, 0.6); }
+html.light .border-rose-300\/45 { border-color: rgba(159, 69, 80, 0.65); }
+html.light .border-rose-300\/50 { border-color: rgba(159, 69, 80, 0.7); }
+html.light .border-rose-400 { border-color: #9F4550; }
+html.light .border-rose-400\/10 { border-color: rgba(159, 69, 80, 0.3); }
+html.light .border-rose-400\/15 { border-color: rgba(159, 69, 80, 0.35); }
+html.light .border-rose-400\/20 { border-color: rgba(159, 69, 80, 0.4); }
+html.light .border-sky-200\/40 { border-color: rgba(2, 132, 199, 0.6); }
+html.light .border-sky-200\/50 { border-color: rgba(2, 132, 199, 0.7); }
+html.light .border-sky-400\/15 { border-color: rgba(2, 132, 199, 0.35); }
+html.light .border-sky-400\/25 { border-color: rgba(2, 132, 199, 0.45); }
+html.light .border-sky-400\/30 { border-color: rgba(2, 132, 199, 0.5); }
+html.light .border-sky-400\/40 { border-color: rgba(2, 132, 199, 0.6); }
+html.light .border-teal-200\/40 { border-color: rgba(13, 148, 136, 0.6); }
+html.light .border-teal-200\/45 { border-color: rgba(13, 148, 136, 0.65); }
+html.light .border-teal-400\/15 { border-color: rgba(13, 148, 136, 0.35); }
+html.light .border-teal-400\/30 { border-color: rgba(13, 148, 136, 0.5); }
+html.light .border-violet-200 { border-color: #7C3AED; }
+html.light .border-violet-200\/60 { border-color: rgba(124, 58, 237, 0.8); }
+html.light .border-violet-300 { border-color: #7C3AED; }
+html.light .border-violet-300\/35 { border-color: rgba(124, 58, 237, 0.55); }
+html.light .border-violet-400 { border-color: #7C3AED; }
+html.light .border-violet-400\/25 { border-color: rgba(124, 58, 237, 0.45); }
+html.light .focus-visible\:border-violet-400\/50:focus-visible { border-color: rgba(124, 58, 237, 0.7); }
+html.light .focus-within\:border-violet-400\/50 { border-color: rgba(124, 58, 237, 0.7); }
+html.light .focus\:border-violet-400\/40:focus { border-color: rgba(124, 58, 237, 0.6); }
+html.light .focus\:border-violet-400\/50:focus { border-color: rgba(124, 58, 237, 0.7); }
+html.light .focus\:border-violet-400\/70:focus { border-color: rgba(124, 58, 237, 0.9); }
+html.light .group-focus-visible\:bg-violet-400\/60 { background-color: rgba(124, 58, 237, 0.64); }
+html.light .group:hover .group-hover\:bg-violet-400\/40 { background-color: rgba(124, 58, 237, 0.44); }
+html.light .group:hover .group-hover\:border-violet-400\/40 { border-color: rgba(124, 58, 237, 0.6); }
+html.light .hover\:bg-amber-400\/20:hover { background-color: rgba(217, 119, 6, 0.24); }
+html.light .hover\:bg-amber-400\/30:hover { background-color: rgba(217, 119, 6, 0.34); }
+html.light .hover\:bg-emerald-400\/20:hover { background-color: rgba(63, 111, 85, 0.24); }
+html.light .hover\:bg-rose-400\/10:hover { background-color: rgba(159, 69, 80, 0.14); }
+html.light .hover\:bg-rose-400\/20:hover { background-color: rgba(159, 69, 80, 0.24); }
+html.light .hover\:bg-rose-400\/25:hover { background-color: rgba(159, 69, 80, 0.29); }
+html.light .hover\:bg-violet-400:hover { background-color: #7C3AED; }
+html.light .hover\:border-amber-300\/60:hover { border-color: rgba(217, 119, 6, 0.8); }
+html.light .hover\:border-emerald-400\/60:hover { border-color: rgba(63, 111, 85, 0.8); }
+html.light .hover\:border-rose-300\/40:hover { border-color: rgba(159, 69, 80, 0.6); }
+html.light .hover\:border-rose-400\/30:hover { border-color: rgba(159, 69, 80, 0.5); }
+html.light .hover\:border-rose-400\/40:hover { border-color: rgba(159, 69, 80, 0.6); }
+html.light .hover\:border-rose-400\/50:hover { border-color: rgba(159, 69, 80, 0.7); }
+html.light .hover\:border-rose-400\/60:hover { border-color: rgba(159, 69, 80, 0.8); }
+html.light .hover\:border-rose-400\/70:hover { border-color: rgba(159, 69, 80, 0.9); }
+html.light .hover\:border-violet-400\/40:hover { border-color: rgba(124, 58, 237, 0.6); }
+html.light .hover\:border-violet-400\/50:hover { border-color: rgba(124, 58, 237, 0.7); }
+
+/* ----------------------------------------------------------------------------
+   Status surfaces — the AUTHORED light-theme values, pinned.
+
+   The token flip at the top of this file already gives every `emerald-*` /
+   `rose-*` utility a sage / clay value in both themes. This block exists for
+   the handful of utilities that make up an actual status BANNER — the tinted
+   fill and its outline — because the light overrides above inherit alphas that
+   were tuned to keep a SATURATED colour visible on white. Sage and clay are
+   quiet enough that those same alphas over-darken them, so the banner pairs
+   are stated literally instead:
+
+     success   bg #F4F7F5   border #D5E2DA   icon #3F6F55   text #355E48
+     error     bg #FAF5F5   border #E8D4D6   icon #9F4550   text #873944
+
+   Later in the file at equal specificity, so these win over the generic
+   emerald/rose rows above. Solid fills (`bg-*-400/80`, progress bars, dots)
+   are deliberately NOT listed — those want the full-strength colour.
+---------------------------------------------------------------------------- */
+
+/* Success — sage */
+html.light .bg-emerald-400\/\[0\.08\] { background-color: #F4F7F5; }
+html.light .bg-emerald-400\/10 { background-color: #F4F7F5; }
+html.light .bg-emerald-400\/15 { background-color: #EDF2EF; }
+html.light .bg-emerald-500\/15 { background-color: #EDF2EF; }
+html.light .bg-emerald-500\/20 { background-color: #E6EEE9; }
+
+html.light .border-emerald-400\/15 { border-color: #E2EBE6; }
+html.light .border-emerald-400\/20 { border-color: #DCE7E1; }
+html.light .border-emerald-400\/25 { border-color: #D5E2DA; }
+html.light .border-emerald-400\/30 { border-color: #D5E2DA; }
+html.light .border-emerald-400\/35 { border-color: #CBDBD2; }
+html.light .border-emerald-400\/40 { border-color: #C2D5CA; }
+html.light .border-emerald-200\/40 { border-color: #D5E2DA; }
+html.light .border-emerald-200\/50 { border-color: #CBDBD2; }
+
+/* Error — clay */
+html.light .bg-rose-500\/\[0\.06\] { background-color: #FAF5F5; }
+html.light .bg-rose-500\/\[0\.08\] { background-color: #FAF5F5; }
+html.light .bg-rose-500\/\[0\.12\] { background-color: #F6EEEF; }
+html.light .bg-rose-500\/10 { background-color: #FAF5F5; }
+html.light .bg-rose-400\/10 { background-color: #FAF5F5; }
+html.light .bg-rose-500\/15 { background-color: #F6EEEF; }
+html.light .bg-rose-400\/15 { background-color: #F6EEEF; }
+html.light .bg-rose-500\/20 { background-color: #F1E6E8; }
+
+html.light .border-rose-400\/10 { border-color: #F0E2E4; }
+html.light .border-rose-400\/15 { border-color: #EDDCDE; }
+html.light .border-rose-400\/20 { border-color: #E8D4D6; }
+html.light .border-rose-400\/25 { border-color: #E8D4D6; }
+html.light .border-rose-400\/30 { border-color: #E8D4D6; }
+html.light .border-rose-400\/40 { border-color: #DFC5C8; }
+html.light .border-rose-300\/30 { border-color: #E8D4D6; }
+html.light .border-rose-300\/40 { border-color: #E8D4D6; }

@@ -2,6 +2,8 @@
 
 import * as React from "react";
 import { fmtPrecise } from "./utils";
+import { usePlaybackTime } from "../playback-clock";
+import { useRenderCount } from "@/lib/perf/render-probe";
 
 /**
  * Cinematic playhead — a chunkier triangle head, a glowing time chip just
@@ -33,17 +35,21 @@ import { fmtPrecise } from "./utils";
  */
 export function Playhead({
   videoRef,
-  currentTime,
   playing,
   total,
   rulerHeight,
 }: {
   videoRef: React.RefObject<HTMLVideoElement | null>;
-  currentTime: number;
   playing: boolean;
   total: number;
   rulerHeight: number;
 }) {
+  // Subscribed HERE rather than passed down from the timeline. The time is what
+  // this component draws, so it is the right place to take the re-render — and
+  // taking it here means the surrounding track stack (every lane, every pill)
+  // no longer re-renders in sympathy on each tick.
+  useRenderCount("playhead");
+  const currentTime = usePlaybackTime();
   const wrapRef = React.useRef<HTMLDivElement | null>(null);
   const chipRef = React.useRef<HTMLSpanElement | null>(null);
   /** Track width in px, measured (not read per-frame — that would force layout). */

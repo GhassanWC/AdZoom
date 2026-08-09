@@ -4,6 +4,7 @@ import * as React from "react";
 import { Activity, Gauge, Scissors, MousePointerClick } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { dequantizeArray } from "@/lib/cv/resample";
+import { usePlaybackTime } from "./playback-clock";
 import type { VisualAnalysis } from "@/lib/firebase/schema";
 
 /**
@@ -15,14 +16,15 @@ import type { VisualAnalysis } from "@/lib/firebase/schema";
 export function CvSignalTracks({
   visualAnalysis,
   duration,
-  currentTime,
   onSeek,
 }: {
   visualAnalysis: VisualAnalysis;
   duration: number;
-  currentTime: number;
   onSeek: (t: number) => void;
 }) {
+  // Debug-only surface, and it draws a moving playhead line, so it legitimately
+  // wants the raw time — but it subscribes itself, so nothing else re-renders.
+  const currentTime = usePlaybackTime();
   const va = visualAnalysis;
   const motion = React.useMemo(() => dequantizeArray(va.motion), [va.motion]);
   const attention = React.useMemo(
@@ -66,8 +68,10 @@ export function CvSignalTracks({
           label="Attention"
           icon={<Gauge size={9} />}
           values={attention}
-          color="#34D399"
-          fill="rgba(52,211,153,0.16)"
+          // Sage, matching --color-emerald-400. Still separates cleanly from
+          // the violet Motion curve and the amber Scenes markers beside it.
+          color="#7FA890"
+          fill="rgba(127,168,144,0.16)"
           playheadPct={playheadPct}
           onSeek={seekFromEvent}
         />

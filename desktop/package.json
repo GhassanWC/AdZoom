@@ -1,0 +1,42 @@
+{
+  "name": "framevo-desktop",
+  "productName": "Framevo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Framevo desktop — the Framevo editor, local projects, and local GPU-accelerated MP4 export.",
+  "author": "Framevo",
+  "license": "UNLICENSED",
+  "main": ".vite/main.js",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "build:bundle": "node esbuild.mjs",
+    "make:icon": "node scripts/make-icon.mjs",
+    "build:renderer": "node scripts/build-renderer.mjs",
+    "build": "npm run build:bundle && npm run build:renderer",
+    "package": "npm run build && electron-forge package",
+    "make": "npm run build && electron-forge make",
+    "db:generate": "drizzle-kit generate",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import ./test/register.mjs --test \"test/**/*.test.mts\"",
+    "test:e2e": "playwright test",
+    "package:win": "node scripts/package-win.mjs"
+  },
+  "dependencies": {
+    "@napi-rs/canvas": "^0.1.65",
+    "drizzle-orm": "^0.45.2"
+  },
+  "devDependencies": {
+    "@electron-forge/cli": "^7.11.2",
+    "@electron-forge/maker-squirrel": "^7.11.2",
+    "@electron-forge/maker-zip": "^7.11.2",
+    "@electron-forge/plugin-fuses": "^7.11.2",
+    "@electron/fuses": "^1.8.0",
+    "@types/node": "^22.10.0",
+    "drizzle-kit": "^0.31.10",
+    "electron": "^43.2.0",
+    "esbuild": "^0.24.2",
+    "ffmpeg-static": "^5.2.0",
+    "ffprobe-static": "^3.1.0",
+    "typescript": "^5"
+  }
+}

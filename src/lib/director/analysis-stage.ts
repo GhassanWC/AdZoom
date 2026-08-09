@@ -29,7 +29,7 @@ import { buildDirectorContext } from "./context-builder";
 import { planDirector } from "./gemini-planner";
 import { runDirectorPipeline } from "./pipeline";
 import { hashDirectorRequest, parseDirectorRequest } from "./request";
-import { commitRun, failRun, startRun } from "./state";
+import { commitRun, failRun, proposeRun, startRun } from "./state";
 import type { DirectorBrief, DirectorState } from "./types";
 
 /** A line for the analysis activity log. Same shape the route already emits. */
@@ -51,6 +51,16 @@ export interface RunDirectorStageInput {
   effects?: EffectsSettings;
   /** Prior Director state, if the project has been directed before. */
   prior?: DirectorState;
+  /**
+   * Plan mode: build the plan and report exactly what it WOULD do, but leave
+   * the timeline alone.
+   *
+   * The pipeline still runs — that is the only way to know the real answer —
+   * and its moments are then thrown away. Approving later re-runs it against
+   * whatever the timeline is at that point, which is why nothing here is
+   * cached beyond the plan itself.
+   */
+  planOnly?: boolean;
 }
 
 export interface RunDirectorStageResult {
@@ -165,6 +175,34 @@ export async function runDirectorStage(
     sourceHeight: project.height,
     effects,
   });
+
+  // ── Plan mode: report, don't apply. ───────────────────────────────────────
+  // The check is the same one instant mode makes — a plan that would apply
+  // nothing is a failure, and proposing it would ask the user to approve a
+  // no-op. It has to fail here, before anything is shown as a choice.
+  if (input.planOnly) {
+    if (!result.applied) {
+      const why =
+        result.failures[0]?.detail ?? "No operation from the plan could be applied.";
+      log.push({ kind: "warn", text: `Director had nothing to propose — ${why}` });
+      return unchanged(failRun(state, why, result.failures));
+    }
+    log.push({
+      kind: "ok",
+      text: `Director proposed ${result.appliedOperationIds.length} change${
+        result.appliedOperationIds.length === 1 ? "" : "s"
+      } for review — the timeline is unchanged until you approve it.`,
+    });
+    return unchanged(
+      proposeRun(state, {
+        plan: result.plan,
+        summary: result.summary,
+        review: result.review,
+        failures: result.failures,
+        command: "",
+      })
+    );
+  }
 
   if (!result.applied) {
     // "Applied nothing" is a failed run, however cleanly it failed. Never report

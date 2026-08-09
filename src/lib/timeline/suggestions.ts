@@ -19,6 +19,7 @@ import type {
 } from "@/lib/firebase/schema";
 import { PACING_PROFILES } from "@/lib/timeline-balancer";
 import { dequantize, dequantizeArray } from "@/lib/cv/resample";
+import { clampZoomWindow, zoomPreset } from "@/lib/timeline/zoom-presets";
 
 function fmt(s: number): string {
   const m = Math.floor(s / 60);
@@ -26,21 +27,30 @@ function fmt(s: number): string {
   return `${m}:${String(r).padStart(2, "0")}`;
 }
 
-/** A candidate moment for an insert-kind suggestion (id assigned on accept). */
+/**
+ * A candidate moment for an insert-kind suggestion (id assigned on accept).
+ * Camera suggestions are built through the shared zoom window, so accepting one
+ * lands an edit with exactly the timing the AI pass would have produced.
+ */
 function makeMoment(
   effectType: EffectType,
   start: number,
   end: number,
   cx: number,
   cy: number,
-  label: string
+  label: string,
+  limit: number
 ): DetectedMoment {
   const w = 0.4;
   const h = 0.4;
+  const window =
+    effectType === "zoom" || effectType === "cursor-focus"
+      ? clampZoomWindow(start, end, zoomPreset(undefined), limit)
+      : { startTime: Math.max(0, start), endTime: Math.max(start + 0.4, end) };
   return {
     id: "suggestion",
-    startTime: Math.max(0, start),
-    endTime: Math.max(start + 0.4, end),
+    startTime: window.startTime,
+    endTime: window.endTime,
     label,
     reason: "Suggested by AI from motion + attention signals.",
     focusRegion: {
@@ -111,7 +121,8 @@ export function generateSuggestions(
             Math.min(duration, tMid + 2.4),
             c.x,
             c.y,
-            "Emphasis"
+            "Emphasis",
+            duration
           ),
         });
       }
@@ -137,7 +148,8 @@ export function generateSuggestions(
           Math.min(duration, ev.t + 1.6),
           c.x,
           c.y,
-          "Interaction"
+          "Interaction",
+          duration
         ),
       });
     }
@@ -192,7 +204,8 @@ export function generateSuggestions(
         Math.min(duration, tMid + 2),
         c.x,
         c.y,
-        "Keep momentum"
+        "Keep momentum",
+        duration
       ),
     });
   }

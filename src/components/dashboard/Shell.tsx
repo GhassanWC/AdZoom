@@ -2,7 +2,8 @@
 
 import * as React from "react";
 import { usePathname, useRouter } from "next/navigation";
-import { Sidebar } from "./Sidebar";
+import { SIDEBAR_CONTENT_PAD, Sidebar } from "./Sidebar";
+import { NavShellProvider, type NavShellValue } from "./nav-shell";
 import { Topbar } from "./Topbar";
 import { RecordingProvider } from "@/components/recording/RecordingProvider";
 import { RecordingChrome } from "@/components/recording/RecordingChrome";
@@ -10,6 +11,7 @@ import { ExportProvider } from "@/components/export/ExportProvider";
 import { EditframeExportProvider } from "@/components/export/EditframeExportProvider";
 import { ExportPill } from "@/components/export/ExportPill";
 import { NotificationProvider } from "@/lib/notifications/store";
+import { ThemeDock } from "@/components/ui/ThemeDock";
 import { isEditorRoute } from "@/components/dashboard/real-editor/editor-shell-behavior";
 
 export function Shell({ children }: { children: React.ReactNode }) {
@@ -17,29 +19,43 @@ export function Shell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   useRecordHotkey();
 
-  // The project editor is a dedicated fullscreen workspace: no persistent
-  // sidebar, no dashboard topbar, no content padding. It brings its own
-  // chrome (EditorTopBar + overlay nav drawer). Providers + the recording /
-  // export overlays still wrap it so those flows keep working inside the
-  // editor.
+  // The project editor brings its OWN chrome (EditorTopBar, tool rail, docked
+  // inspector), so it renders full-bleed: no dashboard topbar, no content
+  // padding, no theme dock. The nav rail is NOT part of that exception — it is
+  // 72px of icons, the same 72px the rest of the workspace shows, and the
+  // editor is the one screen people navigate away from most.
   const fullBleed = isEditorRoute(pathname);
+
+  const nav = React.useMemo<NavShellValue>(
+    () => ({ homeHref: "/", openNav: () => setOpen(true) }),
+    []
+  );
 
   return (
     <NotificationProvider>
       <RecordingProvider>
         <ExportProvider>
           <EditframeExportProvider>
-          {fullBleed ? (
-            <div className="min-h-screen bg-ink">{children}</div>
-          ) : (
+          <NavShellProvider value={nav}>
             <div className="min-h-screen bg-ink">
-              <Sidebar open={open} onClose={() => setOpen(false)} />
-              <div className="lg:pl-64">
-                <Topbar onOpenSidebar={() => setOpen(true)} />
-                <main className="px-4 py-6 lg:px-8 lg:py-8">{children}</main>
+              <Sidebar open={open} onClose={() => setOpen(false)} variant="rail" />
+              {/* Same source as the sidebar's own width — see SIDEBAR_WIDTH. */}
+              <div className={SIDEBAR_CONTENT_PAD.rail}>
+                {fullBleed ? (
+                  children
+                ) : (
+                  <>
+                    <Topbar onOpenSidebar={() => setOpen(true)} />
+                    <main className="px-4 py-6 lg:px-8 lg:py-8">{children}</main>
+                  </>
+                )}
               </div>
+              {/* Workspace only. The editor is excluded on purpose: it has its
+                  own dense chrome, and a floating control near the timeline
+                  would steal clicks — the same rule the chat bubble follows. */}
+              {!fullBleed && <ThemeDock />}
             </div>
-          )}
+          </NavShellProvider>
           <RecordingChrome />
           <ExportPill />
           </EditframeExportProvider>

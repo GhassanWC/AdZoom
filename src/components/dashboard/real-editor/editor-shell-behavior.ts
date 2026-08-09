@@ -7,8 +7,10 @@
 /* ── Editor route detection ──────────────────────────────────────────────── */
 
 /**
- * The project editor detail route gets the dedicated fullscreen shell; every
- * other dashboard route keeps the regular sidebar+topbar chrome.
+ * The project editor detail route gets the dedicated fullscreen shell: it
+ * drops the dashboard topbar, the content padding and the theme dock in favour
+ * of its own chrome. It KEEPS the nav rail — that is shared with every other
+ * dashboard route, so there is exactly one navigation in the app.
  * Matches /dashboard/projects/<id> (one non-empty segment, optional trailing
  * slash) but NOT /dashboard/projects (the list page).
  */

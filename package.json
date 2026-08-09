@@ -9,6 +9,14 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
+    "desktop:install": "npm --prefix desktop install",
+    "desktop:dev": "npm --prefix desktop run dev",
+    "desktop:build": "npm --prefix desktop run build",
+    "desktop:package": "npm --prefix desktop run package:win",
+    "desktop:make": "npm --prefix desktop run make",
+    "desktop:typecheck": "npm --prefix desktop run typecheck",
+    "desktop:test": "npm --prefix desktop test",
+    "desktop:test:e2e": "npm --prefix desktop run test:e2e",
     "gen:icons": "node scripts/gen-icons.mjs",
     "test": "node --import ./tests/register-resolver.mjs --test \"tests/**/*.test.ts\"",
     "test:e2e": "playwright test",
@@ -39,7 +47,12 @@
     "asr:install": "npm --prefix services/asr-worker install",
     "asr:build": "npm --prefix services/asr-worker run build",
     "asr:typecheck": "npm --prefix services/asr-worker run typecheck",
-    "asr:deploy": "node scripts/deploy-asr-worker.mjs"
+    "asr:deploy": "node scripts/deploy-asr-worker.mjs",
+    "emu": "firebase emulators:start --only auth,firestore,storage --project framevo-test",
+    "test:integration": "firebase emulators:exec --only auth,firestore,storage --project framevo-test \"npm run test --prefix desktop\"",
+    "desktop:audit": "node scripts/audit-desktop-bundle.mjs",
+    "desktop:release": "node scripts/desktop-release.mjs",
+    "desktop:release:upload": "node scripts/desktop-upload-release.mjs"
   },
   "dependencies": {
     "@editframe/elements": "^0.58.4",
@@ -71,6 +84,7 @@
     "@types/react-dom": "^19",
     "eslint": "^9.39.5",
     "eslint-config-next": "^16.2.6",
+    "firebase-tools": "^15.24.0",
     "tailwindcss": "^4",
     "typescript": "^5"
   }

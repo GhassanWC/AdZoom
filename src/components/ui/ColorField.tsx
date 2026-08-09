@@ -2,6 +2,8 @@
 
 import * as React from "react";
 import { cn } from "@/lib/cn";
+import { useLiveValue } from "@/components/dashboard/real-editor/useLiveValue";
+import { COMMIT_PROFILES } from "@/components/dashboard/real-editor/live-commit";
 
 /** Normalize free text to a `#rrggbb` hex, or null if it isn't a valid colour. */
 function normalizeHex(input: string): string | null {
@@ -30,15 +32,29 @@ export function ColorField({
   onChange: (hex: string) => void;
   className?: string;
 }) {
-  const safe = normalizeHex(value) ?? "#000000";
-  // Local draft so a user can type freely (e.g. mid-edit "#8b5") without the
-  // parent clobbering the field; commit on valid input / blur.
+  // The SWATCH is a drag: the OS colour picker streams `change` events while the
+  // user moves through the gradient, and persisting each one wrote the project
+  // document dozens of times a second. The live value keeps the swatch and the
+  // hex field in step with the pointer and persists on the drag cadence.
+  const live = useLiveValue(
+    normalizeHex(value) ?? "#000000",
+    onChange,
+    COMMIT_PROFILES.drag
+  );
+  const safe = live.value;
+  // Separate draft for the TEXT field so a user can type freely (e.g. mid-edit
+  // "#8b5") without it being normalized out from under them; commit on valid
+  // input / blur.
   const [draft, setDraft] = React.useState(safe);
-  React.useEffect(() => setDraft(normalizeHex(value) ?? "#000000"), [value]);
+  const [seenSafe, setSeenSafe] = React.useState(safe);
+  if (seenSafe !== safe) {
+    setSeenSafe(safe);
+    setDraft(safe);
+  }
 
   const commit = (raw: string) => {
     const hex = normalizeHex(raw);
-    if (hex) onChange(hex);
+    if (hex) live.set(hex);
     else setDraft(safe); // revert invalid text
   };
 
@@ -52,7 +68,11 @@ export function ColorField({
             type="color"
             aria-label={`${label} colour picker`}
             value={safe}
-            onChange={(e) => onChange(e.target.value.toLowerCase())}
+            onChange={(e) => live.set(e.target.value.toLowerCase())}
+            onPointerDown={live.begin}
+            onPointerUp={live.end}
+            onPointerCancel={live.end}
+            onBlur={live.end}
             className="absolute inset-0 cursor-pointer opacity-0"
           />
         </span>
@@ -62,12 +82,16 @@ export function ColorField({
           spellCheck={false}
           aria-label={`${label} hex`}
           value={draft}
+          onFocus={live.begin}
           onChange={(e) => {
             setDraft(e.target.value);
             const hex = normalizeHex(e.target.value);
-            if (hex) onChange(hex);
+            if (hex) live.set(hex);
           }}
-          onBlur={(e) => commit(e.target.value)}
+          onBlur={(e) => {
+            commit(e.target.value);
+            live.end();
+          }}
           className="w-full min-w-0 bg-transparent font-mono text-[12.5px] uppercase tracking-wide text-white outline-none placeholder:text-fog/50"
           placeholder="#ffffff"
         />

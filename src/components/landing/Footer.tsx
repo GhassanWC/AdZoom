@@ -18,6 +18,7 @@ const INLINE_LINKS: { label: string; href: string }[] = [
   { label: "Use cases", href: "/use-cases" },
   { label: "Screen recording editor", href: "/screen-recording-editor" },
   { label: "Pricing", href: "/pricing" },
+  { label: "Download", href: "/download" },
   { label: "Docs", href: "/docs" },
   { label: "Tutorials", href: "/tutorials" },
   { label: "Templates", href: "/templates" },

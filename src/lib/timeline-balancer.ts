@@ -35,6 +35,8 @@ import { sampleCvForMoment, fuseAttention, nearestClickEvent } from "./cv/fusion
 import { visualMomentsFromCv } from "./cv/visual-moments";
 import type { Interaction } from "./recording/types";
 import { refineMomentFocalRegion } from "./timeline/focal-region";
+import { normalizeZoomTimeline } from "./timeline/zoom-normalize";
+import type { ZoomPresetId } from "./timeline/zoom-presets";
 
 export interface PacingProfile {
   /** Target moments per minute. */
@@ -138,6 +140,11 @@ export interface BalancerInput {
    * hard-dropped — used by the rebalance endpoint under "dense" pacing.
    */
   unrejectRebalance?: boolean;
+  /**
+   * The project's zoom style. Sets the duration window generated zooms are held
+   * to (see `timeline/zoom-normalize`). Absent ⇒ "standard".
+   */
+  zoomPreset?: ZoomPresetId;
 }
 
 export interface BalancerResult {
@@ -190,6 +197,15 @@ export interface BalancerResult {
     sceneChangeNudged: number;
     /** Quartiles left empty after honouring rejection (no rescue performed). */
     quartileLeftEmpty: number;
+    /**
+     * Zoom hygiene (see `timeline/zoom-normalize`): duplicate pushes on the same
+     * target collapsed, windows pulled into the preset's duration range, and
+     * leftover overlaps trimmed so one zoom owns any instant. User-authored
+     * edits are never counted here — they're never reshaped.
+     */
+    zoomsMerged: number;
+    zoomsClamped: number;
+    zoomsTrimmed: number;
     /**
      * Per-provenance accounting for event-derived (real click / typing /
      * scroll-pause) candidates. Surfaced so the editor's Analysis Debug
@@ -1354,8 +1370,15 @@ export function balanceTimeline(input: BalancerInput): BalancerResult {
   // Sort by start time
   kept.sort((a, b) => a.startTime - b.startTime);
 
+  // Zoom hygiene BEFORE the quota, so the quota measures the timeline that
+  // actually ships: merging two AI zooms into one changes the AI count.
+  const hygiene = normalizeZoomTimeline(kept, {
+    preset: input.zoomPreset,
+    duration,
+  });
+
   // Enforce the AI quota (≤ 15% of final timeline).
-  const quotaResult = enforceAiQuota(kept.map(ensureConfidence));
+  const quotaResult = enforceAiQuota(hygiene.moments.map(ensureConfidence));
   const final: DetectedMoment[] = quotaResult.kept;
   const quotaDropped = quotaResult.quotaDropped;
 
@@ -1427,6 +1450,9 @@ export function balanceTimeline(input: BalancerInput): BalancerResult {
       aiRejectedNoTarget: rejectPass.stats.aiRejectedNoTarget,
       sceneChangeNudged,
       quartileLeftEmpty,
+      zoomsMerged: hygiene.merged,
+      zoomsClamped: hygiene.clamped,
+      zoomsTrimmed: hygiene.trimmed,
       eventStats: {
         eventCandidatesIn,
         eventDroppedByOverlap: overlapResolved.eventsDropped,

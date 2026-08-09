@@ -17,7 +17,7 @@
  *
  * Pure. No Firebase. The caller writes the returned state.
  */
-import type { DirectorFailure, DirectorPlan, DirectorRequest, DirectorReviewResult, DirectorRevisionEntry, DirectorStage, DirectorState, DirectorSummary } from "./types";
+import type { DirectorFailure, DirectorPlan, DirectorProposal, DirectorRequest, DirectorReviewResult, DirectorRevisionEntry, DirectorStage, DirectorState, DirectorSummary } from "./types";
 
 /** Cap history so a project document can't grow without bound. */
 export const MAX_REVISIONS = 20;
@@ -104,11 +104,62 @@ export function commitRun(
     review: input.review,
     failures: input.failures,
     revisions,
+    // Whatever was pending is now either what we just committed, or was
+    // computed against a timeline that no longer exists. Either way it must not
+    // survive this write.
+    proposal: undefined,
     modelVersion: input.plan.modelVersion,
     planVersion: input.plan.planVersion,
     completedAt: now,
     errorMessage: undefined,
   };
+}
+
+/**
+ * Record a plan the user has NOT accepted — Plan mode's terminal state.
+ *
+ * Status is `proposed`, never `complete`: nothing was applied. The previous
+ * plan/summary/review are left exactly as they were, because they still
+ * describe the timeline the user is looking at. Only `proposal` is new.
+ */
+export function proposeRun(
+  state: DirectorState,
+  input: Omit<DirectorProposal, "createdAt"> & { now?: number }
+): DirectorState {
+  const now = input.now ?? Date.now();
+  return {
+    ...state,
+    status: "proposed",
+    stage: undefined,
+    errorMessage: undefined,
+    completedAt: now,
+    proposal: {
+      plan: input.plan,
+      summary: input.summary,
+      review: input.review,
+      failures: input.failures,
+      command: input.command,
+      createdAt: now,
+    },
+  };
+}
+
+/**
+ * Drop a pending proposal.
+ *
+ * Also the guard against a stale one: any change that moves the timeline out
+ * from under a proposal (an instant-mode edit, an undo) must call this, because
+ * a proposal's summary was computed against the timeline as it was, and showing
+ * it afterwards would describe a result approving can no longer produce.
+ *
+ * Status falls back to what the applied history says, NOT to `complete` —
+ * discarding the very first proposal leaves a project that was never directed.
+ */
+export function clearProposal(state: DirectorState): DirectorState {
+  if (!state.proposal) return state;
+  const next = { ...state, proposal: undefined };
+  if (state.status !== "proposed") return next;
+  return { ...next, status: state.revisions.length ? "complete" : "idle" };
 }
 
 export function failRun(
@@ -173,6 +224,9 @@ export function undoLastRevision(state: DirectorState): UndoTarget | null {
         review: undefined,
         failures: [],
         revisions: [],
+        // An undo moves the timeline, so any pending proposal now describes a
+        // result approving it could no longer produce.
+        proposal: undefined,
       },
     };
   }
@@ -193,6 +247,7 @@ export function undoLastRevision(state: DirectorState): UndoTarget | null {
       review: restore.review,
       failures: restore.failures,
       revisions,
+      proposal: undefined,
       modelVersion: restore.plan.modelVersion,
       planVersion: restore.plan.planVersion,
     },

@@ -185,7 +185,14 @@ export function DirectorBriefFields({
 
   // The SAME pure parser the server runs — so "what the Director understood" is
   // the real thing, not a UI approximation of it.
-  const parsed = parseDirectorRequest(value.prompt, directorDraftToForm(value));
+  //
+  // Memoized: this runs a full parse of the brief, and unmemoized it re-ran
+  // synchronously on every keystroke in the prompt textarea — blocking work on
+  // the typing path, which is the one place it is most felt.
+  const parsed = React.useMemo(
+    () => parseDirectorRequest(value.prompt, directorDraftToForm(value)),
+    [value]
+  );
   const hasPrompt = directorDraftHasPrompt(value);
 
   return (

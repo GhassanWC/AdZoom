@@ -7,7 +7,10 @@ import { Play, Clock, Sparkles, AlertCircle, Loader2, Trash2, Pencil } from "luc
 import type { ProjectDoc, ProjectStatus } from "@/lib/firebase/schema";
 import { useAuth } from "@/lib/firebase/AuthProvider";
 import { deleteProject, updateProject } from "@/lib/firebase/projects";
+import { usePlatform, isLocalProject } from "@/lib/platform";
+import type { ProjectSummary } from "@/lib/platform/types";
 import { useToast } from "@/components/ui/Toast";
+import { CloudTransferControl } from "@/components/dashboard/CloudTransferControl";
 import { cn } from "@/lib/cn";
 
 function fmtDuration(sec?: number) {
@@ -53,7 +56,20 @@ const TONE_CLASS: Record<string, string> = {
   fog: "border-white/10 bg-white/[0.03] text-fog",
 };
 
-export function RealProjectCard({ project }: { project: ProjectDoc }) {
+export function RealProjectCard({
+  project,
+  local: localRow,
+}: {
+  project: ProjectDoc;
+  /**
+   * The row behind this card in THIS computer's library, when there is one.
+   *
+   * Only the desktop passes it, and only it can answer the question the cloud
+   * controls need: is the video on this disk, or only in the cloud? A
+   * `ProjectDoc` is the same shape on the web and cannot say.
+   */
+  local?: ProjectSummary;
+}) {
   const pill = STATUS_PILL[project.status];
   const PillIcon = pill?.icon;
   const aspect =
@@ -63,7 +79,13 @@ export function RealProjectCard({ project }: { project: ProjectDoc }) {
   const previewURL = project.originalVideoUrl;
 
   const { user } = useAuth();
+  const platform = usePlatform();
   const toast = useToast();
+  // A card in the desktop library can be either backend's. The document names
+  // its own home (the local sentinel uid vs. a Firebase uid), so rename and
+  // delete follow the document rather than the shell — otherwise deleting a
+  // local project would issue a Firestore write for an id that isn't there.
+  const local = isLocalProject(project);
   const [confirmOpen, setConfirmOpen] = React.useState(false);
   const [deleting, setDeleting] = React.useState(false);
   const [renameOpen, setRenameOpen] = React.useState(false);
@@ -82,10 +104,16 @@ export function RealProjectCard({ project }: { project: ProjectDoc }) {
   };
 
   const handleConfirm = async () => {
-    if (!user || deleting) return;
+    if (deleting || (!local && !user)) return;
     setDeleting(true);
     try {
-      await deleteProject(user.uid, project.id, project.storagePath);
+      if (local) {
+        // Removes the project and its edit history. The user's source video is
+        // never touched — the app doesn't own that file.
+        await platform.projects.delete?.(project.id);
+      } else {
+        await deleteProject(user!.uid, project.id, project.storagePath);
+      }
       toast.success("Project deleted", project.title);
       setConfirmOpen(false);
     } catch (err) {
@@ -97,7 +125,7 @@ export function RealProjectCard({ project }: { project: ProjectDoc }) {
   };
 
   const handleRename = async (next: string) => {
-    if (!user || renaming) return;
+    if (renaming || (!local && !user)) return;
     const trimmed = next.trim();
     if (!trimmed || trimmed === project.title) {
       setRenameOpen(false);
@@ -105,7 +133,11 @@ export function RealProjectCard({ project }: { project: ProjectDoc }) {
     }
     setRenaming(true);
     try {
-      await updateProject(user.uid, project.id, { title: trimmed });
+      if (local) {
+        await platform.projects.write(project.id, { title: trimmed });
+      } else {
+        await updateProject(user!.uid, project.id, { title: trimmed });
+      }
       toast.success("Project renamed", trimmed);
       setRenameOpen(false);
     } catch (err) {
@@ -178,6 +210,21 @@ export function RealProjectCard({ project }: { project: ProjectDoc }) {
             <span>·</span>
             <span>Edited {relativeTime(project.updatedAt)}</span>
           </div>
+          {/* Only for projects this computer actually has a row for. A pure
+              cloud project on the desktop has nothing local to move, and on the
+              web the control renders nothing at all. */}
+          {localRow && (
+            <div className="mt-2.5">
+              <CloudTransferControl
+                projectId={localRow.id}
+                cloudOnly={Boolean(localRow.cloudOnly)}
+                // Neither direction is possible: no file here and nothing in
+                // the cloud to fetch.
+                disabled={Boolean(localRow.mediaMissing)}
+                onNotice={(message) => toast.info(message)}
+              />
+            </div>
+          )}
         </div>
         <div className="-mt-1 flex shrink-0 items-center gap-0.5">
           <button

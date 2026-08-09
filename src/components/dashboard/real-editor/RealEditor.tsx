@@ -4,11 +4,12 @@ import * as React from "react";
 import Link from "next/link";
 import { ArrowLeft, Sparkles, Loader2, AlertCircle } from "lucide-react";
 import { useAuth } from "@/lib/firebase/AuthProvider";
-import { subscribeProject } from "@/lib/firebase/projects";
+import { useProjectStorage } from "@/lib/platform/useProjectStorage";
+import { isLocalProject } from "@/lib/platform";
+import { CloudSyncBanner } from "./CloudSyncBanner";
 import type { ProjectDoc } from "@/lib/firebase/schema";
 import { FREE_VIDEO_DURATION_LIMIT_MESSAGE } from "@/lib/usage/plan";
 import { Button } from "@/components/ui/Button";
-import { SidebarNav } from "@/components/dashboard/Sidebar";
 import { EditorRealProvider, useEditorReal } from "./context";
 import { RealVideoPlayer } from "./RealVideoPlayer";
 import { EditorSplitWorkspace } from "./EditorSplitWorkspace";
@@ -17,6 +18,7 @@ import { MomentInspectorModal } from "./MomentInspectorModal";
 import { ExportModal } from "./ExportModal";
 import { AnalysisOptionsModal } from "./AnalysisOptionsModal";
 import type { AnalysisOptions } from "@/lib/analysis/engine-layers";
+import { DEFAULT_ZOOM_PRESET } from "@/lib/timeline/zoom-presets";
 import { useWorkspaceSettings } from "@/lib/firebase/workspace-settings";
 import { RealProcessingOverlay } from "./RealProcessingOverlay";
 import { ProcessingMiniPill } from "./ProcessingMiniPill";
@@ -24,27 +26,42 @@ import { DebugOverlay } from "./DebugOverlay";
 import { EditorTopBar } from "./EditorTopBar";
 import { EditorToolRail } from "./EditorToolRail";
 import { EditorInspectorDock } from "./EditorInspectorDock";
-import { EditorDrawer } from "./EditorDrawer";
 import { disposeThumbnails } from "./timeline/thumbnails";
 import { restoreEditorScrollLock } from "./scroll-lock";
+import { reconcileProjectIdentity } from "./moment-identity";
+import { RenderProbe } from "@/lib/perf/RenderProbe";
+import type { ChatMode } from "@/lib/director/chat";
 
 export function RealEditorPage({ projectId }: { projectId: string }) {
   const { user, getIdToken } = useAuth();
+  // A project id alone doesn't say which backend holds it — on the desktop it
+  // may be this computer's library OR the signed-in account's. Resolve it once,
+  // then everything below (including the editor context) uses that one store.
+  const resolution = useProjectStorage(projectId);
+  const storage = resolution.storage;
+  // Cloud projects are per-user, so the browser still waits for auth; the
+  // desktop's local library has no user to wait for.
+  const canLoad = !!storage && (storage.kind === "local" || !!user);
   const [project, setProject] = React.useState<ProjectDoc | null>(null);
   const [notFound, setNotFound] = React.useState(false);
 
   React.useEffect(() => {
-    if (!user) return;
-    const unsub = subscribeProject(user.uid, projectId, (p) => {
+    if (!canLoad || !storage) return;
+    const unsub = storage.subscribe(projectId, (p) => {
       if (!p) {
         setNotFound(true);
       } else {
         setNotFound(false);
-        setProject(p);
+        // Every echo arrives as freshly parsed JSON, so all ~40 moment objects
+        // are new even when a single one changed — and the pills are memoized on
+        // exactly those references, so one slider nudge re-rendered all of them.
+        // Reconciling HERE, at the one point a document enters React, fixes it
+        // for every consumer at once.
+        setProject((prev) => reconcileProjectIdentity(prev, p));
       }
     });
     return () => unsub();
-  }, [user, projectId]);
+  }, [canLoad, storage, projectId]);
 
   // Release decoded thumbnail frames + the hidden <video> when the editor
   // unmounts — keeps memory bounded across project navigations.
@@ -57,7 +74,7 @@ export function RealEditorPage({ projectId }: { projectId: string }) {
     []
   );
 
-  if (!user) return null;
+  if (!canLoad) return null;
 
   if (notFound) {
     return (
@@ -99,7 +116,7 @@ export function RealEditorPage({ projectId }: { projectId: string }) {
   }
 
   return (
-    <EditorRealProvider uid={user.uid} project={project} idTokenGetter={getIdToken}>
+    <EditorRealProvider uid={user?.uid ?? null} project={project} idTokenGetter={getIdToken}>
       <Body />
       <RealProcessingOverlay />
       <ProcessingMiniPill />
@@ -111,7 +128,7 @@ export function RealEditorPage({ projectId }: { projectId: string }) {
 /**
  * The fullscreen editing workspace — a fixed-height shell (no page scroll):
  *
- *   EditorTopBar        — sticky: menu (nav drawer) · back · title · undo/redo · Export
+ *   EditorTopBar        — sticky: back · title · undo/redo · Export
  *   workspace ROW       — a resizable vertical split (preview + playback controls
  *                         over an internally-scrolling timeline) fills the width;
  *                         a docked inspector panel + the narrow tool RAIL flank it
@@ -121,6 +138,11 @@ export function RealEditorPage({ projectId }: { projectId: string }) {
  * Presets / Insights now live in the right rail and open a docked inspector
  * (one `activeTool` source of truth); Re-analyze + Export stay as modals; the
  * Previous/Next edit review nav moved into the timeline toolbar.
+ *
+ * Framevo's own navigation is NOT here. The shell around this component keeps
+ * its 72px rail on screen at `lg` and up — the same rail as every other screen
+ * — so the editor no longer carries a private copy of the nav that could (and
+ * did) drift from it.
  */
 function Body() {
   const {
@@ -129,11 +151,13 @@ function Body() {
     analyzing,
     analyzeError,
     activeTool,
+    setActiveTool,
     cropEditing,
     closeCropEditor,
     selectedVideoType,
     setSelectedVideoType,
     saveDirectorBrief,
+    updateEffects,
     exportModalOpen,
     openExportModal,
     closeExportModal,
@@ -144,9 +168,17 @@ function Body() {
   // failed run, or a completed run that produced zero moments. In every such
   // case the primary "Generate AI edit" CTA must be reachable.
   const isAnalyzingNow = analyzing || project.status === "analyzing";
-  const canAnalyze = !isAnalyzingNow && !!project.originalVideoUrl;
+  // A local desktop project has nothing for the server to analyze until it is
+  // uploaded. Disabling the button (and saying why) is honest; leaving it
+  // enabled just walks the user into "turn on cloud sync for this project
+  // first" — advice they can act on via the banner right above it.
+  const needsCloudSync = isLocalProject(project);
+  const canAnalyze = !isAnalyzingNow && !!project.originalVideoUrl && !needsCloudSync;
   const [analysisOptionsOpen, setAnalysisOptionsOpen] = React.useState(false);
-  const [navOpen, setNavOpen] = React.useState(false);
+  // Instant / Plan for the AI chat. Owned here rather than inside the chat
+  // because the options dialog can start a run too, and both entry points have
+  // to mean the same thing by "Plan".
+  const [aiMode, setAiMode] = React.useState<ChatMode>("instant");
   const { settings, save } = useWorkspaceSettings();
 
   // Crop has no dock panel — it edits directly on the preview. Opening any
@@ -156,11 +188,13 @@ function Body() {
     if (activeTool && cropEditing) closeCropEditor();
   }, [activeTool, cropEditing, closeCropEditor]);
 
-  const analyzeTitle = isFailed
-    ? "The previous analysis failed — try again."
-    : !hasAnalysis && project.analysis?.status === "complete"
-      ? "No moments were produced — re-run to try again."
-      : undefined;
+  const analyzeTitle = needsCloudSync
+    ? "AI analysis runs on Framevo's servers — turn on cloud sync above first."
+    : isFailed
+      ? "The previous analysis failed — try again."
+      : !hasAnalysis && project.analysis?.status === "complete"
+        ? "No moments were produced — re-run to try again."
+        : undefined;
 
   // The project's LAST RUN toggles — passed to the dialog so Re-analyze respects
   // what the user turned off. The dialog owns the video type + recipe defaults now.
@@ -181,10 +215,7 @@ function Body() {
     // stop the workspace from snapping into existence.
     <div className="fv-enter flex h-[100dvh] flex-col overflow-hidden">
       {/* ── 1. Editor top bar ─────────────────────────────────────────────── */}
-      <EditorTopBar
-        onOpenNav={() => setNavOpen(true)}
-        onExport={openExportModal}
-      />
+      <EditorTopBar onExport={openExportModal} />
 
       {/* ── 2. Transient strips (error / first-run CTA) — compact, shrink-0 ── */}
       {analyzeError && (
@@ -204,12 +235,19 @@ function Body() {
         </div>
       )}
 
+      {/* A local project can't reach the AI features until it is uploaded —
+          this is the action that makes the CTA below usable. */}
+      <CloudSyncBanner project={project} />
+
       {!hasAnalysis && (
         <PreAnalysisBanner
           analyzing={isAnalyzingNow}
           canAnalyze={canAnalyze}
           title={analyzeTitle}
-          onGenerate={() => setAnalysisOptionsOpen(true)}
+          // Opens the CHAT, not the options dialog. The first thing a new user
+          // should be asked for is what they want the video to be — a sentence
+          // — not eight groups of toggles they have no basis to set yet.
+          onGenerate={() => setActiveTool("ai-chat")}
         />
       )}
 
@@ -225,38 +263,35 @@ function Body() {
       <div className="relative flex min-h-0 flex-1 overflow-hidden">
         <div className="flex min-w-0 flex-1 flex-col">
           <EditorSplitWorkspace
-            preview={<RealVideoPlayer fill />}
+            preview={
+              <RenderProbe id="preview">
+                <RealVideoPlayer fill />
+              </RenderProbe>
+            }
             timeline={
               <div className="min-h-0 flex-1 overflow-hidden">
-                <RealTimeline />
+                <RenderProbe id="timeline">
+                  <RealTimeline />
+                </RenderProbe>
               </div>
             }
           />
         </div>
 
         {/* Floating inspector popup (renders only when a tool is active). */}
-        <EditorInspectorDock />
+        <RenderProbe id="dock">
+          <EditorInspectorDock
+            aiMode={aiMode}
+            onAiModeChange={setAiMode}
+            onOpenAnalysisOptions={() => setAnalysisOptionsOpen(true)}
+            canAnalyze={canAnalyze}
+            analyzeBlockedReason={analyzeTitle}
+          />
+        </RenderProbe>
 
         {/* Far-right tool rail — always visible. */}
-        <EditorToolRail
-          hasAnalysis={hasAnalysis}
-          isAnalyzingNow={isAnalyzingNow}
-          canAnalyze={canAnalyze}
-          analyzeTitle={analyzeTitle}
-          onReanalyze={() => setAnalysisOptionsOpen(true)}
-        />
+        <EditorToolRail isAnalyzingNow={isAnalyzingNow} analyzeTitle={analyzeTitle} />
       </div>
-
-      {/* ── Overlay drawers — temporary, never resize the preview. ────────── */}
-      <EditorDrawer
-        open={navOpen}
-        onClose={() => setNavOpen(false)}
-        side="left"
-        ariaLabel="Framevo navigation"
-        widthClass="w-72"
-      >
-        <SidebarNav onNavigate={() => setNavOpen(false)} />
-      </EditorDrawer>
 
       {/* ── Editing dialogs (shared shell) ────────────────────────────────── */}
       <AnalysisOptionsModal
@@ -273,9 +308,14 @@ function Body() {
         onPersistDetail={(detail) => void save({ analysisDetail: detail })}
         directorBrief={project.directorBrief}
         onSaveDirectorBrief={saveDirectorBrief}
+        zoomPreset={project.effectsSettings?.zoomPreset ?? DEFAULT_ZOOM_PRESET}
+        onSelectZoomPreset={(p) => void updateEffects("zoomPreset", p)}
         onConfirm={(opts) => {
           setAnalysisOptionsOpen(false);
-          void startAnalyze(opts);
+          // Plan mode is a property of the SESSION, not of the surface that
+          // started the run — a run launched from this dialog while the chat is
+          // in Plan mode still proposes rather than applies.
+          void startAnalyze({ ...opts, directorPlanOnly: aiMode === "plan" });
         }}
       />
       <ExportModal open={exportModalOpen} onClose={closeExportModal} />

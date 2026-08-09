@@ -67,6 +67,7 @@ import {
 import { logFramevoEvent } from "../firebase/analytics";
 import { EVENTS } from "../analytics/events";
 
+import { apiFetch } from "@/lib/platform/api";
 /** A job updated within this window is treated as "actively driven" elsewhere. */
 const ACTIVE_JOB_HEARTBEAT_MS = 45_000;
 
@@ -965,7 +966,7 @@ async function finalizeWithAi(
 ): Promise<void> {
   const token = await idTokenGetter();
   if (!token) throw new Error("Not signed in.");
-  const res = await fetch(`/api/projects/${projectId}/analyze`, {
+  const res = await apiFetch(`/api/projects/${projectId}/analyze`, {
     method: "POST",
     headers: {
       authorization: `Bearer ${token}`,

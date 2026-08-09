@@ -2,6 +2,8 @@
 
 import * as React from "react";
 import { cn } from "@/lib/cn";
+import { useLiveValue } from "@/components/dashboard/real-editor/useLiveValue";
+import { COMMIT_PROFILES } from "@/components/dashboard/real-editor/live-commit";
 
 interface SliderProps {
   label: string;
@@ -13,8 +15,27 @@ interface SliderProps {
   onChange: (value: number) => void;
   className?: string;
   format?: (v: number) => string;
+  /**
+   * Persist on every change instead of on the drag cadence. Only for sliders
+   * whose `onChange` is already cheap local state — anything that writes to the
+   * project document should use the default.
+   */
+  immediate?: boolean;
 }
 
+/**
+ * Range slider with LOCAL drag state.
+ *
+ * The handle used to be driven straight from persisted state: each pixel of a
+ * drag called `onChange`, which serialized and wrote the project document, and
+ * the handle only moved once that write echoed back through the subscription.
+ * The result was a slider that lagged the pointer and dropped input.
+ *
+ * Now the handle follows the pointer immediately (local state) and the value is
+ * persisted on the drag cadence — fast enough that the preview tracks the
+ * handle, slow enough that a drag is a handful of writes instead of hundreds.
+ * The final value is always committed on release (and on unmount).
+ */
 export function Slider({
   label,
   value,
@@ -25,9 +46,16 @@ export function Slider({
   onChange,
   className,
   format,
+  immediate = false,
 }: SliderProps) {
-  const pct = ((value - min) / (max - min)) * 100;
-  const display = format ? format(value) : `${value}${unit}`;
+  const live = useLiveValue(
+    value,
+    onChange,
+    immediate ? { delayMs: 0, maxWaitMs: 0 } : COMMIT_PROFILES.drag
+  );
+  const shown = live.value;
+  const pct = ((shown - min) / (max - min)) * 100;
+  const display = format ? format(shown) : `${shown}${unit}`;
 
   return (
     <div className={cn("space-y-2", className)}>
@@ -46,12 +74,22 @@ export function Slider({
           min={min}
           max={max}
           step={step}
-          value={value}
-          onChange={(e) => onChange(Number(e.target.value))}
+          value={shown}
+          onChange={(e) => live.set(Number(e.target.value))}
+          // A gesture freezes reconciliation, so the write echoing back
+          // mid-drag can never yank the handle out from under the pointer.
+          onPointerDown={live.begin}
+          onPointerUp={live.end}
+          onPointerCancel={live.end}
+          // Keyboard adjustment is a gesture too: hold ↑ and the repeat rate
+          // would otherwise out-run the write and rubber-band the handle.
+          onKeyDown={live.begin}
+          onKeyUp={live.end}
+          onBlur={live.end}
           aria-label={label}
           aria-valuemin={min}
           aria-valuemax={max}
-          aria-valuenow={value}
+          aria-valuenow={shown}
           className="range-thumb absolute inset-0 z-10 w-full cursor-grab opacity-100"
         />
       </div>

@@ -30,6 +30,13 @@ export interface CaptionUsageState {
   remainingMinutes: number;
   /** Plan's per-video source cap, in seconds. */
   maxVideoSeconds: number;
+  /**
+   * End of the CURRENT allowance window, epoch ms — i.e. when these minutes
+   * refill. Paid plans anchor to the subscription renewal, Free to the UTC
+   * calendar month, so the billing page has to read it from here rather than
+   * assume "the 1st".
+   */
+  periodEndMs: number;
   loading: boolean;
 }
 
@@ -106,6 +113,7 @@ export function useCaptionUsage(): CaptionUsageState {
     usedMinutes: Math.round((usedSeconds + reservedSeconds) / 60),
     remainingMinutes: Math.floor(remainingSeconds / 60),
     maxVideoSeconds: CAPTION_PLAN_LIMITS[tier].maxCaptionVideoSeconds,
+    periodEndMs: period.endMs,
     loading: !!uid && (!subLoaded || !usageLoaded),
   };
 }

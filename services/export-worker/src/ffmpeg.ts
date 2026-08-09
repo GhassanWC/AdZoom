@@ -43,11 +43,19 @@ function resolveBinary(p: string | null | undefined, fallback: string): string {
 // Resolved lazily per-spawn (not at module load) so a binary that appears after
 // the worker started — e.g. a re-run ffmpeg-static download — is picked up
 // without a restart.
+// FRAMEVO_FFMPEG_PATH / FRAMEVO_FFPROBE_PATH take precedence over the bundled
+// static binaries. The desktop app sets them: in a packaged Electron build the
+// binaries live in `resources/ffmpeg/` (node_modules is not shipped), and this
+// is how the SAME render core finds them without a second copy of the logic.
 export function ffmpegBin(): string {
-  return resolveBinary(ffmpegStatic, "ffmpeg");
+  return resolveBinary(process.env.FRAMEVO_FFMPEG_PATH || ffmpegStatic, "ffmpeg");
 }
 export function ffprobeBin(): string {
-  return resolveBinary((ffprobeStatic as { path?: string } | undefined)?.path, "ffprobe");
+  return resolveBinary(
+    process.env.FRAMEVO_FFPROBE_PATH ||
+      (ffprobeStatic as { path?: string } | undefined)?.path,
+    "ffprobe"
+  );
 }
 
 // ── Audio-codec policy ──────────────────────────────────────────────────────
@@ -669,6 +677,21 @@ export type EncoderAudio =
   | { kind: "direct" }
   | { kind: "filter"; filterComplex: string };
 
+/**
+ * Which H.264 encoder to drive. Absent ⇒ `libx264 -preset <preset> -crf <crf>`,
+ * i.e. exactly what the cloud render has always done — the desktop app is the
+ * only caller that sets this, to use the machine's GPU (NVENC / Quick Sync /
+ * AMF / VideoToolbox). Only the ENCODER changes: every pixel is still composited
+ * by the shared `composeFrame`, so the output is identical apart from the codec
+ * implementation's own quality/bitrate behaviour.
+ */
+export interface VideoEncoderChoice {
+  /** ffmpeg encoder name, e.g. "h264_nvenc". */
+  codec: string;
+  /** Quality/preset flags for that encoder (never the codec itself). */
+  args: string[];
+}
+
 export interface EncoderOptions {
   width: number;
   height: number;
@@ -679,6 +702,8 @@ export interface EncoderOptions {
   audio: EncoderAudio;
   crf: number;
   preset: string;
+  /** Hardware encoder override (desktop). Omit for the cloud's libx264 path. */
+  videoEncoder?: VideoEncoderChoice;
   /**
    * Chunked render (linear timeline only): window the source AUDIO to this
    * [startSec, startSec+durSec] so the chunk's audio aligns with its video (which
@@ -765,11 +790,9 @@ export async function spawnEncoder(opts: EncoderOptions): Promise<Encoder> {
 
   args.push(
     "-c:v",
-    "libx264",
-    "-preset",
-    preset,
-    "-crf",
-    String(crf),
+    ...(opts.videoEncoder
+      ? [opts.videoEncoder.codec, ...opts.videoEncoder.args]
+      : ["libx264", "-preset", preset, "-crf", String(crf)]),
     "-pix_fmt",
     "yuv420p",
     "-movflags",

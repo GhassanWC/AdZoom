@@ -88,6 +88,28 @@ export const EVENTS = {
   SUBSCRIPTION_CANCELLED: "subscription_cancelled",
   PAYMENT_SUCCESS: "payment_success",
 
+  // ── Desktop app distribution ─────────────────────────────────────────
+  // The funnel from "saw the website" to "editing in the app": which OS was
+  // detected, whether a download was actually started, whether the deep link
+  // found an installed app, and whether the app ever launched. Metadata is
+  // platform/arch/version only — never a file path or a machine identifier.
+  DESKTOP_DOWNLOAD_PAGE_VIEWED: "desktop_download_page_viewed",
+  DESKTOP_DOWNLOAD_CLICKED: "desktop_download_clicked",
+  /** The website asked the OS to launch Framevo via a framevo:// link. */
+  DESKTOP_DEEP_LINK_ATTEMPTED: "desktop_deep_link_attempted",
+  /** The page never lost focus, so no handler took the link — app not installed. */
+  DESKTOP_DEEP_LINK_FAILED: "desktop_deep_link_failed",
+  /** The blocking "editing happens in the app" dialog was shown on the web. */
+  DESKTOP_GATE_SHOWN: "desktop_gate_shown",
+  /** A visitor on a phone/tablet was told editing needs a computer. */
+  DESKTOP_MOBILE_NOTICE_SHOWN: "desktop_mobile_notice_shown",
+  /** First launch of a freshly installed build (sent by the app itself). */
+  DESKTOP_APP_INSTALLED: "desktop_app_installed",
+  /** Any launch of the desktop app, once per session. */
+  DESKTOP_APP_OPENED: "desktop_app_opened",
+  /** The app received and resolved a framevo:// link. */
+  DESKTOP_DEEP_LINK_OPENED: "desktop_deep_link_opened",
+
   // ── Errors ───────────────────────────────────────────────────────────
   ERROR_OCCURRED: "error_occurred",
 } as const;

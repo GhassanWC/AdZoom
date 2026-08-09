@@ -84,6 +84,62 @@ export async function createCheckout(
   return { url: json.data.attributes.url };
 }
 
+/** The hosted-page URLs Lemon Squeezy signs for one subscription. */
+export interface LsSubscriptionUrls {
+  /** Full customer portal — invoices, payment method, cancel, resume. */
+  customerPortal?: string;
+  /** Direct "update payment method" page for the card on file. */
+  updatePaymentMethod?: string;
+  /** Direct plan switcher (upgrade / downgrade within the store). */
+  changePlan?: string;
+}
+
+/**
+ * Fetch the CURRENT signed hosted-page URLs for a subscription.
+ *
+ * Why this exists instead of just reading `subscriptions/{uid}`: every LS
+ * hosted URL is signed and **expires 24 hours after it is issued**. The copies
+ * the webhook stores are fresh only for the day the webhook fired, so a user
+ * clicking "Update card" three weeks into a billing cycle lands on an expired
+ * link. Asking LS at click time is the only way these buttons actually work.
+ *
+ * Callers must treat this as best-effort: on any failure fall back to the
+ * stored URL rather than dead-ending the user (a stale link that *might*
+ * work beats no link at all).
+ */
+export async function fetchSubscriptionUrls(
+  subscriptionId: string,
+  { timeoutMs = 8000 }: { timeoutMs?: number } = {}
+): Promise<LsSubscriptionUrls> {
+  const res = await fetch(`${LS_API}/subscriptions/${encodeURIComponent(subscriptionId)}`, {
+    method: "GET",
+    headers: headers(),
+    signal: AbortSignal.timeout(timeoutMs),
+    cache: "no-store",
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Lemon Squeezy subscription lookup failed (${res.status}): ${text}`);
+  }
+  const json = (await res.json()) as {
+    data?: {
+      attributes?: {
+        urls?: {
+          customer_portal?: string;
+          update_payment_method?: string;
+          customer_portal_update_subscription?: string;
+        };
+      };
+    };
+  };
+  const urls = json.data?.attributes?.urls ?? {};
+  return {
+    customerPortal: urls.customer_portal,
+    updatePaymentMethod: urls.update_payment_method,
+    changePlan: urls.customer_portal_update_subscription,
+  };
+}
+
 /**
  * Map an LS variant id back to our internal plan tier. Driven entirely by
  * env so the prod variant ids stay out of the codebase. Unknown variants

@@ -2,10 +2,10 @@
 
 import * as React from "react";
 import { Plus, Search, Loader2 } from "lucide-react";
-import { useAuth } from "@/lib/firebase/AuthProvider";
-import { subscribeProjects } from "@/lib/firebase/projects";
+import { useProjectLibrary } from "@/lib/projects/useProjectLibrary";
 import type { ProjectDoc } from "@/lib/firebase/schema";
 import { RealProjectCard } from "@/components/dashboard/RealProjectCard";
+import { CloudSyncSummary } from "@/components/dashboard/CloudSyncSummary";
 import { PageHeader } from "@/components/dashboard/PageHeader";
 import { Button } from "@/components/ui/Button";
 import { cn } from "@/lib/cn";
@@ -34,21 +34,12 @@ function matchesFilter(p: ProjectDoc, f: (typeof filters)[number]) {
 }
 
 export default function ProjectsPage() {
-  const { user } = useAuth();
-  const [projects, setProjects] = React.useState<ProjectDoc[]>([]);
-  const [loaded, setLoaded] = React.useState(false);
+  // Firestore on the web; Firestore + this computer's library, deduped, on the
+  // desktop. A project that exists in both places is listed once.
+  const { projects, localById, loading, localCount, cloudUnavailable } = useProjectLibrary();
+  const loaded = !loading;
   const [filter, setFilter] = React.useState<(typeof filters)[number]>("All");
   const [q, setQ] = React.useState("");
-
-  React.useEffect(() => {
-    if (!user) return;
-    setLoaded(false);
-    const unsub = subscribeProjects(user.uid, (list) => {
-      setProjects(list);
-      setLoaded(true);
-    });
-    return () => unsub();
-  }, [user]);
 
   const filtered = projects.filter((p) => {
     if (!matchesFilter(p, filter)) return false;
@@ -61,7 +52,11 @@ export default function ProjectsPage() {
       <PageHeader
         eyebrow="Projects"
         title="Your library"
-        subtitle={`${projects.length} ${projects.length === 1 ? "recording" : "recordings"} in your workspace.`}
+        subtitle={
+          localCount > 0
+            ? `${projects.length} ${projects.length === 1 ? "recording" : "recordings"} — ${localCount} on this computer.`
+            : `${projects.length} ${projects.length === 1 ? "recording" : "recordings"} in your workspace.`
+        }
         action={
           <Button href="/dashboard/upload" variant="primary" size="md" leftIcon={<Plus size={14} />}>
             New project
@@ -82,6 +77,9 @@ export default function ProjectsPage() {
             className="h-9 w-full rounded-lg border border-white/10 bg-white/[0.02] pl-9 pr-3 text-sm text-white placeholder:text-fog/70 outline-none transition-colors duration-200 focus:border-white/20"
           />
         </div>
+        {/* Desktop only — on the web Firestore IS the store and there is
+            nothing to be behind on. Renders nothing when sync is absent. */}
+        <CloudSyncSummary className="order-last w-full sm:order-none sm:ml-auto sm:w-auto" />
         <div className="flex gap-1 rounded-lg border border-white/10 bg-white/[0.02] p-1">
           {filters.map((f) => (
             <button
@@ -99,6 +97,13 @@ export default function ProjectsPage() {
           ))}
         </div>
       </div>
+
+      {cloudUnavailable && (
+        <p className="rounded-xl border border-amber-400/25 bg-amber-500/[0.06] px-4 py-2.5 text-[12.5px] text-amber-100">
+          Framevo couldn&apos;t reach your cloud projects — you may be offline. Projects stored on
+          this computer are listed and fully editable.
+        </p>
+      )}
 
       {!loaded ? (
         <div className="glass grid place-items-center rounded-2xl p-12 text-sm text-fog">
@@ -123,7 +128,7 @@ export default function ProjectsPage() {
       ) : (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {filtered.map((p) => (
-            <RealProjectCard key={p.id} project={p} />
+            <RealProjectCard key={p.id} project={p} local={localById.get(p.id)} />
           ))}
         </div>
       )}

@@ -5,10 +5,12 @@ import { useRouter } from "next/navigation";
 import { Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import { useAuth } from "@/lib/firebase/AuthProvider";
+import { usePlatform } from "@/lib/platform";
 import { cn } from "@/lib/cn";
 import { logFramevoEvent } from "@/lib/firebase/analytics";
 import { EVENTS } from "@/lib/analytics/events";
 
+import { apiFetch } from "@/lib/platform/api";
 interface Props {
   plan: "creator" | "pro";
   label: string;
@@ -38,6 +40,7 @@ export function CheckoutButton({
   signInRedirect = "/login",
 }: Props) {
   const { user, getIdToken } = useAuth();
+  const platform = usePlatform();
   const router = useRouter();
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
@@ -56,7 +59,7 @@ export function CheckoutButton({
     try {
       const token = await getIdToken();
       if (!token) throw new Error("Not signed in");
-      const res = await fetch("/api/billing/checkout", {
+      const res = await apiFetch("/api/billing/checkout", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -67,6 +70,15 @@ export function CheckoutButton({
       const json = (await res.json()) as { ok?: boolean; url?: string; error?: string };
       if (!res.ok || !json.url) {
         throw new Error(json.error || `Checkout failed (${res.status})`);
+      }
+      // Lemon Squeezy's hosted checkout is somebody else's origin: on the web
+      // that's a tab, and in the desktop app it's the system browser. Payment
+      // pages must never render inside an app window — the user has to be able
+      // to see the real address bar and padlock.
+      if (platform.kind === "desktop") {
+        platform.openExternal(json.url);
+        setLoading(false);
+        return;
       }
       window.location.href = json.url;
     } catch (err) {

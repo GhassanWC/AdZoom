@@ -215,6 +215,9 @@ export const navLinks = [
   { label: "Features", href: "/features" },
   { label: "Use cases", href: "/use-cases" },
   { label: "Pricing", href: "/pricing" },
+  // Reachable in the nav for everyone, including phones and Linux, where the
+  // OS-aware download BUTTON deliberately doesn't render — the page explains.
+  { label: "Download", href: "/download" },
   { label: "Changelog", href: "/changelog" },
 ];
 

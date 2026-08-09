@@ -1,0 +1,241 @@
+{
+  "mode": "prod",
+  "edits": 40,
+  "reports": [
+    {
+      "label": "idle",
+      "durationMs": 1655,
+      "renders": {},
+      "totalRenders": 0,
+      "commits": {},
+      "frames": {
+        "frames": 72,
+        "durationMs": 1655,
+        "meanMs": 22.67,
+        "p50Ms": 16.8,
+        "p95Ms": 33.4,
+        "maxMs": 33.5,
+        "jankFrames": 27,
+        "longFrames": 0
+      },
+      "longTasks": {
+        "count": 0,
+        "totalMs": 0,
+        "maxMs": 0
+      },
+      "events": {},
+      "interactions": 0
+    },
+    {
+      "label": "playback-3s",
+      "durationMs": 3208,
+      "renders": {
+        "playhead": 12,
+        "provider": 3,
+        "playback-transport": 3,
+        "preview": 2,
+        "timeline": 2,
+        "control-bar": 2
+      },
+      "totalRenders": 24,
+      "commits": {},
+      "frames": {
+        "frames": 136,
+        "durationMs": 3208,
+        "meanMs": 23.43,
+        "p50Ms": 16.8,
+        "p95Ms": 33.5,
+        "maxMs": 50.1,
+        "jankFrames": 54,
+        "longFrames": 1
+      },
+      "longTasks": {
+        "count": 0,
+        "totalMs": 0,
+        "maxMs": 0
+      },
+      "events": {},
+      "interactions": 0
+    },
+    {
+      "label": "wheel-scroll",
+      "durationMs": 1504,
+      "renders": {},
+      "totalRenders": 0,
+      "commits": {},
+      "frames": {
+        "frames": 89,
+        "durationMs": 1504,
+        "meanMs": 16.81,
+        "p50Ms": 16.7,
+        "p95Ms": 17.1,
+        "maxMs": 33.4,
+        "jankFrames": 2,
+        "longFrames": 0
+      },
+      "longTasks": {
+        "count": 0,
+        "totalMs": 0,
+        "maxMs": 0
+      },
+      "events": {},
+      "interactions": 40
+    },
+    {
+      "label": "pill-drag",
+      "durationMs": 1238,
+      "renders": {
+        "pill": 31,
+        "lane": 4,
+        "provider": 2,
+        "preview": 2,
+        "timeline": 2,
+        "control-bar": 2,
+        "playback-transport": 2,
+        "playhead": 2
+      },
+      "totalRenders": 47,
+      "commits": {},
+      "frames": {
+        "frames": 69,
+        "durationMs": 1238,
+        "meanMs": 17.71,
+        "p50Ms": 16.7,
+        "p95Ms": 17.3,
+        "maxMs": 66.5,
+        "jankFrames": 3,
+        "longFrames": 1
+      },
+      "longTasks": {
+        "count": 0,
+        "totalMs": 0,
+        "maxMs": 0
+      },
+      "events": {},
+      "interactions": 40
+    },
+    {
+      "label": "split-drag",
+      "durationMs": 1839,
+      "renders": {
+        "preview": 14,
+        "provider": 1,
+        "timeline": 1,
+        "control-bar": 1,
+        "playback-transport": 1,
+        "playhead": 1
+      },
+      "totalRenders": 19,
+      "commits": {},
+      "frames": {
+        "frames": 52,
+        "durationMs": 1839,
+        "meanMs": 35.25,
+        "p50Ms": 17.2,
+        "p95Ms": 83.1,
+        "maxMs": 167,
+        "jankFrames": 24,
+        "longFrames": 13
+      },
+      "longTasks": {
+        "count": 0,
+        "totalMs": 0,
+        "maxMs": 0
+      },
+      "events": {},
+      "interactions": 30
+    },
+    {
+      "label": "window-resize",
+      "durationMs": 989,
+      "renders": {
+        "preview": 8,
+        "timeline": 8,
+        "control-bar": 8,
+        "playback-transport": 8,
+        "playhead": 8
+      },
+      "totalRenders": 40,
+      "commits": {},
+      "frames": {
+        "frames": 23,
+        "durationMs": 989,
+        "meanMs": 42.78,
+        "p50Ms": 16.8,
+        "p95Ms": 99.9,
+        "maxMs": 133.3,
+        "jankFrames": 10,
+        "longFrames": 9
+      },
+      "longTasks": {
+        "count": 2,
+        "totalMs": 157,
+        "maxMs": 95
+      },
+      "events": {},
+      "interactions": 8
+    },
+    {
+      "label": "slider-drag",
+      "durationMs": 1462,
+      "renders": {
+        "lane": 36,
+        "provider": 9,
+        "preview": 9,
+        "timeline": 9,
+        "control-bar": 9,
+        "playback-transport": 9,
+        "pill": 9,
+        "playhead": 9,
+        "inspector": 9
+      },
+      "totalRenders": 108,
+      "commits": {},
+      "frames": {
+        "frames": 66,
+        "durationMs": 1462,
+        "meanMs": 20.2,
+        "p50Ms": 16.7,
+        "p95Ms": 33.5,
+        "maxMs": 83.3,
+        "jankFrames": 7,
+        "longFrames": 3
+      },
+      "longTasks": {
+        "count": 0,
+        "totalMs": 0,
+        "maxMs": 0
+      },
+      "events": {},
+      "interactions": 30
+    },
+    {
+      "label": "seek-across-edits",
+      "durationMs": 1623,
+      "renders": {
+        "playhead": 12,
+        "playback-transport": 5,
+        "inspector": 1
+      },
+      "totalRenders": 18,
+      "commits": {},
+      "frames": {
+        "frames": 90,
+        "durationMs": 1623,
+        "meanMs": 17.96,
+        "p50Ms": 16.7,
+        "p95Ms": 33.2,
+        "maxMs": 66.5,
+        "jankFrames": 6,
+        "longFrames": 1
+      },
+      "longTasks": {
+        "count": 0,
+        "totalMs": 0,
+        "maxMs": 0
+      },
+      "events": {},
+      "interactions": 20
+    }
+  ]
+}

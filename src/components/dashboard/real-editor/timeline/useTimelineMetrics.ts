@@ -47,11 +47,31 @@ export function useTimelineMetrics({
   React.useEffect(() => {
     const el = contentRef.current;
     if (!el || typeof ResizeObserver === "undefined") return;
-    const update = () => setContentWidth(el.getBoundingClientRect().width);
-    update();
-    const ro = new ResizeObserver(update);
+
+    // Coalesced to one measurement per FRAME. A window resize or a drag of the
+    // preview/timeline split grip fires the observer continuously, and each fire
+    // used to be a `setState` that re-rendered the whole timeline — several times
+    // within a single frame that only paints once. The width is also compared
+    // before storing, so the many observer callbacks that don't change it (a
+    // scrollbar elsewhere, a child mutation) cost nothing at all.
+    let frame = 0;
+    const measure = () => {
+      frame = 0;
+      const width = el.getBoundingClientRect().width;
+      setContentWidth((prev) => (prev === width ? prev : width));
+    };
+    const schedule = () => {
+      if (frame) return;
+      frame = requestAnimationFrame(measure);
+    };
+
+    measure();
+    const ro = new ResizeObserver(schedule);
     ro.observe(el);
-    return () => ro.disconnect();
+    return () => {
+      if (frame) cancelAnimationFrame(frame);
+      ro.disconnect();
+    };
     // contentRef is a stable ref object; observe once.
   }, [contentRef]);
 

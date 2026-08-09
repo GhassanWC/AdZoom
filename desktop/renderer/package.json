@@ -1,0 +1,7 @@
+{
+  "name": "framevo-desktop-renderer",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Static Next.js export of the Framevo UI, served inside Electron. Its dependencies (next, react, the component tree) all resolve from the repo root — this package exists only to give the renderer its own module type and Next config, separate from the CommonJS Electron package above it.",
+  "type": "module"
+}

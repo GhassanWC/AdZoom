@@ -33,6 +33,7 @@ import type {
   Pacing,
   ProjectStatus,
   VisualAnalysis,
+  ZoomPresetId,
 } from "@/lib/firebase/schema";
 
 export const runtime = "nodejs";
@@ -191,6 +192,8 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     boringSections: analysis.boringSections ?? [],
     interactions,
     unrejectRebalance,
+    zoomPreset: (project.effectsSettings as { zoomPreset?: ZoomPresetId } | undefined)
+      ?.zoomPreset,
   });
 
   // 5. Persist. `rawMoments` is rewritten so the new rejection state (which

@@ -14,6 +14,10 @@ import {
   Minimize2,
 } from "lucide-react";
 import { useEditorReal } from "./context";
+import { useClockSelector } from "./playback-clock";
+import { useRenderCount } from "@/lib/perf/render-probe";
+import { useLiveValue } from "./useLiveValue";
+import { COMMIT_PROFILES } from "./live-commit";
 import { cn } from "@/lib/cn";
 
 /**
@@ -36,12 +40,17 @@ export const PLAYBACK_SECONDARY_CLS =
  * mirror it. Scrubbing itself lives on the timeline (click/drag the playhead).
  */
 export function PlaybackTransport() {
-  const { project, playing, currentTime, duration, togglePlay, seek, seekBy } =
+  useRenderCount("playback-transport");
+  const { project, playing, duration, togglePlay, seek, seekBy } =
     useEditorReal();
 
   const total = duration > 0 ? duration : project.duration ?? 0;
-  const atStart = currentTime <= 0.02;
-  const atEnd = total > 0 && currentTime >= total - 0.05;
+  // Booleans, not the raw time: these decide whether two buttons are disabled
+  // and flip twice per playthrough. Subscribing the whole transport to the clock
+  // re-rendered every button several times a second for no visible change; the
+  // moving readout is isolated in <TransportTime> below.
+  const atStart = useClockSelector((t) => t <= 0.02);
+  const atEnd = useClockSelector((t) => total > 0 && t >= total - 0.05);
 
   return (
     <>
@@ -120,13 +129,64 @@ export function PlaybackTransport() {
         </span>
       </button>
 
-      {/* Time — tabular figures keep the layout from shifting while playing. */}
-      <div className="ml-1 shrink-0 whitespace-nowrap font-mono text-[12px] tabular-nums text-fog sm:ml-2">
-        <span className="text-white/90">{fmtTime(currentTime)}</span>
-        <span className="mx-1 text-fog/50">/</span>
-        <span>{fmtTime(total)}</span>
-      </div>
+      <TransportTime total={total} />
     </>
+  );
+}
+
+/**
+ * Volume handle with local drag state. `setPreviewVolume` writes editor context
+ * state, so driving it straight from the input re-rendered every context
+ * consumer on each pointermove of the drag. The handle now follows the pointer
+ * locally and the context is updated on the drag cadence — inaudible as latency,
+ * and roughly an order of magnitude fewer renders.
+ */
+function VolumeSlider({
+  value,
+  onChange,
+}: {
+  value: number;
+  onChange: (v: number) => void;
+}) {
+  const live = useLiveValue(value, onChange, COMMIT_PROFILES.drag);
+  return (
+    <input
+      type="range"
+      min={0}
+      max={1}
+      step={0.01}
+      value={live.value}
+      onChange={(e) => live.set(Number(e.target.value))}
+      onPointerDown={live.begin}
+      onPointerUp={live.end}
+      onPointerCancel={live.end}
+      onKeyDown={live.begin}
+      onKeyUp={live.end}
+      onBlur={live.end}
+      aria-label="Volume"
+      title="Volume"
+      className="range-thumb ml-1 h-0.5 w-[60px]"
+    />
+  );
+}
+
+/**
+ * The moving time readout, deliberately its own component: it is the only part
+ * of the transport that changes while the video plays, so it is the only part
+ * that subscribes to the clock. Everything around it stays still.
+ */
+function TransportTime({ total }: { total: number }) {
+  // The label only changes once a second, so selecting the FORMATTED string
+  // (rather than the raw time) makes this ~1 re-render per second instead of one
+  // per `timeupdate`.
+  const label = useClockSelector((t) => fmtTime(t));
+  return (
+    // Tabular figures keep the layout from shifting while playing.
+    <div className="ml-1 shrink-0 whitespace-nowrap font-mono text-[12px] tabular-nums text-fog sm:ml-2">
+      <span className="text-white/90">{label}</span>
+      <span className="mx-1 text-fog/50">/</span>
+      <span>{fmtTime(total)}</span>
+    </div>
   );
 }
 
@@ -164,16 +224,9 @@ export function PlaybackVolumeFullscreen() {
           stares at all day.
         */}
         <div className="hidden overflow-hidden opacity-0 transition-[width,opacity] duration-200 ease-[cubic-bezier(0.23,1,0.32,1)] sm:block sm:w-0 group-hover:w-[68px] group-hover:opacity-100 group-focus-within:w-[68px] group-focus-within:opacity-100">
-          <input
-            type="range"
-            min={0}
-            max={1}
-            step={0.01}
+          <VolumeSlider
             value={muted ? 0 : volume}
-            onChange={(e) => setPreviewVolume(Number(e.target.value))}
-            aria-label="Volume"
-            title="Volume"
-            className="range-thumb ml-1 h-0.5 w-[60px]"
+            onChange={setPreviewVolume}
           />
         </div>
       </div>

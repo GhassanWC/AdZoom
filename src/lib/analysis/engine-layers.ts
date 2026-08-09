@@ -65,6 +65,16 @@ export interface AnalysisOptions {
    * apply and analysis behaves exactly as it did before the Director existed.
    */
   applyDirectorBrief?: boolean;
+  /**
+   * Plan mode: let the Director build its plan and report what it would do, but
+   * leave the timeline as the plain analysis produced it.
+   *
+   * Orthogonal to `applyDirectorBrief`, which decides whether the brief runs at
+   * all. This decides what happens to its result: the run still costs a model
+   * call, and the proposal is persisted on `project.director.proposal` for the
+   * chat to offer. Ignored when the brief doesn't run.
+   */
+  directorPlanOnly?: boolean;
   existingEditMode: ExistingEditMode;
   /** Analysis-granularity preset (or "custom"). */
   chunkMode: ChunkMode;

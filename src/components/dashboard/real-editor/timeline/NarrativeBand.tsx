@@ -2,6 +2,7 @@
 
 import * as React from "react";
 import type { NarrativeRole } from "@/lib/firebase/schema";
+import { useClockSelector } from "../playback-clock";
 import { cn } from "@/lib/cn";
 import {
   NARRATIVE_COLORS,
@@ -28,14 +29,18 @@ interface Segment {
 export function NarrativeBand({
   segments,
   duration,
-  currentTime,
   onSeek,
 }: {
   segments: Segment[];
   duration: number;
-  currentTime: number;
   onSeek: (t: number) => void;
 }) {
+  // Only the ACTIVE CHAPTER matters here, and that changes a handful of times per
+  // video — so this subscribes to the derived index rather than the raw time and
+  // re-renders on chapter boundaries instead of several times a second.
+  const activeIndex = useClockSelector((t) =>
+    segments.findIndex((s) => t >= s.startTime && t <= s.endTime)
+  );
   if (segments.length === 0 || duration <= 0) return null;
   return (
     <div
@@ -48,7 +53,7 @@ export function NarrativeBand({
         const dur = Number.isFinite(rawDur) && rawDur > 0 ? rawDur : 0;
         const renderDur = dur > 0 ? dur : MIN_RENDER_DURATION;
         const widthPct = duration > 0 ? (renderDur / duration) * 100 : 0;
-        const active = currentTime >= s.startTime && currentTime <= s.endTime;
+        const active = i === activeIndex;
         const gradient = NARRATIVE_COLORS[s.role];
         const textTone = NARRATIVE_TEXT[s.role];
         const tag = NARRATIVE_LABEL[s.role];

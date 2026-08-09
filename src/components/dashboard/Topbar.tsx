@@ -2,12 +2,11 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { Menu, LogOut, Video, Sun, Moon, ShieldCheck } from "lucide-react";
+import { Menu, LogOut, Video, ShieldCheck } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { useAuth } from "@/lib/firebase/AuthProvider";
 import { isAdminUser } from "@/lib/admin/isAdminUser";
-import { useTheme } from "@/lib/theme";
-import { NavbarSearch } from "./NavbarSearch";
+import { usePlatform } from "@/lib/platform";
 import { NavbarNotifications } from "./NavbarNotifications";
 
 interface TopbarProps {
@@ -15,9 +14,23 @@ interface TopbarProps {
   className?: string;
 }
 
+/**
+ * The workspace header.
+ *
+ * It carries ONE primary action (Record) and the account controls, aligned to
+ * the right so the eye lands in the same place on every screen. Two things it
+ * deliberately no longer holds: the global search field, which took the whole
+ * left half of the bar for a feature reached far more often by its ⌘K shortcut,
+ * and the theme switch, which is a preference and now lives at the bottom-right
+ * of the workspace (see components/ui/ThemeDock).
+ */
 export function Topbar({ onOpenSidebar, className }: TopbarProps) {
   const { user, signOut } = useAuth();
-  const { theme, toggleTheme } = useTheme();
+  const platform = usePlatform();
+  // /admin is a server-rendered website route; the desktop bundle does not
+  // contain it. Linking there in Electron would open a blank screen, so the
+  // shell that lacks the route sends the user to their browser instead.
+  const adminOrigin = platform.webAppOrigin;
   const [open, setOpen] = React.useState(false);
   const ref = React.useRef<HTMLDivElement | null>(null);
 
@@ -54,7 +67,10 @@ export function Topbar({ onOpenSidebar, className }: TopbarProps) {
         <Menu size={16} />
       </button>
 
-      <NavbarSearch />
+      {/* The bar's only flexible element: everything after it is pinned right,
+          which is what keeps the account control in a fixed corner rather than
+          drifting with the width of whatever sits beside it. */}
+      <div className="flex-1" />
 
       <Link
         href="/dashboard/record"
@@ -69,25 +85,25 @@ export function Topbar({ onOpenSidebar, className }: TopbarProps) {
         <Video size={14} className="sm:hidden" />
       </Link>
 
-      {isAdminUser(user) && (
-        <Link
-          href="/admin"
-          title="Admin dashboard"
-          className="inline-flex size-9 items-center justify-center rounded-lg border border-white/10 bg-white/[0.02] text-fog transition-colors duration-200 hover:text-violet-300"
-        >
-          <ShieldCheck size={15} />
-        </Link>
-      )}
-
-      <button
-        type="button"
-        onClick={toggleTheme}
-        aria-label={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
-        title={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
-        className="inline-flex size-9 items-center justify-center rounded-lg border border-white/10 bg-white/[0.02] text-fog transition-colors duration-200 hover:text-white"
-      >
-        {theme === "dark" ? <Sun size={15} /> : <Moon size={15} />}
-      </button>
+      {isAdminUser(user) &&
+        (adminOrigin ? (
+          <button
+            type="button"
+            onClick={() => platform.openExternal(`${adminOrigin}/admin`)}
+            title="Admin dashboard (opens in your browser)"
+            className="inline-flex size-9 items-center justify-center rounded-lg border border-white/10 bg-white/[0.02] text-fog transition-colors duration-200 hover:text-violet-300"
+          >
+            <ShieldCheck size={15} />
+          </button>
+        ) : (
+          <Link
+            href="/admin"
+            title="Admin dashboard"
+            className="inline-flex size-9 items-center justify-center rounded-lg border border-white/10 bg-white/[0.02] text-fog transition-colors duration-200 hover:text-violet-300"
+          >
+            <ShieldCheck size={15} />
+          </Link>
+        ))}
 
       <NavbarNotifications />
 

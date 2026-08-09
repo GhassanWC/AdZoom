@@ -3,6 +3,7 @@
 import * as React from "react";
 import { Bug, X } from "lucide-react";
 import { useEditorReal } from "./context";
+import { usePlaybackTime } from "./playback-clock";
 import { cn } from "@/lib/cn";
 import type { DetectedMoment, MomentProvenance } from "@/lib/firebase/schema";
 
@@ -16,7 +17,8 @@ import type { DetectedMoment, MomentProvenance } from "@/lib/firebase/schema";
  * Excluded from production bundles by `NODE_ENV !== "production"`.
  */
 export function DebugOverlay() {
-  const { project, selectedMomentId, currentTime } = useEditorReal();
+  const { project, selectedMomentId } = useEditorReal();
+  const currentTime = usePlaybackTime();
   const [open, setOpen] = React.useState(false);
 
   // Toggle hotkey + URL flag.

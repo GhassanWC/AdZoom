@@ -23,6 +23,7 @@ import {
   spawnDecoder,
   spawnEncoder,
   type EncoderAudio,
+  type VideoEncoderChoice,
 } from "./ffmpeg.js";
 import { buildAudioFilterComplex } from "./audio.js";
 import { AUDIO_UNSUPPORTED_WARNING, isUnsupportedAudioCodec } from "./preflight.js";
@@ -46,6 +47,12 @@ export interface RenderOptions {
   outputPath: string;
   crf: number;
   preset: string;
+  /**
+   * Hardware encoder override. Only the DESKTOP app sets this (to use the local
+   * GPU); the cloud leaves it undefined and keeps libx264. Compositing is
+   * unaffected — `composeFrame` still draws every frame.
+   */
+  videoEncoder?: VideoEncoderChoice;
   /** Aborting kills both ffmpeg processes (breaks a hung await) → CanceledError. */
   signal: AbortSignal;
   /**
@@ -324,6 +331,7 @@ export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
     audio,
     crf: opts.crf,
     preset: opts.preset,
+    videoEncoder: opts.videoEncoder,
   });
 
   const frameBytes = sourceWidth * sourceHeight * 4;

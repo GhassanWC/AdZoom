@@ -3,14 +3,17 @@
 import {
   addDoc,
   collection,
+  count,
   deleteDoc,
   doc,
+  getAggregateFromServer,
   getDoc,
   onSnapshot,
   orderBy,
   query,
   serverTimestamp,
   setDoc,
+  sum,
   updateDoc,
   type Unsubscribe,
 } from "firebase/firestore";
@@ -290,6 +293,37 @@ export function subscribeProjects(
   return onSnapshot(q, (snap) => {
     onChange(snap.docs.map((d) => materializeProject(d.id, d.data())));
   });
+}
+
+/** How many cloud projects, and how many bytes they hold. */
+export interface CloudProjectStats {
+  projectCount: number;
+  /** Sum of `fileSize` — the number the storage plan is measured against. */
+  storageBytes: number;
+}
+
+/**
+ * The cloud library's numbers, computed BY Firestore.
+ *
+ * An aggregate query returns one row instead of every document, so the
+ * dashboard's "31 projects · 409 MB" costs a single server round trip rather
+ * than a full listing. It is a one-shot read on purpose — aggregates have no
+ * realtime form, and a header stat does not need one.
+ *
+ * Rejects when offline (there is no cached aggregate); callers show whatever
+ * they know locally rather than a zero.
+ */
+export async function getCloudProjectStats(uid: string): Promise<CloudProjectStats> {
+  const { db } = getFirebase();
+  const snap = await getAggregateFromServer(collection(db, "users", uid, "projects"), {
+    projectCount: count(),
+    storageBytes: sum("fileSize"),
+  });
+  const data = snap.data();
+  return {
+    projectCount: Math.max(0, data.projectCount ?? 0),
+    storageBytes: Math.max(0, data.storageBytes ?? 0),
+  };
 }
 
 export async function getProject(uid: string, projectId: string): Promise<ProjectDoc | null> {

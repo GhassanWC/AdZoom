@@ -24,6 +24,8 @@ export default function sitemap(): MetadataRoute.Sitemap {
     entry("/features", 0.9, "monthly"),
     entry("/use-cases", 0.9, "monthly"),
     entry("/pricing", 0.8, "monthly"),
+    // The app is how people use Framevo, so /download ranks with the top pages.
+    entry("/download", 0.9, "weekly"),
     entry("/changelog", 0.6, "weekly"),
     entry("/about", 0.5, "monthly"),
     entry("/docs", 0.5, "monthly"),

@@ -105,6 +105,8 @@ function applyCameraFrame(
   // camera state OR identity when no moment overlaps.
   const { camera, moment } = resolveCameraFrame(moments, t, {
     autoZoom: effects.autoZoom,
+    preset: effects.zoomPreset,
+    speed: effects.zoomSpeed,
   });
   const { tx, ty } = canvasTranslateFor(camera, base.drawW, base.drawH);
 

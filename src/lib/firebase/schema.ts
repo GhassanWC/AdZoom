@@ -19,6 +19,11 @@ import type {
 // preset back-link an applied preset persists on its moment.
 import type { PresetAnimation } from "@/lib/presets/animation";
 import type { PresetRef } from "@/lib/presets/types";
+// Type-only (erased at runtime → no import cycle): the zoom-style vocabulary the
+// camera resolver reads. The table itself lives in lib/timeline/zoom-presets.ts.
+import type { ZoomPresetId } from "@/lib/timeline/zoom-presets";
+
+export type { ZoomPresetId };
 
 export type { SourceCrop };
 
@@ -232,9 +237,16 @@ export interface CutSettings {
 export interface CameraMotionSettings {
   /**
    * 0..100. Higher = snappier (a shorter ramp); lower = a slower, more
-   * cinematic glide. 50 is the built-in default ramp.
+   * cinematic glide. 50 is the built-in default ramp. Absent ⇒ the project's
+   * `effectsSettings.zoomSpeed`.
    */
-  speed: number;
+  speed?: number;
+  /**
+   * This edit's zoom style — how far it pushes, how long it takes, how long it
+   * holds. Absent ⇒ the project's `effectsSettings.zoomPreset` (which itself
+   * defaults to "standard"). See `lib/timeline/zoom-presets.ts` for the table.
+   */
+  preset?: ZoomPresetId;
 }
 
 /**
@@ -1618,7 +1630,18 @@ export interface EffectsSettings {
   autoZoom: number;
   cursorSize: number;
   cursorSmoothing: number;
+  /**
+   * Project-level camera speed, 0..100 (50 = the preset's own ramp). Higher =
+   * snappier. Read by the shared camera resolver, so it moves preview, browser
+   * export, desktop local export and cloud export together; a per-edit
+   * `cameraMotion.speed` overrides it for one edit.
+   */
   zoomSpeed: number;
+  /**
+   * Project-level zoom style — Subtle / Standard / Emphasis. Absent ⇒
+   * "standard", the polished default. Per-edit `cameraMotion.preset` wins.
+   */
+  zoomPreset?: ZoomPresetId;
   motionSensitivity: number;
   clickHighlightSize: number;
   clickHighlightStyle: "ring" | "pulse" | "burst";
@@ -1653,6 +1676,7 @@ export const DEFAULT_EFFECTS_SETTINGS: EffectsSettings = {
   cursorSize: 50,
   cursorSmoothing: 65,
   zoomSpeed: 55,
+  zoomPreset: "standard",
   motionSensitivity: 70,
   clickHighlightSize: 60,
   clickHighlightStyle: "ring",
@@ -1970,6 +1994,25 @@ export interface ProjectDoc {
    * project is unaffected. See src/lib/timeline/layers.ts.
    */
   timelineLayers?: LayerVisibility;
+  /**
+   * SYNC BOOKKEEPING — owned by the sync engine, never by the editor.
+   *
+   * `rev` is a monotonic write counter. Every accepted write increments it, and
+   * the desktop pushes with a compare-and-set against the value it last saw, so
+   * a write composed against a stale document is detected and merged instead of
+   * overwriting whatever landed in between. Absent on documents written before
+   * sync existed — treated as 0, which lets them join on their first write with
+   * no migration pass over Firestore. See src/lib/sync/revision.ts.
+   */
+  rev?: number;
+  /** The device that performed the last accepted write (attribution + echo detection). */
+  lastWriterDeviceId?: string;
+  /**
+   * The operation id of the last accepted write. This is the IDEMPOTENCY
+   * MARKER: a retry whose commit succeeded but whose ack was lost carries the
+   * same id, sees it here, and is acked instead of applied a second time.
+   */
+  lastOpId?: string;
   createdAt: number;
   updatedAt: number;
 }
@@ -2198,10 +2241,15 @@ export interface ExportDoc {
   container?: "webm" | "mp4";
   /**
    * Render engine that produced this record. "editframe" / "browser" render in
-   * the browser; "cloud" is the server worker. Absent on legacy permit-flow docs
+   * the browser; "desktop" renders on the user's own machine via the packaged
+   * app; "cloud" is the server worker. Absent on legacy permit-flow docs
    * (treated as browser).
+   *
+   * Server-owned: set by the export-permit endpoint from the client's declared
+   * engine and immutable afterwards, so a record cannot later claim to have been
+   * produced by a path that never ran.
    */
-  engine?: "browser" | "editframe" | "cloud";
+  engine?: "browser" | "editframe" | "cloud" | "desktop";
   /**
    * False for in-browser (editframe) renders — the file downloads the moment it
    * finishes and is NOT kept in storage, so there's no re-download from history.

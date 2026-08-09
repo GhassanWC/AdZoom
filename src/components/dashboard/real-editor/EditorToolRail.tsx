@@ -31,17 +31,12 @@ import {
  * only — the preview + timeline keep their full height.
  */
 export function EditorToolRail({
-  hasAnalysis,
   isAnalyzingNow,
-  canAnalyze,
   analyzeTitle,
-  onReanalyze,
 }: {
-  hasAnalysis: boolean;
   isAnalyzingNow: boolean;
-  canAnalyze: boolean;
+  /** Why analysis can't run, when it can't — shown on the AI button. */
   analyzeTitle?: string;
-  onReanalyze: () => void;
 }) {
   const {
     project,
@@ -86,15 +81,17 @@ export function EditorToolRail({
       data-editor-dialog-hold
       className="flex w-14 shrink-0 flex-col items-stretch gap-1 border-l border-white/[0.06] bg-surface/60 px-1.5 py-2 backdrop-blur-xl"
     >
-      {/* AI action — separated from the persistent tools. */}
+      {/* The AI action — separated from the persistent tools.
+          It opens the CHAT, not the options dialog. Asking for an edit is now a
+          sentence, and the dialog full of toggles is what sits behind the chat's
+          ⚙ for the times you want to set something exactly. Never disabled: a
+          conversation you can't open in order to read what it did last time is
+          not much of a conversation. */}
       <RailButton
-        label={hasAnalysis ? "Re-analyze" : "AI edit"}
-        title={
-          analyzeTitle ??
-          (hasAnalysis ? "Re-run the AI analysis" : "Generate your AI edit")
-        }
-        onClick={onReanalyze}
-        disabled={hasAnalysis ? isAnalyzingNow : !canAnalyze}
+        label="AI"
+        title={analyzeTitle ?? "Edit with AI — ask for a change in plain English"}
+        onClick={() => toggle("ai-chat")}
+        active={activeTool === "ai-chat"}
         icon={
           isAnalyzingNow ? (
             <Loader2 size={24} className="animate-spin" />

@@ -3,7 +3,9 @@
 import * as React from "react";
 import { Eye, EyeOff, Move3D, RefreshCcw } from "lucide-react";
 import { cn } from "@/lib/cn";
-import { useEditorReal } from "./context";
+import { useActiveMoment, useEditorReal } from "./context";
+import { usePlaybackTime, useSetPlaybackTime } from "./playback-clock";
+import { useRenderCount } from "@/lib/perf/render-probe";
 import { useDebugParam } from "./use-debug-param";
 import { CvDebugOverlay } from "./CvDebugOverlay";
 import { dequantize } from "@/lib/cv/resample";
@@ -41,6 +43,7 @@ import type {
   FitMode,
   FocusRegion,
   VisualAnalysis,
+  ZoomPresetId,
 } from "@/lib/firebase/schema";
 
 /**
@@ -58,12 +61,36 @@ function useContainerSize(
     if (!enabled) return;
     const el = ref.current;
     if (!el) return;
+    // Coalesced to one update per FRAME, then deduped. Dragging the split grip
+    // resizes this box continuously, and the preview is the most expensive
+    // component in the editor to re-render — without the frame gate it re-rendered
+    // several times inside a single painted frame (measured: 19 preview renders
+    // across a 30-move grip drag, with 13 frames over 50ms).
+    //
+    // The dedupe stays: returning the SAME object when the box hasn't actually
+    // changed lets React bail out entirely, which matters because ResizeObserver
+    // fires for plenty of reasons that don't change this element's size.
+    let frame = 0;
+    let latest: { w: number; h: number } | null = null;
+    const flush = () => {
+      frame = 0;
+      const next = latest;
+      if (!next) return;
+      setSize((prev) =>
+        prev && prev.w === next.w && prev.h === next.h ? prev : next
+      );
+    };
     const ro = new ResizeObserver((entries) => {
       const r = entries[0]?.contentRect;
-      if (r) setSize({ w: r.width, h: r.height });
+      if (!r) return;
+      latest = { w: r.width, h: r.height };
+      if (!frame) frame = requestAnimationFrame(flush);
     });
     ro.observe(el);
-    return () => ro.disconnect();
+    return () => {
+      if (frame) cancelAnimationFrame(frame);
+      ro.disconnect();
+    };
   }, [ref, enabled]);
   return enabled ? size : null;
 }
@@ -72,8 +99,10 @@ interface CameraDriverState {
   moments: DetectedMoment[];
   previewMode: boolean;
   autoZoom: number;
+  /** Project camera speed (0..100) — read by the SHARED resolver, not by this loop. */
   zoomSpeed: number;
-  pacing: string;
+  /** Project zoom style — Subtle / Standard / Emphasis. */
+  zoomPreset: ZoomPresetId | undefined;
   /** When true, an export render is running — the preview camera loop yields. */
   exporting: boolean;
   /** When true, the crop editor owns the preview — the camera stays at identity. */
@@ -95,18 +124,20 @@ interface CameraDebugInfo {
 }
 
 /**
- * Continuous cinematic camera. A rAF loop recomputes the *target* every
- * frame from the live `video.currentTime`, then eases the *current*
- * transform toward it with time-based exponential smoothing — inertia,
- * natural deceleration, never a robotic straight CSS line. A very low
- * amplitude drift keeps the frame alive while zoomed in.
+ * Continuous cinematic camera. A rAF loop asks the SHARED resolver where the
+ * camera sits at the live `video.currentTime` and writes that transform
+ * straight to the DOM — no second easing pass.
  *
- * The target comes from `resolveCameraFrame` — the SAME function the
- * exporter calls. The moment's edge envelope (auto ease-in/out for
- * non-keyframed moments) is baked into the resolver, so preview and
- * export ramp in and out identically. Any difference the user sees
- * between the two surfaces is a real bug, not a smoothing-vs-no-smoothing
- * artifact.
+ * That last part is the parity contract, and it used to be violated. This loop
+ * layered its own exponential smoothing on top of the resolver, which meant the
+ * preview always LAGGED the curve the exporter baked: same destination, different
+ * path, and the discrepancy grew with the smoothing constant (which the Zoom
+ * Speed slider drove, so the two surfaces disagreed *more* the further the user
+ * moved a slider that changed nothing about the export). The easing now lives in
+ * the resolver — where every export path also reads it — so what plays here is
+ * frame-for-frame what renders. Zoom Speed and the zoom preset ride through the
+ * resolver as project-level inputs; they still change the feel, they just change
+ * it everywhere at once.
  */
 function useCinematicCamera(
   wrapRef: React.RefObject<HTMLDivElement | null>,
@@ -114,7 +145,8 @@ function useCinematicCamera(
   state: CameraDriverState,
   debugRef?: React.MutableRefObject<CameraDebugInfo>
 ) {
-  const currentRef = React.useRef({ scale: 1, tx: 0, ty: 0 });
+  /** Last transform string written — skip redundant style writes. */
+  const lastTransformRef = React.useRef("");
   const stateRef = React.useRef(state);
   stateRef.current = state;
   /** Last moment id we logged a snapshot for — one log per activation. */
@@ -122,11 +154,8 @@ function useCinematicCamera(
 
   React.useEffect(() => {
     let raf = 0;
-    let last = performance.now();
 
-    const tick = (now: number) => {
-      const dt = Math.min(0.05, (now - last) / 1000);
-      last = now;
+    const tick = () => {
       const s = stateRef.current;
 
       // While a render is running, yield the main thread to the exporter — it
@@ -144,7 +173,7 @@ function useCinematicCamera(
       if (s.cropEditing) {
         const el = wrapRef.current;
         if (el) el.style.transform = "translate(0%, 0%) scale(1)";
-        currentRef.current = { scale: 1, tx: 0, ty: 0 };
+        lastTransformRef.current = "";
         raf = requestAnimationFrame(tick);
         return;
       }
@@ -184,15 +213,18 @@ function useCinematicCamera(
         }
       }
 
-      // Recompute the target from the live playhead each frame.
-      let tgt: CameraState = IDENTITY_CAMERA;
+      // Resolve the camera for the live playhead. This IS the exported curve —
+      // same function, same inputs, same frame.
+      let cam: CameraState = IDENTITY_CAMERA;
       let activeMomentId: string | null = null;
       if (s.previewMode && s.moments.length > 0) {
         const t = videoRef.current?.currentTime ?? 0;
         const { camera, moment } = resolveCameraFrame(s.moments, t, {
           autoZoom: s.autoZoom,
+          preset: s.zoomPreset,
+          speed: s.zoomSpeed,
         });
-        tgt = camera;
+        cam = camera;
         activeMomentId = moment?.id ?? null;
 
         // Dev-mode camera diagnostic: log the moment's three checkpoints
@@ -238,6 +270,8 @@ function useCinematicCamera(
               .map((tt) =>
                 cameraDiagnostic(s.moments, tt, {
                   autoZoom: s.autoZoom,
+                  preset: s.zoomPreset,
+                  speed: s.zoomSpeed,
                   drawW,
                   drawH,
                 })
@@ -260,35 +294,24 @@ function useCinematicCamera(
         }
       }
 
-      // Responsiveness `k` — higher = snappier. Driven by Zoom Speed + pacing.
-      let k = 3 + (s.zoomSpeed / 100) * 3;
-      if (s.pacing === "fast") k += 1.6;
-      else if (s.pacing === "slow") k -= 0.9;
-      k = Math.max(1.6, k);
-
-      const f = 1 - Math.exp(-k * dt);
-      const cur = currentRef.current;
-      cur.scale += (tgt.scale - cur.scale) * f;
-      cur.tx += (tgt.panXPct - cur.tx) * f;
-      cur.ty += (tgt.panYPct - cur.ty) * f;
-
-      // Inertial drift removed — the preview's CSS transform now mirrors
-      // the resolver target exactly (after the smoothing pass). The
-      // exporter is per-frame deterministic, so the sinusoidal sway
-      // here would have made preview ≠ export at every zoomed frame.
+      // Write the resolved transform straight through. No smoothing pass: the
+      // resolver's easing is the whole motion design, and re-easing an already
+      // eased curve is what made the preview drift from the file.
+      const next = `translate(${cam.panXPct.toFixed(3)}%, ${cam.panYPct.toFixed(3)}%) scale(${cam.scale.toFixed(4)})`;
       const el = wrapRef.current;
-      if (el) {
-        el.style.transform = `translate(${cur.tx.toFixed(3)}%, ${cur.ty.toFixed(3)}%) scale(${cur.scale.toFixed(4)})`;
+      if (el && next !== lastTransformRef.current) {
+        el.style.transform = next;
+        lastTransformRef.current = next;
       }
 
-      // Publish the live transform for the camera debug overlay. When no
-      // moment is active the smoothing target is identity, so this settles
-      // to {scale:1, tx:0, ty:0} — the invariant the overlay asserts.
+      // Publish the live transform for the camera debug overlay. With no active
+      // edit the resolver returns identity, so this reads {scale:1, tx:0, ty:0}
+      // — the invariant the overlay asserts.
       if (debugRef) {
         debugRef.current = {
-          scale: cur.scale,
-          tx: cur.tx,
-          ty: cur.ty,
+          scale: cam.scale,
+          tx: cam.panXPct,
+          ty: cam.panYPct,
           momentId: activeMomentId,
         };
       }
@@ -311,16 +334,15 @@ export function RealVideoPlayer({
    */
   fill?: boolean;
 } = {}) {
+  useRenderCount("preview");
   const {
     project,
     videoRef,
-    currentTime,
-    setCurrentTime,
     setPlaying,
     exporting,
     duration,
     setDuration,
-    activeMoment,
+
     previewMode,
     setPreviewMode,
     cvDebug,
@@ -341,6 +363,12 @@ export function RealVideoPlayer({
     isFullscreen,
     previewFullscreenRef,
   } = useEditorReal();
+  // This component OWNS the <video>, so it publishes the clock — but it
+  // deliberately does not subscribe to it. Nothing in the player's own render
+  // depends on the time (the camera transform is written straight to the DOM in
+  // a rAF loop, and the two debug overlays below subscribe for themselves), so
+  // a 1700-line component now re-renders zero times per second during playback.
+  const setCurrentTime = useSetPlaybackTime();
 
   // Dev-only CV debug overlay gate (?debug=1 / Ctrl+Shift+D).
   const cvDebugOverlay = useDebugParam();
@@ -478,7 +506,7 @@ export function RealVideoPlayer({
       previewMode,
       autoZoom: previewEffects.autoZoom,
       zoomSpeed: previewEffects.zoomSpeed,
-      pacing: previewEffects.pacing,
+      zoomPreset: previewEffects.zoomPreset,
       exporting,
       cropEditing,
     },
@@ -950,7 +978,6 @@ export function RealVideoPlayer({
                 {cvDebug && va && va.sampleCount > 0 && (
                   <CentroidPath
                     visualAnalysis={va}
-                    currentTime={currentTime}
                     duration={duration > 0 ? duration : project.duration ?? 0}
                   />
                 )}
@@ -960,7 +987,6 @@ export function RealVideoPlayer({
                   <CvDebugOverlay
                     visualAnalysis={va}
                     moments={previewMoments}
-                    currentTime={currentTime}
                   />
                 )}
 
@@ -984,48 +1010,12 @@ export function RealVideoPlayer({
                   highlight is a real exported effect, so the "before" view
                   must drop it too (the editing guides below stay: they're
                   editor affordances, not exported output). */}
-              {!cropEditing && activeMoment && activeMoment.id !== compareBypassId && (
-                <OverlayLayer
-                  moment={activeMoment}
-                  currentTime={currentTime}
-                  clickHighlightStyle={previewEffects.clickHighlightStyle}
-                  clickHighlightSize={previewEffects.clickHighlightSize}
-                  clickHighlightsEnabled={previewEffects.clickHighlights}
-                />
-              )}
-
-              {!cropEditing && activeMoment && <FocalPathOverlay moment={activeMoment} />}
-
-              {!cropEditing && activeMoment?.effectType === "crop" && previewMode && (
-                <CropGuides />
-              )}
-
-              {/* Speed moments don't frame a region — no box for them. */}
-              {!cropEditing && activeMoment && activeMoment.effectType !== "speed-up" && (
-                <EditableFocusBox
-                  key={activeMoment.id}
-                  moment={activeMoment}
-                  aspectRef={sourceFrameRef}
-                  ghost={previewMode}
-                  onCommit={(focusRegion) => {
-                    // Stamp `targetRegionSource: "user"` so the balancer's
-                    // `refineMomentFocalRegion` pass leaves this region alone
-                    // on any subsequent re-analyze / reframe — user wins.
-                    const patch: Partial<DetectedMoment> = {
-                      focusRegion,
-                      targetRegionSource: "user",
-                    };
-                    // A manual box drag makes the crop position "custom".
-                    if (activeMoment.effectType === "crop") {
-                      patch.crop = {
-                        ...(activeMoment.crop ?? DEFAULT_CROP),
-                        position: "custom",
-                      };
-                    }
-                    updateMoment(activeMoment.id, patch);
-                  }}
-                />
-              )}
+              {/* The active-moment overlays subscribe to the playhead THEMSELVES
+                  (see ActiveMomentOverlays below). Reading `activeMoment` up here
+                  re-rendered this whole component — canvas sizing, camera driver,
+                  every control — each time the playhead crossed an edit boundary,
+                  which during playback is several times a second. */}
+              <ActiveMomentOverlays sourceFrameRef={sourceFrameRef} />
             </div>
           </div>
         </div>
@@ -1291,6 +1281,76 @@ type FocusHandle =
 const MIN_FOCUS = 0.08;
 
 /**
+ * The source-space overlays that follow the edit under the playhead: click
+ * highlight, focal path, crop guides and the draggable focus box.
+ *
+ * Split out of `RealVideoPlayer` for ONE reason — it is the only part of the
+ * preview that depends on which moment is active, and `useActiveMoment()`
+ * re-renders its caller every time the playhead crosses an edit boundary. Inside
+ * the player that meant re-rendering the canvas sizing, the camera driver wiring
+ * and every control several times a second during playback (measured: 9 preview
+ * renders in 3 seconds, against a budget of 4). Down here the same subscription
+ * re-renders four small overlays and nothing else.
+ *
+ * Everything but the frame ref comes from context, so the seam is one prop wide.
+ */
+function ActiveMomentOverlays({
+  sourceFrameRef,
+}: {
+  sourceFrameRef: React.RefObject<HTMLDivElement | null>;
+}) {
+  const { cropEditing, compareBypassId, previewMode, previewEffects, updateMoment } =
+    useEditorReal();
+  const activeMoment = useActiveMoment();
+
+  if (cropEditing || !activeMoment) return null;
+
+  return (
+    <>
+      {activeMoment.id !== compareBypassId && (
+        <OverlayLayer
+          moment={activeMoment}
+          clickHighlightStyle={previewEffects.clickHighlightStyle}
+          clickHighlightSize={previewEffects.clickHighlightSize}
+          clickHighlightsEnabled={previewEffects.clickHighlights}
+        />
+      )}
+
+      <FocalPathOverlay moment={activeMoment} />
+
+      {activeMoment.effectType === "crop" && previewMode && <CropGuides />}
+
+      {/* Speed moments don't frame a region — no box for them. */}
+      {activeMoment.effectType !== "speed-up" && (
+        <EditableFocusBox
+          key={activeMoment.id}
+          moment={activeMoment}
+          aspectRef={sourceFrameRef}
+          ghost={previewMode}
+          onCommit={(focusRegion) => {
+            // Stamp `targetRegionSource: "user"` so the balancer's
+            // `refineMomentFocalRegion` pass leaves this region alone on any
+            // subsequent re-analyze / reframe — user wins.
+            const patch: Partial<DetectedMoment> = {
+              focusRegion,
+              targetRegionSource: "user",
+            };
+            // A manual box drag makes the crop position "custom".
+            if (activeMoment.effectType === "crop") {
+              patch.crop = {
+                ...(activeMoment.crop ?? DEFAULT_CROP),
+                position: "custom",
+              };
+            }
+            updateMoment(activeMoment.id, patch);
+          }}
+        />
+      )}
+    </>
+  );
+}
+
+/**
  * Framing guides shown while a Crop/Reframe moment is active: a title-safe
  * inset rectangle + a rule-of-thirds grid over the frame. Pure CSS, no
  * geometry — purely advisory. The draggable box (EditableFocusBox) is the
@@ -1492,13 +1552,13 @@ function round3(v: number): number {
  */
 function CentroidPath({
   visualAnalysis: va,
-  currentTime,
   duration,
 }: {
   visualAnalysis: VisualAnalysis;
-  currentTime: number;
   duration: number;
 }) {
+  // Debug overlay: subscribes to the clock itself so the player around it doesn't.
+  const currentTime = usePlaybackTime();
   const bucket = Math.max(
     0,
     Math.min(va.sampleCount - 1, Math.floor(currentTime * va.sampleRate))
@@ -1556,17 +1616,19 @@ function CentroidPath({
 
 function OverlayLayer({
   moment,
-  currentTime,
   clickHighlightStyle,
   clickHighlightSize,
   clickHighlightsEnabled,
 }: {
   moment: DetectedMoment;
-  currentTime: number;
   clickHighlightStyle: "ring" | "pulse" | "burst";
   clickHighlightSize: number;
   clickHighlightsEnabled: boolean;
 }) {
+  // This overlay animates against the playhead, so it subscribes — but only it
+  // does. Hoisting the subscription up to the player re-rendered the entire
+  // 1700-line preview component for an effect drawn in one small box.
+  const currentTime = usePlaybackTime();
   // The SHARED resolver — the same one compose-frame (browser export + the Cloud
   // Run worker) and Remotion call. The click's own style/size win over the
   // project's; null means it shouldn't be drawn at all. Preview and export can

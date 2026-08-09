@@ -36,6 +36,11 @@ export function ChatWidget() {
   const isEditor = /^\/dashboard\/projects\/[^/]+$/.test(pathname ?? "");
   if (isEditor) return null;
 
+  // The workspace pins the theme dock to the bottom edge (components/ui/
+  // ThemeDock), so the bubble steps up out of its way there. Everywhere else —
+  // landing, pricing, docs — it keeps the corner to itself.
+  const aboveThemeDock = (pathname ?? "").startsWith("/dashboard");
+
   return (
     <>
       {/* Floating bubble — bottom-right on every page */}
@@ -44,7 +49,8 @@ export function ChatWidget() {
         aria-label={open ? "Close chat" : `Open chat with ${BRAND.name}`}
         onClick={() => setOpen((v) => !v)}
         className={cn(
-          "fixed bottom-5 right-5 z-50 inline-flex size-14 items-center justify-center rounded-full text-white shadow-[0_18px_38px_-10px_rgba(139,92,246,0.7)] transition-transform duration-200 hover:scale-[1.04] active:scale-95",
+          "fixed right-5 z-50 inline-flex size-14 items-center justify-center rounded-full text-white shadow-[0_18px_38px_-10px_rgba(139,92,246,0.7)] transition-transform duration-200 hover:scale-[1.04] active:scale-95",
+          aboveThemeDock ? "bottom-16" : "bottom-5",
           "bg-gradient-to-br from-violet-500 to-violet-600"
         )}
       >

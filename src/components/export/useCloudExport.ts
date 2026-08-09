@@ -18,6 +18,7 @@ import type {
   VisualAnalysis,
 } from "@/lib/firebase/schema";
 
+import { apiFetch } from "@/lib/platform/api";
 /**
  * Server-export client hook (paid plans). Distinct from `ExportProvider`, which
  * owns the in-browser render machinery — server export just creates a Firestore
@@ -306,7 +307,7 @@ export function useCloudExport(projectId: string) {
           setError(msg);
           return { ok: false, error: msg };
         }
-        const res = await fetch("/api/export/cloud", {
+        const res = await apiFetch("/api/export/cloud", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -366,7 +367,7 @@ export function useCloudExport(projectId: string) {
     try {
       const token = await getIdToken();
       if (!token) return;
-      await fetch("/api/export/cancel", {
+      await apiFetch("/api/export/cancel", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",

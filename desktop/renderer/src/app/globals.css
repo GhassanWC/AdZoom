@@ -1,0 +1,13 @@
+/**
+ * The desktop renderer's stylesheet is the WEBSITE's stylesheet — imported, not
+ * copied, so a token or utility added for the web is instantly true here too.
+ *
+ * `@source` is explicit because Tailwind v4 infers its scan root from the CSS
+ * file's location, and this file lives two packages away from the components it
+ * styles.
+ */
+@import "../../../../src/app/globals.css";
+
+@source "../../../../src/components/**/*.{ts,tsx}";
+@source "../../../../src/lib/**/*.{ts,tsx}";
+@source "./**/*.{ts,tsx}";

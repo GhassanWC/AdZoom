@@ -1,11 +1,7 @@
 "use client";
 
-import * as React from "react";
-import { doc, onSnapshot } from "firebase/firestore";
-import { getFirebase } from "@/lib/firebase/client";
-import { useAuth } from "@/lib/firebase/AuthProvider";
 import { useStoragePlan } from "./useStoragePlan";
-import type { MonthlyUsage } from "@/lib/firebase/schema";
+import { useMonthlyUsage } from "./useMonthlyUsage";
 import type { PlanTier } from "./plan";
 import {
   CLOUD_EXPORT_MINUTES,
@@ -37,41 +33,16 @@ export interface CloudMinutesState {
   freeLimitReached: boolean;
 }
 
-function currentMonthKey(d = new Date()): string {
-  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
-}
-
 /**
  * Live cloud-export minutes for the current user — the meter the export panel
- * shows ("X / 150 minutes left"). Subscribes to `users/{uid}/usage/{YYYY-MM}`
- * (the same doc the browser export count lives on) and derives remaining minutes
- * from the shared `cloud-minutes` helpers, so the client and server agree.
+ * shows ("X / 150 minutes left"). Reads `users/{uid}/usage/{YYYY-MM}` (the same
+ * doc the browser export count lives on) via `useMonthlyUsage` and derives
+ * remaining minutes from the shared `cloud-minutes` helpers, so the client and
+ * server agree.
  */
 export function useCloudMinutes(): CloudMinutesState {
-  const { user } = useAuth();
   const { plan } = useStoragePlan();
-  const uid = user?.uid ?? null;
-
-  const [usage, setUsage] = React.useState<MonthlyUsage | null>(null);
-  const [loaded, setLoaded] = React.useState(false);
-
-  React.useEffect(() => {
-    if (!uid) {
-      setUsage(null);
-      setLoaded(false);
-      return;
-    }
-    const { db } = getFirebase();
-    const ref = doc(db, "users", uid, "usage", currentMonthKey());
-    return onSnapshot(
-      ref,
-      (snap) => {
-        setUsage(snap.exists() ? (snap.data() as MonthlyUsage) : null);
-        setLoaded(true);
-      },
-      () => setLoaded(true)
-    );
-  }, [uid]);
+  const { usage, loading } = useMonthlyUsage();
 
   const tier = plan.tier;
   const monthlyExportsUsed = Math.max(0, usage?.exportsUsedThisMonth ?? 0);
@@ -84,7 +55,7 @@ export function useCloudMinutes(): CloudMinutesState {
     remaining: cloudMinutesRemaining(tier, usage),
     allowed: planAllowsCloudExport(tier),
     plan: tier,
-    loading: !!uid && !loaded,
+    loading,
     monthlyExportsUsed,
     monthlyExportLimit,
     monthlyExportsRemaining,

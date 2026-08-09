@@ -145,8 +145,8 @@ export const EFFECT_TONES: Record<
     user: "from-rose-500/85 via-rose-500/55 to-red-600/40 border-rose-300/50",
     dot: "bg-rose-300",
     label: "Cut",
-    glow: "shadow-[0_8px_36px_-12px_rgba(244,63,94,0.9)]",
-    hoverGlow: "hover:shadow-[0_8px_36px_-12px_rgba(244,63,94,0.9)]",
+    glow: "shadow-[0_8px_36px_-12px_rgba(178,99,112,0.9)]",
+    hoverGlow: "hover:shadow-[0_8px_36px_-12px_rgba(178,99,112,0.9)]",
   },
   crop: {
     ai: "from-teal-400/85 via-teal-500/55 to-emerald-600/40 border-teal-200/40",
@@ -187,8 +187,8 @@ export const EFFECT_TONES: Record<
     user: "from-emerald-400/85 via-emerald-500/55 to-green-600/40 border-emerald-200/50",
     dot: "bg-emerald-300",
     label: "Smart Crop",
-    glow: "shadow-[0_8px_36px_-12px_rgba(52,211,153,0.9)]",
-    hoverGlow: "hover:shadow-[0_8px_36px_-12px_rgba(52,211,153,0.9)]",
+    glow: "shadow-[0_8px_36px_-12px_rgba(127,168,144,0.9)]",
+    hoverGlow: "hover:shadow-[0_8px_36px_-12px_rgba(127,168,144,0.9)]",
   },
   callout: {
     ai: "from-orange-400/85 via-orange-500/55 to-amber-600/40 border-orange-200/40",

@@ -5,6 +5,8 @@ import { ChevronDown } from "lucide-react";
 import { Slider } from "@/components/ui/Slider";
 import { Toggle } from "@/components/ui/Toggle";
 import { ColorField } from "@/components/ui/ColorField";
+import { useLiveValue } from "./useLiveValue";
+import { COMMIT_PROFILES } from "./live-commit";
 import { cn } from "@/lib/cn";
 import { TEXT_STYLE_PRESETS } from "@/lib/render/text-style";
 import type {
@@ -361,19 +363,26 @@ function FontSizeControl({ scale, onChange }: { scale: number; onChange: (fontSc
     const clamped = Math.max(MIN, Math.min(MAX, Math.round(nextPx)));
     onChange(clamped / REF);
   };
+  // The numeric field is typed into, so it gets its own local draft — otherwise
+  // each digit wrote the document and the clamp re-formatted the value out from
+  // under the caret (typing "120" became "12" → clamped → fought back).
+  const live = useLiveValue(px, set, COMMIT_PROFILES.text);
   return (
     <div className="space-y-1.5">
       <div className="flex items-center gap-2">
         <div className="min-w-0 flex-1">
+          {/* The Slider already owns its own drag-local state. */}
           <Slider label="Font size" value={px} min={MIN} max={MAX} unit="px" onChange={set} />
         </div>
         <input
           type="number"
           aria-label="Font size (px)"
-          value={px}
+          value={live.value}
           min={MIN}
           max={MAX}
-          onChange={(e) => set(Number(e.target.value))}
+          onFocus={live.begin}
+          onChange={(e) => live.set(Number(e.target.value))}
+          onBlur={live.end}
           className="mt-4 h-8 w-16 shrink-0 rounded-lg border border-white/[0.1] bg-white/[0.03] px-2 text-center font-mono text-[12px] text-white outline-none focus:border-violet-400/50"
         />
       </div>

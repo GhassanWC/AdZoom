@@ -623,7 +623,36 @@ export const DIRECTOR_STAGE_LABEL: Record<DirectorStage, string> = {
   finalizing: "Finalizing the timeline",
 };
 
-export type DirectorStatus = "idle" | "running" | "complete" | "failed";
+/**
+ * `proposed` = a plan exists and is waiting for the user to approve it. It is
+ * NOT a kind of "complete": nothing has been applied, the timeline is untouched,
+ * and export would produce the video as it was before the request.
+ */
+export type DirectorStatus = "idle" | "running" | "proposed" | "complete" | "failed";
+
+/**
+ * A plan the user has been shown but has not accepted — Plan mode's output.
+ *
+ * It carries the summary/review/failures from a DRY RUN of the real pipeline,
+ * not an estimate of one. Because `runDirectorPipeline` is pure and
+ * deterministic, running it and discarding the moments tells us exactly what
+ * approving would do — so the proposal can never promise an edit that approving
+ * then fails to produce.
+ *
+ * The moments themselves are deliberately NOT stored. Approval re-runs the same
+ * pipeline over the CURRENT timeline at the revision index it will really be
+ * committed at, so an approval that lands after some other change still applies
+ * to what is actually on the timeline.
+ */
+export interface DirectorProposal {
+  plan: DirectorPlan;
+  summary: DirectorSummary;
+  review: DirectorReviewResult;
+  failures: DirectorFailure[];
+  /** The natural-language ask. Empty string for the initial run. */
+  command: string;
+  createdAt: number;
+}
 
 export interface DirectorRevisionEntry {
   id: string;
@@ -659,6 +688,12 @@ export interface DirectorState {
   failures?: DirectorFailure[];
   /** Full history. `revisions[revisions.length - 1]` corresponds to `plan`. */
   revisions: DirectorRevisionEntry[];
+  /**
+   * Plan mode's pending proposal. Present ⇒ there is something to approve, and
+   * the timeline does NOT yet reflect it. Cleared on approve, discard, or any
+   * instant-mode change that would make it stale.
+   */
+  proposal?: DirectorProposal;
   errorMessage?: string;
   modelVersion?: string;
   planVersion?: number;

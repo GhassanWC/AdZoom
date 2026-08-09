@@ -11,6 +11,7 @@
 
 import * as React from "react";
 import { dequantize } from "@/lib/cv/resample";
+import { usePlaybackTime } from "./playback-clock";
 import type { DetectedMoment, VisualAnalysis } from "@/lib/firebase/schema";
 
 const CURSOR_WINDOW_S = 2; // trail length around the playhead
@@ -24,12 +25,12 @@ function pct(v: number): string {
 export function CvDebugOverlay({
   visualAnalysis: va,
   moments,
-  currentTime,
 }: {
   visualAnalysis: VisualAnalysis;
   moments: DetectedMoment[];
-  currentTime: number;
 }) {
+  // Subscribes to the clock itself — the player that hosts it must not.
+  const currentTime = usePlaybackTime();
   const sampleRate = va.sampleRate || 1;
 
   // Cursor trail around the playhead.
@@ -92,7 +93,7 @@ export function CvDebugOverlay({
               top: pct(cy),
               width: 22,
               height: 22,
-              boxShadow: "0 0 8px rgba(251,113,133,0.7)",
+              boxShadow: "0 0 8px rgba(201,127,137,0.7)",
             }}
           />
         );

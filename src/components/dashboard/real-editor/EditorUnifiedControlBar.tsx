@@ -40,6 +40,7 @@ import {
 import { cn } from "@/lib/cn";
 import type { EffectType, TimelineLayerId } from "@/lib/firebase/schema";
 import { useEditorReal } from "./context";
+import { useRenderCount } from "@/lib/perf/render-probe";
 import { useMomentReview } from "./useMomentReview";
 import { MenuPopover, useMenuPopover } from "./MenuPopover";
 import { PlaybackTransport, PlaybackVolumeFullscreen } from "./PlaybackControls";
@@ -115,6 +116,7 @@ export function EditorUnifiedControlBar({
   onSplit: () => void;
   onDelete: () => void;
 }) {
+  useRenderCount("control-bar");
   const { splitFraction, setSplitFraction, scenesOpen, toggleScenes } = useEditorReal();
   // Edit-review navigation (prev / count / next) — lives in the overflow menu
   // now; still timeline navigation, not an editor tool.

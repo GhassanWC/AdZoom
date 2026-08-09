@@ -18,6 +18,7 @@ import { Button } from "@/components/ui/Button";
 import { useToast } from "@/components/ui/Toast";
 import { cn } from "@/lib/cn";
 import { useEditorReal } from "./context";
+import { useClockRef, useClockSelector } from "./playback-clock";
 import { LooksGallery } from "./LooksGallery";
 import { PresetPreview } from "./PresetPreview";
 import { applyPreset } from "@/lib/presets/apply";
@@ -81,13 +82,15 @@ function secs(v: number): string {
 export function PresetBrowserPanel() {
   const {
     project,
-    currentTime,
     duration,
     addMoment,
     newMomentId,
     setSelectedMomentId,
     openInspector,
   } = useEditorReal();
+  // Applying a preset needs the time at the moment of the CLICK, so it reads the
+  // ref — subscribing would re-render this whole 39-card grid on every tick.
+  const clockRef = useClockRef();
   const { settings, loading: settingsLoading, save } = useWorkspaceSettings();
   const toast = useToast();
 
@@ -166,7 +169,7 @@ export function PresetBrowserPanel() {
         // per-type settings bag all live in `applyPreset`.
         const moment = applyPreset({
           preset,
-          startTime: currentTime,
+          startTime: clockRef.current,
           duration,
           canvasWidth,
           canvasHeight,
@@ -212,7 +215,7 @@ export function PresetBrowserPanel() {
       applyingId,
       canvasHeight,
       canvasWidth,
-      currentTime,
+      clockRef,
       duration,
       favouriteIds,
       newMomentId,
@@ -225,7 +228,9 @@ export function PresetBrowserPanel() {
     ]
   );
 
-  const playheadLabel = fmt(currentTime);
+  // The mm:ss label changes once a second, so selecting the FORMATTED string
+  // makes this panel re-render at 1Hz while playing instead of on every tick.
+  const playheadLabel = useClockSelector((t) => fmt(t));
 
   return (
     <div className="flex h-full flex-col">
