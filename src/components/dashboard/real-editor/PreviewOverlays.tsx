@@ -26,6 +26,25 @@ import {
 } from "@/lib/render/overlay-draw";
 import type { DetectedMoment } from "@/lib/firebase/schema";
 
+/**
+ * `hasOverlayMoments`, memoized on the moments ARRAY IDENTITY.
+ *
+ * The predicate scans every moment, and it ran twice per frame (once per canvas)
+ * — on a captioned recording that is hundreds of moments × 2 × 60Hz for an
+ * answer that only changes when the timeline does. `previewMoments` is a stable
+ * reference between edits (see context.tsx), so identity is the right key: a
+ * one-entry cache turns the scan into a pointer compare.
+ */
+let overlayScanKey: DetectedMoment[] | null = null;
+let overlayScanValue = false;
+function hasOverlayMomentsCached(moments: DetectedMoment[]): boolean {
+  if (moments !== overlayScanKey) {
+    overlayScanKey = moments;
+    overlayScanValue = hasOverlayMoments(moments);
+  }
+  return overlayScanValue;
+}
+
 /** Shared rAF canvas loop. `draw(ctx, t, boxW, boxH)` runs each frame (post DPR + clear). */
 function useOverlayCanvas(
   canvasRef: React.RefObject<HTMLCanvasElement | null>,
@@ -38,6 +57,8 @@ function useOverlayCanvas(
     let raf = 0;
     let lastW = 0;
     let lastH = 0;
+    /** True once we've cleared for a state that draws nothing — see below. */
+    let clearedWhileIdle = false;
     const tick = () => {
       const cv = canvasRef.current;
       const ctx = cv?.getContext("2d");
@@ -45,6 +66,26 @@ function useOverlayCanvas(
         raf = requestAnimationFrame(tick);
         return;
       }
+
+      // Decide whether this frame draws ANYTHING before measuring. `rect` below
+      // is a forced synchronous layout, and it lands immediately after the
+      // camera loop writes `transform` on this canvas's parent — so on a project
+      // with no overlay edits we were paying two layout flushes per frame to
+      // clear two canvases that were already empty.
+      const willDraw = enabledRef.current && hasOverlayMomentsCached(momentsRef.current);
+      if (!willDraw) {
+        // Clear ONCE on the transition into idle, then go quiet. Skipping the
+        // clear entirely would leave the last drawn frame stuck on screen.
+        if (!clearedWhileIdle && (lastW || lastH)) {
+          ctx.setTransform(1, 0, 0, 1, 0, 0);
+          ctx.clearRect(0, 0, cv.width, cv.height);
+          clearedWhileIdle = true;
+        }
+        raf = requestAnimationFrame(tick);
+        return;
+      }
+      clearedWhileIdle = false;
+
       const rect = cv.getBoundingClientRect();
       const dpr = Math.min(2, (typeof window !== "undefined" && window.devicePixelRatio) || 1);
       const boxW = Math.max(1, Math.round(rect.width));
@@ -59,10 +100,7 @@ function useOverlayCanvas(
       }
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, boxW, boxH);
-      if (enabledRef.current && hasOverlayMoments(momentsRef.current)) {
-        const t = videoRef.current?.currentTime ?? 0;
-        draw(ctx, t, boxW, boxH);
-      }
+      draw(ctx, videoRef.current?.currentTime ?? 0, boxW, boxH);
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);

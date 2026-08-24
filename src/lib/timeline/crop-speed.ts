@@ -193,6 +193,40 @@ export function snapOutOfActiveCut(
   return cur;
 }
 
+/**
+ * How far PAST a cut's end a skip must land.
+ *
+ * `activeCutAt` excludes the end boundary (`t >= endTime`), so a seek that lands
+ * even a fraction short is still inside the cut and re-triggers on the next
+ * frame. Browsers snap seeks to keyframes, so "a fraction short" is the normal
+ * case, not the edge case.
+ */
+export const CUT_SKIP_EPSILON = 1e-3;
+
+/**
+ * Where playback should jump to when the playhead is inside an active cut, or
+ * `null` when it isn't inside one.
+ *
+ * Extracted from the preview's rAF loop so the rule can be tested: the returned
+ * time must be strictly outside EVERY active cut. Getting that wrong doesn't
+ * look like a bug in the maths — it looks like the video stuttering, because a
+ * target that is still inside a cut makes the next frame seek again, and each
+ * seek is a decoder flush plus (on a remote source) a fresh range request.
+ *
+ * Chains adjacent cuts so a run of them costs ONE seek, not one per cut.
+ */
+export function cutSkipTarget(
+  moments: DetectedMoment[] | null | undefined,
+  t: number,
+  duration?: number
+): number | null {
+  const cut = activeCutAt(moments, t);
+  if (!cut) return null;
+  const chained = snapOutOfActiveCut(moments, cut.endTime + CUT_SKIP_EPSILON);
+  const target = chained + CUT_SKIP_EPSILON;
+  return duration && Number.isFinite(duration) ? Math.min(duration, target) : target;
+}
+
 /** Merge overlapping/adjacent ranges (sorted by start). */
 function mergeRanges(ranges: Array<{ start: number; end: number }>): Array<{ start: number; end: number }> {
   const sorted = [...ranges].sort((a, b) => a.start - b.start);

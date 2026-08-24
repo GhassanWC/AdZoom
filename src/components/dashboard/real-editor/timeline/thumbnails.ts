@@ -11,6 +11,21 @@
  * We render at a small width (160px) — pills are 28px tall in the UI, so
  * 160×90 is already 5× the rendered density on retina. Anything larger is
  * wasted memory.
+ *
+ * ── Why this file is careful about bandwidth ─────────────────────────────────
+ * This element loads the SAME url the preview player is streaming, and it has to
+ * carry `crossOrigin` (the canvas is read back with `toDataURL`, which a tainted
+ * canvas refuses) while the preview deliberately does not. Different CORS modes
+ * mean different HTTP cache entries, so the browser treats them as two unrelated
+ * downloads of one file. With `preload="auto"` that was a full second copy of a
+ * multi-hundred-megabyte recording, pulled while the user was trying to watch
+ * the first one — which showed up as the preview stalling and resuming.
+ *
+ * So: `preload="metadata"` (seeking still works; it fetches only the ranges it
+ * lands on), and the per-URL queue the paragraph above promised is now real —
+ * before, N pills mounting together all wrote `currentTime` on ONE element and
+ * raced on a single `seeked` handler, turning a screenful of pills into a seek
+ * storm on the same connection the player needs.
  */
 
 import { resolveSourceRect } from "@/lib/timeline/source-crop";
@@ -37,14 +52,21 @@ const TARGET_WIDTH = 160;
 const slots = new Map<string, VideoSlot>();
 const cache = new Map<string, string>();
 const inflight = new Map<string, Promise<string | null>>();
+/** Tail of the per-URL seek queue — see `acquire`. */
+const queues = new Map<string, Promise<void>>();
 
 function ensureSlot(url: string, crop?: SourceCrop): VideoSlot {
   const existing = slots.get(url);
   if (existing) return existing;
 
   const video = document.createElement("video");
+  // Required: the frame is read back with `toDataURL`, and a canvas drawn from a
+  // cross-origin video without this is tainted and throws.
   video.crossOrigin = "anonymous";
-  video.preload = "auto";
+  // NOT "auto" — see the header. This element must never race the preview player
+  // for the same file; metadata plus on-demand range fetches is all a seek-and-
+  // grab-one-frame extractor needs.
+  video.preload = "metadata";
   video.muted = true;
   video.playsInline = true;
   video.src = url;
@@ -135,46 +157,37 @@ export async function captureFrame(
       await slot.ready;
       if (!slot.ctx) return null;
 
-      await new Promise<void>((resolve, reject) => {
-        const onSeeked = () => {
-          slot.video.removeEventListener("seeked", onSeeked);
-          slot.video.removeEventListener("error", onErr);
-          resolve();
-        };
-        const onErr = () => {
-          slot.video.removeEventListener("seeked", onSeeked);
-          slot.video.removeEventListener("error", onErr);
-          reject(new Error("seek failed"));
-        };
-        slot.video.addEventListener("seeked", onSeeked);
-        slot.video.addEventListener("error", onErr);
-        try {
-          slot.video.currentTime = Math.max(0, time);
-        } catch (err) {
-          onErr();
-          throw err;
-        }
-      });
+      // Take the per-URL lock. One element, one `seeked` event stream — two
+      // captures in flight at once would each see the other's `seeked` and draw
+      // the wrong frame, and every extra concurrent seek is another range
+      // request competing with the preview player.
+      const release = await acquire(url);
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const onSeeked = () => {
+            slot.video.removeEventListener("seeked", onSeeked);
+            slot.video.removeEventListener("error", onErr);
+            resolve();
+          };
+          const onErr = () => {
+            slot.video.removeEventListener("seeked", onSeeked);
+            slot.video.removeEventListener("error", onErr);
+            reject(new Error("seek failed"));
+          };
+          slot.video.addEventListener("seeked", onSeeked);
+          slot.video.addEventListener("error", onErr);
+          try {
+            slot.video.currentTime = Math.max(0, time);
+          } catch (err) {
+            onErr();
+            throw err;
+          }
+        });
 
-      if (slot.cropActive) {
-        // 9-arg: sample only the Frame Crop sub-rectangle.
-        slot.ctx.drawImage(
-          slot.video,
-          slot.cropSrcX,
-          slot.cropSrcY,
-          slot.cropSrcW,
-          slot.cropSrcH,
-          0,
-          0,
-          slot.width,
-          slot.height
-        );
-      } else {
-        slot.ctx.drawImage(slot.video, 0, 0, slot.width, slot.height);
+        return drawSlot(slot, key);
+      } finally {
+        release();
       }
-      const data = slot.canvas.toDataURL("image/jpeg", 0.72);
-      cache.set(key, data);
-      return data;
     } catch {
       return null;
     } finally {
@@ -184,6 +197,50 @@ export async function captureFrame(
 
   inflight.set(key, promise);
   return promise;
+}
+
+/**
+ * Serialise work per URL.
+ *
+ * The file's header has always claimed captures were queued; they weren't. Each
+ * caller awaits the previous one's release, so exactly one seek is ever in
+ * flight against a given hidden element.
+ */
+function acquire(url: string): Promise<() => void> {
+  const prev = queues.get(url) ?? Promise.resolve();
+  let release!: () => void;
+  const next = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  queues.set(
+    url,
+    prev.then(() => next)
+  );
+  return prev.then(() => release);
+}
+
+/** Draw the current frame of `slot` into its canvas and cache the data URL. */
+function drawSlot(slot: VideoSlot, key: string): string | null {
+  if (!slot.ctx) return null;
+  if (slot.cropActive) {
+    // 9-arg: sample only the Frame Crop sub-rectangle.
+    slot.ctx.drawImage(
+      slot.video,
+      slot.cropSrcX,
+      slot.cropSrcY,
+      slot.cropSrcW,
+      slot.cropSrcH,
+      0,
+      0,
+      slot.width,
+      slot.height
+    );
+  } else {
+    slot.ctx.drawImage(slot.video, 0, 0, slot.width, slot.height);
+  }
+  const data = slot.canvas.toDataURL("image/jpeg", 0.72);
+  cache.set(key, data);
+  return data;
 }
 
 /**
@@ -212,4 +269,5 @@ export function disposeThumbnails(url?: string): void {
   slots.clear();
   cache.clear();
   inflight.clear();
+  queues.clear();
 }

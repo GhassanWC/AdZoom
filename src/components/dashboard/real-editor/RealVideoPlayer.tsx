@@ -20,7 +20,7 @@ import { resolveClickHighlight } from "@/lib/render/click-highlight";
 import { coverFitDims } from "@/lib/timeline/cover";
 import {
   activeSpeedAt,
-  activeCutAt,
+  cutSkipTarget,
   DEFAULT_CROP,
 } from "@/lib/timeline/crop-speed";
 import {
@@ -151,6 +151,11 @@ function useCinematicCamera(
   stateRef.current = state;
   /** Last moment id we logged a snapshot for — one log per activation. */
   const loggedMomentRef = React.useRef<string | null>(null);
+  /**
+   * A cut-skip seek is in flight. Held until `seeked` fires, so the loop cannot
+   * queue a second seek for a cut it is already jumping out of.
+   */
+  const seekingPastCutRef = React.useRef(false);
 
   React.useEffect(() => {
     let raf = 0;
@@ -179,20 +184,49 @@ function useCinematicCamera(
       }
 
       // Active cuts remove time: during playback, jump past a cut the instant
-      // the playhead enters it (the `!seeking` guard prevents a re-seek storm).
-      // Runs regardless of `previewMode` — a cut is a timeline edit, not a
-      // camera-preview affordance — so preview always matches the export.
+      // the playhead enters it. Runs regardless of `previewMode` — a cut is a
+      // timeline edit, not a camera-preview affordance — so preview always
+      // matches the export.
+      //
+      // Three details, all of which were missing and all of which turned a
+      // 6-minute edit with a dozen cuts into visible play/stall/play/stall:
+      //
+      //   1. `!vEl.seeking` is NOT a sufficient guard. It goes false the moment
+      //      the seek completes, but a browser snaps a seek to a keyframe and
+      //      can land a few ms SHORT of the requested time — still inside the
+      //      cut. The next frame detects the same cut and seeks again, forever.
+      //      `seekingPastCutRef` latches until `seeked` actually fires, exactly
+      //      as the export path has always done (see export.ts `seekingPastCut`).
+      //   2. Seeking to `cut.endTime` exactly lands ON the boundary that
+      //      `activeCutAt` treats as still-inside, and a run of back-to-back
+      //      cuts used to cost one full seek + rebuffer EACH. Both are now
+      //      `cutSkipTarget`'s job (crop-speed.ts), where they are tested.
       const vEl = videoRef.current;
-      if (vEl && !vEl.paused && !vEl.seeking) {
-        const cut = activeCutAt(s.moments, vEl.currentTime);
-        if (cut) {
+      if (vEl && !vEl.paused && !seekingPastCutRef.current && !vEl.seeking) {
+        const target = cutSkipTarget(
+          s.moments,
+          vEl.currentTime,
+          Number.isFinite(vEl.duration) ? vEl.duration : undefined
+        );
+        if (target !== null) {
           if (process.env.NODE_ENV !== "production") {
             console.info("[preview-cut]", {
               jumpedFrom: +vEl.currentTime.toFixed(2),
-              jumpedTo: +cut.endTime.toFixed(2),
+              jumpedTo: +target.toFixed(2),
             });
           }
-          vEl.currentTime = cut.endTime;
+          seekingPastCutRef.current = true;
+          const onSeeked = () => {
+            vEl.removeEventListener("seeked", onSeeked);
+            seekingPastCutRef.current = false;
+          };
+          vEl.addEventListener("seeked", onSeeked);
+          try {
+            vEl.currentTime = target;
+          } catch {
+            vEl.removeEventListener("seeked", onSeeked);
+            seekingPastCutRef.current = false;
+          }
         }
       }
 
@@ -806,22 +840,49 @@ export function RealVideoPlayer({
   const canvasManual = canvasActive && !!previewPlacement?.manual;
 
   // Keep the blurred-background video roughly in step with the main one.
-  // Heavy blur tolerates loose sync, so we only correct on drift / play state.
+  //
+  // This is a SECOND decode of the same file, so how it re-syncs matters far
+  // more than it looks. It used to run at rAF and re-seek whenever it drifted
+  // 80ms — but a seek takes longer than a frame, so while one was in flight the
+  // main video kept advancing, the drift stayed over the threshold, and the next
+  // frame issued another seek. On a remote source each of those is a fresh HTTP
+  // range request, and the two elements ended up fighting each other (and the
+  // player) for bandwidth: the preview stalled, resumed, stalled again.
+  //
+  // Now: correct at most a few times a second, never while a seek is already in
+  // flight, and tolerate a quarter-second of drift. The layer is blurred 40px,
+  // dimmed, and overscaled — it only ever peeks into the letterbox margins, so
+  // frame-accurate sync buys nothing a viewer can see. Play/pause still tracks
+  // immediately, because THAT is visible.
   const blurBgActive = showCanvasBg && canvasBgMode === "blur";
   React.useEffect(() => {
-    // Skip while exporting — this loop seeks bgVideo every frame, and the
-    // export doesn't capture the preview's blur background anyway.
+    // Skip while exporting — the export doesn't capture the preview's blur
+    // background anyway, and the renderer needs the decoder.
     if (!blurBgActive || exporting) return;
     let raf = 0;
+    let lastCorrection = 0;
+    /** Drift we accept before correcting. Invisible at 40px of blur. */
+    const DRIFT_TOLERANCE_S = 0.25;
+    /** Minimum gap between corrections. */
+    const CORRECTION_INTERVAL_MS = 400;
+
     const tick = () => {
       const main = videoRef.current;
       const bg = bgVideoRef.current;
       if (main && bg) {
-        if (Math.abs(bg.currentTime - main.currentTime) > 0.08) {
-          bg.currentTime = main.currentTime;
-        }
+        // Play state is visible, so it tracks every frame.
         if (main.paused && !bg.paused) bg.pause();
         else if (!main.paused && bg.paused) void bg.play().catch(() => {});
+
+        const now = performance.now();
+        if (
+          !bg.seeking &&
+          now - lastCorrection > CORRECTION_INTERVAL_MS &&
+          Math.abs(bg.currentTime - main.currentTime) > DRIFT_TOLERANCE_S
+        ) {
+          lastCorrection = now;
+          bg.currentTime = main.currentTime;
+        }
       }
       raf = requestAnimationFrame(tick);
     };
@@ -945,7 +1006,15 @@ export function RealVideoPlayer({
                   // load and the preview goes black. Export uses its OWN
                   // offscreen `crossOrigin` video for canvas readback, so this
                   // is display-only and safe.
-                  preload="metadata"
+                  //
+                  // "auto", not "metadata": this is an editor, so the video WILL
+                  // be played and scrubbed — buffering only the header meant
+                  // every press of play, and every jump past a cut, started from
+                  // a cold fetch. Now that the thumbnail extractor no longer
+                  // pulls its own full copy of the same file (see
+                  // timeline/thumbnails.ts), this element is the one that should
+                  // be using the bandwidth.
+                  preload="auto"
                 />
                 {!project.originalVideoUrl && (
                   <div className="pointer-events-none absolute inset-0 grid place-items-center text-sm text-fog">
