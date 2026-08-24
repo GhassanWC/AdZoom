@@ -33,11 +33,14 @@ import {
   X,
   AlertTriangle,
   SlidersHorizontal,
+  Sparkles,
   Zap,
   ListChecks,
 } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { Button } from "@/components/ui/Button";
+import { useAuth } from "@/lib/firebase/AuthProvider";
+import { apiFetch } from "@/lib/platform/api";
 import { useEditorReal } from "./context";
 import {
   CHAT_BRIEF_EXAMPLES,
@@ -45,10 +48,13 @@ import {
   approveProposal,
   describePlan,
   runChatTurn,
+  runChatTurnWithIntents,
   transcriptFromState,
   undoLastChange,
   type ChatMode,
+  type ChatTurnResult,
 } from "@/lib/director/chat";
+import type { DirectorRevisionIntent } from "@/lib/director/revision";
 import type { DirectorState } from "@/lib/director/types";
 import { DEFAULT_ANALYSIS_OPTIONS } from "@/lib/analysis/engine-layers";
 
@@ -58,6 +64,12 @@ interface EphemeralMessage {
   role: "user" | "assistant";
   text: string;
   tone?: "normal" | "warn";
+  /**
+   * An offer attached to the message — currently only "run this as a brief",
+   * shown when neither the parser nor the model could patch the existing plan.
+   * A dead end with a button on it is not a dead end.
+   */
+  action?: { label: string; run: () => void | Promise<void> };
 }
 
 export function DirectorChatPanel({
@@ -83,6 +95,7 @@ export function DirectorChatPanel({
 }) {
   const { project, writeProject, analyzing, saveDirectorBrief, startAnalyze } =
     useEditorReal();
+  const { getIdToken } = useAuth();
   const director = project.director as DirectorState | undefined;
   // Read the timeline off the PROJECT, the same source the pipeline writes back
   // to, so a turn can never be computed against a different array than the one
@@ -108,11 +121,77 @@ export function DirectorChatPanel({
     if (el) el.scrollTop = el.scrollHeight;
   }, [history.length, ephemeral.length, proposal?.createdAt, busy]);
 
-  const say = (role: "user" | "assistant", text: string, tone?: "normal" | "warn") =>
+  const say = (
+    role: "user" | "assistant",
+    text: string,
+    tone?: "normal" | "warn",
+    action?: EphemeralMessage["action"]
+  ) =>
     setEphemeral((prev) => [
       ...prev,
-      { id: `${role}-${prev.length}-${text.slice(0, 12)}`, role, text, tone },
+      { id: `${role}-${prev.length}-${text.slice(0, 12)}`, role, text, tone, action },
     ]);
+
+  /**
+   * Re-direct the whole video, using the message as the brief.
+   *
+   * The same path the very first message takes. It is the honest answer to
+   * "I want something the current plan can't be patched into": the model gets
+   * the sentence and plans from scratch, which is why it can absorb phrasings
+   * no local parser will ever cover.
+   */
+  const redirectWithBrief = async (command: string) => {
+    if (!canAnalyze) {
+      say("assistant", analyzeBlockedReason ?? "This video can't be analyzed yet.", "warn");
+      return;
+    }
+    say(
+      "assistant",
+      mode === "plan"
+        ? "On it — I'll watch the video and come back with a plan to approve before anything changes."
+        : "On it — I'll re-direct the whole video from that. This one takes a few minutes; every change after it is instant."
+    );
+    await saveDirectorBrief(command, {});
+    await startAnalyze({
+      ...DEFAULT_ANALYSIS_OPTIONS,
+      selectedVideoType: project.selectedVideoType ?? "auto",
+      applyDirectorBrief: true,
+      directorPlanOnly: mode === "plan",
+    });
+  };
+
+  /**
+   * Ask the model what the message meant.
+   *
+   * Only reached when the local parser came up empty, so the common commands
+   * stay instant and free. Returns null on ANY failure (offline, no key, a
+   * request that classifies to nothing) — a classification that didn't happen
+   * must never look like a classification that found nothing to do.
+   */
+  const understandRemotely = async (
+    command: string
+  ): Promise<DirectorRevisionIntent[] | null> => {
+    try {
+      const token = await getIdToken();
+      if (!token) return null;
+      const res = await apiFetch("/api/director/understand", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ command }),
+      });
+      if (!res.ok) return null;
+      const body = (await res.json()) as {
+        intents?: DirectorRevisionIntent[];
+        understood?: boolean;
+      };
+      return body.understood && body.intents?.length ? body.intents : null;
+    } catch {
+      return null;
+    }
+  };
 
   const send = async (raw: string) => {
     const command = raw.trim();
@@ -121,7 +200,18 @@ export function DirectorChatPanel({
     say("user", command);
     setBusy(true);
     try {
-      const result = runChatTurn({ project, moments, command, mode });
+      let result: ChatTurnResult = runChatTurn({ project, moments, command, mode });
+
+      // The parser didn't recognise it — that is a reason to ask the model, not
+      // a reason to tell the user to rephrase. Everything the model returns is
+      // applied through the identical pipeline, so understanding more can never
+      // mean doing something a typed command couldn't.
+      if (result.kind === "not-understood") {
+        const intents = await understandRemotely(command);
+        if (intents) {
+          result = runChatTurnWithIntents({ project, moments, command, mode }, intents);
+        }
+      }
 
       switch (result.kind) {
         case "needs-analysis":
@@ -130,26 +220,24 @@ export function DirectorChatPanel({
           // shouldn't have to learn that, or go and find a dialog to type the
           // same sentence into again. Save what they said as the brief and start
           // the run they clearly meant.
-          if (!canAnalyze) {
-            say("assistant", analyzeBlockedReason ?? "This video can't be analyzed yet.", "warn");
-            break;
-          }
-          say(
-            "assistant",
-            mode === "plan"
-              ? "On it — I'll watch the video and come back with a plan to approve before anything changes."
-              : "On it — I'll watch the video and build your first edit. This one takes a few minutes; every change after it is instant."
-          );
-          await saveDirectorBrief(command, {});
-          await startAnalyze({
-            ...DEFAULT_ANALYSIS_OPTIONS,
-            selectedVideoType: project.selectedVideoType ?? "auto",
-            applyDirectorBrief: true,
-            directorPlanOnly: mode === "plan",
-          });
+          await redirectWithBrief(command);
           break;
 
         case "not-understood":
+          // Last resort, and still not a dead end.
+          say(
+            "assistant",
+            result.reply,
+            "warn",
+            result.canRedirect && canAnalyze
+              ? {
+                  label: "Re-direct the video with this",
+                  run: () => redirectWithBrief(command),
+                }
+              : undefined
+          );
+          break;
+
         case "nothing-to-do":
         case "failed":
           say("assistant", result.reply, "warn");
@@ -273,7 +361,13 @@ export function DirectorChatPanel({
           m.role === "user" ? (
             <UserBubble key={m.id} text={m.text} />
           ) : (
-            <AssistantBubble key={m.id} lines={[m.text]} tone={m.tone} />
+            <AssistantBubble
+              key={m.id}
+              lines={[m.text]}
+              tone={m.tone}
+              action={m.action}
+              actionDisabled={busy || analyzing}
+            />
           )
         )}
 
@@ -425,11 +519,16 @@ function AssistantBubble({
   warnings = 0,
   tone = "normal",
   onUndo,
+  action,
+  actionDisabled,
 }: {
   lines: string[];
   warnings?: number;
   tone?: "normal" | "warn";
   onUndo?: () => void;
+  /** An offer the message makes — rendered as the obvious next move. */
+  action?: { label: string; run: () => void | Promise<void> };
+  actionDisabled?: boolean;
 }) {
   if (!lines.length) return null;
   return (
@@ -453,6 +552,20 @@ function AssistantBubble({
           </li>
         ))}
       </ul>
+
+      {action && (
+        <div className="mt-2.5">
+          <Button
+            size="sm"
+            variant="ghost"
+            disabled={actionDisabled}
+            onClick={() => void action.run()}
+            leftIcon={<Sparkles size={13} />}
+          >
+            {action.label}
+          </Button>
+        </div>
+      )}
 
       {(warnings > 0 || onUndo) && (
         <div className="mt-2 flex items-center justify-between gap-2 border-t border-white/[0.06] pt-2">

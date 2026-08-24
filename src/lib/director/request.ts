@@ -67,9 +67,28 @@ function clampTarget(v: number | undefined): number | undefined {
 }
 
 /**
+ * Numbers people write as words.
+ *
+ * "thirty seconds" and "a minute" are exactly as common as "30s" and "1:00" in a
+ * chat box, and reading only the digits meant a perfectly ordinary sentence
+ * parsed to no duration at all. `a`/`an` count as one — "a minute" is a length,
+ * not an article the parser should shrug at.
+ */
+const WORD_NUMBERS: Record<string, number> = {
+  a: 1, an: 1, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7,
+  eight: 8, nine: 9, ten: 10, eleven: 11, twelve: 12, fifteen: 15, twenty: 20,
+  thirty: 30, forty: 40, fourty: 40, fifty: 50, sixty: 60, ninety: 90,
+  "twenty-five": 25, "thirty-five": 35, "forty-five": 45, "fourty-five": 45,
+};
+
+const WORD_NUMBER_ALT = Object.keys(WORD_NUMBERS)
+  .sort((a, b) => b.length - a.length) // "forty-five" must beat "forty"
+  .join("|");
+
+/**
  * Pull a duration out of free text. Handles the forms people actually type:
  * "45-second", "45 seconds", "45s", "make it 30 sec", "1:30", "2 minutes",
- * "a minute and a half", "under 60 seconds".
+ * "a minute and a half", "under 60 seconds", "thirty seconds", "half a minute".
  *
  * Returns undefined when the text names no duration — the caller then falls back
  * to the form control, so silence never means "0 seconds".
@@ -84,7 +103,9 @@ export function parseTargetDuration(text: string): number | undefined {
   }
 
   // "a minute and a half" / "minute and a half"
-  if (/\b(a\s+)?minute\s+and\s+a\s+half\b/.test(s)) return 90;
+  if (/\b(a\s+)?minutes?\s+and\s+a\s+half\b/.test(s)) return 90;
+  // "half a minute" / "half-minute"
+  if (/\bhalf\s*[-\s]?\s*a?\s*minute\b/.test(s)) return 30;
 
   // "90 seconds" / "90-second" / "90s" / "90 sec"
   const secs = s.match(/\b(\d{1,4})\s*[-\s]?\s*(seconds?|secs?|s)\b/);
@@ -93,6 +114,13 @@ export function parseTargetDuration(text: string): number | undefined {
   // "2 minutes" / "2-minute" / "2 min" / "1.5 minutes"
   const mins = s.match(/\b(\d{1,3}(?:\.\d+)?)\s*[-\s]?\s*(minutes?|mins?|m)\b/);
   if (mins) return clampTarget(Number(mins[1]) * 60);
+
+  // "thirty seconds" / "a minute" / "two minutes"
+  const wordSecs = s.match(new RegExp(String.raw`\b(${WORD_NUMBER_ALT})\s*[-\s]?\s*(?:seconds?|secs?)\b`));
+  if (wordSecs) return clampTarget(WORD_NUMBERS[wordSecs[1]]);
+
+  const wordMins = s.match(new RegExp(String.raw`\b(${WORD_NUMBER_ALT})\s*[-\s]?\s*(?:minutes?|mins?)\b`));
+  if (wordMins) return clampTarget(WORD_NUMBERS[wordMins[1]] * 60);
 
   return undefined;
 }

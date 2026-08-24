@@ -25,10 +25,25 @@ import {
   DIRECTOR_SECTION_ORDER,
   type DirectorAspect,
   type DirectorEditOperation,
+  type DirectorEditType,
   type DirectorPlan,
   type DirectorSectionKind,
   type DirectorStyle,
 } from "./types";
+import {
+  findEditTargets,
+  isResetCommand,
+  normalizeCommand,
+  type EditTarget,
+} from "./vocabulary";
+
+/** Edit types `addMoreEdits` can genuinely find new, grounded windows for. */
+const GROWABLE_EDIT_TYPES = ["zoom", "callout", "transition", "text-overlay"] as const;
+type GrowableEditType = (typeof GROWABLE_EDIT_TYPES)[number];
+
+function isGrowable(t: DirectorEditType): t is GrowableEditType {
+  return (GROWABLE_EDIT_TYPES as readonly string[]).includes(t);
+}
 
 /** The structured meaning of a follow-up command. */
 export type DirectorRevisionIntent =
@@ -36,13 +51,22 @@ export type DirectorRevisionIntent =
   | { kind: "set-aspect"; aspect: DirectorAspect }
   | { kind: "set-caption-style"; style: DirectorStyle }
   | { kind: "toggle-captions"; enabled: boolean }
-  | { kind: "adjust-edit-count"; editType: "zoom" | "callout" | "transition" | "text-overlay"; direction: "fewer" | "more" }
+  /**
+   * More / fewer / NONE of an edit type. `none` is the direction the old parser
+   * had no way to express, which is why "remove the zooms" used to be heard as
+   * either "fewer zooms" or nothing at all depending on how it was phrased.
+   * `editType` is the full allowlist, not a hand-picked four — every kind of
+   * edit the Director can make is a kind the user can ask about.
+   */
+  | { kind: "adjust-edit-count"; editType: DirectorEditType; direction: "fewer" | "more" | "none" }
   | { kind: "remove-clip"; index: number }
   | { kind: "remove-section"; section: DirectorSectionKind }
   | { kind: "keep-more"; query: string }
   | { kind: "strengthen-cta"; text?: string }
   | { kind: "remove-cta" }
-  | { kind: "pace-section"; section: DirectorSectionKind | "beginning" | "ending"; direction: "faster" | "slower" };
+  | { kind: "pace-section"; section: DirectorSectionKind | "beginning" | "ending"; direction: "faster" | "slower" }
+  /** "Start over" — strip every Director edit and give the whole recording back. */
+  | { kind: "reset-edits" };
 
 export interface ParsedRevision {
   intents: DirectorRevisionIntent[];
@@ -73,9 +97,26 @@ function sectionFromText(s: string): DirectorSectionKind | undefined {
  * A wrong guess here silently rewrites the user's video.
  */
 export function parseRevisionCommand(command: string): ParsedRevision {
-  const s = (command ?? "").trim().toLowerCase();
+  // Repair typos FIRST. Everything below is a regex over exact spellings, so a
+  // transposed letter used to be indistinguishable from a sentence about
+  // something else entirely — "please reomve the zooms" understood nothing, and
+  // the user was told to rephrase a message that was already perfectly clear.
+  const s = normalizeCommand((command ?? "").trim().toLowerCase());
   const intents: DirectorRevisionIntent[] = [];
   if (!s) return { intents, unrecognized: true };
+
+  // "Start over" / "remove all the edits" — checked before anything else,
+  // because it is a statement about the whole direction rather than about any
+  // part of it, and every other rule would only see fragments of it.
+  if (isResetCommand(s)) {
+    return { intents: [{ kind: "reset-edits" }], unrecognized: false };
+  }
+
+  // Which edit types the message is about, each with its own direction.
+  const targets = findEditTargets(s);
+  /** Targets a more specific rule below has already spoken for. */
+  const claimed = new Set<EditTarget>();
+  const directionOf = (t: EditTarget) => targets.find((x) => x.type === t)?.direction;
 
   // "Make it 30 seconds" / "cut it to a minute"
   const dur = parseTargetDuration(s);
@@ -87,13 +128,21 @@ export function parseRevisionCommand(command: string): ParsedRevision {
   const aspect = parseAspect(s);
   if (aspect && /\b(change|make|switch|convert|turn|to)\b/.test(s)) {
     intents.push({ kind: "set-aspect", aspect });
+    claimed.add("smart-crop");
   }
+  const aspectClaimed = claimed.has("smart-crop");
 
   // "Make the captions more professional"
-  if (/\bcaptions?\b/.test(s)) {
-    if (/\b(no|remove|delete|drop|without|turn\s+off)\b/.test(s)) {
+  if (targets.some((t) => t.type === "captions")) {
+    claimed.add("captions");
+    const dir = directionOf("captions");
+    // Turning captions ON needs an explicit verb. A bare "more" ("make the
+    // captions more professional") is about their LOOK, and enabling captions
+    // the user never asked for would be a change they didn't request riding
+    // along with one they did.
+    if (dir === "none") {
       intents.push({ kind: "toggle-captions", enabled: false });
-    } else if (/\b(add|turn\s+on|enable)\b/.test(s)) {
+    } else if (/\b(add|turn\s+on|enable|include|put\s+in)\b/.test(s)) {
       intents.push({ kind: "toggle-captions", enabled: true });
     }
     const style: DirectorStyle | undefined =
@@ -111,18 +160,18 @@ export function parseRevisionCommand(command: string): ParsedRevision {
     if (style) intents.push({ kind: "set-caption-style", style });
   }
 
-  // "Reduce the number of zooms" / "add more callouts"
-  const fewer = /\b(fewer|less|reduce|reducing|cut\s+down|too\s+many|tone\s+down|remove\s+some)\b/.test(s);
-  const more = /\b(more|add\s+more|increase|too\s+few)\b/.test(s);
-  for (const [re, editType] of [
-    [/\bzooms?\b/, "zoom"],
-    [/\bcallouts?\b/, "callout"],
-    [/\btransitions?\b/, "transition"],
-    [/\b(text\s+overlays?|labels?)\b/, "text-overlay"],
-  ] as const) {
-    if (!re.test(s)) continue;
-    if (fewer) intents.push({ kind: "adjust-edit-count", editType, direction: "fewer" });
-    else if (more) intents.push({ kind: "adjust-edit-count", editType, direction: "more" });
+  // "Reduce the number of zooms" · "add more callouts" · "remove the focus and
+  // the cuts". Every Director edit type, in the user's own words, with the
+  // direction read per mention so one sentence can say two different things.
+  for (const target of targets) {
+    if (claimed.has(target.type) || !target.direction) continue;
+    if (target.type === "branding-cta") continue; // the CTA rule below is richer.
+    intents.push({
+      kind: "adjust-edit-count",
+      editType: target.type,
+      direction: target.direction,
+    });
+    claimed.add(target.type);
   }
 
   // "Remove the third clip"
@@ -156,16 +205,19 @@ export function parseRevisionCommand(command: string): ParsedRevision {
   }
 
   // "Add a stronger CTA" / "remove the CTA"
-  if (/\b(cta|call[- ]to[- ]action|end\s?card)\b/.test(s)) {
-    if (/\b(no|remove|delete|drop|without)\b/.test(s)) {
+  if (targets.some((t) => t.type === "branding-cta")) {
+    const dir = directionOf("branding-cta");
+    if (dir === "none" || dir === "fewer") {
       intents.push({ kind: "remove-cta" });
-    } else if (/\b(add|stronger|better|punchier|improve|change)\b/.test(s)) {
+      claimed.add("branding-cta");
+    } else if (dir === "more" || /\b(stronger|better|punchier|improve|change)\b/.test(s)) {
       // Quoted text becomes the CTA copy verbatim: `add a CTA saying "Book a demo"`.
       const quoted = command.match(/["“']([^"”']{2,60})["”']/);
       intents.push({
         kind: "strengthen-cta",
         ...(quoted ? { text: quoted[1].trim() } : {}),
       });
+      claimed.add("branding-cta");
     }
   }
 
@@ -187,6 +239,19 @@ export function parseRevisionCommand(command: string): ParsedRevision {
       // "make it faster" with no target = shorten the whole thing.
       intents.push({ kind: "pace-section", section: "demo", direction });
     }
+  }
+
+  // A bare answer is still an answer.
+  //
+  // "half a minute" and "square please" name a length and a shape and nothing
+  // else — the verb guards above want "make it…"/"change it to…", which is how
+  // someone writes the FIRST time and not how they write the fifth. Accepting a
+  // bare value only when nothing else in the message parsed keeps the guards
+  // doing their real job (not reading "keep more of the 30-second demo" as a
+  // duration change) while letting a one-word reply work.
+  if (!intents.length) {
+    if (dur !== undefined) intents.push({ kind: "set-target-duration", seconds: dur });
+    else if (aspect && !aspectClaimed) intents.push({ kind: "set-aspect", aspect });
   }
 
   return { intents, unrecognized: intents.length === 0 };
@@ -213,6 +278,130 @@ let revSeq = 0;
 function revOpId(kind: string): string {
   revSeq += 1;
   return `rev${revSeq}-${kind}`;
+}
+
+/**
+ * What each edit type is CALLED when we talk back to the user.
+ *
+ * The internal id leaks otherwise — "Removed all 4 cursor-focuss" is both
+ * ungrammatical and jargon, and the reply is the only place the user ever finds
+ * out what actually happened.
+ */
+const EDIT_TYPE_LABEL: Record<DirectorEditType, string> = {
+  zoom: "zoom",
+  "click-highlight": "click highlight",
+  "cursor-focus": "focus effect",
+  "speed-up": "speed-up",
+  cut: "cut",
+  captions: "caption",
+  "hook-text": "hook",
+  "text-overlay": "text overlay",
+  callout: "callout",
+  transition: "transition",
+  "branding-cta": "CTA",
+  "smart-crop": "reframe",
+};
+
+/** "388" → "6:28". */
+function fmtDuration(seconds: number): string {
+  const s = Math.max(0, Math.round(seconds));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+function mergeWindows(
+  windows: Array<{ start: number; end: number }>
+): Array<{ start: number; end: number }> {
+  const sorted = windows
+    .filter((r) => r.end > r.start)
+    .sort((a, b) => a.start - b.start);
+  const merged: Array<{ start: number; end: number }> = [];
+  for (const r of sorted) {
+    const last = merged[merged.length - 1];
+    if (last && r.start <= last.end + 0.2) last.end = Math.max(last.end, r.end);
+    else merged.push({ ...r });
+  }
+  return merged;
+}
+
+/**
+ * Give removed footage back.
+ *
+ * Both kinds of cut have to be undone together: clip removals live in
+ * `clipOperations`, but silence and filler cuts live in `audioOperations` and
+ * compile to their own `cut` moments. Restoring only one of the two would leave
+ * the video visibly still cut while the reply claimed otherwise.
+ *
+ * `partial` restores the SHORTEST cuts — those are the choppy ones, so "fewer
+ * cuts" removes the most cut POINTS for the least change to the edit, which is
+ * what someone complaining about choppiness means.
+ */
+function restoreCuts(
+  plan: DirectorPlan,
+  ctx: DirectorVideoContext,
+  partial: boolean
+): { plan: DirectorPlan; seconds: number } {
+  const dur = ctx.durationSeconds;
+  const cutWindows = mergeWindows([
+    ...plan.clipOperations.filter((o) => o.kind === "remove"),
+    ...plan.audioOperations.filter((o) => o.kind !== "keep-audio"),
+  ].map((o) => ({ start: o.startTime, end: o.endTime })));
+
+  if (!cutWindows.length) return { plan, seconds: 0 };
+
+  const restoreWindows = partial
+    ? cutWindows
+        .slice()
+        .sort((a, b) => a.end - a.start - (b.end - b.start))
+        .slice(0, Math.max(1, Math.floor(cutWindows.length / 2)))
+    : cutWindows;
+
+  const seconds = restoreWindows.reduce((a, r) => a + (r.end - r.start), 0);
+  const evidence = [
+    { kind: "user-request" as const, detail: "revision: put the cut footage back" },
+  ];
+
+  const keeps = partial
+    ? [
+        ...plan.clipOperations,
+        ...restoreWindows.map((r) => ({
+          id: revOpId("keep"),
+          kind: "keep" as const,
+          startTime: round(Math.max(0, r.start)),
+          endTime: round(Math.min(dur, r.end)),
+          reason: "You asked for fewer cuts.",
+          confidence: 0.9,
+          priority: 0.9,
+          evidence,
+        })),
+      ]
+    : [
+        {
+          id: revOpId("keep"),
+          kind: "keep" as const,
+          startTime: 0,
+          endTime: round(dur),
+          reason: "You asked to remove the cuts.",
+          confidence: 0.95,
+          priority: 1,
+          evidence,
+        },
+      ];
+
+  const next: DirectorPlan = {
+    ...plan,
+    clipOperations: keeps,
+    audioOperations: plan.audioOperations.filter(
+      (o) =>
+        o.kind === "keep-audio" ||
+        !restoreWindows.some((r) => overlaps(o.startTime, o.endTime, r.start, r.end))
+    ),
+  };
+
+  // A restored stretch that the target duration would immediately cut again is
+  // not restored at all, so the constraint goes with it.
+  if (!partial) delete next.targetDurationSeconds;
+
+  return { plan: rebuildRemovals(next, ctx), seconds };
 }
 
 export interface ApplyRevisionResult {
@@ -388,13 +577,84 @@ export function applyRevision(
 
       // ── Edit counts ────────────────────────────────────────────────────
       case "adjust-edit-count": {
+        const editType: DirectorEditType = intent.editType;
+        const label = EDIT_TYPE_LABEL[editType] ?? editType;
+
+        // Three edit types aren't counted edits at all — they're properties of
+        // the whole video — so "no captions" / "no crop" / "no cuts" have to be
+        // routed to the thing that really controls them. Handling them here
+        // rather than making the parser know is what lets the user say any of
+        // it in any phrasing.
+        if (intent.editType === "captions") {
+          const enabled = intent.direction === "more";
+          if (enabled && !ctx.hasTranscript) {
+            noops.push(
+              "Captions need a transcript, and this project doesn't have one yet. Generate one from the Captions panel, then ask again."
+            );
+            break;
+          }
+          next.captionInstructions.enabled = enabled;
+          changes.push(enabled ? "Turned captions on." : "Turned captions off.");
+          break;
+        }
+
+        if (intent.editType === "cut") {
+          // "Remove the cuts" means give the footage back. That is a real,
+          // honest reading of the request, and because it lands as a plain
+          // revision it is undoable like any other message.
+          if (intent.direction === "more") {
+            noops.push(
+              "Ask for a length instead — \"make it 30 seconds\" — and I'll work out where the cuts go."
+            );
+            break;
+          }
+          const restored = restoreCuts(next, ctx, intent.direction === "fewer");
+          if (restored.seconds <= 0.25) {
+            noops.push("Nothing was cut out of this edit, so there was nothing to restore.");
+            break;
+          }
+          next = restored.plan;
+          changes.push(
+            intent.direction === "fewer"
+              ? `Put back ${Math.round(restored.seconds)}s of footage — kept the longest cuts.`
+              : `Removed every cut — the full ${fmtDuration(dur)} recording is back.`
+          );
+          break;
+        }
+
+        if (intent.editType === "smart-crop") {
+          if (intent.direction === "more") {
+            noops.push("Name the shape you want — \"make it vertical\" or \"16:9\".");
+            break;
+          }
+          const before = next.editOperations.length;
+          next.editOperations = next.editOperations.filter((o) => o.editType !== "smart-crop");
+          if (next.editOperations.length === before) {
+            noops.push("The canvas hasn't been reframed, so there's no crop to remove.");
+            break;
+          }
+          delete next.aspectRatio;
+          changes.push("Removed the reframe — back to the original shape.");
+          break;
+        }
+
         const ofType = next.editOperations
           .filter((o) => o.editType === intent.editType)
           .sort((a, b) => a.confidence - b.confidence);
 
-        if (intent.direction === "fewer") {
+        if (intent.direction === "none") {
           if (!ofType.length) {
-            noops.push(`There are no ${intent.editType}s to reduce.`);
+            noops.push(`There were no ${label}s on the timeline to remove.`);
+            break;
+          }
+          const dropIds = new Set(ofType.map((o) => o.id));
+          next.editOperations = next.editOperations.filter((o) => !dropIds.has(o.id));
+          changes.push(
+            `Removed all ${ofType.length} ${label}${ofType.length === 1 ? "" : "s"}.`
+          );
+        } else if (intent.direction === "fewer") {
+          if (!ofType.length) {
+            noops.push(`There are no ${label}s to reduce.`);
             break;
           }
           // Drop the weakest half (at least one) — keeps the strongest emphasis.
@@ -402,18 +662,39 @@ export function applyRevision(
           const dropIds = new Set(ofType.slice(0, drop).map((o) => o.id));
           next.editOperations = next.editOperations.filter((o) => !dropIds.has(o.id));
           changes.push(
-            `Removed ${drop} ${intent.editType}${drop === 1 ? "" : "s"} — kept the strongest ${ofType.length - drop}.`
+            `Removed ${drop} ${label}${drop === 1 ? "" : "s"} — kept the strongest ${ofType.length - drop}.`
           );
-        } else {
-          const added = addMoreEdits(next, ctx, intent.editType);
+        } else if (isGrowable(editType)) {
+          const added = addMoreEdits(next, ctx, editType);
           if (added === 0) {
             noops.push(
-              `No further ${intent.editType} candidates were grounded in the video — adding more would mean inventing them.`
+              `No further ${label} candidates were grounded in the video — adding more would mean inventing them.`
             );
           } else {
-            changes.push(`Added ${added} more ${intent.editType}${added === 1 ? "" : "s"}.`);
+            changes.push(`Added ${added} more ${label}${added === 1 ? "" : "s"}.`);
           }
+        } else {
+          // The honest answer. There is no grounded way to invent a hook line or
+          // a speed-up window on request, and making one up is worse than saying
+          // so — see `addMoreEdits`.
+          noops.push(
+            `I can remove or thin out ${label}s, but I can't add new ones on their own — they come from the plan. Try re-directing with a new brief instead.`
+          );
         }
+        break;
+      }
+
+      // ── Start over ─────────────────────────────────────────────────────
+      case "reset-edits": {
+        const removedEdits = next.editOperations.length;
+        const restored = restoreCuts(next, ctx, false);
+        next = restored.plan;
+        next.editOperations = [];
+        next.captionInstructions.enabled = false;
+        delete next.targetDurationSeconds;
+        changes.push(
+          `Cleared every edit${removedEdits ? ` (${removedEdits} of them)` : ""} — the full ${fmtDuration(dur)} recording is back, untouched.`
+        );
         break;
       }
 

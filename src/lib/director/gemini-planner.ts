@@ -37,6 +37,7 @@ import { parseRevisionCommand, type DirectorRevisionIntent } from "./revision";
 import {
   DIRECTOR_EDIT_TYPES,
   DIRECTOR_SECTION_KINDS,
+  isDirectorEditType,
   type DirectorPlan,
   type DirectorRequest,
 } from "./types";
@@ -431,6 +432,21 @@ export async function planDirector(
 // Revisions
 // ════════════════════════════════════════════════════════════════════════════
 
+const REVISION_INTENT_KINDS = [
+  "set-target-duration",
+  "set-aspect",
+  "set-caption-style",
+  "toggle-captions",
+  "adjust-edit-count",
+  "remove-clip",
+  "remove-section",
+  "keep-more",
+  "strengthen-cta",
+  "remove-cta",
+  "pace-section",
+  "reset-edits",
+] as const;
+
 const REVISION_SCHEMA = {
   type: Type.OBJECT,
   required: ["intents"],
@@ -443,22 +459,7 @@ const REVISION_SCHEMA = {
         type: Type.OBJECT,
         required: ["kind"],
         properties: {
-          kind: {
-            type: Type.STRING,
-            enum: [
-              "set-target-duration",
-              "set-aspect",
-              "set-caption-style",
-              "toggle-captions",
-              "adjust-edit-count",
-              "remove-clip",
-              "remove-section",
-              "keep-more",
-              "strengthen-cta",
-              "remove-cta",
-              "pace-section",
-            ],
-          },
+          kind: { type: Type.STRING, enum: [...REVISION_INTENT_KINDS] },
           seconds: { type: Type.NUMBER },
           aspect: { type: Type.STRING, enum: ["9:16", "1:1", "4:5", "16:9"] },
           style: {
@@ -468,9 +469,13 @@ const REVISION_SCHEMA = {
           enabled: { type: Type.BOOLEAN },
           editType: {
             type: Type.STRING,
-            enum: ["zoom", "callout", "transition", "text-overlay"],
+            enum: [...DIRECTOR_EDIT_TYPES],
+            description: "The kind of edit the user is talking about.",
           },
-          direction: { type: Type.STRING, enum: ["fewer", "more", "faster", "slower"] },
+          direction: {
+            type: Type.STRING,
+            enum: ["none", "fewer", "more", "faster", "slower"],
+          },
           index: { type: Type.NUMBER, description: "1-based clip number." },
           section: {
             type: Type.STRING,
@@ -486,17 +491,26 @@ const REVISION_SCHEMA = {
 
 const REVISION_SYSTEM = `You translate a user's follow-up editing command into structured intents for Framevo's AI Director. You do NOT edit anything — you only classify what they asked for.
 
-Return ONE intent per distinct request. Return an EMPTY array if the command asks for something not in the list — do not force a bad match. A wrong intent silently rewrites the user's video, which is far worse than saying "I didn't understand that".
+The user is typing into a chat box next to their video. They will not phrase things the way this list does. They will use typos, slang, fragments, other languages, and the names they personally use for effects ("the zoomy bits", "those pop-up labels", "the wobble"). Your entire job is to map that onto the list below. Be GENEROUS: if a reasonable editor would know what they meant, classify it.
+
+Return ONE intent per distinct request — "remove the focus and the cuts and the zooms" is THREE intents. Return an EMPTY array only when the command genuinely asks for something not in the list (e.g. "add background music", "reorder the clips", "make it funnier"). A wrong intent silently rewrites the user's video, so do not force a match — but "I can't quite phrase it" is not the same as "they asked for something impossible".
 
 Intent notes:
-- set-target-duration → needs \`seconds\`.
-- set-aspect → needs \`aspect\`.
+- set-target-duration → needs \`seconds\`. Any way of naming a length.
+- set-aspect → needs \`aspect\`. "vertical"/"for TikTok" = 9:16, "square" = 1:1, "widescreen" = 16:9.
 - set-caption-style → needs \`style\`. toggle-captions → needs \`enabled\`.
-- adjust-edit-count → needs \`editType\` + \`direction\` ("fewer" | "more").
+- adjust-edit-count → needs \`editType\` + \`direction\`. This is the workhorse.
+  · \`direction: "none"\` = REMOVE ALL of that edit type ("no zooms", "get rid of the callouts", "lose the text").
+  · \`direction: "fewer"\` = thin them out ("too many zooms", "tone down the transitions").
+  · \`direction: "more"\` = add more.
+  · Valid \`editType\`: ${DIRECTOR_EDIT_TYPES.join(", ")}.
+  · Map the user's word to the type: focus/spotlight → cursor-focus · highlight/click ring → click-highlight · label/title/text → text-overlay · arrow/annotation → callout · fade/crossfade → transition · fast-forward/timelapse → speed-up · reframe/crop → smart-crop · jump cut/silence/pause/trim → cut.
+  · editType "cut" with direction "none" means PUT THE REMOVED FOOTAGE BACK.
 - remove-clip → needs 1-based \`index\`. remove-section → needs \`section\`.
 - keep-more → needs \`query\`: the TOPIC ("pricing", "checkout"), not a time.
 - pace-section → needs \`section\` + \`direction\` ("faster" | "slower").
 - strengthen-cta → \`text\` only if the user actually supplied the copy.
+- reset-edits → "start over", "remove everything", "give me the raw video back".
 
 Output ONLY the JSON schema.`;
 
@@ -576,12 +590,14 @@ function coerceIntent(raw: Record<string, unknown>): DirectorRevisionIntent | nu
       return typeof raw.enabled === "boolean" ? { kind, enabled: raw.enabled } : null;
     case "adjust-edit-count": {
       const ok =
-        ["zoom", "callout", "transition", "text-overlay"].includes(String(raw.editType)) &&
-        ["fewer", "more"].includes(String(raw.direction));
+        isDirectorEditType(raw.editType) &&
+        ["none", "fewer", "more"].includes(String(raw.direction));
       return ok
         ? { kind, editType: raw.editType as never, direction: raw.direction as never }
         : null;
     }
+    case "reset-edits":
+      return { kind };
     case "remove-clip": {
       const index = num(raw.index);
       return index && index >= 1 ? { kind, index: Math.round(index) } : null;

@@ -32,7 +32,11 @@ import type {
 } from "../firebase/schema";
 import { buildDirectorContext } from "./context-builder";
 import { runDirectorPipeline } from "./pipeline";
-import { applyRevision, parseRevisionCommand } from "./revision";
+import {
+  applyRevision,
+  parseRevisionCommand,
+  type DirectorRevisionIntent,
+} from "./revision";
 import { clearProposal, commitRun, proposeRun, undoLastRevision } from "./state";
 import type { DirectorPlan, DirectorState, DirectorSummary } from "./types";
 
@@ -50,13 +54,15 @@ export type ChatMode = "instant" | "plan";
  *
  * Every one of these is a command `parseRevisionCommand` really handles —
  * showing an example that then isn't understood would teach the opposite of
- * what an example is for.
+ * what an example is for. They are examples, not a grammar: the parser also
+ * takes typos, synonyms and several instructions in one sentence, and anything
+ * it still can't place escalates to the model rather than being refused.
  */
 export const CHAT_EXAMPLES = [
   "Make it 30 seconds",
   "Change it to vertical",
-  "Fewer zooms",
-  "Remove the captions",
+  "Remove the zooms and the focus",
+  "Fewer transitions",
   "Make the beginning faster",
   "Stronger call to action",
 ] as const;
@@ -96,8 +102,17 @@ export interface ChatChange {
 export type ChatTurnResult =
   /** No plan yet: this project has never been directed. Run a full analysis. */
   | { kind: "needs-analysis" }
-  /** Nothing in the message was understood. `reply` says so; never a silent no-op. */
-  | { kind: "not-understood"; reply: string }
+  /**
+   * The LOCAL parser couldn't place this message.
+   *
+   * Deliberately not a final answer. The caller is expected to escalate to the
+   * model (`/api/director/understand`) and try again with the intents it
+   * returns; only when that also comes back empty does `reply` get shown, and
+   * even then `canRedirect` says there is still a way forward — the message can
+   * be run as a fresh brief, which is the path that handles arbitrary language
+   * because a model plans it end to end.
+   */
+  | { kind: "not-understood"; reply: string; command: string; canRedirect: boolean }
   /** Understood, but it changed nothing (e.g. "remove the 9th clip" with 4 clips). */
   | { kind: "nothing-to-do"; reply: string; noops: string[] }
   /** Understood and applied. Persist `moments` AND `state`. */
@@ -129,15 +144,55 @@ function pipelineContext(project: ProjectDoc, effects?: EffectsSettings) {
  */
 export function runChatTurn(input: ChatTurnInput): ChatTurnResult {
   const director = input.project.director as DirectorState | undefined;
-  const plan = director?.plan;
-  if (!director || !plan) return { kind: "needs-analysis" };
+  if (!director?.plan) return { kind: "needs-analysis" };
 
   const parsed = parseRevisionCommand(input.command);
   if (parsed.unrecognized || parsed.intents.length === 0) {
     return {
       kind: "not-understood",
-      reply:
-        "I didn't catch a change I can make in that. Try naming the length, the shape, or an edit type — for example “make it 30 seconds”, “change it to vertical”, or “fewer zooms”.",
+      reply: NOT_UNDERSTOOD_REPLY,
+      command: input.command,
+      canRedirect: true,
+    };
+  }
+
+  return runChatTurnWithIntents(input, parsed.intents);
+}
+
+/**
+ * The reply of last resort — shown only after the model has also failed to place
+ * the message.
+ *
+ * It states what it CAN'T do and immediately offers the thing it can, because a
+ * chat that answers a real request with a list of accepted phrasings is teaching
+ * the user to talk like a parser. The re-direct offer is not a consolation
+ * prize: it is the path that genuinely handles any sentence.
+ */
+const NOT_UNDERSTOOD_REPLY =
+  "I couldn't turn that into a change to the current edit. I can re-direct the whole video with that as the brief instead — or tell me about a length, a shape, or an edit type (“make it 30 seconds”, “vertical”, “remove the zooms”) and I'll patch what's there.";
+
+/**
+ * Run a turn from intents that are ALREADY understood.
+ *
+ * Split out from `runChatTurn` so the model escalation path and the local parser
+ * converge here: whichever one read the message, the change is applied by the
+ * same code, validated by the same validator and executed by the same pipeline.
+ * There is no "model revision" that could behave differently from a typed one.
+ */
+export function runChatTurnWithIntents(
+  input: ChatTurnInput,
+  intents: DirectorRevisionIntent[]
+): ChatTurnResult {
+  const director = input.project.director as DirectorState | undefined;
+  const plan = director?.plan;
+  if (!director || !plan) return { kind: "needs-analysis" };
+
+  if (intents.length === 0) {
+    return {
+      kind: "not-understood",
+      reply: NOT_UNDERSTOOD_REPLY,
+      command: input.command,
+      canRedirect: true,
     };
   }
 
@@ -147,7 +202,7 @@ export function runChatTurn(input: ChatTurnInput): ChatTurnResult {
   // approved at another would produce different ids than it showed. Approval
   // recomputes this rather than trusting the stored value.
   const revisionIndex = director.revisions.length;
-  const revised = applyRevision(plan, parsed.intents, ctx, revisionIndex);
+  const revised = applyRevision(plan, intents, ctx, revisionIndex);
 
   if (revised.changes.length === 0) {
     return {
