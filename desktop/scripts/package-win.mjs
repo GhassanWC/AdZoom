@@ -255,4 +255,15 @@ if (existsSync(producedSetup)) {
   renameSync(producedSetup, finalSetup);
 }
 
+// VERIFY before declaring victory. createWindowsInstaller has failure modes
+// that resolve without producing an installer, and this script used to log
+// "installer → …" unconditionally — leaving an empty out/make behind a
+// success-looking build log, which then reads as "the installer is broken"
+// one download attempt later. Missing artifact ⇒ loud non-zero exit, here.
+if (!existsSync(finalSetup)) {
+  console.error(
+    `[package:win] FAILED: the installer build completed without producing ${finalSetup}`
+  );
+  process.exit(1);
+}
 log(`installer → ${finalSetup}`);

@@ -560,6 +560,19 @@ interface EditorRealContextValue {
   /** Set preview volume 0..1 (0 also mutes; a positive value unmutes). */
   setPreviewVolume: (v: number) => void;
 
+  /**
+   * Live handle to the preview's smart-rebuffer hold (RealVideoPlayer writes
+   * it; see useSmartBuffering). While a hold is active the <video> element is
+   * PAUSED by the player — deliberately, until a real buffer builds — but the
+   * user's intent is still "playing", so `togglePlay` must read this to tell
+   * "paused because buffering" (toggle ⇒ genuinely pause) from "paused by the
+   * user" (toggle ⇒ play). Null when no player is mounted.
+   */
+  bufferHoldRef: React.MutableRefObject<{
+    active: boolean;
+    cancel: () => void;
+  } | null>;
+
   // ── Fullscreen (the preview/editor-preview container) ──
   /** Ref the preview attaches to the element that should go fullscreen. */
   previewFullscreenRef: React.RefObject<HTMLDivElement | null>;
@@ -973,10 +986,16 @@ export function EditorRealProvider({
     setCurrentTime(v.currentTime);
   }, [setCurrentTime]);
 
+  // Smart-rebuffer hold handle, written by RealVideoPlayer (useSmartBuffering).
+  // A ref on purpose: it flips with buffering state and nothing should
+  // re-render on it — togglePlay reads it at call time.
+  const bufferHoldRef = React.useRef<{ active: boolean; cancel: () => void } | null>(null);
+
   const togglePlay = React.useCallback(() => {
     const v = videoRef.current;
     if (!v) return;
-    if (v.paused) {
+    const hold = bufferHoldRef.current;
+    if (v.paused && !hold?.active) {
       // Parked at the end (the browser paused on 'ended') → restart from 0 so
       // pressing Play again replays the video instead of doing nothing.
       if (Number.isFinite(v.duration) && v.duration > 0 && v.currentTime >= v.duration - 0.05) {
@@ -987,7 +1006,13 @@ export function EditorRealProvider({
       const p = v.play();
       if (p && typeof p.catch === "function") p.catch(() => {});
     } else {
+      // Playing — or paused by the rebuffer hold, which the UI (correctly)
+      // still presents as playing. Either way the user's intent is "pause":
+      // cancel the hold so it can't auto-resume, and make the paused state
+      // explicit (no `pause` event fires when the element is already paused).
+      hold?.cancel();
       v.pause();
+      setPlaying(false);
     }
   }, [setCurrentTime]);
 
@@ -2826,6 +2851,7 @@ export function EditorRealProvider({
     volume,
     toggleMute,
     setPreviewVolume,
+    bufferHoldRef,
     previewFullscreenRef,
     isFullscreen,
     toggleFullscreen,

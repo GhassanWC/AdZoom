@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Eye, EyeOff, Move3D, RefreshCcw } from "lucide-react";
+import { Eye, EyeOff, Loader2, Move3D, RefreshCcw } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { useActiveMoment, useEditorReal } from "./context";
 import { usePlaybackTime, useSetPlaybackTime } from "./playback-clock";
@@ -23,6 +23,14 @@ import {
   cutSkipTarget,
   DEFAULT_CROP,
 } from "@/lib/timeline/crop-speed";
+import {
+  BG_MIN_HEADROOM_S,
+  bufferedAheadSeconds,
+  canResume,
+  resumeGoalSeconds,
+  shouldForceResume,
+  shouldHold,
+} from "@/lib/timeline/buffer-health";
 import {
   resolveOutputCanvas,
   resolveCanvasDims,
@@ -357,6 +365,170 @@ function useCinematicCamera(
   }, [wrapRef, videoRef]);
 }
 
+/**
+ * Smart rebuffering — the resume strategy the browser doesn't have.
+ *
+ * On the web the preview streams from cloud storage. When the connection can't
+ * keep up, the browser stalls, resumes the moment it has a few frames, and
+ * stalls again — the user sees the video "freeze, continue, freeze" for the
+ * whole session. Every cut-skip is a seek into unbuffered territory, so a
+ * timeline full of cuts stalls at every boundary on top of that.
+ *
+ * This hook does what every streaming player does instead: on an underrun
+ * (`waiting`, or landing cold after a seek) it HOLDS playback — element
+ * paused, spinner up — until a real buffer builds (goal scaled by playback
+ * rate, capped by the time remaining; see buffer-health.ts), then resumes
+ * once. One honest buffering moment instead of a play/stall thrash.
+ *
+ * Contract with the rest of the editor:
+ *  - The hold's pause is INTERNAL. `suppressPauseRef` is raised around it so
+ *    the element wire-up doesn't flip the UI to "paused" — the user's intent
+ *    is still "playing", and the transport must keep showing that.
+ *  - The hold registers itself in `bufferHoldRef` (context) so `togglePlay`
+ *    can tell "paused because buffering" from "paused by the user" and turn a
+ *    click during buffering into a real pause (via `cancel`).
+ *  - While `exporting` the hook is fully disarmed — the exporter owns playback.
+ *
+ * Returns the live "buffering" flag for the spinner overlay.
+ */
+function useSmartBuffering(
+  videoRef: React.RefObject<HTMLVideoElement | null>,
+  bufferHoldRef: React.MutableRefObject<{ active: boolean; cancel: () => void } | null>,
+  suppressPauseRef: React.MutableRefObject<boolean>,
+  exporting: boolean
+): boolean {
+  const [buffering, setBuffering] = React.useState(false);
+
+  React.useEffect(() => {
+    const v = videoRef.current;
+    if (!v || exporting) return;
+
+    let holding = false;
+    let holdStart = 0;
+    let timer = 0;
+    /** The user's intent — survives the hold's own pause() (suppressed below). */
+    let wantPlay = !v.paused;
+
+    const aheadS = () => bufferedAheadSeconds(v.buffered, v.currentTime);
+    const remainingS = () =>
+      Number.isFinite(v.duration) ? Math.max(0, v.duration - v.currentTime) : Infinity;
+
+    const publish = () => {
+      bufferHoldRef.current = { active: holding, cancel };
+    };
+
+    const endHold = (resume: boolean) => {
+      if (timer) {
+        window.clearInterval(timer);
+        timer = 0;
+      }
+      if (!holding) return;
+      holding = false;
+      suppressPauseRef.current = false;
+      setBuffering(false);
+      publish();
+      if (resume) {
+        const p = v.play();
+        if (p && typeof p.catch === "function") p.catch(() => {});
+      }
+    };
+
+    /** User pressed pause while buffering: stop holding and do NOT auto-resume. */
+    function cancel() {
+      wantPlay = false;
+      endHold(false);
+    }
+
+    const check = () => {
+      if (!holding) return;
+      const a = aheadS();
+      const goal = resumeGoalSeconds(v.playbackRate, remainingS());
+      const held = performance.now() - holdStart;
+      if (canResume(a, goal) || shouldForceResume(held, a)) {
+        if (process.env.NODE_ENV !== "production") {
+          console.info("[preview-buffer] resume", {
+            heldMs: Math.round(held),
+            bufferedAheadS: +a.toFixed(2),
+            goalS: +goal.toFixed(2),
+          });
+        }
+        endHold(true);
+      }
+    };
+
+    const beginHold = () => {
+      if (holding || !wantPlay) return;
+      holding = true;
+      holdStart = performance.now();
+      suppressPauseRef.current = true;
+      v.pause();
+      setBuffering(true);
+      publish();
+      // `progress` isn't guaranteed to keep firing; poll as a backstop.
+      timer = window.setInterval(check, 250);
+      if (process.env.NODE_ENV !== "production") {
+        console.info("[preview-buffer] hold", {
+          t: +v.currentTime.toFixed(2),
+          bufferedAheadS: +aheadS().toFixed(2),
+        });
+      }
+    };
+
+    const onWaiting = () => {
+      // Only a genuine underrun starts a hold — a transient `waiting` fired
+      // while plenty is buffered (some seeks do this) resolves on its own.
+      if (wantPlay && shouldHold(aheadS(), remainingS())) beginHold();
+    };
+    const onSeeked = () => {
+      // Landed somewhere new. With a healthy buffer, a running hold can end
+      // right now (scrubbed back into buffered data); on a cold position a
+      // hold starts BEFORE the browser plays three frames and stalls.
+      if (holding) check();
+      else onWaiting();
+    };
+    const onPlay = () => {
+      wantPlay = true;
+    };
+    const onPause = () => {
+      if (!suppressPauseRef.current) wantPlay = false;
+    };
+    const onEnded = () => {
+      wantPlay = false;
+      endHold(false);
+    };
+    const onProgress = () => {
+      if (holding) check();
+    };
+    const onError = () => {
+      // The load-error overlay takes over; a spinner on top of it would lie.
+      wantPlay = false;
+      endHold(false);
+    };
+
+    v.addEventListener("waiting", onWaiting);
+    v.addEventListener("seeked", onSeeked);
+    v.addEventListener("play", onPlay);
+    v.addEventListener("pause", onPause);
+    v.addEventListener("ended", onEnded);
+    v.addEventListener("progress", onProgress);
+    v.addEventListener("error", onError);
+    publish();
+    return () => {
+      v.removeEventListener("waiting", onWaiting);
+      v.removeEventListener("seeked", onSeeked);
+      v.removeEventListener("play", onPlay);
+      v.removeEventListener("pause", onPause);
+      v.removeEventListener("ended", onEnded);
+      v.removeEventListener("progress", onProgress);
+      v.removeEventListener("error", onError);
+      endHold(false);
+      bufferHoldRef.current = null;
+    };
+  }, [videoRef, bufferHoldRef, suppressPauseRef, exporting]);
+
+  return buffering;
+}
+
 export function RealVideoPlayer({
   fill = false,
 }: {
@@ -396,6 +568,7 @@ export function RealVideoPlayer({
     volume,
     isFullscreen,
     previewFullscreenRef,
+    bufferHoldRef,
   } = useEditorReal();
   // This component OWNS the <video>, so it publishes the clock — but it
   // deliberately does not subscribe to it. Nothing in the player's own render
@@ -403,6 +576,11 @@ export function RealVideoPlayer({
   // a rAF loop, and the two debug overlays below subscribe for themselves), so
   // a 1700-line component now re-renders zero times per second during playback.
   const setCurrentTime = useSetPlaybackTime();
+
+  // True while the smart-rebuffer hold is pausing the element ON PURPOSE —
+  // read by the element wire-up below so that pause doesn't flip the
+  // transport UI to "paused". Written only by useSmartBuffering.
+  const suppressPauseRef = React.useRef(false);
 
   // Dev-only CV debug overlay gate (?debug=1 / Ctrl+Shift+D).
   const cvDebugOverlay = useDebugParam();
@@ -463,7 +641,11 @@ export function RealVideoPlayer({
       }
     };
     const onPlay = () => setPlaying(true);
-    const onPause = () => setPlaying(false);
+    // Raised by the smart-rebuffer hold around ITS pause(): the user's intent
+    // is still "playing", so the transport UI must not flip to paused.
+    const onPause = () => {
+      if (!suppressPauseRef.current) setPlaying(false);
+    };
     // A real load failure (bad/expired URL, network, or a CORS-tainted
     // cross-origin request) — surface it instead of a silent black frame.
     const onError = () => setLoadError(true);
@@ -518,6 +700,17 @@ export function RealVideoPlayer({
       /* ignore — the error handler re-fires if it fails again */
     }
   }, [videoRef]);
+
+  // Smart rebuffering — hold playback through underruns until a real buffer
+  // builds instead of letting the browser thrash play/stall/play. Registers
+  // its hold in `bufferHoldRef` (context) for togglePlay; `suppressPauseRef`
+  // keeps its internal pause() from flipping the transport UI to "paused".
+  const buffering = useSmartBuffering(
+    videoRef,
+    bufferHoldRef,
+    suppressPauseRef,
+    exporting
+  );
 
   // Cinematic camera — the rAF loop recomputes the target each frame
   // from the live playhead by calling the SAME shared resolver the
@@ -870,25 +1063,40 @@ export function RealVideoPlayer({
       const main = videoRef.current;
       const bg = bgVideoRef.current;
       if (main && bg) {
-        // Play state is visible, so it tracks every frame.
-        if (main.paused && !bg.paused) bg.pause();
-        else if (!main.paused && bg.paused) void bg.play().catch(() => {});
+        // Bandwidth triage: this layer is a SECOND network stream of the same
+        // file, and on the web the main stream can barely keep up on its own.
+        // While the rebuffer hold is active, or the main buffer is thin, the
+        // backdrop is starved outright — paused, no seeks, nothing competing
+        // with the player. It freezes on its last decoded frame, which at
+        // 40px of blur in the letterbox margins is not something anyone sees.
+        const starved =
+          bufferHoldRef.current?.active === true ||
+          (!main.paused &&
+            bufferedAheadSeconds(main.buffered, main.currentTime) <
+              BG_MIN_HEADROOM_S);
+        if (starved) {
+          if (!bg.paused) bg.pause();
+        } else {
+          // Play state is visible, so it tracks every frame.
+          if (main.paused && !bg.paused) bg.pause();
+          else if (!main.paused && bg.paused) void bg.play().catch(() => {});
 
-        const now = performance.now();
-        if (
-          !bg.seeking &&
-          now - lastCorrection > CORRECTION_INTERVAL_MS &&
-          Math.abs(bg.currentTime - main.currentTime) > DRIFT_TOLERANCE_S
-        ) {
-          lastCorrection = now;
-          bg.currentTime = main.currentTime;
+          const now = performance.now();
+          if (
+            !bg.seeking &&
+            now - lastCorrection > CORRECTION_INTERVAL_MS &&
+            Math.abs(bg.currentTime - main.currentTime) > DRIFT_TOLERANCE_S
+          ) {
+            lastCorrection = now;
+            bg.currentTime = main.currentTime;
+          }
         }
       }
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [blurBgActive, exporting, videoRef]);
+  }, [blurBgActive, exporting, videoRef, bufferHoldRef]);
 
   return (
     <div
@@ -1098,6 +1306,19 @@ export function RealVideoPlayer({
           moments={allMoments}
           enabled={previewMode && !cropEditing}
         />
+
+        {/* Buffering indicator — up while the smart-rebuffer hold builds a
+            real buffer (see useSmartBuffering). Fades in after a beat so a
+            sub-200ms hold never flashes; non-interactive so the transport
+            stays clickable. Hidden behind the load-error overlay's concern:
+            a hard error cancels the hold, so the two never stack. */}
+        {buffering && !loadError && (
+          <div className="pointer-events-none absolute inset-0 z-30 grid place-items-center">
+            <div className="rounded-full border border-white/15 bg-black/50 p-3 opacity-0 shadow-cinematic backdrop-blur-md [animation:fv-fade-only_180ms_ease-out_200ms_forwards]">
+              <Loader2 size={18} className="animate-spin text-white/90" />
+            </div>
+          </div>
+        )}
 
         {/* Manual reposition surface — drag the whole video inside the canvas.
             Only in Manual fit mode; above the video, below the controls. */}
