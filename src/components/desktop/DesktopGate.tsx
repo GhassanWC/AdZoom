@@ -31,7 +31,8 @@ import {
 import { Button } from "@/components/ui/Button";
 import { logFramevoEvent } from "@/lib/firebase/analytics";
 import { EVENTS } from "@/lib/analytics/events";
-import { PLATFORM_LABEL, formatBytes } from "@/lib/desktop/release";
+import { PLATFORM_LABEL, formatBytes, gateReady } from "@/lib/desktop/release";
+import { CURRENT_RELEASE } from "@/lib/desktop/current-release";
 import {
   evaluateGate,
   gateDisabledByEnv,
@@ -132,8 +133,17 @@ export function DesktopGate() {
   const pathname = usePathname() ?? "";
   const router = useRouter();
   const platform = useDetectedPlatform();
-  const { available, version } = useDesktopAvailability(platform);
+  const { version, asset } = useDesktopAvailability(platform);
   const dialogRef = React.useRef<HTMLDivElement | null>(null);
+
+  // The gate arms only when EVERY supported platform ships an installer
+  // (`gateReady`) — a Windows-only release keeps downloads live but must not
+  // block macOS users from web editing with nothing to offer them. On top of
+  // that, THIS machine must have an installer (`asset`) unless it's a phone,
+  // where the mobile notice — which offers no download — is the designed
+  // outcome. A Linux desktop therefore keeps web editing even after both
+  // installers ship: blocking it would be a dead end too.
+  const armed = gateReady(CURRENT_RELEASE) && (platform.isMobile || asset !== null);
 
   // No "wait until detected" flag: `useDetectedPlatform` is a
   // useSyncExternalStore, so the server renders the neutral snapshot (os
@@ -146,9 +156,9 @@ export function DesktopGate() {
         isDesktopApp: platform.isDesktopApp,
         isMobile: platform.isMobile,
         disabled: gateDisabledByEnv(),
-        released: available,
+        released: armed,
       }),
-    [pathname, platform.isDesktopApp, platform.isMobile, available]
+    [pathname, platform.isDesktopApp, platform.isMobile, armed]
   );
 
   React.useEffect(() => {

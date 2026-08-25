@@ -162,8 +162,10 @@ function manifestSource({ assets, notes, updateFeedUrl }) {
  *
  * \`status\` is the one field a human changes, and only by re-running with
  * \`--publish\` once the packaged app has passed end-to-end verification.
- * Publishing turns on the public download AND the website's desktop gate in the
- * same edit — see src/lib/desktop/release.ts for why those are coupled.
+ * Publishing turns on the public download for every platform listed in
+ * \`assets\`. The desktop-first gate additionally waits until EVERY supported
+ * platform ships an installer (see \`gateReady\` in release.ts), so a
+ * Windows-only publish serves downloads without blocking web editing anywhere.
  */
 import type { DesktopRelease } from "./release";
 
@@ -224,7 +226,7 @@ async function main() {
   }
   log(
     publish
-      ? "status = PUBLISHED — the website will serve this build and the desktop gate goes live."
+      ? "status = PUBLISHED — the website will serve this build. (The desktop-first gate arms only once EVERY supported platform ships an installer — see gateReady in release.ts.)"
       : "status = draft — the website is unchanged until you re-run with --publish."
   );
 }

@@ -9,17 +9,19 @@
  * export, and someone on a phone must still be able to cancel their plan.
  *
  * ── When the gate is live ──────────────────────────────────────────────────
- * Only when an installer has actually been published. A gate that pushes people
- * toward a download that doesn't exist yet strands every user on the website
- * with no way forward, so `status: "draft"` in the release manifest keeps the
- * website behaving exactly as it does today. Publishing turns both on at once.
+ * Only when an installer exists for EVERY supported platform AND for the
+ * visitor's own machine (see `gateReady` in release.ts and the `armed` check in
+ * DesktopGate). A gate that pushes people toward a download that doesn't exist
+ * for their OS strands them with no way forward — so a draft release keeps the
+ * website unchanged, and a Windows-only publish turns downloads on while the
+ * gate stays off until the macOS build ships.
  *
  * Pure functions, no React — the rules are the kind of thing that should be
  * readable and testable without mounting anything.
  */
 
 import { CURRENT_RELEASE } from "./current-release";
-import { isPublished } from "./release";
+import { gateReady } from "./release";
 
 /**
  * Routes that CREATE or CHANGE a video. These are what the app is for.
@@ -98,7 +100,10 @@ export type GateDecision =
  * Windows" button they cannot use.
  */
 export function evaluateGate(pathname: string, ctx: GateContext): GateDecision {
-  const released = ctx.released ?? isPublished(CURRENT_RELEASE);
+  // The safe default is gateReady (every supported platform ships), NOT
+  // isPublished: a caller that forgets to pass `released` must not start
+  // blocking web editing on the strength of a Windows-only release.
+  const released = ctx.released ?? gateReady(CURRENT_RELEASE);
   if (!released) return { kind: "allow" };
   if (ctx.disabled) return { kind: "allow" };
   if (ctx.isDesktopApp) return { kind: "allow" };

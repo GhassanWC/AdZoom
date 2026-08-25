@@ -38,6 +38,7 @@ import {
   assetsFor,
   formatBytes,
   PLATFORM_LABEL,
+  SUPPORTED_PLATFORMS,
   type ReleaseAsset,
   type ReleasePlatform,
 } from "@/lib/desktop/release";
@@ -93,6 +94,7 @@ export function DownloadPanel({ reason }: { reason?: string }) {
             asset={asset}
             detecting={detecting}
             platformLabel={platform.label}
+            downloadPlatform={platform.downloadPlatform}
             version={version}
           />
           <OtherPlatforms primary={platform.downloadPlatform} other={otherPlatform} />
@@ -108,11 +110,13 @@ function PrimaryDownload({
   asset,
   detecting,
   platformLabel,
+  downloadPlatform,
   version,
 }: {
   asset: ReleaseAsset | null;
   detecting: boolean;
   platformLabel: string;
+  downloadPlatform: ReleasePlatform | null;
   version: string;
 }) {
   if (detecting) {
@@ -125,18 +129,31 @@ function PrimaryDownload({
   }
 
   if (!asset) {
-    // A desktop OS we don't ship for (Linux, ChromeOS) — name it rather than
-    // silently offering the Windows build.
+    // Two honest variants of "nothing for this machine":
+    //   • a SUPPORTED platform whose build hasn't shipped yet (macOS while the
+    //     release is Windows-only) — say it's on the way, don't imply it exists;
+    //   • a desktop OS we don't ship for (Linux, ChromeOS) — name it rather
+    //     than silently offering the Windows build.
+    // Either way, list only the platforms that actually have an installer.
+    const shipped = SUPPORTED_PLATFORMS.filter(
+      (p) => assetsFor(CURRENT_RELEASE, p).length > 0
+    );
+    const comingSoon = !!downloadPlatform && !shipped.includes(downloadPlatform);
+    const shippedLabels = shipped.map((p) => PLATFORM_LABEL[p]).join(" and ");
     return (
       <div className="rounded-2xl border border-white/[0.08] bg-white/[0.02] p-6 text-center">
         <Laptop size={22} className="mx-auto text-fog" />
         <h2 className="mt-3 text-[15px] font-semibold text-white">
-          No installer for {platformLabel} yet
+          {comingSoon
+            ? `The ${PLATFORM_LABEL[downloadPlatform]} app is on its way`
+            : `No installer for ${platformLabel} yet`}
         </h2>
         <p className="mx-auto mt-2 max-w-md text-[13.5px] leading-relaxed text-fog">
-          Framevo Desktop ships for Windows and macOS today. You can keep using
-          the web app for your account, billing, project history and downloading
-          finished exports.
+          {shipped.length > 0
+            ? `Framevo Desktop is available for ${shippedLabels} today.`
+            : "Framevo Desktop ships for Windows and macOS."}{" "}
+          You can keep using the web app for everything in the meantime —
+          editing included.
         </p>
         <div className="mt-4 flex flex-wrap justify-center gap-2">
           <PlatformLink platform="windows" placement="unsupported-os" />

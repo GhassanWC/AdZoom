@@ -7,16 +7,18 @@
  *
  * `status` is the one field a human changes, and only by re-running with
  * `--publish` once the packaged app has passed end-to-end verification.
- * Publishing turns on the public download AND the website's desktop gate in the
- * same edit — see src/lib/desktop/release.ts for why those are coupled.
+ * Publishing turns on the public download for every platform listed in
+ * `assets`. The desktop-first gate additionally waits until EVERY supported
+ * platform ships an installer (see `gateReady` in release.ts), so a
+ * Windows-only publish serves downloads without blocking web editing anywhere.
  */
 import type { DesktopRelease } from "./release";
 
 export const CURRENT_RELEASE: DesktopRelease = {
   "version": "0.1.0",
   "channel": "stable",
-  "status": "draft",
-  "releasedAt": "2026-07-30",
+  "status": "published",
+  "releasedAt": "2026-08-25",
   "notes": [
     "First public build of the Framevo desktop app.",
     "Local-first editing: projects, media and the timeline live on your machine.",
@@ -28,11 +30,12 @@ export const CURRENT_RELEASE: DesktopRelease = {
     {
       "platform": "windows",
       "arch": "x64",
-      "url": "REPLACE_ME/0.1.0/Framevo-Setup.exe",
+      "url": "https://storage.googleapis.com/adzoom-prod.firebasestorage.app/desktop/releases/0.1.0/Framevo-Setup.exe",
       "filename": "Framevo-Setup.exe",
-      "sizeBytes": 205083648,
-      "sha256": "1fe9e69f7c46d58da58cc6adc2271e5efa7cf526c49a6b94f90001900a9b4cca",
+      "sizeBytes": 205113344,
+      "sha256": "6e076dc970628e6662b7e88d6dc782205d97c8328f5dec9fe417e57cd778cd86",
       "minimumOs": "Windows 10 (64-bit) or later"
     }
-  ]
+  ],
+  "updateFeedUrl": "https://storage.googleapis.com/adzoom-prod.firebasestorage.app/desktop/releases/stable"
 };

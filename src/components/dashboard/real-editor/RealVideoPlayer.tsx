@@ -24,13 +24,14 @@ import {
   DEFAULT_CROP,
 } from "@/lib/timeline/crop-speed";
 import {
-  BG_MIN_HEADROOM_S,
   bufferedAheadSeconds,
   canResume,
+  previewNeedsBandwidth,
   resumeGoalSeconds,
   shouldForceResume,
   shouldHold,
 } from "@/lib/timeline/buffer-health";
+import { setThumbnailPriorityGate } from "./timeline/thumbnails";
 import {
   resolveOutputCanvas,
   resolveCanvasDims,
@@ -712,6 +713,24 @@ export function RealVideoPlayer({
     exporting
   );
 
+  // While the preview is fighting for bandwidth, the timeline-thumbnail
+  // extractor must not spend it (same rule the blur background follows —
+  // previewNeedsBandwidth). Registered here because this component owns the
+  // element whose buffer the rule reads.
+  React.useEffect(() => {
+    setThumbnailPriorityGate(() => {
+      const v = videoRef.current;
+      if (!v) return false;
+      return previewNeedsBandwidth({
+        paused: v.paused,
+        ended: v.ended,
+        holding: bufferHoldRef.current?.active === true,
+        aheadS: bufferedAheadSeconds(v.buffered, v.currentTime),
+      });
+    });
+    return () => setThumbnailPriorityGate(null);
+  }, [videoRef, bufferHoldRef]);
+
   // Cinematic camera — the rAF loop recomputes the target each frame
   // from the live playhead by calling the SAME shared resolver the
   // exporter uses. Passing the full moments array (not just
@@ -1065,15 +1084,17 @@ export function RealVideoPlayer({
       if (main && bg) {
         // Bandwidth triage: this layer is a SECOND network stream of the same
         // file, and on the web the main stream can barely keep up on its own.
-        // While the rebuffer hold is active, or the main buffer is thin, the
-        // backdrop is starved outright — paused, no seeks, nothing competing
-        // with the player. It freezes on its last decoded frame, which at
-        // 40px of blur in the letterbox margins is not something anyone sees.
-        const starved =
-          bufferHoldRef.current?.active === true ||
-          (!main.paused &&
-            bufferedAheadSeconds(main.buffered, main.currentTime) <
-              BG_MIN_HEADROOM_S);
+        // While the preview needs the connection (rebuffer hold, or playing on
+        // a thin buffer — the same shared rule the thumbnail extractor obeys),
+        // the backdrop is starved outright — paused, no seeks, nothing
+        // competing with the player. It freezes on its last decoded frame,
+        // which at 40px of blur in the letterbox margins nobody can see.
+        const starved = previewNeedsBandwidth({
+          paused: main.paused,
+          ended: main.ended,
+          holding: bufferHoldRef.current?.active === true,
+          aheadS: bufferedAheadSeconds(main.buffered, main.currentTime),
+        });
         if (starved) {
           if (!bg.paused) bg.pause();
         } else {

@@ -128,3 +128,23 @@ export function canResume(aheadS: number, goalS: number): boolean {
 export function shouldForceResume(heldMs: number, aheadS: number): boolean {
   return heldMs >= HOLD_MAX_MS && aheadS >= FORCE_RESUME_MIN_S;
 }
+
+/**
+ * ONE rule for "the preview needs the connection to itself right now" —
+ * consulted by every secondary consumer of the same source URL (the blur
+ * Canvas-Fit background's second decoder, the timeline-thumbnail extractor)
+ * before it costs the player a range request. During a rebuffer hold, or while
+ * playing on a thin buffer, those consumers wait; once the runway is healthy
+ * (or playback is paused — no deadline), they proceed. On a local/desktop
+ * source the buffer is effectively the whole file, so this never throttles.
+ */
+export function previewNeedsBandwidth(opts: {
+  paused: boolean;
+  ended: boolean;
+  holding: boolean;
+  aheadS: number;
+}): boolean {
+  if (opts.holding) return true;
+  if (opts.paused || opts.ended) return false;
+  return opts.aheadS < BG_MIN_HEADROOM_S;
+}

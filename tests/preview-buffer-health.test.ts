@@ -22,11 +22,13 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  BG_MIN_HEADROOM_S,
   bufferedAheadSeconds,
   canResume,
   FORCE_RESUME_MIN_S,
   HOLD_LOW_WATER_S,
   HOLD_MAX_MS,
+  previewNeedsBandwidth,
   REBUFFER_GOAL_S,
   resumeGoalSeconds,
   shouldForceResume,
@@ -129,4 +131,48 @@ test("force-resume: never before the deadline, never with an empty buffer", () =
   assert.equal(shouldForceResume(HOLD_MAX_MS - 1, 10), false);
   // A dead connection keeps the (honest) spinner rather than playing 0 frames.
   assert.equal(shouldForceResume(HOLD_MAX_MS * 2, 0), false);
+});
+
+// ── previewNeedsBandwidth — the shared starve rule ──────────────────────────
+// One predicate governs every secondary consumer of the preview's source URL
+// (blur background, thumbnail extractor): they wait exactly when the player
+// itself is short on runway.
+
+test("bandwidth: a rebuffer hold claims the connection outright", () => {
+  assert.equal(
+    previewNeedsBandwidth({ paused: false, ended: false, holding: true, aheadS: 100 }),
+    true
+  );
+});
+
+test("bandwidth: playing on a thin buffer claims it; a healthy one shares it", () => {
+  assert.equal(
+    previewNeedsBandwidth({
+      paused: false,
+      ended: false,
+      holding: false,
+      aheadS: BG_MIN_HEADROOM_S - 0.5,
+    }),
+    true
+  );
+  assert.equal(
+    previewNeedsBandwidth({
+      paused: false,
+      ended: false,
+      holding: false,
+      aheadS: BG_MIN_HEADROOM_S + 1,
+    }),
+    false
+  );
+});
+
+test("bandwidth: paused or ended playback has no deadline — everyone may fetch", () => {
+  assert.equal(
+    previewNeedsBandwidth({ paused: true, ended: false, holding: false, aheadS: 0 }),
+    false
+  );
+  assert.equal(
+    previewNeedsBandwidth({ paused: false, ended: true, holding: false, aheadS: 0 }),
+    false
+  );
 });

@@ -15,11 +15,11 @@
  *   • the download page shows a "not yet available" state instead of a button,
  *   • and the desktop gate does NOT block web editing.
  *
- * That last one is the important coupling: a gate that pushes people to an
- * installer that does not exist yet would strand every user on the website with
- * no way forward. Publishing is therefore a single edit — `status: "published"`
- * — that turns the download on and the gate on together, and reverting it rolls
- * both back.
+ * Publishing turns the download on for every platform that has an asset. The
+ * GATE is stricter: it additionally waits for every supported platform to ship
+ * (see {@link gateReady}) — a Windows-only publish serves Windows downloads
+ * while macOS users keep editing on the web, and the gate arms in the same
+ * deploy that adds the macOS asset. Reverting to draft rolls everything back.
  */
 
 export type ReleaseStatus = "draft" | "published";
@@ -86,6 +86,25 @@ export function isPublished(release: DesktopRelease): boolean {
   if (release.status !== "published") return false;
   if (release.assets.length === 0) return false;
   return release.assets.every((a) => a.url.startsWith("https://") && a.sha256.length === 64);
+}
+
+/**
+ * True when the desktop-first GATE may engage: published AND every supported
+ * platform ships an installer.
+ *
+ * The download page and endpoints go live per-platform the moment
+ * {@link isPublished} — a Windows-only release serves Windows and tells macOS
+ * "coming soon", which strands nobody. The gate is different: it pushes people
+ * OFF the web editor, so arming it while any supported platform has no
+ * installer would block those users from editing with nothing to offer them.
+ * Windows-only publish ⇒ downloads on, gate off; the gate arms automatically
+ * in the same deploy that adds the missing platform's asset.
+ */
+export function gateReady(release: DesktopRelease): boolean {
+  if (!isPublished(release)) return false;
+  return SUPPORTED_PLATFORMS.every((platform) =>
+    release.assets.some((a) => a.platform === platform)
+  );
 }
 
 /**

@@ -55,6 +55,31 @@ const inflight = new Map<string, Promise<string | null>>();
 /** Tail of the per-URL seek queue — see `acquire`. */
 const queues = new Map<string, Promise<void>>();
 
+/**
+ * Preview-priority gate, registered by the player (RealVideoPlayer).
+ *
+ * A screenful of pills mounting when the editor opens turns into dozens of
+ * range requests against the SAME url the preview is trying to buffer — on a
+ * thin connection the two starve each other, and the loser the user notices is
+ * always the preview. When the registered predicate says the preview needs the
+ * bandwidth (rebuffering, or playing on a thin buffer — see
+ * `previewNeedsBandwidth` in buffer-health.ts), captures WAIT; thumbnails are
+ * a nicety with no deadline, and they resume the moment playback pauses or
+ * the buffer is healthy. No player mounted (or a local source) ⇒ no gate.
+ */
+let previewBusy: (() => boolean) | null = null;
+const PRIORITY_POLL_MS = 500;
+
+export function setThumbnailPriorityGate(busy: (() => boolean) | null): void {
+  previewBusy = busy;
+}
+
+async function awaitPreviewIdle(): Promise<void> {
+  while (previewBusy && previewBusy()) {
+    await new Promise((resolve) => setTimeout(resolve, PRIORITY_POLL_MS));
+  }
+}
+
 function ensureSlot(url: string, crop?: SourceCrop): VideoSlot {
   const existing = slots.get(url);
   if (existing) return existing;
@@ -163,6 +188,11 @@ export async function captureFrame(
       // request competing with the preview player.
       const release = await acquire(url);
       try {
+        // Yield to the preview player before spending its bandwidth — holding
+        // the per-URL lock while waiting is deliberate, since every queued
+        // capture behind this one would only have to wait the same way.
+        await awaitPreviewIdle();
+
         await new Promise<void>((resolve, reject) => {
           const onSeeked = () => {
             slot.video.removeEventListener("seeked", onSeeked);

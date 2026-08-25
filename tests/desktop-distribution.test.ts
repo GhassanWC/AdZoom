@@ -23,7 +23,9 @@ import {
   assetsFor,
   compareVersions,
   formatBytes,
+  gateReady,
   isPublished,
+  SUPPORTED_PLATFORMS,
   type DesktopRelease,
   type ReleaseAsset,
 } from "../src/lib/desktop/release.ts";
@@ -233,13 +235,54 @@ test("a release fails closed unless the flag AND the data are both ready", () =>
   assert.equal(isPublished(release()), true);
 });
 
-test("the release that ships today is a draft — production is not replaced until it passes", () => {
-  // This is the interlock the brief asked for, asserted rather than trusted:
-  // flipping it is a deliberate act, and this test is where someone notices.
+// ── gateReady: downloads may ship one platform at a time; the GATE may not ──
+
+test("the gate is not ready until EVERY supported platform ships", () => {
+  // Windows-only release: downloads live, gate off — macOS users must keep
+  // web editing rather than being blocked with nothing to install.
+  assert.equal(gateReady(release()), false);
+  // Draft never arms the gate, however many assets it lists.
   assert.equal(
-    isPublished(CURRENT_RELEASE),
-    false,
-    "CURRENT_RELEASE went live — was the packaged app verified end to end first?"
+    gateReady(
+      release({
+        status: "draft",
+        assets: [asset(), asset({ platform: "macos", arch: "universal", filename: "Framevo.dmg" })],
+      })
+    ),
+    false
+  );
+  // Both platforms shipped and published — now the gate may engage.
+  assert.equal(
+    gateReady(
+      release({
+        assets: [asset(), asset({ platform: "macos", arch: "universal", filename: "Framevo.dmg" })],
+      })
+    ),
+    true
+  );
+});
+
+test("the live manifest is coherent — and never arms the gate one-sided", () => {
+  // The old form of this test pinned CURRENT_RELEASE to draft outright. The
+  // Windows build has since been packaged, boot-tested and uploaded, so the
+  // interlocks this asserts are the surviving ones:
+  //   • if the manifest claims "published" its data must actually validate
+  //     (real https URLs, full digests) — a half-generated publish fails closed;
+  //   • the desktop-first gate must never arm while any supported platform has
+  //     no installer, whatever the status flag says.
+  if (CURRENT_RELEASE.status === "published") {
+    assert.equal(
+      isPublished(CURRENT_RELEASE),
+      true,
+      "CURRENT_RELEASE claims published but its assets don't validate — regenerate it"
+    );
+  }
+  const platforms = new Set(CURRENT_RELEASE.assets.map((a) => a.platform));
+  const allShipped = SUPPORTED_PLATFORMS.every((p) => platforms.has(p));
+  assert.equal(
+    gateReady(CURRENT_RELEASE),
+    isPublished(CURRENT_RELEASE) && allShipped,
+    "the gate must arm exactly when published AND every supported platform ships"
   );
 });
 
