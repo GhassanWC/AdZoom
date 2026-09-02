@@ -1,0 +1,55 @@
+{
+  "id": "hy-01-intro-then-demo",
+  "kind": "hybrid",
+  "tier": "replay",
+  "title": "Camera intro, screen demo, camera outro",
+  "description": "210s modern creator shape: talking-head intro (0-55s), screen demo with real inferred clicks (55-165s), talking-head outro (165-210s). Phase 3's modality segmentation will vary policy by section; today this documents the whole-video compromise.",
+  "durationSeconds": 210,
+  "selectedVideoType": "auto",
+  "signals": {
+    "hasTranscript": true,
+    "hasAudioAnalysis": true,
+    "hasUsableSpeech": true,
+    "silenceSegmentCount": 3,
+    "hasSceneData": true,
+    "hasVisualMoments": true,
+    "hasInteractionData": true,
+    "isScreenRecording": false,
+    "durationSeconds": 210
+  },
+  "context": {
+    "pacing": "moderate",
+    "videoType": "mixed",
+    "clickTimes": [68, 97, 126, 150],
+    "sceneChanges": [55.3, 164.8],
+    "silenceSegments": [
+      { "startTime": 40, "endTime": 44 },
+      { "startTime": 110, "endTime": 114 },
+      { "startTime": 196, "endTime": 201 }
+    ],
+    "boringSections": [{ "startTime": 110, "endTime": 116 }],
+    "attention": {
+      "baseline": 0.15,
+      "amp": 0.65,
+      "bumps": [
+        { "t": 20, "w": 26 },
+        { "t": 68, "w": 20 },
+        { "t": 97, "w": 20 },
+        { "t": 126, "w": 20 },
+        { "t": 150, "w": 20 },
+        { "t": 185, "w": 26 }
+      ]
+    }
+  },
+  "candidates": [
+    { "id": "cam-click-ghost", "t": 20, "end": 21.6, "type": "click-highlight", "conf": 0.63, "target": "cv-inferred-click", "reason": "Hand movement in the camera intro produced an inferred click" },
+    { "id": "scr-zoom-1", "t": 67.8, "end": 70.2, "type": "zoom", "conf": 0.86, "prov": "event", "target": "click-event", "label": "Open the settings pane", "reason": "The demo's first real click" },
+    { "id": "scr-focus-2", "t": 96.8, "end": 98.6, "type": "cursor-focus", "conf": 0.76, "prov": "event", "target": "click-event", "label": "Adjust the export options", "reason": "A form interaction inside the demo" },
+    { "id": "scr-zoom-3", "t": 125.8, "end": 128.2, "type": "zoom", "conf": 0.84, "prov": "event", "target": "click-event", "label": "Run the export", "reason": "The demo's key action" },
+    { "id": "scr-zoom-4", "t": 149.8, "end": 152.2, "type": "zoom", "conf": 0.8, "prov": "event", "target": "click-event", "label": "Open the result", "reason": "The result reveal of the demo" },
+    { "id": "cam-zoom-outro", "t": 185, "end": 187.2, "type": "zoom", "conf": 0.72, "reason": "The closing ask lands on camera" },
+    { "id": "cut-a", "t": 40, "end": 44, "type": "cut", "conf": 0.8, "reason": "Removes a pause before the handoff to the demo" },
+    { "id": "cut-b", "t": 110, "end": 116, "type": "cut", "conf": 0.82, "reason": "Removes an idle stretch flagged as boring" },
+    { "id": "cut-c", "t": 196, "end": 201, "type": "cut", "conf": 0.79, "reason": "Removes trailing silence before the endcard" }
+  ]
+}

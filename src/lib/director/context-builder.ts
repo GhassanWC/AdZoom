@@ -127,6 +127,45 @@ function collectInteractionTimes(va: VisualAnalysis | undefined): number[] {
 }
 
 /**
+ * Conservative filler-word lexicon. Single tokens only, checked against the
+ * transcript's own word timings — never fuzzy-matched, never invented. "like"
+ * and "so" are deliberately absent: they carry real meaning too often, and a
+ * false filler here becomes a cut the planner is TOLD is safe to make.
+ */
+const FILLER_WORD_SET = new Set([
+  "um",
+  "uh",
+  "umm",
+  "uhh",
+  "uhm",
+  "erm",
+  "hmm",
+  "mm",
+  "mmm",
+]);
+const MAX_FILLER_ZONES = 40;
+
+/**
+ * Real filler words from the transcript's word timings — the honest fallback
+ * for the never-produced `audioAnalysis.fillerWords` field. Pure; exported for
+ * tests.
+ */
+export function fillerWordsFromTranscript(
+  transcript: Transcript | undefined
+): Array<{ word: string; startTime: number; endTime: number }> {
+  if (transcript?.status !== "complete") return [];
+  const out: Array<{ word: string; startTime: number; endTime: number }> = [];
+  for (const w of transcript.words ?? []) {
+    if (out.length >= MAX_FILLER_ZONES) break;
+    const token = (w.word ?? "").trim().toLowerCase().replace(/[.,!?…]+$/u, "");
+    if (!FILLER_WORD_SET.has(token)) continue;
+    if (!(w.endTime > w.startTime) || w.endTime - w.startTime > 1.5) continue;
+    out.push({ word: w.word, startTime: w.startTime, endTime: w.endTime });
+  }
+  return out;
+}
+
+/**
  * Build the Director's understanding of this video.
  *
  * The candidate set is a UNION of every signal, deduped by window: a stretch
@@ -244,7 +283,15 @@ export function buildDirectorContext(project: ProjectDoc): DirectorVideoContext 
   }
 
   // Filler words ("um", "uh") — real ASR data, grouped into removable blips.
-  for (const [i, f] of (audio?.fillerWords ?? []).entries()) {
+  // `audioAnalysis.fillerWords` was declared-but-never-produced (the only
+  // writer in the repo was a test fixture), so "remove filler words" could
+  // only ever act on model guesses. The transcript's word timings ARE real ASR
+  // data, so when the audio field is absent we derive fillers from them —
+  // same shape, same evidence, actually grounded.
+  const fillerWords = audio?.fillerWords?.length
+    ? audio.fillerWords
+    : fillerWordsFromTranscript(transcript);
+  for (const [i, f] of fillerWords.entries()) {
     deadZones.push({
       id: `filler-${i}`,
       startTime: f.startTime,

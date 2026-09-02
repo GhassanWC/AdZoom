@@ -1,0 +1,45 @@
+{
+  "runId": "2026-09-02T14-01-35",
+  "scorer": "claude-model-review (PROVISIONAL — structural judgment of the replay moment lists; the binding human pass per RUBRIC.md happens on tier-2 real videos)",
+  "entries": [
+    {
+      "fixtureId": "th-01-clean-speaker",
+      "classic-talking-head": {
+        "scores": { "inappropriateEdits": 2, "missedObviousEdits": 3, "timing": 4, "densityPacing": 3, "zoomQuality": 4, "captionQuality": 0, "visualConflicts": 4 },
+        "publishable": false,
+        "notes": "Two cursor-emphasis edits on camera footage; a real silence cut crowded out by one of them."
+      },
+      "talking-clean-pro": {
+        "scores": { "inappropriateEdits": 5, "missedObviousEdits": 4, "timing": 4, "densityPacing": 5, "zoomQuality": 4, "captionQuality": 0, "visualConflicts": 5 },
+        "publishable": true,
+        "notes": "Both emphatic beats zoomed, all four pauses cut, nothing decorative."
+      }
+    },
+    {
+      "fixtureId": "th-02-energetic-creator",
+      "classic-talking-head": {
+        "scores": { "inappropriateEdits": 1, "missedObviousEdits": 4, "timing": 3, "densityPacing": 2, "zoomQuality": 3, "captionQuality": 0, "visualConflicts": 4 },
+        "publishable": false,
+        "notes": "Two cursor edits + a speed ramp on gesticulating footage; zoom pair under the 12s reference bar; quiet share 0.35."
+      },
+      "talking-clean-pro": {
+        "scores": { "inappropriateEdits": 5, "missedObviousEdits": 4, "timing": 4, "densityPacing": 4, "zoomQuality": 4, "captionQuality": 0, "visualConflicts": 5 },
+        "publishable": true,
+        "notes": "Three spaced, confident zooms carry the energy; the pileup and false positives are gone."
+      }
+    },
+    {
+      "fixtureId": "th-03-low-signal",
+      "classic-talking-head": {
+        "scores": { "inappropriateEdits": 2, "missedObviousEdits": 3, "timing": 4, "densityPacing": 3, "zoomQuality": 3, "captionQuality": 0, "visualConflicts": 4 },
+        "publishable": false,
+        "notes": "A ghost cursor edit + a speed ramp on a near-static interview; one pause cut lost to spacing against them."
+      },
+      "talking-clean-pro": {
+        "scores": { "inappropriateEdits": 5, "missedObviousEdits": 5, "timing": 4, "densityPacing": 5, "zoomQuality": 5, "captionQuality": 0, "visualConflicts": 5 },
+        "publishable": true,
+        "notes": "Exactly what the footage wanted: all five pauses removed, zero emphasis edits forced onto a static shot."
+      }
+    }
+  ]
+}

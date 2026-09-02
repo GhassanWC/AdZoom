@@ -20,6 +20,8 @@
 import type { DetectedMoment, EffectsSettings } from "../firebase/schema";
 import { buildTimelineMap } from "../timeline/crop-speed";
 import { resolveTextStyleValues } from "../render/text-style";
+import { CLASSIC_ZOOM_COMPOSITION } from "../editorial/constants";
+import { zoomDensityPass } from "../editorial/composition";
 import { isDirectorMoment } from "./executor";
 import type {
   DirectorPlan,
@@ -53,10 +55,12 @@ export interface ReviewOutput extends DirectorReviewResult {
 const SAFE_TOP = 0.08;
 const SAFE_BOTTOM = 0.88;
 
-/** Zooms closer together than this read as a twitch rather than emphasis. */
-const MIN_ZOOM_GAP_SECONDS = 1.5;
-/** More zooms per output minute than this is visual noise regardless of style. */
-const MAX_ZOOMS_PER_MINUTE = 10;
+/**
+ * Zoom-density backstop numbers — sourced from the editorial constants module
+ * (the single owner; see tests/editorial-ownership.test.ts). Values unchanged.
+ */
+const MIN_ZOOM_GAP_SECONDS = CLASSIC_ZOOM_COMPOSITION.minGapSeconds;
+const MAX_ZOOMS_PER_MINUTE = CLASSIC_ZOOM_COMPOSITION.maxPerOutputMinute;
 
 /** A surviving segment shorter than this can't read as a shot. */
 const MIN_SEGMENT_SECONDS = 0.7;
@@ -314,34 +318,22 @@ export function reviewDirectorResult(input: ReviewInput): ReviewOutput {
   }
 
   // ── 6. Zoom density ──────────────────────────────────────────────────────
+  // The judgment itself is the shared Gate-D implementation
+  // (`editorial/composition.ts:zoomDensityPass`) — one owner for "zooms too
+  // close / too many", called here with this review's exact historical
+  // constants and Director-only scope, and by the analyze route with the
+  // run's template numbers. Semantics are pinned equivalent by
+  // tests/editorial-composition.test.ts.
   if (enabled(plan, "zoom-density")) {
     const zooms = dir()
       .filter((m) => m.effectType === "zoom" && m.enabled !== false)
       .sort((a, b) => a.startTime - b.startTime);
 
-    const tooClose: string[] = [];
-    for (let i = 1; i < zooms.length; i++) {
-      if (zooms[i].startTime - zooms[i - 1].endTime < MIN_ZOOM_GAP_SECONDS) {
-        // Drop the weaker of the pair, not blindly the later one.
-        const a = zooms[i - 1];
-        const b = zooms[i];
-        const weaker =
-          (a.confidenceScore ?? 0) <= (b.confidenceScore ?? 0) ? a : b;
-        if (!tooClose.includes(weaker.id)) tooClose.push(weaker.id);
-      }
-    }
-
-    const outMinutes = Math.max(reportedOutputDuration, 1) / 60;
-    const budget = Math.max(1, Math.floor(outMinutes * MAX_ZOOMS_PER_MINUTE));
-    const overBudget = zooms.length - budget;
-    if (overBudget > 0) {
-      const weakest = zooms
-        .slice()
-        .sort((a, b) => (a.confidenceScore ?? 0) - (b.confidenceScore ?? 0))
-        .slice(0, overBudget)
-        .map((m) => m.id);
-      for (const id of weakest) if (!tooClose.includes(id)) tooClose.push(id);
-    }
+    const tooClose = zoomDensityPass(zooms, {
+      minGapSeconds: MIN_ZOOM_GAP_SECONDS,
+      maxPerOutputMinute: MAX_ZOOMS_PER_MINUTE,
+      outputDurationSeconds: reportedOutputDuration,
+    });
 
     if (tooClose.length) {
       if (canAutoFix(plan, "zoom-density")) {

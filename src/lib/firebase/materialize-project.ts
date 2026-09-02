@@ -15,6 +15,7 @@
 
 import type { ProjectDoc, ProjectStatus, SourceCrop } from "./schema";
 import { DEFAULT_EFFECTS_SETTINGS } from "./schema";
+import { normalizeContentProfile } from "../editorial/context";
 
 /**
  * Every key of T, required — but still allowed to hold `undefined`. Omitting a
@@ -39,6 +40,10 @@ export function materializeProject(
     mimeType: (data.mimeType as string) ?? undefined,
     status: ((data.status as ProjectStatus) ?? "uploaded") as ProjectStatus,
     selectedVideoType: (data.selectedVideoType as ProjectDoc["selectedVideoType"]) ?? undefined,
+    // Editorial Engine Phase 1 — the fields whose omission would reproduce the
+    // Smart Clips bug (written fine, read back `undefined` forever).
+    contentProfile: normalizeContentProfile(data.contentProfile),
+    editingTemplateId: (data.editingTemplateId as string) ?? undefined,
     analysis: (data.analysis as ProjectDoc["analysis"]) ?? undefined,
     visualAnalysis: (data.visualAnalysis as ProjectDoc["visualAnalysis"]) ?? undefined,
     // Merged onto the defaults, not substituted for them: a doc written before a

@@ -38,6 +38,22 @@ import {
   mapSelectedToDetectedVideoType,
 } from "@/lib/analysis/video-type";
 import { resolveEditRecipe, logEditRecipePlan } from "@/lib/analysis/edit-recipe";
+// ── Editorial Engine Phase 1 — content profile + template → ONE resolved
+// policy every selection stage reads. Classic templates resolve to shipped
+// behaviour bit-for-bit; see src/lib/editorial/resolve.ts.
+import { contextFromSelectedVideoType } from "@/lib/editorial/context";
+import { defaultTemplateFor, getTemplate } from "@/lib/editorial/templates";
+import {
+  overlayAllowFromPolicy,
+  overridesFromToggles,
+  policyDigest,
+  resolveEditorialPolicy,
+} from "@/lib/editorial/resolve";
+import {
+  applyCompositionActions,
+  reviewComposition,
+} from "@/lib/editorial/composition";
+import { buildEditsGeneratedMetadata } from "@/lib/editorial/telemetry";
 // The AI Editor — decides which candidate edits deserve to exist at all.
 import {
   decideTimeline,
@@ -536,7 +552,11 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     const ranLayers = ((): Set<EngineLayer> => {
       const existingAiLayers = aiLayersPresent(preservedMoments);
       return new Set(
-        (["camera", "crop", "speed"] as EngineLayer[]).filter((l) =>
+        // "cut" was mistakenly "crop" here (the crop engine never runs, so
+        // shouldRunLayer("crop") is always false) — latent rather than live
+        // because cuts always arrive as preserved progressive moments, but the
+        // set now says what it always meant.
+        (["camera", "cut", "speed"] as EngineLayer[]).filter((l) =>
           shouldRunLayer(l, analysisOptions, existingAiLayers)
         )
       );
@@ -906,6 +926,45 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     });
     logEditRecipePlan(editRecipePlan, { projectId, mode: isFinalize ? "finalize" : "direct" });
 
+    // ── Editorial policy (Editorial Engine Phase 1) ───────────────────────
+    // ONE resolution per run: content profile (from the user's shortcut —
+    // detection fusion is Phase 3) + template (Classic for the selected type
+    // unless the run names one) + the same feasibility signals the recipe used
+    // + the dialog's explicit toggles. Every selection stage below reads THIS
+    // object; a Classic resolution reproduces shipped behaviour bit-for-bit.
+    const contentProfile = contextFromSelectedVideoType(selectedVideoType);
+    const editingTemplate =
+      getTemplate(analysisOptions.templateId) ??
+      getTemplate((project.editingTemplateId as string | undefined) ?? undefined) ??
+      defaultTemplateFor(selectedVideoType);
+    const resolvedPolicy = resolveEditorialPolicy({
+      profile: contentProfile,
+      template: editingTemplate,
+      signals: {
+        hasTranscript: transcriptUsable,
+        hasAudioAnalysis: audioAnalysis?.status === "complete",
+        hasUsableSpeech: audioAnalysis?.hasUsableSpeech ?? false,
+        silenceSegmentCount,
+        transcriptLanguage: transcript.language,
+        hasSceneData: (visualAnalysis?.sceneChanges?.length ?? 0) > 0,
+        hasVisualMoments: (visualAnalysis?.sampleCount ?? 0) > 0,
+        hasInteractionData: isTabScope,
+        isScreenRecording: selectedVideoType === "screen-recording" || isTabScope,
+        durationSeconds: duration ?? undefined,
+      },
+      overrides: overridesFromToggles(analysisOptions),
+    });
+    // The template's pacing (e.g. Clean Professional = slow) governs enforce
+    // runs; Classic resolutions carry none, so `pacing` stays as loaded.
+    const effectivePacing: Pacing = resolvedPolicy.pacing ?? pacing;
+    console.info("[editorial-policy]", {
+      projectId,
+      templateId: resolvedPolicy.templateId,
+      mode: resolvedPolicy.mode,
+      pacing: effectivePacing,
+      statuses: resolvedPolicy.statuses,
+    });
+
     // Cursor intent (hesitation / velocity per bucket) feeds the click
     // classifier's "deliberate approach" signal — small bump per click
     // when the user slowed before pressing. Cheap; skip when there's
@@ -1010,10 +1069,15 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     const firstPass = balanceTimeline({
       raw: [],
       duration: duration ?? 0,
-      pacing,
+      pacing: effectivePacing,
       videoType: effectiveVideoType,
       visualAnalysis,
       eventMoments,
+      // Enforce templates replace the Classic floors (minTotal 0 = "no edit is
+      // a valid outcome"); Classic passes nothing and keeps shipped floors.
+      ...(resolvedPolicy.mode === "enforce"
+        ? { policy: { minTotal: resolvedPolicy.balancer.minTotal } }
+        : {}),
       // Finalize: the progressive moments ARE the CV result — don't regenerate
       // CV candidates (that's what pruned 17 → 6–7). Direct runs still do.
       useCvCandidates: !isFinalize,
@@ -1204,10 +1268,13 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     const balanced = balanceTimeline({
       raw: [...aiGapMoments, ...aiVisualMoments],
       duration: dur,
-      pacing,
+      pacing: effectivePacing,
       videoType: effectiveVideoType,
       visualAnalysis,
       eventMoments,
+      ...(resolvedPolicy.mode === "enforce"
+        ? { policy: { minTotal: resolvedPolicy.balancer.minTotal } }
+        : {}),
       // Finalize keeps progressive moments as `preserved`; don't regenerate CV.
       useCvCandidates: !isFinalize,
       boringSections: sections.boringSections,
@@ -1548,7 +1615,10 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     //     judged by the Director's own editorial engine instead of twice here.
     const editorialCtx: EditorialContext = {
       duration: dur,
-      pacing,
+      pacing: effectivePacing,
+      // The run's policy: Classic = the engine's own defaults (no behaviour
+      // change); an enforce template supplies statuses, bars, budgets, spacing.
+      policy: resolvedPolicy.decision,
       videoType: effectiveVideoType,
       narrativeStructure: sections.narrativeStructure,
       boringSections: sections.boringSections,
@@ -1690,15 +1760,27 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       // Phase 4 — real transcript drives auto-captions + strengthens the hook.
       transcript,
       // Analyze-modal toggles — `false` SUPPRESSES that category (maps the UI
-      // toggle names onto recipe categories; branding = CTA).
-      allow: {
-        hook_text: analysisOptions.generateHookText,
-        text_overlay: analysisOptions.generateTextOverlays,
-        smart_crop: analysisOptions.generateSmartCrop,
-        callout: analysisOptions.generateCallouts,
-        transition: analysisOptions.generateTransitions,
-        branding: analysisOptions.generateCta,
-      },
+      // toggle names onto recipe categories; branding = CTA) — ANDed with the
+      // template's forbidden categories. A Classic policy forbids nothing here
+      // (enforcement stays the shipped toggles+recipe path); an enforce
+      // template can only restrict on top of the user's toggles, never widen.
+      allow: (() => {
+        const policyAllow = overlayAllowFromPolicy(resolvedPolicy);
+        const and = (
+          toggle: boolean | undefined,
+          key: keyof typeof policyAllow
+        ): boolean | undefined => (policyAllow[key] === false ? false : toggle);
+        return {
+          hook_text: and(analysisOptions.generateHookText, "hook_text"),
+          text_overlay: and(analysisOptions.generateTextOverlays, "text_overlay"),
+          smart_crop: and(analysisOptions.generateSmartCrop, "smart_crop"),
+          callout: and(analysisOptions.generateCallouts, "callout"),
+          transition: and(analysisOptions.generateTransitions, "transition"),
+          branding: and(analysisOptions.generateCta, "branding"),
+        };
+      })(),
+      // Template overlay caps; Classic = the historical top-3/4/5 numbers.
+      policy: resolvedPolicy.overlays,
     });
     if (overlayGen.moments.length > 0) {
       finalMoments = [...finalMoments, ...overlayGen.moments].sort(
@@ -1739,6 +1821,33 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
         ref,
         "ok",
         `Added ${overlayGen.moments.length} overlay edit${overlayGen.moments.length === 1 ? "" : "s"} from the ${editRecipePlan.recipeName} recipe`
+      );
+    }
+
+    // ── GATE D — timeline composition review (Editorial Engine Phase 1) ─────
+    // Gates A–C judged edits one at a time; this judges the ASSEMBLED timeline
+    // (stacked emphasis, clusters, per-type budgets the overlays never faced).
+    // A NO-OP for every Classic template (`composition.mode === "off"`), so
+    // shipped behaviour is untouched. Disables rather than deletes — the user
+    // can flip any decision back on. Runs BEFORE the Director stage, whose own
+    // review applies the same shared implementation to its edits.
+    const composition = reviewComposition(finalMoments, resolvedPolicy, {
+      durationSeconds: dur,
+    });
+    if (composition.actions.length > 0) {
+      finalMoments = applyCompositionActions(finalMoments, composition);
+      console.info("[editorial-composition]", {
+        projectId,
+        templateId: resolvedPolicy.templateId,
+        disabled: composition.actions.length,
+        counts: composition.counts,
+      });
+      await emitActivity(
+        ref,
+        "info",
+        `Composition review turned off ${composition.actions.length} edit${
+          composition.actions.length === 1 ? "" : "s"
+        } that crowded the timeline — they're still there if you want them back.`
       );
     }
 
@@ -1902,6 +2011,10 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
         // Persist the resolved user selection (top-level project field) so it
         // survives + stays the source of truth for a re-analysis.
         selectedVideoType,
+        // Editorial Engine Phase 1 — the classification + template that
+        // governed this run. Both are in materializeProject's whitelist.
+        contentProfile,
+        editingTemplateId: editingTemplate.id,
         // smart_crop applies the vertical/social reframe via the output canvas.
         // Merge-write only the canvas so the user's other effects are untouched;
         // only set when the recipe generated one (user had no canvas of their own).
@@ -1921,6 +2034,8 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
           recommendedPresetIds: sections.recommendedPresetIds,
           videoType: effectiveVideoType,
           editRecipe: editRecipePlan,
+          // Explainability: the template + per-category statuses of this run.
+          editorialPolicy: policyDigest(resolvedPolicy),
           // Phase 4 — persist the transcript + audio intelligence (stripUndefined
           // so optional fields never write literal `undefined` to Firestore).
           transcript: stripUndefined(transcript),
@@ -1969,6 +2084,25 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       userEmail: decoded.email ?? null,
       projectId,
       metadata: { momentCount: balanced.moments.length },
+    });
+
+    // Editorial Engine telemetry — counts + enums ONLY (no labels, no text;
+    // pinned by tests/editorial-telemetry.test.ts). This is the generation
+    // half of the acceptance loop; the export-time outcome diff lands in
+    // Phase 2.
+    void recordEvent(EVENTS.EDITS_GENERATED, {
+      userId: uid,
+      projectId,
+      metadata: {
+        ...buildEditsGeneratedMetadata({
+          policy: resolvedPolicy,
+          profile: contentProfile,
+          finalMoments,
+          selectionDropped: editorialRejects.length,
+          compositionDisabled: composition.actions.length,
+          durationSeconds: dur,
+        }),
+      },
     });
 
     return NextResponse.json({

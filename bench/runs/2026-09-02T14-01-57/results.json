@@ -1,0 +1,811 @@
+{
+  "results": {
+    "th-01-clean-speaker": {
+      "kind": "talking-head",
+      "cells": {
+        "classic-talking-head": {
+          "templateId": "classic-talking-head",
+          "mode": "classic",
+          "metrics": {
+            "totalAi": 7,
+            "totalLive": 7,
+            "byType": {
+              "hook-text": 1,
+              "click-highlight": 1,
+              "zoom": 2,
+              "cursor-focus": 1,
+              "cut": 2
+            },
+            "perMinuteOutput": 2.44,
+            "zoomCount": 2,
+            "cursorEmphasisCount": 2,
+            "cutCount": 2,
+            "speedCount": 0,
+            "decorativeOverlayCount": 0,
+            "zoomSpacingViolations": 0,
+            "zoomsInSilence": 0,
+            "overlapEmphasisPairs": 0,
+            "clusters": 0,
+            "editFreeShare": 0.517,
+            "disabledCount": 0,
+            "inappropriate": {
+              "cursorOnCameraFootage": 2,
+              "speedOnTalkingFootage": 0,
+              "decorativeOnTalkingFootage": 0,
+              "total": 2
+            }
+          },
+          "keptIds": [
+            "hook-text:gen-hook",
+            "click-highlight:cv-click-a",
+            "zoom:zoom-key-1",
+            "cursor-focus:cv-focus-b",
+            "zoom:zoom-key-2",
+            "cut:cut-dead",
+            "cut:cut-tail"
+          ],
+          "disabledIds": [],
+          "selectionDrops": {
+            "candidates": 12,
+            "judged": 12,
+            "protectedPassThrough": 0,
+            "keptCount": 6,
+            "maxEdits": 11,
+            "droppedUnjustified": 1,
+            "droppedCrowding": 0,
+            "droppedRhythm": 5,
+            "droppedBudget": 0,
+            "distribution": [
+              {
+                "label": "Q1@0s",
+                "kept": 1,
+                "cap": 4
+              },
+              {
+                "label": "Q2@45s",
+                "kept": 1,
+                "cap": 4
+              },
+              {
+                "label": "Q3@90s",
+                "kept": 2,
+                "cap": 4
+              },
+              {
+                "label": "Q4@135s",
+                "kept": 2,
+                "cap": 4
+              }
+            ]
+          },
+          "compositionCounts": {}
+        },
+        "talking-clean-pro": {
+          "templateId": "talking-clean-pro",
+          "mode": "enforce",
+          "metrics": {
+            "totalAi": 6,
+            "totalLive": 6,
+            "byType": {
+              "hook-text": 1,
+              "cut": 3,
+              "zoom": 2
+            },
+            "perMinuteOutput": 2.14,
+            "zoomCount": 2,
+            "cursorEmphasisCount": 0,
+            "cutCount": 3,
+            "speedCount": 0,
+            "decorativeOverlayCount": 0,
+            "zoomSpacingViolations": 0,
+            "zoomsInSilence": 0,
+            "overlapEmphasisPairs": 0,
+            "clusters": 0,
+            "editFreeShare": 0.572,
+            "disabledCount": 0,
+            "inappropriate": {
+              "cursorOnCameraFootage": 0,
+              "speedOnTalkingFootage": 0,
+              "decorativeOnTalkingFootage": 0,
+              "total": 0
+            }
+          },
+          "keptIds": [
+            "hook-text:gen-hook",
+            "cut:cut-pause-1",
+            "zoom:zoom-key-1",
+            "zoom:zoom-key-2",
+            "cut:cut-dead",
+            "cut:cut-tail"
+          ],
+          "disabledIds": [],
+          "selectionDrops": {
+            "candidates": 12,
+            "judged": 12,
+            "protectedPassThrough": 0,
+            "keptCount": 5,
+            "maxEdits": 7,
+            "droppedUnjustified": 5,
+            "droppedCrowding": 0,
+            "droppedRhythm": 2,
+            "droppedBudget": 0,
+            "distribution": [
+              {
+                "label": "Q1@0s",
+                "kept": 1,
+                "cap": 3
+              },
+              {
+                "label": "Q2@45s",
+                "kept": 1,
+                "cap": 3
+              },
+              {
+                "label": "Q3@90s",
+                "kept": 1,
+                "cap": 3
+              },
+              {
+                "label": "Q4@135s",
+                "kept": 2,
+                "cap": 3
+              }
+            ]
+          },
+          "compositionCounts": {}
+        }
+      }
+    },
+    "th-02-energetic-creator": {
+      "kind": "talking-head",
+      "cells": {
+        "classic-talking-head": {
+          "templateId": "classic-talking-head",
+          "mode": "classic",
+          "metrics": {
+            "totalAi": 8,
+            "totalLive": 8,
+            "byType": {
+              "hook-text": 1,
+              "click-highlight": 1,
+              "zoom": 3,
+              "speed-up": 1,
+              "cursor-focus": 1,
+              "cut": 1
+            },
+            "perMinuteOutput": 3.33,
+            "zoomCount": 3,
+            "cursorEmphasisCount": 2,
+            "cutCount": 1,
+            "speedCount": 1,
+            "decorativeOverlayCount": 0,
+            "zoomSpacingViolations": 1,
+            "zoomsInSilence": 0,
+            "overlapEmphasisPairs": 0,
+            "clusters": 0,
+            "editFreeShare": 0.347,
+            "disabledCount": 0,
+            "inappropriate": {
+              "cursorOnCameraFootage": 2,
+              "speedOnTalkingFootage": 1,
+              "decorativeOnTalkingFootage": 0,
+              "total": 3
+            }
+          },
+          "keptIds": [
+            "hook-text:gen-hook",
+            "click-highlight:cv-click-a",
+            "zoom:zoom-pile-1",
+            "zoom:zoom-pile-3",
+            "speed-up:speed-a",
+            "zoom:zoom-key",
+            "cursor-focus:cv-focus-c",
+            "cut:cut-b"
+          ],
+          "disabledIds": [],
+          "selectionDrops": {
+            "candidates": 12,
+            "judged": 12,
+            "protectedPassThrough": 0,
+            "keptCount": 7,
+            "maxEdits": 9,
+            "droppedUnjustified": 1,
+            "droppedCrowding": 0,
+            "droppedRhythm": 4,
+            "droppedBudget": 0,
+            "distribution": [
+              {
+                "label": "Q1@0s",
+                "kept": 1,
+                "cap": 3
+              },
+              {
+                "label": "Q2@38s",
+                "kept": 2,
+                "cap": 3
+              },
+              {
+                "label": "Q3@75s",
+                "kept": 3,
+                "cap": 3
+              },
+              {
+                "label": "Q4@113s",
+                "kept": 1,
+                "cap": 3
+              }
+            ]
+          },
+          "compositionCounts": {}
+        },
+        "talking-clean-pro": {
+          "templateId": "talking-clean-pro",
+          "mode": "enforce",
+          "metrics": {
+            "totalAi": 5,
+            "totalLive": 5,
+            "byType": {
+              "hook-text": 1,
+              "zoom": 3,
+              "cut": 1
+            },
+            "perMinuteOutput": 2.05,
+            "zoomCount": 3,
+            "cursorEmphasisCount": 0,
+            "cutCount": 1,
+            "speedCount": 0,
+            "decorativeOverlayCount": 0,
+            "zoomSpacingViolations": 0,
+            "zoomsInSilence": 0,
+            "overlapEmphasisPairs": 0,
+            "clusters": 0,
+            "editFreeShare": 0.587,
+            "disabledCount": 0,
+            "inappropriate": {
+              "cursorOnCameraFootage": 0,
+              "speedOnTalkingFootage": 0,
+              "decorativeOnTalkingFootage": 0,
+              "total": 0
+            }
+          },
+          "keptIds": [
+            "hook-text:gen-hook",
+            "zoom:zoom-pile-1",
+            "zoom:zoom-key",
+            "zoom:zoom-late",
+            "cut:cut-b"
+          ],
+          "disabledIds": [],
+          "selectionDrops": {
+            "candidates": 12,
+            "judged": 12,
+            "protectedPassThrough": 0,
+            "keptCount": 4,
+            "maxEdits": 6,
+            "droppedUnjustified": 5,
+            "droppedCrowding": 0,
+            "droppedRhythm": 3,
+            "droppedBudget": 0,
+            "distribution": [
+              {
+                "label": "Q1@0s",
+                "kept": 0,
+                "cap": 3
+              },
+              {
+                "label": "Q2@38s",
+                "kept": 1,
+                "cap": 3
+              },
+              {
+                "label": "Q3@75s",
+                "kept": 1,
+                "cap": 3
+              },
+              {
+                "label": "Q4@113s",
+                "kept": 2,
+                "cap": 3
+              }
+            ]
+          },
+          "compositionCounts": {}
+        }
+      }
+    },
+    "th-03-low-signal": {
+      "kind": "talking-head",
+      "cells": {
+        "classic-talking-head": {
+          "templateId": "classic-talking-head",
+          "mode": "classic",
+          "metrics": {
+            "totalAi": 7,
+            "totalLive": 7,
+            "byType": {
+              "hook-text": 1,
+              "cut": 4,
+              "click-highlight": 1,
+              "speed-up": 1
+            },
+            "perMinuteOutput": 1.97,
+            "zoomCount": 0,
+            "cursorEmphasisCount": 1,
+            "cutCount": 4,
+            "speedCount": 1,
+            "decorativeOverlayCount": 0,
+            "zoomSpacingViolations": 0,
+            "zoomsInSilence": 0,
+            "overlapEmphasisPairs": 0,
+            "clusters": 0,
+            "editFreeShare": 0.554,
+            "disabledCount": 0,
+            "inappropriate": {
+              "cursorOnCameraFootage": 1,
+              "speedOnTalkingFootage": 1,
+              "decorativeOnTalkingFootage": 0,
+              "total": 2
+            }
+          },
+          "keptIds": [
+            "hook-text:gen-hook",
+            "cut:cut-p1",
+            "click-highlight:cv-click-ghost",
+            "cut:cut-p2",
+            "speed-up:speed-ghost",
+            "cut:cut-p3",
+            "cut:cut-p4"
+          ],
+          "disabledIds": [],
+          "selectionDrops": {
+            "candidates": 9,
+            "judged": 9,
+            "protectedPassThrough": 0,
+            "keptCount": 6,
+            "maxEdits": 15,
+            "droppedUnjustified": 2,
+            "droppedCrowding": 0,
+            "droppedRhythm": 1,
+            "droppedBudget": 0,
+            "distribution": [
+              {
+                "label": "Q1@0s",
+                "kept": 1,
+                "cap": 5
+              },
+              {
+                "label": "Q2@60s",
+                "kept": 2,
+                "cap": 5
+              },
+              {
+                "label": "Q3@120s",
+                "kept": 2,
+                "cap": 5
+              },
+              {
+                "label": "Q4@180s",
+                "kept": 1,
+                "cap": 5
+              }
+            ]
+          },
+          "compositionCounts": {}
+        },
+        "talking-clean-pro": {
+          "templateId": "talking-clean-pro",
+          "mode": "enforce",
+          "metrics": {
+            "totalAi": 6,
+            "totalLive": 6,
+            "byType": {
+              "hook-text": 1,
+              "cut": 5
+            },
+            "perMinuteOutput": 1.71,
+            "zoomCount": 0,
+            "cursorEmphasisCount": 0,
+            "cutCount": 5,
+            "speedCount": 0,
+            "decorativeOverlayCount": 0,
+            "zoomSpacingViolations": 0,
+            "zoomsInSilence": 0,
+            "overlapEmphasisPairs": 0,
+            "clusters": 0,
+            "editFreeShare": 0.613,
+            "disabledCount": 0,
+            "inappropriate": {
+              "cursorOnCameraFootage": 0,
+              "speedOnTalkingFootage": 0,
+              "decorativeOnTalkingFootage": 0,
+              "total": 0
+            }
+          },
+          "keptIds": [
+            "hook-text:gen-hook",
+            "cut:cut-p1",
+            "cut:cut-p2",
+            "cut:cut-p3",
+            "cut:cut-p4",
+            "cut:cut-p5"
+          ],
+          "disabledIds": [],
+          "selectionDrops": {
+            "candidates": 9,
+            "judged": 9,
+            "protectedPassThrough": 0,
+            "keptCount": 5,
+            "maxEdits": 9,
+            "droppedUnjustified": 4,
+            "droppedCrowding": 0,
+            "droppedRhythm": 0,
+            "droppedBudget": 0,
+            "distribution": [
+              {
+                "label": "Q1@0s",
+                "kept": 1,
+                "cap": 3
+              },
+              {
+                "label": "Q2@60s",
+                "kept": 1,
+                "cap": 3
+              },
+              {
+                "label": "Q3@120s",
+                "kept": 1,
+                "cap": 3
+              },
+              {
+                "label": "Q4@180s",
+                "kept": 2,
+                "cap": 3
+              }
+            ]
+          },
+          "compositionCounts": {}
+        }
+      }
+    },
+    "sr-01-saas-walkthrough": {
+      "kind": "screen-recording",
+      "cells": {
+        "classic-screen-recording": {
+          "templateId": "classic-screen-recording",
+          "mode": "classic",
+          "metrics": {
+            "totalAi": 15,
+            "totalLive": 15,
+            "byType": {
+              "zoom": 4,
+              "text-overlay": 3,
+              "callout": 4,
+              "cursor-focus": 1,
+              "cut": 1,
+              "click-highlight": 1,
+              "speed-up": 1
+            },
+            "perMinuteOutput": 4.75,
+            "zoomCount": 4,
+            "cursorEmphasisCount": 2,
+            "cutCount": 1,
+            "speedCount": 1,
+            "decorativeOverlayCount": 7,
+            "zoomSpacingViolations": 0,
+            "zoomsInSilence": 0,
+            "overlapEmphasisPairs": 9,
+            "clusters": 6,
+            "editFreeShare": 0.45,
+            "disabledCount": 0,
+            "inappropriate": {
+              "cursorOnCameraFootage": 0,
+              "speedOnTalkingFootage": 0,
+              "decorativeOnTalkingFootage": 0,
+              "total": 0
+            }
+          },
+          "keptIds": [
+            "zoom:ev-zoom-1",
+            "text-overlay:gen-textlabel-0",
+            "callout:gen-callout-0",
+            "zoom:ev-zoom-2",
+            "text-overlay:gen-textlabel-1",
+            "callout:gen-callout-1",
+            "cursor-focus:ev-focus-3",
+            "text-overlay:gen-textlabel-2",
+            "cut:cut-idle",
+            "zoom:ev-zoom-4",
+            "callout:gen-callout-3",
+            "click-highlight:ev-click-5",
+            "speed-up:speed-loading",
+            "zoom:ev-zoom-6",
+            "callout:gen-callout-2"
+          ],
+          "disabledIds": [],
+          "selectionDrops": {
+            "candidates": 8,
+            "judged": 8,
+            "protectedPassThrough": 0,
+            "keptCount": 8,
+            "maxEdits": 17,
+            "droppedUnjustified": 0,
+            "droppedCrowding": 0,
+            "droppedRhythm": 0,
+            "droppedBudget": 0,
+            "distribution": [
+              {
+                "label": "Q1@0s",
+                "kept": 2,
+                "cap": 5
+              },
+              {
+                "label": "Q2@50s",
+                "kept": 2,
+                "cap": 5
+              },
+              {
+                "label": "Q3@100s",
+                "kept": 3,
+                "cap": 5
+              },
+              {
+                "label": "Q4@150s",
+                "kept": 1,
+                "cap": 5
+              }
+            ]
+          },
+          "compositionCounts": {}
+        }
+      }
+    },
+    "hy-01-intro-then-demo": {
+      "kind": "hybrid",
+      "cells": {
+        "classic-auto": {
+          "templateId": "classic-auto",
+          "mode": "classic",
+          "metrics": {
+            "totalAi": 9,
+            "totalLive": 9,
+            "byType": {
+              "click-highlight": 1,
+              "cut": 3,
+              "zoom": 4,
+              "cursor-focus": 1
+            },
+            "perMinuteOutput": 2.77,
+            "zoomCount": 4,
+            "cursorEmphasisCount": 2,
+            "cutCount": 3,
+            "speedCount": 0,
+            "decorativeOverlayCount": 0,
+            "zoomSpacingViolations": 0,
+            "zoomsInSilence": 0,
+            "overlapEmphasisPairs": 0,
+            "clusters": 0,
+            "editFreeShare": 0.424,
+            "disabledCount": 0,
+            "inappropriate": {
+              "cursorOnCameraFootage": 0,
+              "speedOnTalkingFootage": 0,
+              "decorativeOnTalkingFootage": 0,
+              "total": 0
+            }
+          },
+          "keptIds": [
+            "click-highlight:cam-click-ghost",
+            "cut:cut-a",
+            "zoom:scr-zoom-1",
+            "cursor-focus:scr-focus-2",
+            "cut:cut-b",
+            "zoom:scr-zoom-3",
+            "zoom:scr-zoom-4",
+            "zoom:cam-zoom-outro",
+            "cut:cut-c"
+          ],
+          "disabledIds": [],
+          "selectionDrops": {
+            "candidates": 9,
+            "judged": 9,
+            "protectedPassThrough": 0,
+            "keptCount": 9,
+            "maxEdits": 18,
+            "droppedUnjustified": 0,
+            "droppedCrowding": 0,
+            "droppedRhythm": 0,
+            "droppedBudget": 0,
+            "distribution": [
+              {
+                "label": "Q1@0s",
+                "kept": 2,
+                "cap": 6
+              },
+              {
+                "label": "Q2@53s",
+                "kept": 2,
+                "cap": 6
+              },
+              {
+                "label": "Q3@105s",
+                "kept": 3,
+                "cap": 6
+              },
+              {
+                "label": "Q4@158s",
+                "kept": 2,
+                "cap": 6
+              }
+            ]
+          },
+          "compositionCounts": {}
+        },
+        "talking-clean-pro": {
+          "templateId": "talking-clean-pro",
+          "mode": "enforce",
+          "metrics": {
+            "totalAi": 6,
+            "totalLive": 6,
+            "byType": {
+              "cut": 3,
+              "zoom": 3
+            },
+            "perMinuteOutput": 1.85,
+            "zoomCount": 3,
+            "cursorEmphasisCount": 0,
+            "cutCount": 3,
+            "speedCount": 0,
+            "decorativeOverlayCount": 0,
+            "zoomSpacingViolations": 0,
+            "zoomsInSilence": 0,
+            "overlapEmphasisPairs": 0,
+            "clusters": 0,
+            "editFreeShare": 0.59,
+            "disabledCount": 0,
+            "inappropriate": {
+              "cursorOnCameraFootage": 0,
+              "speedOnTalkingFootage": 0,
+              "decorativeOnTalkingFootage": 0,
+              "total": 0
+            }
+          },
+          "keptIds": [
+            "cut:cut-a",
+            "zoom:scr-zoom-1",
+            "cut:cut-b",
+            "zoom:scr-zoom-3",
+            "zoom:scr-zoom-4",
+            "cut:cut-c"
+          ],
+          "disabledIds": [],
+          "selectionDrops": {
+            "candidates": 9,
+            "judged": 9,
+            "protectedPassThrough": 0,
+            "keptCount": 6,
+            "maxEdits": 11,
+            "droppedUnjustified": 2,
+            "droppedCrowding": 0,
+            "droppedRhythm": 1,
+            "droppedBudget": 0,
+            "distribution": [
+              {
+                "label": "Q1@0s",
+                "kept": 1,
+                "cap": 4
+              },
+              {
+                "label": "Q2@53s",
+                "kept": 1,
+                "cap": 4
+              },
+              {
+                "label": "Q3@105s",
+                "kept": 3,
+                "cap": 4
+              },
+              {
+                "label": "Q4@158s",
+                "kept": 1,
+                "cap": 4
+              }
+            ]
+          },
+          "compositionCounts": {}
+        }
+      }
+    }
+  },
+  "gates": [
+    {
+      "fixtureId": "th-01-clean-speaker",
+      "name": "fewer-inappropriate",
+      "ok": true,
+      "detail": "2 → 0"
+    },
+    {
+      "fixtureId": "th-01-clean-speaker",
+      "name": "zero-cursor-emphasis",
+      "ok": true,
+      "detail": "0"
+    },
+    {
+      "fixtureId": "th-01-clean-speaker",
+      "name": "no-cut-regression",
+      "ok": true,
+      "detail": "2 → 3"
+    },
+    {
+      "fixtureId": "th-01-clean-speaker",
+      "name": "zoom-spacing-clean",
+      "ok": true,
+      "detail": "0"
+    },
+    {
+      "fixtureId": "th-01-clean-speaker",
+      "name": "zero-decoration",
+      "ok": true,
+      "detail": "0"
+    },
+    {
+      "fixtureId": "th-02-energetic-creator",
+      "name": "fewer-inappropriate",
+      "ok": true,
+      "detail": "3 → 0"
+    },
+    {
+      "fixtureId": "th-02-energetic-creator",
+      "name": "zero-cursor-emphasis",
+      "ok": true,
+      "detail": "0"
+    },
+    {
+      "fixtureId": "th-02-energetic-creator",
+      "name": "no-cut-regression",
+      "ok": true,
+      "detail": "1 → 1"
+    },
+    {
+      "fixtureId": "th-02-energetic-creator",
+      "name": "zoom-spacing-clean",
+      "ok": true,
+      "detail": "0"
+    },
+    {
+      "fixtureId": "th-02-energetic-creator",
+      "name": "zero-decoration",
+      "ok": true,
+      "detail": "0"
+    },
+    {
+      "fixtureId": "th-03-low-signal",
+      "name": "fewer-inappropriate",
+      "ok": true,
+      "detail": "2 → 0"
+    },
+    {
+      "fixtureId": "th-03-low-signal",
+      "name": "zero-cursor-emphasis",
+      "ok": true,
+      "detail": "0"
+    },
+    {
+      "fixtureId": "th-03-low-signal",
+      "name": "no-cut-regression",
+      "ok": true,
+      "detail": "4 → 5"
+    },
+    {
+      "fixtureId": "th-03-low-signal",
+      "name": "zoom-spacing-clean",
+      "ok": true,
+      "detail": "0"
+    },
+    {
+      "fixtureId": "th-03-low-signal",
+      "name": "zero-decoration",
+      "ok": true,
+      "detail": "0"
+    }
+  ]
+}

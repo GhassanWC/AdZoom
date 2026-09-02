@@ -38,6 +38,18 @@ export const EVENTS = {
   CHUNKED_ANALYSIS_STARTED: "chunked_analysis_started",
   CHUNKED_ANALYSIS_COMPLETED: "chunked_analysis_completed",
 
+  // ── Editorial Engine (Phase 1) ───────────────────────────────────────
+  // COUNTS AND ENUMS ONLY in the metadata (template id, policy mode, intent /
+  // mode / target enums, per-type counts, confidence-bucket histograms, gate
+  // drop counts). Never a label, a hook line, a reason sentence, or any other
+  // user-authored text — pinned by tests/editorial-telemetry.test.ts.
+  /** Fired at analyze finalize: what was generated under which template. */
+  EDITS_GENERATED: "edits_generated",
+  /** Phase 2 wiring: the export-time kept/modified/disabled/deleted diff. */
+  EDITS_OUTCOME: "edits_outcome",
+  /** Phase 2 wiring: Director chat "fewer/none X" pushback (editType + direction). */
+  DIRECTOR_PUSHBACK: "director_pushback",
+
   // ── Engine options ───────────────────────────────────────────────────
   CAMERA_EDITS_ENABLED: "camera_edits_enabled",
   CUTS_ENABLED: "cuts_enabled",

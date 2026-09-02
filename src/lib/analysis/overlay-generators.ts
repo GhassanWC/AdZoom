@@ -27,6 +27,9 @@ import type {
   EditOperationCategory,
   EditRecipePlan,
 } from "./edit-recipe";
+// Pure data, no runtime deps — safe under node --test like everything here.
+import { CLASSIC_OVERLAYS } from "../editorial/constants";
+import type { OverlayPolicy } from "../editorial/policy";
 
 export interface OverlayGenInput {
   plan: EditRecipePlan | null | undefined;
@@ -45,6 +48,12 @@ export interface OverlayGenInput {
    * category even if the recipe enables it; absent = allow (recipe decides).
    */
   allow?: Partial<Record<EditOperationCategory, boolean>>;
+  /**
+   * Editorial Engine Phase 1 — the template's overlay caps. ABSENT ⇒ the
+   * Classic caps (top-3 labels / top-4 callouts ≥0.55 / max-5 transitions),
+   * i.e. exactly the numbers that used to be hardcoded below.
+   */
+  policy?: OverlayPolicy;
 }
 
 export interface OverlayGenResult {
@@ -172,6 +181,7 @@ export function generateOverlayEdits(input: OverlayGenInput): OverlayGenResult {
 
   const videoType = plan.effectiveVideoType;
   const allow = input.allow;
+  const caps = input.policy ?? CLASSIC_OVERLAYS;
   /** A category generates only if the recipe enables it AND the user allows it. */
   const allowed = (c: EditOperationCategory) => allow?.[c] !== false;
   const enabled = (c: EditOperationCategory) =>
@@ -309,7 +319,7 @@ export function generateOverlayEdits(input: OverlayGenInput): OverlayGenResult {
           isDescriptive(m.label)
       )
       .sort((a, b) => (b.attentionScore ?? 0) - (a.attentionScore ?? 0))
-      .slice(0, 3);
+      .slice(0, caps.textOverlayMax);
     let i = 0;
     for (const c of candidates) {
       out.push(
@@ -350,10 +360,10 @@ export function generateOverlayEdits(input: OverlayGenInput): OverlayGenResult {
             m.effectType === "cursor-focus" ||
             m.effectType === "zoom") &&
           (m.targetRegionSource === "click-event" || m.targetRegionSource === "ui-region") &&
-          (m.confidenceScore ?? 0) >= 0.55
+          (m.confidenceScore ?? 0) >= caps.calloutMinConfidence
       )
       .sort((a, b) => (b.confidenceScore ?? 0) - (a.confidenceScore ?? 0))
-      .slice(0, 4);
+      .slice(0, caps.calloutMax);
     let i = 0;
     for (const g of grounded) {
       out.push(
@@ -390,7 +400,7 @@ export function generateOverlayEdits(input: OverlayGenInput): OverlayGenResult {
       .map((m) => m.endTime)
       .filter((e) => e > 0.3 && e < duration - 0.5)
       .sort((a, b) => a - b)
-      .slice(0, 5);
+      .slice(0, caps.transitionMax);
     let i = 0;
     for (const e of cutEnds) {
       out.push(

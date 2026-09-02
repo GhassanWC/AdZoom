@@ -1,0 +1,59 @@
+{
+  "id": "th-02-energetic-creator",
+  "kind": "talking-head",
+  "tier": "replay",
+  "title": "Creator hot take, handheld",
+  "description": "150s energetic creator, constant gesticulation. Motion bumps everywhere → many CV false positives and a zoom pileup around 40-55s. The fixture that punishes over-eager emphasis.",
+  "durationSeconds": 150,
+  "selectedVideoType": "talking-head",
+  "signals": {
+    "hasTranscript": true,
+    "hasAudioAnalysis": true,
+    "hasUsableSpeech": true,
+    "silenceSegmentCount": 3,
+    "hasSceneData": true,
+    "hasVisualMoments": true,
+    "hasInteractionData": false,
+    "isScreenRecording": false,
+    "durationSeconds": 150
+  },
+  "context": {
+    "pacing": "moderate",
+    "videoType": "talking-tutorial",
+    "clickTimes": [],
+    "sceneChanges": [39.7, 88.4, 120.2],
+    "silenceSegments": [
+      { "startTime": 33, "endTime": 36 },
+      { "startTime": 75, "endTime": 79 },
+      { "startTime": 139, "endTime": 143 }
+    ],
+    "boringSections": [],
+    "attention": {
+      "baseline": 0.2,
+      "amp": 0.62,
+      "bumps": [
+        { "t": 15, "w": 22 },
+        { "t": 40, "w": 30 },
+        { "t": 48, "w": 22 },
+        { "t": 55, "w": 22 },
+        { "t": 88, "w": 30 },
+        { "t": 105, "w": 22 },
+        { "t": 120, "w": 30 }
+      ]
+    }
+  },
+  "candidates": [
+    { "id": "cv-click-a", "t": 15, "end": 16.6, "type": "click-highlight", "conf": 0.74, "target": "cv-inferred-click", "reason": "A hand gesture produced a localized change near the tracked point" },
+    { "id": "cv-click-b", "t": 48, "end": 49.6, "type": "click-highlight", "conf": 0.66, "target": "cv-inferred-click", "reason": "A localized change near the tracked cursor position" },
+    { "id": "cv-focus-c", "t": 105, "end": 106.6, "type": "cursor-focus", "conf": 0.69, "target": "cv-inferred-click", "reason": "Sustained dwell on the gesturing hand" },
+    { "id": "zoom-pile-1", "t": 40, "end": 41.8, "type": "zoom", "conf": 0.76, "reason": "The take lands its first punchline" },
+    { "id": "zoom-pile-2", "t": 45, "end": 46.8, "type": "zoom", "conf": 0.7, "reason": "Continued emphasis through the run of jokes" },
+    { "id": "zoom-pile-3", "t": 52, "end": 53.8, "type": "zoom", "conf": 0.72, "reason": "Another beat in the same energetic run" },
+    { "id": "zoom-key", "t": 88, "end": 90.2, "type": "zoom", "conf": 0.84, "reason": "The core argument of the video is stated here" },
+    { "id": "zoom-late", "t": 120, "end": 122, "type": "zoom", "conf": 0.71, "reason": "The closing position lands with a scene change" },
+    { "id": "zoom-weak", "t": 132, "end": 133.6, "type": "zoom", "conf": 0.5, "reason": "A smaller motion peak near the outro" },
+    { "id": "speed-a", "t": 75, "end": 79, "type": "speed-up", "conf": 0.68, "reason": "Compresses a quieter connective stretch" },
+    { "id": "cut-a", "t": 33, "end": 36, "type": "cut", "conf": 0.8, "reason": "Removes a silent reset between takes" },
+    { "id": "cut-b", "t": 139, "end": 143, "type": "cut", "conf": 0.79, "reason": "Removes trailing dead air before the endcard" }
+  ]
+}

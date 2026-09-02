@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "notes": "Golden Editorial Benchmark corpus. Tier 'replay' fixtures are committed signal bundles replayed through the real selection pipeline (deterministic — exact comparisons). Tier 'video' entries reference REAL videos in the dev-project GCS bucket (never committed) and run through the Playwright harness with tolerance bands; add entries as the corpus is collected.",
+  "fixtures": [
+    { "id": "th-01-clean-speaker", "tier": "replay", "kind": "talking-head", "file": "fixtures/th-01-clean-speaker.json", "templates": ["classic-talking-head", "talking-clean-pro"] },
+    { "id": "th-02-energetic-creator", "tier": "replay", "kind": "talking-head", "file": "fixtures/th-02-energetic-creator.json", "templates": ["classic-talking-head", "talking-clean-pro"] },
+    { "id": "th-03-low-signal", "tier": "replay", "kind": "talking-head", "file": "fixtures/th-03-low-signal.json", "templates": ["classic-talking-head", "talking-clean-pro"] },
+    { "id": "sr-01-saas-walkthrough", "tier": "replay", "kind": "screen-recording", "file": "fixtures/sr-01-saas-walkthrough.json", "templates": ["classic-screen-recording"] },
+    { "id": "hy-01-intro-then-demo", "tier": "replay", "kind": "hybrid", "file": "fixtures/hy-01-intro-then-demo.json", "templates": ["classic-auto", "talking-clean-pro"] }
+  ],
+  "video_corpus": {
+    "bucket": "gs://<dev-project-bench-bucket>/editorial-bench/",
+    "entries": [],
+    "wanted": [
+      "2× real talking-head (one already publishable, one rough)",
+      "2× screen recording (one tab-capture with interactions.json, one plain upload)",
+      "1-2× tutorial (one screen-led, one camera-led)",
+      "1× podcast/interview clip",
+      "1× vlog",
+      "1× ad/promo",
+      "1-2× hybrid (mode-switching)"
+    ]
+  }
+}

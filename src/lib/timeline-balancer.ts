@@ -38,56 +38,13 @@ import { refineMomentFocalRegion } from "./timeline/focal-region";
 import { normalizeZoomTimeline } from "./timeline/zoom-normalize";
 import type { ZoomPresetId } from "./timeline/zoom-presets";
 
-export interface PacingProfile {
-  /** Target moments per minute. */
-  ratePerMin: number;
-  /** Minimum seconds between adjacent kept moments. */
-  minSpacing: number;
-  /** Hard cap on moments per minute (anti-spam). */
-  maxPerMin: number;
-  /** Lower bound — try to ensure at least this many moments per minute. */
-  minPerMin: number;
-  /** Cool-down (seconds) before another "zoom" effect can follow another "zoom". */
-  zoomCooldown: number;
-}
+// The pacing model + video-type bias moved to src/lib/editorial/constants.ts —
+// the single owner of every editorial number (Editorial Engine Phase 1). Both
+// are re-exported here so existing imports keep working unchanged.
+import { PACING_PROFILES, VIDEO_TYPE_BIAS, type PacingProfile } from "./editorial/constants";
 
-export const PACING_PROFILES: Record<Pacing, PacingProfile> = {
-  slow: {
-    ratePerMin: 3,
-    minSpacing: 14,
-    maxPerMin: 4,
-    minPerMin: 1,
-    zoomCooldown: 18,
-  },
-  moderate: {
-    ratePerMin: 5,
-    minSpacing: 7,
-    maxPerMin: 7,
-    minPerMin: 2,
-    zoomCooldown: 10,
-  },
-  fast: {
-    ratePerMin: 9,
-    minSpacing: 4,
-    maxPerMin: 12,
-    minPerMin: 4,
-    zoomCooldown: 6,
-  },
-};
-
-/**
- * Video-type bias modifiers — applied on top of the pacing profile so a coding
- * tutorial with "fast" pacing is still calmer than a TikTok with "fast" pacing.
- */
-const VIDEO_TYPE_BIAS: Record<VideoType, { rateMult: number; spacingMult: number }> = {
-  "coding-tutorial": { rateMult: 0.85, spacingMult: 1.15 },
-  "saas-demo": { rateMult: 1.0, spacingMult: 1.0 },
-  "talking-tutorial": { rateMult: 0.75, spacingMult: 1.25 },
-  presentation: { rateMult: 0.8, spacingMult: 1.2 },
-  "vertical-short": { rateMult: 1.25, spacingMult: 0.8 },
-  "onboarding-flow": { rateMult: 0.95, spacingMult: 1.05 },
-  mixed: { rateMult: 1.0, spacingMult: 1.0 },
-};
+export { PACING_PROFILES };
+export type { PacingProfile };
 
 export interface BalancerInput {
   /**
@@ -145,6 +102,14 @@ export interface BalancerInput {
    * to (see `timeline/zoom-normalize`). Absent ⇒ "standard".
    */
   zoomPreset?: ZoomPresetId;
+  /**
+   * Editorial Engine Phase 1. ABSENT ⇒ the Classic floors (MIN_MOMENTS +
+   * duration-bracket minimums + minPerMin) apply exactly as they always have.
+   * When present, `minTotal` REPLACES all of those floors — `minTotal: 0` is
+   * how a template makes "no edit" a reachable outcome ("no hidden floor").
+   * Ceilings are untouched either way.
+   */
+  policy?: { minTotal: number };
 }
 
 export interface BalancerResult {
@@ -1188,9 +1153,16 @@ export function balanceTimeline(input: BalancerInput): BalancerResult {
       : duration <= 120
         ? { min: 6, max: 12 }
         : { min: 12, max: 20 };
+  // Editorial Engine Phase 1: a policy's minTotal REPLACES the Classic floors
+  // (that stack of floors is exactly what forced edits onto videos that
+  // deserved none). No policy ⇒ shipped behaviour, bit for bit.
+  const floorTotal =
+    input.policy !== undefined
+      ? Math.max(0, input.policy.minTotal)
+      : Math.max(MIN_MOMENTS, durationBucket.min, Math.ceil(minutes * minPerMin));
   const targetCount = clamp(
     Math.round(minutes * ratePerMin),
-    Math.max(MIN_MOMENTS, durationBucket.min, Math.ceil(minutes * minPerMin)),
+    floorTotal,
     Math.min(MAX_MOMENTS, durationBucket.max, Math.ceil(minutes * maxPerMin))
   );
 

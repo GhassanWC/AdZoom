@@ -22,6 +22,10 @@ import type { PresetRef } from "@/lib/presets/types";
 // Type-only (erased at runtime → no import cycle): the zoom-style vocabulary the
 // camera resolver reads. The table itself lives in lib/timeline/zoom-presets.ts.
 import type { ZoomPresetId } from "@/lib/timeline/zoom-presets";
+// Type-only (erased at runtime → no import cycle): the Editorial Engine's
+// content profile + policy digest persisted on a project/run.
+import type { ContentProfile } from "@/lib/editorial/context";
+import type { EditorialPolicyDigest } from "@/lib/editorial/policy";
 
 export type { ZoomPresetId };
 
@@ -1238,6 +1242,12 @@ export interface Analysis {
    */
   editRecipe?: EditRecipePlan;
   /**
+   * Editorial Engine Phase 1 — a compact record of the template + resolved
+   * per-category statuses that governed this run (explainability + telemetry;
+   * the full policy is recomputed from the template at run time, never stored).
+   */
+  editorialPolicy?: EditorialPolicyDigest;
+  /**
    * Phase 4 — real transcript (or an honest `unavailable`/`failed` status when
    * no ASR provider is configured). Drives auto-captions + hook text. Absent on
    * pre-Phase-4 projects.
@@ -1278,10 +1288,30 @@ export interface Analysis {
     generateCameraEdits: boolean;
     generateCut: boolean;
     generateSpeed: boolean;
+    // The overlay toggles + run modifiers ARE persisted (the route writes the
+    // whole AnalysisOptions object) — this type previously under-declared them,
+    // which hid that the round-trip existed. Kept inline + optional so the
+    // schema stays import-free and older docs (which lack them) still parse.
+    generateCaptions?: boolean;
+    generateHookText?: boolean;
+    generateTextOverlays?: boolean;
+    generateSmartCrop?: boolean;
+    generateCallouts?: boolean;
+    generateTransitions?: boolean;
+    generateCta?: boolean;
+    applyDirectorBrief?: boolean;
+    directorPlanOnly?: boolean;
+    selectedVideoType?: SelectedVideoType;
+    /** Editorial Engine Phase 1 — the template this run resolved against. */
+    templateId?: string;
     existingEditMode: "keep" | "replace-selected" | "clear-all";
     chunkMode?: "fast" | "balanced" | "detailed" | "very-detailed" | "custom";
     chunkSizeSeconds?: number;
     chunkCount?: number;
+    transcriptLanguageMode?: "auto" | "selected";
+    transcriptLanguageCode?: string;
+    transcriptLocaleHint?: string;
+    forceRetranscribe?: boolean;
   };
 
   // ── Hybrid pipeline (V2) ──
@@ -1890,6 +1920,24 @@ export interface ProjectDoc {
    * recipe. Absent on projects created before this shipped → treated as "auto".
    */
   selectedVideoType?: SelectedVideoType;
+  /**
+   * EDITORIAL CONTENT PROFILE (Editorial Engine Phase 1) — the internal
+   * classification that separates the axes `selectedVideoType` mixes:
+   * primary intent (what the content IS), content modes (what the pixels are,
+   * as coexisting fractions) and output target, each with its OWN source
+   * (`default` | `detected` | `user`) so detection can never overwrite an axis
+   * the user pinned. `selectedVideoType` stays the user-facing shortcut; the
+   * picker's choice expands into this via `contextFromSelectedVideoType`.
+   * Absent on existing projects → derived from `selectedVideoType` at run time.
+   */
+  contentProfile?: ContentProfile;
+  /**
+   * The editing template governing AI generation for this project (Editorial
+   * Engine Phase 1). Absent → the Classic template for `selectedVideoType`,
+   * which reproduces pre-template behaviour exactly. See
+   * src/lib/editorial/templates.ts.
+   */
+  editingTemplateId?: string;
   analysis?: Analysis;
   /**
    * Client-side computer-vision pass output. Written by the browser before the

@@ -1,0 +1,56 @@
+{
+  "id": "th-03-low-signal",
+  "kind": "talking-head",
+  "tier": "replay",
+  "title": "Quiet interview answer, static cam",
+  "description": "240s near-static interview answer. Attention curve is almost flat (the real talking-head shape from the audit: min 0.024 / max 0.192) so attention must abstain; long pauses are the only real edits. The fixture where 'no edit' must be reachable.",
+  "durationSeconds": 240,
+  "selectedVideoType": "talking-head",
+  "signals": {
+    "hasTranscript": true,
+    "hasAudioAnalysis": true,
+    "hasUsableSpeech": true,
+    "silenceSegmentCount": 5,
+    "hasSceneData": false,
+    "hasVisualMoments": true,
+    "hasInteractionData": false,
+    "isScreenRecording": false,
+    "durationSeconds": 240
+  },
+  "context": {
+    "pacing": "moderate",
+    "videoType": "talking-tutorial",
+    "clickTimes": [],
+    "sceneChanges": [],
+    "silenceSegments": [
+      { "startTime": 31, "endTime": 36 },
+      { "startTime": 84, "endTime": 91 },
+      { "startTime": 140, "endTime": 144 },
+      { "startTime": 185, "endTime": 192 },
+      { "startTime": 226, "endTime": 232 }
+    ],
+    "boringSections": [
+      { "startTime": 84, "endTime": 91 },
+      { "startTime": 185, "endTime": 192 }
+    ],
+    "attention": {
+      "baseline": 0.03,
+      "amp": 0.04,
+      "bumps": [
+        { "t": 60, "w": 40 },
+        { "t": 160, "w": 40 }
+      ]
+    }
+  },
+  "candidates": [
+    { "id": "cv-click-ghost", "t": 60, "end": 61.6, "type": "click-highlight", "conf": 0.58, "target": "cv-inferred-click", "reason": "A small localized change near the tracked point" },
+    { "id": "zoom-ghost-1", "t": 100, "end": 101.8, "type": "zoom", "conf": 0.41, "reason": "A slight motion rise in an otherwise static shot" },
+    { "id": "zoom-ghost-2", "t": 160, "end": 161.8, "type": "zoom", "conf": 0.47, "reason": "The speaker leans in slightly" },
+    { "id": "cut-p1", "t": 31, "end": 36, "type": "cut", "conf": 0.81, "reason": "Removes a long thinking pause" },
+    { "id": "cut-p2", "t": 84, "end": 91, "type": "cut", "conf": 0.84, "reason": "Removes a silent stretch flagged as boring" },
+    { "id": "cut-p3", "t": 140, "end": 144, "type": "cut", "conf": 0.78, "reason": "Removes a mid-answer pause" },
+    { "id": "cut-p4", "t": 185, "end": 192, "type": "cut", "conf": 0.83, "reason": "Removes the second boring stretch" },
+    { "id": "cut-p5", "t": 226, "end": 232, "type": "cut", "conf": 0.8, "reason": "Removes the trailing silence" },
+    { "id": "speed-ghost", "t": 120, "end": 128, "type": "speed-up", "conf": 0.62, "reason": "Compresses a slower stretch of the answer" }
+  ]
+}

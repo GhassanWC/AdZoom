@@ -1,0 +1,53 @@
+{
+  "id": "sr-01-saas-walkthrough",
+  "kind": "screen-recording",
+  "tier": "replay",
+  "title": "Dashboard walkthrough with real clicks",
+  "description": "200s tab-captured SaaS walkthrough. Real click events with targets, one loading stretch, one idle stretch. The control fixture: Classic behaviour here is already good and must stay untouched by the engine work.",
+  "durationSeconds": 200,
+  "selectedVideoType": "screen-recording",
+  "signals": {
+    "hasTranscript": true,
+    "hasAudioAnalysis": true,
+    "hasUsableSpeech": true,
+    "silenceSegmentCount": 2,
+    "hasSceneData": true,
+    "hasVisualMoments": true,
+    "hasInteractionData": true,
+    "isScreenRecording": true,
+    "durationSeconds": 200
+  },
+  "context": {
+    "pacing": "moderate",
+    "videoType": "saas-demo",
+    "clickTimes": [18, 44, 71, 102, 131, 166],
+    "sceneChanges": [43.5, 101.2, 165.4],
+    "silenceSegments": [
+      { "startTime": 84, "endTime": 90 },
+      { "startTime": 143, "endTime": 148 }
+    ],
+    "boringSections": [{ "startTime": 84, "endTime": 92 }],
+    "attention": {
+      "baseline": 0.18,
+      "amp": 0.65,
+      "bumps": [
+        { "t": 18, "w": 18 },
+        { "t": 44, "w": 18 },
+        { "t": 71, "w": 18 },
+        { "t": 102, "w": 18 },
+        { "t": 131, "w": 18 },
+        { "t": 166, "w": 18 }
+      ]
+    }
+  },
+  "candidates": [
+    { "id": "ev-zoom-1", "t": 17.8, "end": 20.2, "type": "zoom", "conf": 0.9, "prov": "event", "target": "click-event", "label": "Open the analytics workspace", "reason": "The user clicks into the analytics workspace" },
+    { "id": "ev-zoom-2", "t": 43.8, "end": 46.2, "type": "zoom", "conf": 0.88, "prov": "event", "target": "click-event", "label": "Create a new report", "reason": "The primary CTA of the flow is clicked" },
+    { "id": "ev-focus-3", "t": 70.8, "end": 72.6, "type": "cursor-focus", "conf": 0.78, "prov": "event", "target": "click-event", "label": "Filter the date range", "reason": "A form interaction the viewer must follow" },
+    { "id": "ev-zoom-4", "t": 101.8, "end": 104.2, "type": "zoom", "conf": 0.86, "prov": "event", "target": "click-event", "label": "Share the report", "reason": "The share dialog opens from this click" },
+    { "id": "ev-click-5", "t": 130.8, "end": 132.4, "type": "click-highlight", "conf": 0.74, "prov": "event", "target": "click-event", "label": "Toggle the comparison view", "reason": "A small but meaningful toggle click" },
+    { "id": "ev-zoom-6", "t": 165.8, "end": 168.2, "type": "zoom", "conf": 0.87, "prov": "event", "target": "click-event", "label": "Export the dashboard", "reason": "The closing action of the walkthrough" },
+    { "id": "cut-idle", "t": 84, "end": 92, "type": "cut", "conf": 0.82, "reason": "Removes an idle stretch while the report loads" },
+    { "id": "speed-loading", "t": 143, "end": 148, "type": "speed-up", "conf": 0.75, "reason": "Speeds up the export progress bar" }
+  ]
+}

@@ -88,6 +88,13 @@ export interface AnalysisOptions {
    * `startAnalyze` from the project's `selectedVideoType`.
    */
   selectedVideoType?: SelectedVideoType;
+  /**
+   * Editorial Engine Phase 1 — the editing template for this run. Absent ⇒ the
+   * Classic template for the selected video type (pre-template behaviour,
+   * bit for bit). No dialog control yet (that's Phase 2); tests and the
+   * benchmark harness set it directly.
+   */
+  templateId?: string;
   // ── Spoken language (transcription) — see src/lib/transcript/language.ts ──
   /** "auto" = detect from a small candidate list; "selected" = the user's choice. */
   transcriptLanguageMode?: "auto" | "selected";

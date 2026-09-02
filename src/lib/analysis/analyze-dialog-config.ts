@@ -1,10 +1,16 @@
 /**
  * Analyze-dialog structure — pure config so the separation rule is testable:
  * CAPTIONS ARE NOT AN "AI VIDEO EDIT". They're a transcription feature with
- * their own quota, language, background processing, and failure modes, so the
- * dialog renders them in a dedicated "Captions & transcription" section and
- * the AI-edit bulk actions (Select all / Disable extras / recipe reset of the
- * grid) never touch the captions toggle.
+ * their own quota, language, background processing, and failure modes. The AI
+ * edit bulk actions (Select all / Disable extras / recipe reset of the grid)
+ * never touch the captions toggle.
+ *
+ * NOTE: the dialog no longer renders a captions section at all — captions are
+ * generated only by the dedicated "Generate AI Captions" action, and the modal
+ * STRIPS `generateCaptions` from its payload so analysis can never start ASR.
+ * `CAPTIONS_TOGGLE` below stays as the structural record of that separation
+ * (tests/caption-separation.test.ts pins the rule against it); it is spec, not
+ * rendered UI.
  */
 import type { GenerationToggles } from "./edit-recipe";
 
@@ -66,7 +72,11 @@ export const AI_EDIT_EXTRA_KEYS: (keyof GenerationToggles)[] = [
   "generateTransitions",
 ];
 
-/** The captions toggle — rendered ONLY in the Captions & transcription section. */
+/**
+ * The captions toggle SPEC — deliberately absent from every rendered group.
+ * Not UI: it exists so the separation rule ("captions are never an AI edit")
+ * stays a testable structural fact rather than tribal knowledge.
+ */
 export const CAPTIONS_TOGGLE: AnalyzeToggleSpec = {
   key: "generateCaptions",
   label: "Generate captions",

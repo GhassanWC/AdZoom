@@ -55,6 +55,13 @@ import type {
   VideoType,
 } from "../firebase/schema";
 import { PACING_PROFILES } from "../timeline-balancer";
+import { CLASSIC_DECISION, VIDEO_TYPE_BIAS } from "../editorial/constants";
+import {
+  categoryForEffectType,
+  statusAllowsGeneration,
+  type DecisionPolicy,
+} from "../editorial/policy";
+import { classicDecisionPolicy } from "../editorial/resolve";
 
 /**
  * One shared vocabulary with the Director's own judgment stage
@@ -66,17 +73,15 @@ export type EditorialJustification = DirectorJustification;
 export const EDITORIAL_JUSTIFICATIONS = DIRECTOR_JUSTIFICATIONS;
 
 // ── Bars ────────────────────────────────────────────────────────────────────
+// The VALUES live in src/lib/editorial/constants.ts (the single owner of every
+// editorial number — see tests/editorial-ownership.test.ts). The names below
+// are kept so the judgment code reads as before; anything a TEMPLATE may vary
+// is read off the run's DecisionPolicy instead (see `decideTimeline`).
 
-/** Below this we aren't sure enough to put the edit in front of a viewer. */
-const MIN_CONFIDENCE = 0.35;
 /** A reason shorter than this reads as a placeholder, not a justification. */
-const MIN_REASON_LENGTH = 8;
+const MIN_REASON_LENGTH = CLASSIC_DECISION.minReasonLength;
 /** How close a click / scene change must be to count as grounding an edit. */
-const GROUNDING_WINDOW_S = 1.0;
-/** Two edits starting within this window are competing for the same beat. */
-const CROWD_WINDOW_S = 2;
-/** More than this many of the same effect in a row reads as a tic. */
-const SAME_TYPE_STREAK_MAX = 3;
+const GROUNDING_WINDOW_S = CLASSIC_DECISION.groundingWindowS;
 
 /**
  * Attention is judged RELATIVE to the video's own curve, never against an
@@ -89,14 +94,14 @@ const SAME_TYPE_STREAK_MAX = 3;
  * spans nearly the full 0..1. The only portable question is "is this moment
  * quiet *for this video*", so these are percentiles of the curve.
  */
-const FLAT_PERCENTILE = 0.35;
-const PEAK_PERCENTILE = 0.7;
+const FLAT_PERCENTILE = CLASSIC_DECISION.flatPercentile;
+const PEAK_PERCENTILE = CLASSIC_DECISION.peakPercentile;
 /**
  * A curve flatter than this carries no information — every moment looks like
  * every other. Attention then abstains entirely rather than voting: a signal
  * that cannot discriminate must never be the thing that vetoes an edit.
  */
-const MIN_ATTENTION_RANGE = 0.05;
+const MIN_ATTENTION_RANGE = CLASSIC_DECISION.minAttentionRange;
 
 /**
  * The edit types this engine judges: the camera + pacing edits the per-chunk
@@ -161,16 +166,8 @@ const NARRATIVE_WEIGHT: Record<NarrativeRole, number> = {
   filler: 0.2,
 };
 
-/** Video-type bias on rate + spacing. Mirrors the balancer's own table. */
-const VIDEO_TYPE_BIAS: Record<VideoType, { rateMult: number; spacingMult: number }> = {
-  "coding-tutorial": { rateMult: 0.85, spacingMult: 1.15 },
-  "saas-demo": { rateMult: 1.0, spacingMult: 1.0 },
-  "talking-tutorial": { rateMult: 0.75, spacingMult: 1.25 },
-  presentation: { rateMult: 0.8, spacingMult: 1.2 },
-  "vertical-short": { rateMult: 1.25, spacingMult: 0.8 },
-  "onboarding-flow": { rateMult: 0.95, spacingMult: 1.05 },
-  mixed: { rateMult: 1.0, spacingMult: 1.0 },
-};
+// (The video-type bias table now lives in src/lib/editorial/constants.ts —
+// one definition shared with the balancer instead of a mirrored copy.)
 
 // ── Inputs ──────────────────────────────────────────────────────────────────
 
@@ -202,6 +199,13 @@ export interface EditorialContext {
   clickTimes?: number[];
   /** Silent stretches — grounding for pacing edits, a red flag for zooms. */
   silenceSegments?: TimeSpan[];
+  /**
+   * The run's editorial policy (Editorial Engine Phase 1). ABSENT ⇒ the
+   * Classic bars — exactly the engine's pre-policy behaviour, which is what
+   * every existing caller and test gets. A template supplies per-type
+   * statuses, confidence bars, budgets and spacing through this.
+   */
+  policy?: DecisionPolicy;
 }
 
 /**
@@ -499,7 +503,8 @@ function scoreOf(
 
 // ── Budget — the density decision ───────────────────────────────────────────
 
-const MAX_MOMENTS = 24;
+const policyOf = (ctx: EditorialContext): DecisionPolicy =>
+  ctx.policy ?? classicDecisionPolicy();
 
 /**
  * The MOST edits this video may carry. A ceiling, never a target and never a
@@ -519,14 +524,17 @@ const MAX_MOMENTS = 24;
  * the timeline or, worse, quietly raise this ceiling on a calm video.
  */
 export function editorialMaxEdits(ctx: EditorialContext): number {
+  const policy = policyOf(ctx);
   const profile = PACING_PROFILES[ctx.pacing] ?? PACING_PROFILES.moderate;
   const bias = VIDEO_TYPE_BIAS[ctx.videoType ?? "mixed"] ?? VIDEO_TYPE_BIAS.mixed;
   const minutes = Math.max(ctx.duration / 60, 0.5);
-  const bucketMax = ctx.duration <= 30 ? 6 : ctx.duration <= 120 ? 12 : 20;
+  const bucketMax = policy.bucketMax(ctx.duration);
   return Math.max(
     1,
     Math.min(
-      MAX_MOMENTS,
+      policy.maxMoments,
+      // A template's own total ceiling (absent on Classic).
+      policy.maxEditsOverride ?? Number.POSITIVE_INFINITY,
       bucketMax,
       // Hard anti-spam rate.
       Math.ceil(minutes * profile.maxPerMin),
@@ -537,6 +545,8 @@ export function editorialMaxEdits(ctx: EditorialContext): number {
 }
 
 function minSpacingFor(ctx: EditorialContext): number {
+  const policy = policyOf(ctx);
+  if (typeof policy.minSpacingS === "number") return policy.minSpacingS;
   const profile = PACING_PROFILES[ctx.pacing] ?? PACING_PROFILES.moderate;
   const bias = VIDEO_TYPE_BIAS[ctx.videoType ?? "mixed"] ?? VIDEO_TYPE_BIAS.mixed;
   return profile.minSpacing * bias.spacingMult;
@@ -603,6 +613,9 @@ export function decideTimeline(
 ): EditorialDecisionResult {
   const verdicts: EditorialVerdict[] = [];
   const rejected: DetectedMoment[] = [];
+  // The run's policy — Classic bars when absent, so pre-policy callers and
+  // fixtures behave identically (tests/classic-parity.test.ts pins this).
+  const policy = policyOf(ctx);
   // Computed once: every attention judgment below is relative to this profile.
   const stats = attentionStats(ctx);
 
@@ -636,6 +649,25 @@ export function decideTimeline(
 
   for (const m of judged) {
     const type = typeOf(m);
+    const category = categoryForEffectType(type);
+    const typePolicy = policy.perType[category];
+
+    // Gate A/B — the template's stance on this edit type. Classic policies
+    // have `strictTypes: false` and an empty perType map, so nothing changes
+    // for them; an enforce template rejects types it doesn't use (this is how
+    // "no cursor emphasis on a Clean Professional talking head" is enforced).
+    if (
+      (policy.strictTypes && !typePolicy) ||
+      (typePolicy && !statusAllowsGeneration(typePolicy.status))
+    ) {
+      droppedUnjustified++;
+      reject(
+        m,
+        "policy-forbidden",
+        `This editing style doesn't use ${category.replace(/_/g, " ")} edits — dropped by the template's editorial policy.`
+      );
+      continue;
+    }
 
     if (isTrivialReason(m.reason)) {
       droppedUnjustified++;
@@ -648,12 +680,15 @@ export function decideTimeline(
     }
 
     const conf = confOf(m);
-    if (conf < MIN_CONFIDENCE) {
+    const confBar = typePolicy?.minConfidence ?? policy.minConfidence;
+    if (conf < confBar) {
       droppedUnjustified++;
       reject(
         m,
         "low-confidence",
-        `Confidence (${conf.toFixed(2)}) is too low to put this ${type} in front of a viewer. No edit beats a guess.`
+        typePolicy?.minConfidence !== undefined
+          ? `Confidence (${conf.toFixed(2)}) is below this template's ${confBar.toFixed(2)} bar for a ${type}. No edit beats a guess.`
+          : `Confidence (${conf.toFixed(2)}) is too low to put this ${type} in front of a viewer. No edit beats a guess.`
       );
       continue;
     }
@@ -704,14 +739,14 @@ export function decideTimeline(
   let droppedCrowding = 0;
   for (const cand of survivors) {
     const prev = afterCrowding[afterCrowding.length - 1];
-    if (prev && startOf(cand.moment) - startOf(prev.moment) < CROWD_WINDOW_S) {
+    if (prev && startOf(cand.moment) - startOf(prev.moment) < policy.crowdWindowS) {
       const [win, lose] = cand.score > prev.score ? [cand, prev] : [prev, cand];
       if (win === cand) afterCrowding[afterCrowding.length - 1] = cand;
       droppedCrowding++;
       reject(
         lose.moment,
         "crowded",
-        `Crowds a stronger ${typeOf(win.moment)} within ${CROWD_WINDOW_S}s — one intentional edit beats two competing for the same moment.`
+        `Crowds a stronger ${typeOf(win.moment)} within ${policy.crowdWindowS}s — one intentional edit beats two competing for the same moment.`
       );
       continue;
     }
@@ -725,8 +760,12 @@ export function decideTimeline(
   const maxEdits = editorialMaxEdits(ctx);
   const minSpacing = minSpacingFor(ctx);
   const profile = PACING_PROFILES[ctx.pacing] ?? PACING_PROFILES.moderate;
+  const zoomCooldown = policy.zoomCooldownS ?? profile.zoomCooldown;
   const sections = budgetSections(ctx, maxEdits);
   const sectionCounts = new Map<number, number>();
+  // Per-category accounting for the template's own budgets (Classic: no-ops).
+  const minutes = Math.max(ctx.duration / 60, 0.5);
+  const categoryCounts = new Map<string, number>();
 
   // Variety is only a meaningful requirement when the video HAS more than one
   // kind of edit. See the streak rule below.
@@ -770,16 +809,53 @@ export function decideTimeline(
       const tooSoon = accepted.some(
         (a) =>
           ATTENTION_TYPES.has(typeOf(a.moment)) &&
-          Math.abs(startOf(a.moment) - t) < profile.zoomCooldown
+          Math.abs(startOf(a.moment) - t) < zoomCooldown
       );
       if (tooSoon) {
         droppedRhythm++;
         reject(
           cand.moment,
           "zoom-cooldown",
-          `Another camera move happens within ${profile.zoomCooldown}s — letting the shot settle reads as more deliberate than moving again.`
+          `Another camera move happens within ${zoomCooldown}s — letting the shot settle reads as more deliberate than moving again.`
         );
         continue;
+      }
+    }
+
+    // The template's own per-type budget + spacing (Classic has none).
+    const candCategory = categoryForEffectType(type);
+    const candPolicy = policy.perType[candCategory];
+    if (candPolicy) {
+      const catUsed = categoryCounts.get(candCategory) ?? 0;
+      const perMinuteCap =
+        typeof candPolicy.maxPerMinute === "number"
+          ? Math.max(1, Math.floor(minutes * candPolicy.maxPerMinute))
+          : Number.POSITIVE_INFINITY;
+      const cap = Math.min(perMinuteCap, candPolicy.maxTotal ?? Number.POSITIVE_INFINITY);
+      if (catUsed >= cap) {
+        droppedBudget++;
+        reject(
+          cand.moment,
+          "type-budget",
+          `This editing style carries at most ${cap} ${candCategory.replace(/_/g, " ")} edit${cap === 1 ? "" : "s"} for a video this length — this one scored below the ones that earned the slots.`
+        );
+        continue;
+      }
+      if (typeof candPolicy.minSpacingSec === "number") {
+        const tooCloseSameType = accepted.some(
+          (a) =>
+            categoryForEffectType(typeOf(a.moment)) === candCategory &&
+            Math.abs(startOf(a.moment) - t) < candPolicy.minSpacingSec!
+        );
+        if (tooCloseSameType) {
+          droppedRhythm++;
+          reject(
+            cand.moment,
+            "type-spacing",
+            `This editing style keeps ${candCategory.replace(/_/g, " ")} edits at least ${candPolicy.minSpacingSec}s apart — restraint is what makes each one land.`
+          );
+          continue;
+        }
       }
     }
 
@@ -806,16 +882,16 @@ export function decideTimeline(
       const preceding = accepted
         .filter((a) => startOf(a.moment) < t)
         .sort((a, b) => startOf(b.moment) - startOf(a.moment))
-        .slice(0, SAME_TYPE_STREAK_MAX);
+        .slice(0, policy.sameTypeStreakMax);
       if (
-        preceding.length === SAME_TYPE_STREAK_MAX &&
+        preceding.length === policy.sameTypeStreakMax &&
         preceding.every((a) => typeOf(a.moment) === type)
       ) {
         droppedRhythm++;
         reject(
           cand.moment,
           "same-type-streak",
-          `Would be the ${SAME_TYPE_STREAK_MAX + 1}th ${type} in a row — varying the edit keeps the pass feeling intentional.`
+          `Would be the ${policy.sameTypeStreakMax + 1}th ${type} in a row — varying the edit keeps the pass feeling intentional.`
         );
         continue;
       }
@@ -823,6 +899,7 @@ export function decideTimeline(
 
     accepted.push(cand);
     sectionCounts.set(sec.id, used + 1);
+    categoryCounts.set(candCategory, (categoryCounts.get(candCategory) ?? 0) + 1);
   }
 
   // ── 5. Stamp survivors ───────────────────────────────────────────────────

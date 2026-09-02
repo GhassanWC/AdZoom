@@ -1,0 +1,59 @@
+{
+  "id": "th-01-clean-speaker",
+  "kind": "talking-head",
+  "tier": "replay",
+  "title": "Founder update to the team",
+  "description": "180s single speaker, tripod, plain background. Clear sentence pauses; two genuinely emphatic beats (59s, 132s). Head/hand motion at 24s and 96s produced CV inferred-clicks — the classic inappropriate-edit source.",
+  "durationSeconds": 180,
+  "selectedVideoType": "talking-head",
+  "signals": {
+    "hasTranscript": true,
+    "hasAudioAnalysis": true,
+    "hasUsableSpeech": true,
+    "silenceSegmentCount": 6,
+    "hasSceneData": true,
+    "hasVisualMoments": true,
+    "hasInteractionData": false,
+    "isScreenRecording": false,
+    "durationSeconds": 180
+  },
+  "context": {
+    "pacing": "moderate",
+    "videoType": "talking-tutorial",
+    "clickTimes": [],
+    "sceneChanges": [58.6, 131.5],
+    "silenceSegments": [
+      { "startTime": 20, "endTime": 23.5 },
+      { "startTime": 51, "endTime": 54 },
+      { "startTime": 88, "endTime": 93 },
+      { "startTime": 119, "endTime": 122 },
+      { "startTime": 154, "endTime": 158 },
+      { "startTime": 172, "endTime": 176 }
+    ],
+    "boringSections": [{ "startTime": 88, "endTime": 93 }],
+    "attention": {
+      "baseline": 0.12,
+      "amp": 0.72,
+      "bumps": [
+        { "t": 24, "w": 26 },
+        { "t": 59, "w": 40 },
+        { "t": 96, "w": 26 },
+        { "t": 132, "w": 40 }
+      ]
+    }
+  },
+  "candidates": [
+    { "id": "cv-click-a", "t": 24, "end": 25.6, "type": "click-highlight", "conf": 0.71, "target": "cv-inferred-click", "reason": "A localized change near the tracked cursor position" },
+    { "id": "cv-focus-b", "t": 96, "end": 97.6, "type": "cursor-focus", "conf": 0.64, "target": "cv-inferred-click", "reason": "Sustained cursor dwell near a stable region" },
+    { "id": "zoom-weak-a", "t": 30, "end": 31.8, "type": "zoom", "conf": 0.44, "reason": "A motion peak suggests emphasis here" },
+    { "id": "zoom-weak-b", "t": 70, "end": 71.8, "type": "zoom", "conf": 0.55, "reason": "Attention rises through this stretch of delivery" },
+    { "id": "zoom-key-1", "t": 59, "end": 61.4, "type": "zoom", "conf": 0.83, "reason": "The speaker lands the key announcement of the update" },
+    { "id": "zoom-echo", "t": 64, "end": 65.8, "type": "zoom", "conf": 0.69, "reason": "Continued emphasis right after the announcement" },
+    { "id": "zoom-key-2", "t": 132, "end": 134.2, "type": "zoom", "conf": 0.78, "reason": "The second emphatic beat before the closing ask" },
+    { "id": "speed-quiet", "t": 88, "end": 93, "type": "speed-up", "conf": 0.7, "reason": "Compresses a slow, quiet stretch of the delivery" },
+    { "id": "cut-pause-1", "t": 20, "end": 23.5, "type": "cut", "conf": 0.82, "reason": "Removes a silent pause between sentences" },
+    { "id": "cut-pause-2", "t": 51, "end": 54, "type": "cut", "conf": 0.78, "reason": "Removes a breath pause before the next point" },
+    { "id": "cut-dead", "t": 154, "end": 158, "type": "cut", "conf": 0.8, "reason": "Removes dead air near the close" },
+    { "id": "cut-tail", "t": 172, "end": 176, "type": "cut", "conf": 0.77, "reason": "Removes the trailing silence before the outro" }
+  ]
+}
