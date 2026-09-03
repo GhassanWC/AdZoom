@@ -39,6 +39,8 @@ import {
 } from "./revision";
 import { clearProposal, commitRun, proposeRun, undoLastRevision } from "./state";
 import type { DirectorPlan, DirectorState, DirectorSummary } from "./types";
+import { resolveProjectPolicy } from "../editorial/resolve";
+import { getTemplate } from "../editorial/templates";
 
 /**
  * Instant applies; Plan proposes.
@@ -124,6 +126,11 @@ export type ChatTurnResult =
 
 /** The pipeline inputs every path here shares, read off the project once. */
 function pipelineContext(project: ProjectDoc, effects?: EffectsSettings) {
+  // The project's resolved editorial policy — a chat revision is judged under
+  // the SAME template as the run that produced the timeline, so the
+  // conversation can steer the Editorial Engine but never bypass it. Classic
+  // resolutions carry mode "classic" and the gate stays inert.
+  const policy = resolveProjectPolicy(project);
   return {
     duration: Math.max(0, project.duration ?? 0),
     transcript: project.analysis?.transcript ?? null,
@@ -131,6 +138,11 @@ function pipelineContext(project: ProjectDoc, effects?: EffectsSettings) {
     sourceWidth: project.width,
     sourceHeight: project.height,
     effects: effects ?? (project.effectsSettings as EffectsSettings | undefined),
+    policy: {
+      statuses: policy.statuses,
+      mode: policy.mode,
+      templateName: getTemplate(policy.templateId)?.name,
+    },
   };
 }
 

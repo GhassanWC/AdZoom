@@ -56,7 +56,9 @@ import {
 } from "@/lib/director/chat";
 import type { DirectorRevisionIntent } from "@/lib/director/revision";
 import type { DirectorState } from "@/lib/director/types";
-import { DEFAULT_ANALYSIS_OPTIONS } from "@/lib/analysis/engine-layers";
+import { buildAnalysisRunRequest } from "@/lib/analysis/run-request";
+import { useWorkspaceSettings } from "@/lib/firebase/workspace-settings";
+import { trackDirectorPushback } from "@/lib/framevo-ai/telemetry";
 
 /** A message this session produced that isn't part of the applied history. */
 interface EphemeralMessage {
@@ -78,6 +80,7 @@ export function DirectorChatPanel({
   onOpenOptions,
   canAnalyze = true,
   analyzeBlockedReason,
+  lead,
 }: {
   /**
    * Instant / Plan. Owned by the editor page, not by this component: a run
@@ -92,10 +95,17 @@ export function DirectorChatPanel({
   canAnalyze?: boolean;
   /** Why, when it can't. Shown verbatim instead of a generic failure. */
   analyzeBlockedReason?: string;
+  /**
+   * Rendered at the top of the transcript — the Framevo AI panel puts the
+   * completion narration + setup summary here so the conversation opens on
+   * "here's what I did" instead of an empty scrollback.
+   */
+  lead?: React.ReactNode;
 }) {
   const { project, writeProject, analyzing, saveDirectorBrief, startAnalyze } =
     useEditorReal();
   const { getIdToken } = useAuth();
+  const { settings: workspaceSettings } = useWorkspaceSettings();
   const director = project.director as DirectorState | undefined;
   // Read the timeline off the PROJECT, the same source the pipeline writes back
   // to, so a turn can never be computed against a different array than the one
@@ -145,19 +155,37 @@ export function DirectorChatPanel({
       say("assistant", analyzeBlockedReason ?? "This video can't be analyzed yet.", "warn");
       return;
     }
+    // THE canonical run request (2A). Resolves the same persisted preferences,
+    // last-run toggles and chunk detail as every other entry point — the old
+    // path here ran DEFAULT_ANALYSIS_OPTIONS and silently reset them — and
+    // merges the message into the brief as a DELTA: structured setup fields
+    // survive unless the message is confidently explicit about one.
+    const req = buildAnalysisRunRequest({
+      project,
+      workspace: workspaceSettings,
+      instruction: command,
+      planOnly: mode === "plan",
+    });
+    if (req.coreEnginesOff) {
+      say(
+        "assistant",
+        "Every core engine (zooms, cuts, speed) is turned off in your settings, so a full re-edit would generate nothing. Turn one on under Advanced settings and ask again.",
+        "warn"
+      );
+      return;
+    }
     say(
       "assistant",
       mode === "plan"
         ? "On it — I'll watch the video and come back with a plan to approve before anything changes."
-        : "On it — I'll re-direct the whole video from that. This one takes a few minutes; every change after it is instant."
+        : "On it — I'll re-edit the whole video from that. This one takes a few minutes; every change after it is instant."
     );
-    await saveDirectorBrief(command, {});
-    await startAnalyze({
-      ...DEFAULT_ANALYSIS_OPTIONS,
-      selectedVideoType: project.selectedVideoType ?? "auto",
-      applyDirectorBrief: true,
-      directorPlanOnly: mode === "plan",
-    });
+    // The route reads the brief off the document, so the save must land first —
+    // and a failed save must stop the run (same contract the dialog honoured).
+    if (req.briefChanged && req.brief) {
+      await saveDirectorBrief(req.brief.prompt, req.brief.form);
+    }
+    await startAnalyze(req.options);
   };
 
   /**
@@ -244,10 +272,12 @@ export function DirectorChatPanel({
           break;
 
         case "proposed":
+          trackDirectorPushback(command, project.editingTemplateId);
           await writeProject({ director: result.state });
           break;
 
         case "applied":
+          trackDirectorPushback(command, project.editingTemplateId);
           await writeProject({
             director: result.state,
             "analysis.detectedMoments": result.moments,
@@ -328,17 +358,19 @@ export function DirectorChatPanel({
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      {/* No header here — the dock already renders one ("Edit with AI") and two
+      {/* No header here — the dock already renders one ("Framevo AI") and two
           stacked titles in a 340px column is the kind of chrome that makes a
           panel feel heavier than the thing it contains. */}
 
       {/* ── Transcript ──────────────────────────────────────────────────── */}
       <div ref={scrollRef} className="min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-contain p-4">
+        {lead}
         {empty && (
           <EmptyChat
             onPick={(t) => void send(t)}
             disabled={busy || analyzing}
             hasPlan={hasPlan}
+            hasEdit={moments.length > 0}
           />
         )}
 
@@ -398,8 +430,8 @@ export function DirectorChatPanel({
           <button
             type="button"
             onClick={onOpenOptions}
-            title="Analysis options"
-            aria-label="Analysis options"
+            title="Setup & advanced settings"
+            aria-label="Setup and advanced settings"
             className="ml-auto inline-flex size-7 shrink-0 items-center justify-center rounded-lg border border-white/10 bg-white/[0.03] text-fog transition-colors duration-150 hover:border-white/25 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/60"
           >
             <SlidersHorizontal size={13} />
@@ -455,7 +487,7 @@ export function DirectorChatPanel({
  * between them is exactly "does my video change when I press enter" — the one
  * thing a user must never have to discover by pressing it.
  */
-function ModeSwitch({ mode, onChange }: { mode: ChatMode; onChange: (m: ChatMode) => void }) {
+export function ModeSwitch({ mode, onChange }: { mode: ChatMode; onChange: (m: ChatMode) => void }) {
   const options: { value: ChatMode; label: string; hint: string; icon: React.ReactNode }[] = [
     { value: "instant", label: "Instant", hint: "Applies right away · undoable", icon: <Zap size={12} /> },
     { value: "plan", label: "Plan", hint: "Shows the change first", icon: <ListChecks size={12} /> },
@@ -668,17 +700,22 @@ function EmptyChat({
   onPick,
   disabled,
   hasPlan,
+  hasEdit = false,
 }: {
   onPick: (t: string) => void;
   disabled: boolean;
   hasPlan: boolean;
+  /** The timeline has edits (a plain analysis ran) even though no plan exists. */
+  hasEdit?: boolean;
 }) {
   return (
     <div className="py-2">
       <p className="text-[12.5px] leading-relaxed text-fog">
         {hasPlan
           ? "Tell me what you want and I'll change the timeline. Every edit is undoable, so it's safe to try one."
-          : "Describe the video you want. I'll watch this recording and build the first edit — after that, changes are instant."}
+          : hasEdit
+            ? "Want something different? Tell me and I’ll re-edit the whole video from your instruction."
+            : "Describe the video you want. I'll watch this recording and build the first edit — after that, changes are instant."}
       </p>
       <div className="mt-3 flex flex-wrap gap-1.5">
         {(hasPlan ? CHAT_EXAMPLES : CHAT_BRIEF_EXAMPLES).map((example) => (

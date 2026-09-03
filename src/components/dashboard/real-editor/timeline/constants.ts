@@ -302,14 +302,17 @@ export const PROVENANCE_PRESENTATION: Record<
  * app.
  */
 export const DIRECTOR_PRESENTATION = {
-  label: "AI Director",
-  short: "Director",
+  // Customer-facing name: Framevo AI (the Director is internal vocabulary).
+  // The chip keeps its own colour so instruction-driven edits stay visually
+  // distinct from the analysis engines' output.
+  label: "Framevo AI",
+  short: "Framevo AI",
   Icon: Clapperboard,
   dot: "bg-fuchsia-400",
   chip: "border-fuchsia-400/50 bg-fuchsia-500/20 text-fuchsia-50",
   text: "text-fuchsia-100",
   blurb:
-    "Created by the AI Director from your prompt. Move, resize, split, disable or delete it like any other edit.",
+    "Created by Framevo AI from your instructions. Move, resize, split, disable or delete it like any other edit.",
 } as const;
 
 /** True when this edit was placed by the AI Director. */

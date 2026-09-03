@@ -22,17 +22,20 @@ import { countGeneratedEdits } from "@/lib/analysis-progress";
  * pill from project state.
  */
 export function ProcessingMiniPill() {
-  const { project, processingMinimized, setProcessingMinimized, chunkedJob } =
-    useEditorReal();
+  const { project, activeTool, setActiveTool, chunkedJob } = useEditorReal();
   const [mounted, setMounted] = React.useState(false);
   React.useEffect(() => setMounted(true), []);
 
+  // FRAMEVO AI UNIFICATION (rule 9): progress lives in the Framevo AI panel;
+  // this pill covers a CLOSED panel while a run is live and reopens the panel.
+  const panelOpen = activeTool === "ai-chat";
+
   const [now, setNow] = React.useState(() => Date.now());
   React.useEffect(() => {
-    if (!processingMinimized) return;
+    if (panelOpen) return;
     const id = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(id);
-  }, [processingMinimized]);
+  }, [panelOpen]);
 
   if (!mounted) return null;
 
@@ -52,8 +55,7 @@ export function ProcessingMiniPill() {
     chunkedJob?.status === "complete" ||
     (allChunksDone && momentsPresent && lastActivityComplete);
 
-  const visible =
-    processingMinimized && isProcessing(project.status) && !done;
+  const visible = !panelOpen && isProcessing(project.status) && !done;
 
   const stageIdx = Math.max(
     0,
@@ -100,11 +102,11 @@ export function ProcessingMiniPill() {
           animate={{ opacity: 1, y: 0, scale: 1 }}
           exit={{ opacity: 0, y: 12, scale: 0.96 }}
           transition={{ duration: 0.24, ease: [0.22, 1, 0.36, 1] }}
-          onClick={() => setProcessingMinimized(false)}
+          onClick={() => setActiveTool("ai-chat")}
           // Pops in from 0.96 (never from nothing) so it reads as arriving over
           // the preview rather than being teleported in.
           className="fv-pop-in fv-press fixed bottom-5 right-5 z-[115] flex w-72 items-center gap-3 rounded-xl border border-violet-400/30 bg-surface/95 p-3 text-left shadow-cinematic backdrop-blur-xl transition-[border-color,transform] duration-200 ease-[cubic-bezier(0.23,1,0.32,1)] hover:border-violet-400/50"
-          aria-label="Re-open processing details"
+          aria-label="Open Framevo AI"
         >
           <span className="relative inline-flex size-9 shrink-0 items-center justify-center rounded-lg bg-violet-500/15 text-violet-300">
             <Loader2 size={14} className="animate-spin" />

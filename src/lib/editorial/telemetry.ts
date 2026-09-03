@@ -136,6 +136,105 @@ export function computeEditOutcomes(
   };
 }
 
+// ── The generation snapshot (Phase 2H — the diff's left-hand side) ──────────
+
+/**
+ * A compact, Firestore-safe record of one AI-generated edit at the moment the
+ * run finished — just enough identity to diff against the timeline at export
+ * time. Persisted as `analysis.editsGeneratedSnapshot`.
+ */
+export interface GeneratedEditSnapshot {
+  id: string;
+  effectType: string;
+  startTime: number;
+  endTime: number;
+  confidenceBucket: ConfidenceBucket;
+  /** Present only when the run itself disabled it (Gate D / review). */
+  enabled?: boolean;
+}
+
+export function buildEditsSnapshot(moments: DetectedMoment[]): GeneratedEditSnapshot[] {
+  return moments.filter(isAi).map((m) => ({
+    id: m.id,
+    effectType: m.effectType,
+    startTime: Number(m.startTime.toFixed(2)),
+    endTime: Number(m.endTime.toFixed(2)),
+    confidenceBucket: confidenceBucket(m.confidenceScore),
+    ...(m.enabled === false ? { enabled: false } : {}),
+  }));
+}
+
+/**
+ * The export-time diff against the snapshot (kept / modified / disabled /
+ * deleted / user-added) — same semantics as `computeEditOutcomes`, keyed on
+ * the compact snapshot instead of full moments.
+ */
+export function computeOutcomesFromSnapshot(
+  snapshot: GeneratedEditSnapshot[],
+  final: DetectedMoment[]
+): EditOutcomesResult {
+  const byType: EditOutcomesResult["byType"] = {};
+  const byConfidence: EditOutcomesResult["byConfidence"] = {};
+  const totals: EditOutcomeCounts = {
+    generated: 0,
+    kept: 0,
+    modified: 0,
+    disabled: 0,
+    deleted: 0,
+  };
+  const finalById = new Map(final.map((m) => [m.id, m]));
+  const bump = (
+    category: EditCategoryId,
+    bucket: ConfidenceBucket,
+    outcome: EditOutcome
+  ) => {
+    const t = (byType[category] ??= {
+      generated: 0,
+      kept: 0,
+      modified: 0,
+      disabled: 0,
+      deleted: 0,
+    });
+    t.generated += 1;
+    t[outcome] += 1;
+    totals.generated += 1;
+    totals[outcome] += 1;
+    const c = (byConfidence[bucket] ??= {});
+    c[outcome] = (c[outcome] ?? 0) + 1;
+  };
+
+  for (const g of snapshot) {
+    const category = categoryForEffectType(g.effectType as DetectedMoment["effectType"]);
+    const now = finalById.get(g.id);
+    if (!now) {
+      bump(category, g.confidenceBucket, "deleted");
+      continue;
+    }
+    if (now.enabled === false && g.enabled !== false) {
+      bump(category, g.confidenceBucket, "disabled");
+      continue;
+    }
+    const moved =
+      Math.abs(now.startTime - g.startTime) > 0.05 ||
+      Math.abs(now.endTime - g.endTime) > 0.05;
+    if (now.edited === true || now.source === "user" || moved) {
+      bump(category, g.confidenceBucket, "modified");
+      continue;
+    }
+    bump(category, g.confidenceBucket, "kept");
+  }
+
+  const snapIds = new Set(snapshot.map((s) => s.id));
+  return {
+    byType,
+    byConfidence,
+    userAdded: final.filter(
+      (m) => (m.source === "user" || m.provenance === "user") && !snapIds.has(m.id)
+    ).length,
+    totals,
+  };
+}
+
 // ── The `edits_generated` payload (Phase 1, recorded at analyze finalize) ───
 
 export interface EditsGeneratedMetadata {

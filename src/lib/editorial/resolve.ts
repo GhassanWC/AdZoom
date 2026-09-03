@@ -26,6 +26,10 @@
  */
 import type { RecipeSignals } from "@/lib/analysis/edit-recipe";
 import { DEFAULT_RECIPES } from "@/lib/analysis/edit-recipe";
+import type { DirectorBrief } from "@/lib/director/types";
+import type { ProjectDoc } from "@/lib/firebase/schema";
+import { normalizeContentProfile, contextFromSelectedVideoType } from "./context";
+import { defaultTemplateFor, getTemplate } from "./templates";
 import {
   CLASSIC_BALANCER,
   CLASSIC_DECISION,
@@ -87,6 +91,15 @@ export interface ResolvePolicyInput {
   profile: ContentProfile;
   template: EditingTemplate;
   signals: RecipeSignals;
+  /**
+   * The run's brief (Phase 2C). A brief is a RUN-LEVEL request and is applied
+   * here as CONFIDENT, ENUMERABLE deltas between the template and the user's
+   * explicit toggles — "never add a CTA" turns branding off, "no captions"
+   * turns captions off, "always end with a CTA" promotes branding. It can
+   * never resurrect a computed-impossible category, and it NEVER touches the
+   * profile (source ≠ request — approved clarification #1).
+   */
+  brief?: DirectorBrief | null;
   overrides?: PolicyOverrides;
 }
 
@@ -182,7 +195,28 @@ export function resolveEditorialPolicy(
         : `${template.name} does not use this edit`;
     }
 
-    // 3. Explicit user toggles — the outermost layer. `false` always wins;
+    // 3. The brief's confident deltas — between the template and the toggles.
+    //    Only enumerable, explicitly-stated requests act here; "make it
+    //    exciting" is not a delta and changes nothing structurally.
+    const form = input.brief?.form;
+    if (form) {
+      if (category === "branding" && form.cta === "never") {
+        status = "disabled-by-default";
+        reasons[category] = "your instructions asked for no call to action";
+      } else if (
+        category === "branding" &&
+        form.cta === "always" &&
+        !statusAllowsGeneration(status)
+      ) {
+        status = "allowed";
+        reasons[category] = "your instructions asked for a call to action";
+      } else if (category === "captions" && form.captionStyle === "none") {
+        status = "disabled-by-default";
+        reasons[category] = "your instructions asked for no captions";
+      }
+    }
+
+    // 4. Explicit user toggles — the outermost layer. `false` always wins;
     //    `true` re-opens a template-omitted category at Classic defaults (the
     //    user's explicit ask outranks the template's taste, never the matrix).
     const override = overrides[category];
@@ -271,6 +305,55 @@ export function overlayAllowFromPolicy(
   forbid("transition");
   forbid("branding");
   return out;
+}
+
+/**
+ * Resolve the policy that governs a PROJECT as it stands — the client-side
+ * counterpart of the analyze route's per-run resolution, used by the chat's
+ * local revisions (so a follow-up is judged under the same template as the run
+ * that produced the timeline) and by any surface that needs the current
+ * statuses. Same resolver, same layering; signals are derived from what the
+ * project document already carries.
+ */
+export function resolveProjectPolicy(
+  project: Pick<
+    ProjectDoc,
+    | "selectedVideoType"
+    | "editingTemplateId"
+    | "contentProfile"
+    | "directorBrief"
+    | "analysis"
+    | "visualAnalysis"
+    | "interactionScope"
+    | "duration"
+  >
+): ResolvedEditorialPolicy {
+  const profile =
+    normalizeContentProfile(project.contentProfile) ??
+    contextFromSelectedVideoType(project.selectedVideoType);
+  const template =
+    getTemplate(project.editingTemplateId) ??
+    defaultTemplateFor(project.selectedVideoType ?? "auto");
+  const transcript = project.analysis?.transcript;
+  const audio = project.analysis?.audioAnalysis;
+  const isTab = project.interactionScope === "tab";
+  return resolveEditorialPolicy({
+    profile,
+    template,
+    signals: {
+      hasTranscript:
+        transcript?.status === "complete" && (transcript.segments?.length ?? 0) > 0,
+      hasAudioAnalysis: audio?.status === "complete",
+      hasUsableSpeech: audio?.hasUsableSpeech ?? false,
+      silenceSegmentCount: audio?.silenceSegments?.length ?? 0,
+      hasSceneData: (project.visualAnalysis?.sceneChanges?.length ?? 0) > 0,
+      hasVisualMoments: (project.visualAnalysis?.sampleCount ?? 0) > 0,
+      hasInteractionData: isTab,
+      isScreenRecording: project.selectedVideoType === "screen-recording" || isTab,
+      durationSeconds: project.duration ?? undefined,
+    },
+    brief: project.directorBrief ?? null,
+  });
 }
 
 /** Firestore-safe record of what governed a run. */

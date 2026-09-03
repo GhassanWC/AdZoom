@@ -1248,6 +1248,20 @@ export interface Analysis {
    */
   editorialPolicy?: EditorialPolicyDigest;
   /**
+   * Phase 2H — the generation snapshot: what this run's AI edits looked like
+   * the moment the run finished. The export-time `edits_outcome` diff compares
+   * the timeline against this to learn what users kept / moved / disabled /
+   * deleted. Compact by design; see editorial/telemetry.ts.
+   */
+  editsGeneratedSnapshot?: Array<{
+    id: string;
+    effectType: string;
+    startTime: number;
+    endTime: number;
+    confidenceBucket: "lt50" | "b50to70" | "b70to90" | "gte90" | "none";
+    enabled?: boolean;
+  }>;
+  /**
    * Phase 4 — real transcript (or an honest `unavailable`/`failed` status when
    * no ASR provider is configured). Drives auto-captions + hook text. Absent on
    * pre-Phase-4 projects.

@@ -26,7 +26,7 @@ import type {
   SelectedVideoType,
   Transcript,
 } from "../firebase/schema";
-import { applyEditorialJudgment } from "./editorial-judgment";
+import { applyEditorialJudgment, type JudgmentPolicy } from "./editorial-judgment";
 import { executePlan } from "./executor";
 import { reviewDirectorResult } from "./review";
 import { validateDirectorPlan } from "./validate";
@@ -49,6 +49,14 @@ export interface RunPipelineInput {
   sourceWidth?: number;
   sourceHeight?: number;
   effects?: EffectsSettings;
+  /**
+   * The run's editorial-policy slice (Editorial Engine). When present and in
+   * enforce mode, plan ops of categories the template doesn't use are rejected
+   * at the judgment stage — the ONE path from a plan to a timeline consults the
+   * same policy as the analysis engines, so no instruction can route around it.
+   * Absent ⇒ pre-policy behaviour (Classic templates resolve to that anyway).
+   */
+  policy?: JudgmentPolicy;
 }
 
 export interface RunPipelineResult {
@@ -79,7 +87,7 @@ export function runDirectorPipeline(input: RunPipelineInput): RunPipelineResult 
   // ── 2. Editorial judgment — the AI Editor. A valid edit isn't necessarily a
   // GOOD one; this asks whether a professional editor could justify keeping
   // it, and drops the ones that can't. "No edit" is a valid outcome here. ───
-  const judgment = applyEditorialJudgment(validation.plan);
+  const judgment = applyEditorialJudgment(validation.plan, input.policy);
 
   // ── 3. Execute the surviving plan. Per-op failures don't sink the run. ────
   const execution = executePlan({

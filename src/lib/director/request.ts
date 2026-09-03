@@ -182,7 +182,9 @@ export function parseCta(text: string): DirectorCtaMode | undefined {
 /** Caption intent in the prompt. */
 export function parseCaptionStyle(text: string): DirectorCaptionStyle | undefined {
   const s = text.toLowerCase();
-  if (/\b(no|without|skip)\b[^.]{0,20}\bcaptions?\b/.test(s)) return "none";
+  if (/\b(no|without|skip|don'?t\s+(?:add|include|use|put))\b[^.]{0,20}\bcaptions?\b/.test(s)) {
+    return "none";
+  }
   if (!/\b(captions?|subtitles?)\b/.test(s)) return undefined;
   if (/\b(energetic|bold|punchy|social|hype)\b/.test(s)) return "bold_social";
   if (/\b(professional|clean|corporate|business)\b/.test(s)) return "clean";

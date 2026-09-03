@@ -36,6 +36,27 @@ import {
   type DirectorJustification,
   type DirectorPlan,
 } from "./types";
+import {
+  categoryForEffectType,
+  statusAllowsGeneration,
+  type EditCategoryId,
+  type PolicyStatus,
+} from "../editorial/policy";
+
+/**
+ * The slice of the run's ResolvedEditorialPolicy this stage consults (Phase 2C
+ * — "the conversation controls the Editorial Engine; it does not bypass it").
+ * Statuses only: an op of a category the template doesn't use is rejected
+ * before per-op judgment. Budgets/spacing stay with the review + Gate D (the
+ * per-style constants below remain allowlisted until Phase 4 — see
+ * tests/editorial-ownership.test.ts).
+ */
+export interface JudgmentPolicy {
+  statuses: Partial<Record<EditCategoryId, PolicyStatus>>;
+  /** "classic" = pre-policy behaviour: the status gate does not run. */
+  mode: "classic" | "enforce";
+  templateName?: string;
+}
 
 /** Below this, the Director isn't sure enough to put the edit in front of a viewer. */
 const MIN_CONFIDENCE = 0.35;
@@ -193,11 +214,34 @@ function thinCrowding(ops: DirectorEditOperation[]): {
  * reads as one consistent editorial pass, not a pile of isolated per-chunk
  * decisions. Every edit that makes it through is stamped with why it exists.
  */
-export function applyEditorialJudgment(plan: DirectorPlan): EditorialJudgmentResult {
+export function applyEditorialJudgment(
+  plan: DirectorPlan,
+  policy?: JudgmentPolicy
+): EditorialJudgmentResult {
   const failures: DirectorFailure[] = [];
   const survivors: DirectorEditOperation[] = [];
 
+  const enforce = policy?.mode === "enforce";
+  const styleName = policy?.templateName ?? "this editing style";
+
   for (const op of plan.editOperations) {
+    // Gate A/B — the template's stance on this edit type. A brief cannot talk
+    // the Director into an edit category the selected template forbids: the op
+    // is reported (`policy_forbidden`), never executed. Classic policies skip
+    // this gate entirely, so pre-template behaviour is untouched.
+    if (enforce) {
+      const status = policy!.statuses[categoryForEffectType(op.editType)];
+      if (status !== undefined && !statusAllowsGeneration(status)) {
+        failures.push({
+          operationId: op.id,
+          subject: op.editType,
+          reason: "policy_forbidden",
+          detail: `${styleName} doesn't use ${op.editType.replace(/-/g, " ")} edits — the request stays inside the selected editing style.`,
+        });
+        continue;
+      }
+    }
+
     const rejection = judgeOne(op);
     if (rejection) {
       failures.push(rejection);

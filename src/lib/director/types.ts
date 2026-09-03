@@ -535,6 +535,11 @@ export const DIRECTOR_FAILURE_REASONS = [
   // stage couldn't justify it — no real reason, no evidence, or confidence too
   // low to trust in front of a viewer. "No edit" beat this one.
   "not_justified",
+  // The run's editorial policy (Editorial Engine — the selected template's
+  // resolved statuses) does not use this edit type. The conversation controls
+  // the Editorial Engine; it never bypasses it — a plan op of a category the
+  // template forbids is reported here instead of executed.
+  "policy_forbidden",
 ] as const;
 export type DirectorFailureReason = (typeof DIRECTOR_FAILURE_REASONS)[number];
 

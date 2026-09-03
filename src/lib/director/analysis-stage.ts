@@ -61,6 +61,12 @@ export interface RunDirectorStageInput {
    * cached beyond the plan itself.
    */
   planOnly?: boolean;
+  /**
+   * The run's editorial-policy slice (Editorial Engine, Phase 2C). Passed
+   * through to the pipeline's judgment stage so a brief can't produce edit
+   * categories the selected template forbids. Absent ⇒ pre-policy behaviour.
+   */
+  policy?: import("./pipeline").RunPipelineInput["policy"];
 }
 
 export interface RunDirectorStageResult {
@@ -114,7 +120,10 @@ export async function runDirectorStage(
     request.captionStyle === "none" ? "no captions" : `${request.captionStyle} captions`,
     `CTA: ${request.cta}`,
   ];
-  log.push({ kind: "info", text: `Director brief — ${bits.join(", ")}` });
+  // "Framevo AI" is the one user-facing name for the intelligence — the
+  // Director stays an internal architecture concept (approved rule 3). These
+  // lines are shown verbatim in the activity feed, so they carry the name.
+  log.push({ kind: "info", text: `Framevo AI understood — ${bits.join(", ")}` });
 
   const ctx = buildDirectorContext(project);
   if (!ctx.hasAnalysis && !ctx.hasTranscript) {
@@ -122,7 +131,7 @@ export async function runDirectorStage(
     // built on nothing would be invented, and inventing is the one thing we don't do.
     log.push({
       kind: "warn",
-      text: "Director skipped — this analysis produced nothing to build a plan on.",
+      text: "Framevo AI skipped your instructions — this analysis produced nothing to build a plan on.",
     });
     return unchanged(failRun(state, "No analysis or transcript to plan against."));
   }
@@ -134,7 +143,7 @@ export async function runDirectorStage(
   if (wantsCaptions && !ctx.hasTranscript) {
     log.push({
       kind: "warn",
-      text: 'Captions need a transcript — run "Generate AI Captions", then re-apply the Director brief. Every other instruction was applied.',
+      text: 'Captions need a transcript — run "Generate AI Captions", then ask Framevo AI again. Every other instruction was applied.',
     });
   }
 
@@ -143,7 +152,7 @@ export async function runDirectorStage(
     planned = await planDirector(ctx, request);
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
-    log.push({ kind: "warn", text: `Director could not build a plan — ${detail}` });
+    log.push({ kind: "warn", text: `Framevo AI could not build a plan — ${detail}` });
     return unchanged(failRun(state, detail));
   }
 
@@ -152,7 +161,7 @@ export async function runDirectorStage(
     // don't dress it up as the model's work.
     log.push({
       kind: "info",
-      text: `Director planned without the model (${planned.fallbackReason}) — using Framevo's built-in planner.`,
+      text: `Framevo AI planned without the model (${planned.fallbackReason}) — using the built-in planner.`,
     });
   }
 
@@ -174,6 +183,7 @@ export async function runDirectorStage(
     sourceWidth: project.width,
     sourceHeight: project.height,
     effects,
+    ...(input.policy ? { policy: input.policy } : {}),
   });
 
   // ── Plan mode: report, don't apply. ───────────────────────────────────────
@@ -184,12 +194,12 @@ export async function runDirectorStage(
     if (!result.applied) {
       const why =
         result.failures[0]?.detail ?? "No operation from the plan could be applied.";
-      log.push({ kind: "warn", text: `Director had nothing to propose — ${why}` });
+      log.push({ kind: "warn", text: `Framevo AI had nothing to propose — ${why}` });
       return unchanged(failRun(state, why, result.failures));
     }
     log.push({
       kind: "ok",
-      text: `Director proposed ${result.appliedOperationIds.length} change${
+      text: `Framevo AI proposed ${result.appliedOperationIds.length} change${
         result.appliedOperationIds.length === 1 ? "" : "s"
       } for review — the timeline is unchanged until you approve it.`,
     });
@@ -209,7 +219,7 @@ export async function runDirectorStage(
     // it as a success with an empty result.
     const why =
       result.failures[0]?.detail ?? "No operation from the plan could be applied.";
-    log.push({ kind: "warn", text: `Director applied no edits — ${why}` });
+    log.push({ kind: "warn", text: `Framevo AI applied no edits — ${why}` });
     return unchanged(failRun(state, why, result.failures));
   }
 
@@ -219,7 +229,7 @@ export async function runDirectorStage(
     const how = p.chosenBy === "plan" ? "chose" : "matched";
     log.push({
       kind: "ok",
-      text: `Director ${how} ${p.presetName} for ${p.slot} (${p.presetId}) — ${p.momentCount} edit${
+      text: `Framevo AI ${how} ${p.presetName} for ${p.slot} (${p.presetId}) — ${p.momentCount} edit${
         p.momentCount === 1 ? "" : "s"
       }`,
     });
@@ -230,13 +240,13 @@ export async function runDirectorStage(
   // request wasn't honoured.
   for (const f of result.failures) {
     if (f.reason !== "unknown_preset") continue;
-    log.push({ kind: "warn", text: `Director: ${f.detail}` });
+    log.push({ kind: "warn", text: `Framevo AI: ${f.detail}` });
   }
 
   const applied = result.appliedOperationIds.length;
   log.push({
     kind: "ok",
-    text: `Director applied ${applied} decision${applied === 1 ? "" : "s"}${
+    text: `Framevo AI applied ${applied} decision${applied === 1 ? "" : "s"}${
       result.summary.lines.length ? ` — ${result.summary.lines.join("; ")}` : ""
     }`,
   });

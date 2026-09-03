@@ -29,7 +29,7 @@ import {
   IMPLEMENTED_CATEGORIES,
   type EditOperationCategory,
 } from "@/lib/analysis/edit-recipe";
-import type { ContentMode, PrimaryIntent } from "./context";
+import { dominantMode, type ContentMode, type ContentProfile, type PrimaryIntent } from "./context";
 import type {
   CompositionPolicy,
   DensityPolicy,
@@ -161,6 +161,243 @@ export const TALKING_CLEAN_PRO: EditingTemplate = Object.freeze<EditingTemplate>
   },
 });
 
+// ── The Phase-2 template set ────────────────────────────────────────────────
+// Editorial behaviour as data, one card per editing outcome. Numbers follow
+// the approved proposal (§G): budgets are ceilings, minTotal 0 everywhere —
+// "no edit" stays a valid outcome — and every spec stays inside the category
+// matrix (cursor emphasis only where screen content can exist). Planned
+// categories (music, B-roll, freeze-frame, audio cleanup) are OMITTED from
+// every spec: the schema anticipates them, but a template must never advertise
+// a capability without an executor (templateCapabilities pins this).
+
+export const TALKING_HIGH_ENERGY: EditingTemplate = Object.freeze<EditingTemplate>({
+  id: "talking-high-energy",
+  version: 1,
+  family: "talking",
+  name: "High Energy",
+  description: "Social-paced delivery — faster cuts, bolder captions, justified punch-ins.",
+  appliesTo: {
+    dominantModes: ["camera"] as const,
+    intents: ["conversation", "story", "promo", "unknown"] as const,
+  },
+  spec: {
+    pacing: "fast" as Pacing,
+    edits: {
+      cut: { status: "encouraged", priority: 0.9, intensity: 0.8 },
+      silence_removal: { status: "encouraged", priority: 0.9 },
+      captions: { status: "encouraged", priority: 0.9 },
+      zoom: {
+        status: "encouraged",
+        priority: 0.7,
+        minConfidence: 0.5,
+        maxPerMinute: 4,
+        minSpacingSec: 6,
+        intensity: 0.7,
+      },
+      hook_text: { status: "encouraged", priority: 0.85, maxTotal: 1 },
+      text_overlay: { status: "allowed", priority: 0.6, maxPerMinute: 2 },
+      transition: { status: "allowed", priority: 0.5, maxTotal: 4 },
+      branding: { status: "allowed", priority: 0.6, maxTotal: 1 },
+      smart_crop: { status: "allowed", priority: 0.6 },
+    },
+    density: { minTotal: 0, maxTotal: 20, crossDensity: { windowS: 8, maxInWindow: 3 } },
+    composition: {
+      zoom: { minGapSeconds: 6, maxPerOutputMinute: 4 },
+      cluster: { windowS: 6, maxInWindow: 3 },
+      overlapEmphasis: true,
+    },
+  },
+});
+
+export const TALKING_MINIMAL: EditingTemplate = Object.freeze<EditingTemplate>({
+  id: "talking-minimal",
+  version: 1,
+  family: "talking",
+  name: "Minimal",
+  description: "Captions and dead-air cuts only — nothing moves but the words.",
+  appliesTo: {
+    dominantModes: ["camera"] as const,
+    intents: ["conversation", "story", "tutorial", "unknown"] as const,
+  },
+  spec: {
+    pacing: "slow" as Pacing,
+    edits: {
+      cut: { status: "encouraged", priority: 0.85, intensity: 0.5 },
+      silence_removal: { status: "encouraged", priority: 0.9 },
+      captions: { status: "encouraged", priority: 0.9 },
+    },
+    density: { minTotal: 0, maxTotal: 10 },
+    composition: { cluster: { windowS: 10, maxInWindow: 2 }, overlapEmphasis: true },
+  },
+});
+
+export const SCREEN_PRO_DEMO: EditingTemplate = Object.freeze<EditingTemplate>({
+  id: "screen-pro-demo",
+  version: 1,
+  family: "screencast",
+  name: "Professional Demo",
+  description: "Guide the eye through the workflow — restrained everything else.",
+  appliesTo: {
+    dominantModes: ["screen"] as const,
+    intents: ["demo", "tutorial", "unknown"] as const,
+  },
+  spec: {
+    pacing: "moderate" as Pacing,
+    edits: {
+      zoom: {
+        status: "core",
+        priority: 0.85,
+        minConfidence: 0.5,
+        maxPerMinute: 5,
+        minSpacingSec: 4,
+        intensity: 0.8,
+      },
+      cursor_emphasis: { status: "core", priority: 0.8, minConfidence: 0.55 },
+      callout: { status: "allowed", priority: 0.65, maxPerMinute: 2, minConfidence: 0.6 },
+      text_overlay: { status: "allowed", priority: 0.6, maxPerMinute: 2 },
+      captions: { status: "allowed", priority: 0.5 },
+      cut: { status: "encouraged", priority: 0.75, intensity: 0.55 },
+      silence_removal: { status: "allowed", priority: 0.6 },
+      speed: { status: "encouraged", priority: 0.7, intensity: 0.6 },
+      blur_redaction: { status: "allowed", priority: 0.7 },
+      hook_text: { status: "discouraged", priority: 0.4, minConfidence: 0.8, maxTotal: 1 },
+      branding: { status: "allowed", priority: 0.5, maxTotal: 1 },
+      smart_crop: { status: "allowed", priority: 0.5 },
+    },
+    density: { minTotal: 0, maxTotal: 24, crossDensity: { windowS: 8, maxInWindow: 3 } },
+    composition: {
+      zoom: { minGapSeconds: 4, maxPerOutputMinute: 5 },
+      cluster: { windowS: 6, maxInWindow: 3 },
+      overlapEmphasis: true,
+    },
+  },
+});
+
+export const TUTORIAL_CLEAR: EditingTemplate = Object.freeze<EditingTemplate>({
+  id: "tutorial-step-clear",
+  version: 1,
+  family: "screencast",
+  name: "Step-by-Step Clear",
+  description: "Clear pacing, useful captions, contextual focus — never sacrifice comprehension.",
+  appliesTo: { intents: ["tutorial", "unknown"] as const },
+  spec: {
+    pacing: "slow" as Pacing,
+    edits: {
+      captions: { status: "encouraged", priority: 0.9 },
+      text_overlay: { status: "core", priority: 0.8, maxPerMinute: 2 },
+      zoom: {
+        status: "encouraged",
+        priority: 0.7,
+        minConfidence: 0.55,
+        maxPerMinute: 3,
+        minSpacingSec: 5,
+        intensity: 0.6,
+      },
+      cursor_emphasis: { status: "allowed", priority: 0.6, minConfidence: 0.6 },
+      callout: { status: "allowed", priority: 0.65, maxPerMinute: 2, minConfidence: 0.6 },
+      cut: { status: "allowed", priority: 0.55, intensity: 0.35 },
+      silence_removal: { status: "encouraged", priority: 0.7 },
+      branding: { status: "allowed", priority: 0.5, maxTotal: 1 },
+      hook_text: { status: "allowed", priority: 0.55, maxTotal: 1 },
+      smart_crop: { status: "disabled-by-default", priority: 0.4 },
+    },
+    density: { minTotal: 0, maxTotal: 20, crossDensity: { windowS: 10, maxInWindow: 3 } },
+    composition: {
+      zoom: { minGapSeconds: 5, maxPerOutputMinute: 3 },
+      cluster: { windowS: 8, maxInWindow: 3 },
+      overlapEmphasis: true,
+    },
+  },
+});
+
+export const PODCAST_CLIP_FACTORY: EditingTemplate = Object.freeze<EditingTemplate>({
+  id: "podcast-clip-factory",
+  version: 1,
+  family: "talking",
+  name: "Clip Factory",
+  description: "Dead-air removal and captions — the conversation is the star.",
+  appliesTo: {
+    dominantModes: ["camera"] as const,
+    intents: ["conversation", "unknown"] as const,
+  },
+  spec: {
+    pacing: "slow" as Pacing,
+    edits: {
+      silence_removal: { status: "core", priority: 0.95 },
+      cut: { status: "core", priority: 0.9, intensity: 0.5 },
+      captions: { status: "encouraged", priority: 0.9 },
+      text_overlay: { status: "allowed", priority: 0.5, maxTotal: 1 },
+      smart_crop: { status: "encouraged", priority: 0.6, params: { focus: "speaker" } },
+      branding: { status: "allowed", priority: 0.5, maxTotal: 1 },
+    },
+    density: { minTotal: 0, maxTotal: 12 },
+    composition: { cluster: { windowS: 10, maxInWindow: 2 }, overlapEmphasis: true },
+  },
+});
+
+export const VLOG_STORY: EditingTemplate = Object.freeze<EditingTemplate>({
+  id: "vlog-story-driven",
+  version: 1,
+  family: "talking",
+  name: "Story-Driven",
+  description: "Beat cuts and movement — effects serve rhythm, not emphasis.",
+  appliesTo: {
+    dominantModes: ["camera"] as const,
+    intents: ["story", "unknown"] as const,
+  },
+  spec: {
+    pacing: "moderate" as Pacing,
+    edits: {
+      cut: { status: "core", priority: 0.9, intensity: 0.7 },
+      speed: { status: "encouraged", priority: 0.7, intensity: 0.7 },
+      transition: { status: "encouraged", priority: 0.7, maxPerMinute: 3 },
+      smart_crop: { status: "allowed", priority: 0.5 },
+      captions: { status: "allowed", priority: 0.5 },
+      zoom: { status: "disabled-by-default", priority: 0.4, minConfidence: 0.75 },
+      silence_removal: { status: "allowed", priority: 0.6 },
+    },
+    density: { minTotal: 0, maxTotal: 20, crossDensity: { windowS: 8, maxInWindow: 3 } },
+    composition: { cluster: { windowS: 6, maxInWindow: 3 }, overlapEmphasis: true },
+  },
+});
+
+export const PROMO_PUNCHY: EditingTemplate = Object.freeze<EditingTemplate>({
+  id: "promo-punchy",
+  version: 1,
+  family: "promo",
+  name: "Punchy Promo",
+  description: "Hook → product → CTA. Every second earns attention.",
+  appliesTo: { intents: ["promo", "unknown"] as const },
+  spec: {
+    pacing: "fast" as Pacing,
+    edits: {
+      hook_text: { status: "core", priority: 0.95, maxTotal: 1 },
+      cut: { status: "core", priority: 0.9, intensity: 0.9 },
+      zoom: {
+        status: "encouraged",
+        priority: 0.75,
+        minConfidence: 0.5,
+        maxPerMinute: 5,
+        minSpacingSec: 4,
+        intensity: 0.8,
+      },
+      captions: { status: "encouraged", priority: 0.85 },
+      branding: { status: "core", priority: 0.9, maxTotal: 1 },
+      transition: { status: "encouraged", priority: 0.6, maxTotal: 5 },
+      speed: { status: "allowed", priority: 0.55, intensity: 0.6 },
+      smart_crop: { status: "encouraged", priority: 0.7 },
+      text_overlay: { status: "allowed", priority: 0.6, maxPerMinute: 2 },
+      silence_removal: { status: "encouraged", priority: 0.8 },
+    },
+    density: { minTotal: 0, maxTotal: 24, crossDensity: { windowS: 6, maxInWindow: 3 } },
+    composition: {
+      zoom: { minGapSeconds: 4, maxPerOutputMinute: 5 },
+      cluster: { windowS: 5, maxInWindow: 3 },
+      overlapEmphasis: true,
+    },
+  },
+});
+
 // ── Registry ────────────────────────────────────────────────────────────────
 
 const SELECTED_TYPES: SelectedVideoType[] = [
@@ -180,7 +417,37 @@ const CLASSIC_TEMPLATES: EditingTemplate[] = SELECTED_TYPES.map(classicTemplate)
 export const EDITING_TEMPLATES: readonly EditingTemplate[] = Object.freeze([
   ...CLASSIC_TEMPLATES,
   TALKING_CLEAN_PRO,
+  TALKING_HIGH_ENERGY,
+  TALKING_MINIMAL,
+  SCREEN_PRO_DEMO,
+  TUTORIAL_CLEAR,
+  PODCAST_CLIP_FACTORY,
+  VLOG_STORY,
+  PROMO_PUNCHY,
 ]);
+
+/**
+ * The templates the setup surface offers for a profile. Unknown axes are
+ * PERMISSIVE (an "auto" project sees every style; a declared talking head sees
+ * talking styles) — the same "maybe, not no" rule the matrix uses. Classic
+ * templates are not returned here; the caller offers Classic separately as the
+ * compatibility choice.
+ */
+export function templatesForProfile(profile: ContentProfile): EditingTemplate[] {
+  const dominant = dominantMode(profile);
+  const modesKnown = profile.sources.modes !== "default";
+  const intentKnown = profile.primaryIntent !== "unknown";
+
+  return EDITING_TEMPLATES.filter((t) => {
+    if (!t.spec) return false; // Classic handled by the caller
+    const sel = t.appliesTo;
+    const intentOk =
+      !sel.intents || !intentKnown || sel.intents.includes(profile.primaryIntent);
+    const modeOk =
+      !sel.dominantModes || !modesKnown || sel.dominantModes.includes(dominant);
+    return intentOk && modeOk;
+  });
+}
 
 export function getTemplate(id: string | undefined | null): EditingTemplate | undefined {
   if (!id) return undefined;

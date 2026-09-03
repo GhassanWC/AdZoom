@@ -34,6 +34,7 @@ import {
   type ExportStatusUI,
 } from "@/components/export/ExportProvider";
 import { resolveOutputCanvas } from "@/lib/timeline/canvas-layout";
+import { trackEditsOutcome } from "@/lib/framevo-ai/telemetry";
 import { buildTimelineMap } from "@/lib/timeline/crop-speed";
 import { visibleMoments } from "@/lib/timeline/layers";
 import { clipExportMoments, clipEffects } from "@/lib/clips/clip-edits";
@@ -420,6 +421,18 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
   };
 
   // ── Export handlers ────────────────────────────────────────────────────────
+  // Edit-acceptance telemetry (Phase 2H): the export click is the moment the
+  // user "ships" the timeline, so it is where the kept/modified/disabled/
+  // deleted diff against the generation snapshot is recorded. Fired once per
+  // analysis generation even when the editframe→cloud fallback runs both paths.
+  const outcomeFiredRef = React.useRef<string | null>(null);
+  const fireEditsOutcome = () => {
+    const key = `${project.id}:${project.analysis?.completedAt ?? 0}`;
+    if (outcomeFiredRef.current === key) return;
+    outcomeFiredRef.current = key;
+    trackEditsOutcome(project);
+  };
+
   // Submit the SERVER (backup) render. Runs when the in-browser engine isn't
   // available here, and automatically as the fallback when it fails mid-render.
   const runCloudExport = () => {
@@ -428,6 +441,7 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
       setBlockedWarning(v.error!);
       return Promise.resolve<{ ok: boolean }>({ ok: false });
     }
+    fireEditsOutcome();
     // Drop any stale browser job so a prior failure can't bleed into the UI.
     if (myBrowserJob) clearJob();
     return cloud.startCloudExport(serverInput).then((r) => {
@@ -462,8 +476,9 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
   // Start the in-browser render (the PRIMARY engine). Same resolution / fps /
   // moments / effects / range as the server render — it just renders locally and
   // touches no billing/usage/Firestore job.
-  const runEditframeExport = () =>
-    editframe.startExport({
+  const runEditframeExport = () => {
+    fireEditsOutcome();
+    return editframe.startExport({
       project: {
         id: project.id,
         title: project.title,
@@ -489,6 +504,7 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
       // runs automatically and only the final result is surfaced to the user.
       notifyOnFailure: !canUseCloud,
     });
+  };
 
   // ── Primary "Export" action ────────────────────────────────────────────────
   // One button, one intent. Prefer the fast in-browser render; if it can't run or
@@ -551,6 +567,7 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
       requestSourceDownload();
       return false;
     }
+    fireEditsOutcome();
     return desktop.startExport({
       projectId: project.id,
       projectTitle: project.title,

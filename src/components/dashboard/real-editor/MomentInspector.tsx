@@ -1815,7 +1815,7 @@ function EmptyInspector({
         </p>
       ) : status !== "analyzed" && status !== "completed" ? (
         <p className="mt-1 text-[12.5px] leading-relaxed text-fog">
-          Run <strong className="text-white">Analyze with AI</strong> to
+          Ask <strong className="text-white">Framevo AI</strong> to
           generate a first-draft edit.
         </p>
       ) : (

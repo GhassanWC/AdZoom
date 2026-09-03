@@ -158,7 +158,7 @@ const STEP_TEMPLATES: StepTemplate[] = [
   { id: "timeline", base: "Adding selected edits to the timeline", gate: () => true },
   // Only when the user actually wrote a brief — otherwise this step would sit
   // there permanently unticked on every plain analysis, implying a stage failed.
-  { id: "director", base: "Directing your video", gate: (g) => g.director },
+  { id: "director", base: "Applying your instructions", gate: (g) => g.director },
   { id: "finalize", base: "Finalizing AI edit", gate: () => true },
 ];
 
@@ -252,7 +252,9 @@ const TECHNICAL_ACTIVITY = /gemini|files api|file id|inline video|extracting fra
  * "Director planned without the model (gemini timeout)"), which is exactly the
  * line the user most needs to see.
  */
-const DIRECTOR_ACTIVITY = /^director\b|^applying your director/i;
+// Matches BOTH the current "Framevo AI …" lines and the pre-rename
+// "Director …" lines still persisted in older projects' activity feeds.
+const DIRECTOR_ACTIVITY = /^framevo ai\b|^director\b|^applying your director/i;
 
 export interface FriendlyActivity {
   ts: number;

@@ -73,10 +73,21 @@ test("the analyze route no longer runs ASR / reserves quota / generates captions
   assert.ok(src.includes("reAddedCaptions"), "analysis must preserve existing caption moments");
 });
 
-test("the AnalysisOptionsModal strips generateCaptions from what it submits", () => {
-  const src = readFileSync("src/components/dashboard/real-editor/AnalysisOptionsModal.tsx", "utf8");
-  assert.ok(src.includes("generateCaptions: _captionsDecoupled"), "must destructure captions out of the options");
-  assert.ok(!src.includes("SpokenLanguagePicker"), "no spoken-language picker in the analyze dialog");
+test("the canonical run-request builder strips generateCaptions from every payload", () => {
+  // The Analyze dialog is gone (Framevo AI unification, 2G) — the strip now
+  // lives in the ONE builder every entry point uses, which makes the rule
+  // structural instead of per-surface.
+  const src = readFileSync("src/lib/analysis/run-request.ts", "utf8");
+  assert.ok(
+    src.includes("delete options.generateCaptions"),
+    "the builder must strip captions from every run request"
+  );
+  const setup = readFileSync(
+    "src/components/dashboard/real-editor/FramevoAISetup.tsx",
+    "utf8"
+  );
+  assert.ok(!setup.includes("SpokenLanguagePicker"), "no spoken-language picker in setup");
+  assert.ok(!setup.includes("generateCaptions"), "setup renders no captions toggle");
 });
 
 /* ── 2. AI-caption existence resolver ────────────────────────────────────── */

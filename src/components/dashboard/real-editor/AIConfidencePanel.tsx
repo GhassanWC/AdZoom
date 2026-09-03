@@ -77,7 +77,7 @@ export function AIConfidencePanel() {
             AI analysis
           </h3>
           <p className="mt-1.5 text-[13px] leading-relaxed text-fog">
-            Run <strong className="text-white">Analyze with AI</strong> to generate a
+            Ask <strong className="text-white">Framevo AI</strong> to generate a
             first-draft edit. The hybrid engine measures real motion, scene cuts,
             and fused attention scoring — your timeline is just a refinement away.
           </p>

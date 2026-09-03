@@ -8,7 +8,7 @@ import { readPersistedNumber, writePersistedNumber } from "./timeline/utils";
 import { RealCanvasPanel } from "./RealCanvasPanel";
 import { RealCaptionsPanel } from "./RealCaptionsPanel";
 import { ClipsPanel } from "./ClipsPanel";
-import { DirectorChatPanel } from "./DirectorChatPanel";
+import { FramevoAIPanel } from "./FramevoAIPanel";
 import type { ChatMode } from "@/lib/director/chat";
 import { PresetBrowserPanel } from "./PresetBrowserPanel";
 import { RecipeSummary } from "./RecipeSummary";
@@ -33,7 +33,9 @@ const DEFAULT_FRACTION = 0.6;
 const RAIL_WIDTH = 56;
 
 const TOOL_TITLE: Record<RightTool, string> = {
-  "ai-chat": "Edit with AI",
+  // The ONE user-facing AI identity (Framevo AI unification, rule 3). The
+  // internal tool id stays "ai-chat" — persisted in the tool allow-list.
+  "ai-chat": "Framevo AI",
   canvas: "Canvas",
   captions: "Captions",
   // One presets surface: the library AND the whole-recording Looks (a tab in it).
@@ -78,27 +80,30 @@ const CLOSE_MS = 140;
 export function EditorInspectorDock({
   aiMode = "instant",
   onAiModeChange,
-  onOpenAnalysisOptions,
   canAnalyze = true,
   analyzeBlockedReason,
 }: {
-  /** Instant / Plan for the AI chat — owned by the editor page. */
+  /** Instant / Plan for Framevo AI — owned by the editor page. */
   aiMode?: ChatMode;
   onAiModeChange?: (m: ChatMode) => void;
-  /**
-   * Open the full analysis options dialog. Owned by the editor page (it owns
-   * the dialog), reached from the AI chat's ⚙ — the chat is the front door for
-   * AI edits, and those controls are the room behind it.
-   */
-  onOpenAnalysisOptions?: () => void;
-  /** Whether a first analysis can start — the chat's opening message needs one. */
+  /** Whether a first analysis can start — the panel's Edit video needs one. */
   canAnalyze?: boolean;
   analyzeBlockedReason?: string;
 } = {}) {
-  const { activeTool, setActiveTool, project } = useEditorReal();
+  const { activeTool, setActiveTool, project, analyzing } = useEditorReal();
   const [width, setWidth] = React.useState<number>(() =>
     clampW(readPersistedNumber(WIDTH_KEY, defaultWidthPx()))
   );
+  // Adaptive width (approved rule 8): conversation reads fine narrow, but the
+  // SETUP state (type cards + template cards + output controls) must never be
+  // squeezed into a chat-width column. The floor applies while rendering only —
+  // the user's persisted width choice is untouched.
+  const aiInSetup =
+    activeTool === "ai-chat" &&
+    !analyzing &&
+    (project.analysis?.detectedMoments?.length ?? 0) === 0;
+  const SETUP_COMFORT_W = 460;
+  const effectiveWidth = aiInSetup ? Math.max(width, SETUP_COMFORT_W) : width;
   const panelRef = React.useRef<HTMLDivElement | null>(null);
   const dragRef = React.useRef<{ startX: number; startW: number; live: number } | null>(null);
 
@@ -197,7 +202,7 @@ export function EditorInspectorDock({
         "absolute inset-y-0 z-40 flex flex-col border-l border-white/[0.08] bg-surface shadow-[-16px_0_40px_-12px_rgba(0,0,0,0.6)]",
         closing ? "fv-panel-out" : "fv-panel-in"
       )}
-      style={{ width, right: RAIL_WIDTH }}
+      style={{ width: effectiveWidth, right: RAIL_WIDTH }}
     >
       {/* Left-edge resize handle. */}
       <div
@@ -237,10 +242,9 @@ export function EditorInspectorDock({
         )}
       >
         {shownTool === "ai-chat" && (
-          <DirectorChatPanel
+          <FramevoAIPanel
             mode={aiMode}
             onModeChange={onAiModeChange ?? (() => {})}
-            onOpenOptions={onOpenAnalysisOptions ?? (() => {})}
             canAnalyze={canAnalyze}
             analyzeBlockedReason={analyzeBlockedReason}
           />

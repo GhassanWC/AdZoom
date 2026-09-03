@@ -16,10 +16,6 @@ import { EditorSplitWorkspace } from "./EditorSplitWorkspace";
 import { RealTimeline } from "./RealTimeline";
 import { MomentInspectorModal } from "./MomentInspectorModal";
 import { ExportModal } from "./ExportModal";
-import { AnalysisOptionsModal } from "./AnalysisOptionsModal";
-import type { AnalysisOptions } from "@/lib/analysis/engine-layers";
-import { DEFAULT_ZOOM_PRESET } from "@/lib/timeline/zoom-presets";
-import { useWorkspaceSettings } from "@/lib/firebase/workspace-settings";
 import { RealProcessingOverlay } from "./RealProcessingOverlay";
 import { ProcessingMiniPill } from "./ProcessingMiniPill";
 import { DebugOverlay } from "./DebugOverlay";
@@ -147,17 +143,12 @@ export function RealEditorPage({ projectId }: { projectId: string }) {
 function Body() {
   const {
     project,
-    startAnalyze,
     analyzing,
     analyzeError,
     activeTool,
     setActiveTool,
     cropEditing,
     closeCropEditor,
-    selectedVideoType,
-    setSelectedVideoType,
-    saveDirectorBrief,
-    updateEffects,
     exportModalOpen,
     openExportModal,
     closeExportModal,
@@ -174,12 +165,9 @@ function Body() {
   // first" — advice they can act on via the banner right above it.
   const needsCloudSync = isLocalProject(project);
   const canAnalyze = !isAnalyzingNow && !!project.originalVideoUrl && !needsCloudSync;
-  const [analysisOptionsOpen, setAnalysisOptionsOpen] = React.useState(false);
-  // Instant / Plan for the AI chat. Owned here rather than inside the chat
-  // because the options dialog can start a run too, and both entry points have
-  // to mean the same thing by "Plan".
+  // Instant / Plan for Framevo AI. Owned here (not inside the panel) so it
+  // survives the panel's setup ↔ conversation state changes within a session.
   const [aiMode, setAiMode] = React.useState<ChatMode>("instant");
-  const { settings, save } = useWorkspaceSettings();
 
   // Crop has no dock panel — it edits directly on the preview. Opening any
   // OTHER tool exits crop mode (safety net; the rail's Crop button already
@@ -195,10 +183,6 @@ function Body() {
       : !hasAnalysis && project.analysis?.status === "complete"
         ? "No moments were produced — re-run to try again."
         : undefined;
-
-  // The project's LAST RUN toggles — passed to the dialog so Re-analyze respects
-  // what the user turned off. The dialog owns the video type + recipe defaults now.
-  const lastRun = project.analysis?.lastRunOptions as Partial<AnalysisOptions> | undefined;
 
   return (
     // Fixed-height editor shell — fills the viewport and does NOT page-scroll.
@@ -283,7 +267,6 @@ function Body() {
           <EditorInspectorDock
             aiMode={aiMode}
             onAiModeChange={setAiMode}
-            onOpenAnalysisOptions={() => setAnalysisOptionsOpen(true)}
             canAnalyze={canAnalyze}
             analyzeBlockedReason={analyzeTitle}
           />
@@ -294,30 +277,10 @@ function Body() {
       </div>
 
       {/* ── Editing dialogs (shared shell) ────────────────────────────────── */}
-      <AnalysisOptionsModal
-        open={analysisOptionsOpen}
-        onClose={() => setAnalysisOptionsOpen(false)}
-        hasExistingEdits={hasAnalysis}
-        initialVideoType={selectedVideoType}
-        onSelectVideoType={(t) => void setSelectedVideoType(t)}
-        lastRunOptions={lastRun}
-        corePrefs={settings.analysisEngines}
-        onPersistCorePrefs={(core) => void save({ analysisEngines: core })}
-        videoDuration={project.duration ?? 0}
-        initialDetail={settings.analysisDetail}
-        onPersistDetail={(detail) => void save({ analysisDetail: detail })}
-        directorBrief={project.directorBrief}
-        onSaveDirectorBrief={saveDirectorBrief}
-        zoomPreset={project.effectsSettings?.zoomPreset ?? DEFAULT_ZOOM_PRESET}
-        onSelectZoomPreset={(p) => void updateEffects("zoomPreset", p)}
-        onConfirm={(opts) => {
-          setAnalysisOptionsOpen(false);
-          // Plan mode is a property of the SESSION, not of the surface that
-          // started the run — a run launched from this dialog while the chat is
-          // in Plan mode still proposes rather than applies.
-          void startAnalyze({ ...opts, directorPlanOnly: aiMode === "plan" });
-        }}
-      />
+      {/* The Analyze dialog is GONE (Framevo AI unification, 2G): setup,
+          advanced controls, progress and conversation all live in the Framevo
+          AI panel. Its logic survives — the run-request builder, the toggle
+          seeding, the brief contract — the panel simply became the one door. */}
       <ExportModal open={exportModalOpen} onClose={closeExportModal} />
 
       {/* Debug overlay — Ctrl+Shift+D in dev / ?debug=1 anywhere. */}
@@ -349,11 +312,11 @@ function PreAnalysisBanner({
       </span>
       <div className="min-w-0 flex-1">
         <p className="truncate text-[13px] font-medium text-white">
-          Generate your AI edit
+          Edit with Framevo AI
         </p>
         <p className="hidden truncate text-[11.5px] text-fog sm:block">
-          Framevo builds a first-draft edit — cuts, zooms, speed changes, captions —
-          that you refine on the timeline.
+          Framevo AI builds the first edit — cuts, zooms, captions — and you refine
+          it on the timeline or by asking for changes.
         </p>
       </div>
       <Button
@@ -370,7 +333,7 @@ function PreAnalysisBanner({
           )
         }
       >
-        {analyzing ? "Analyzing…" : "Generate AI Edit"}
+        {analyzing ? "Editing…" : "Open Framevo AI"}
       </Button>
     </div>
   );

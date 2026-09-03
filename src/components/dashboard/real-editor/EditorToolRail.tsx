@@ -89,7 +89,7 @@ export function EditorToolRail({
           not much of a conversation. */}
       <RailButton
         label="AI"
-        title={analyzeTitle ?? "Edit with AI — ask for a change in plain English"}
+        title={analyzeTitle ?? "Framevo AI — ask for a change in plain English"}
         onClick={() => toggle("ai-chat")}
         active={activeTool === "ai-chat"}
         icon={
@@ -103,9 +103,9 @@ export function EditorToolRail({
 
       <span aria-hidden className="mx-2 my-1 h-px shrink-0 bg-white/[0.08]" />
 
-      {/* No Director button: the Director is not a tool you open, it's the final
-          stage of the analysis the AI action above starts. Its brief lives at the
-          top of that dialog (AnalysisOptionsModal → DirectorBriefFields). */}
+      {/* No separate "Director" button: the Director is internal architecture,
+          not a tool — the AI button above IS Framevo AI (setup, progress and
+          conversation in one panel), and instructions live in its composer. */}
       <RailButton label="Crop" title="Crop the source frame (applies everywhere)" icon={<Crop size={24} />} active={cropEditing} onClick={toggleCrop} />
       <RailButton label="Clips" title="AI-generated short clips from this video" icon={<Scissors size={24} />} active={activeTool === "clips"} onClick={() => toggle("clips")} />
       <RailButton label="Canvas" title="Output canvas — aspect, fit, background" icon={<Frame size={24} />} active={activeTool === "canvas"} onClick={() => toggle("canvas")} />

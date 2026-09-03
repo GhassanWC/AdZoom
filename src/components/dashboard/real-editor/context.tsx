@@ -516,8 +516,8 @@ interface EditorRealContextValue {
    * The brief is an INPUT to analysis, not a record of a run: the analyze route
    * reads it back off the project document and runs the Director as analysis's
    * final stage. There is no standalone Director run any more — the brief is
-   * written in the analysis dialog (AnalysisOptionsModal) and saved there, right
-   * before the run it belongs to is started.
+   * written by the Framevo AI panel (setup card or composer, via the canonical
+   * run-request builder) and saved right before the run it belongs to starts.
    */
   saveDirectorBrief: (prompt: string, form: DirectorRequestForm) => Promise<void>;
   /** Delete AI-generated captions (manual captions survive). */

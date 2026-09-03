@@ -53,7 +53,7 @@ import {
   applyCompositionActions,
   reviewComposition,
 } from "@/lib/editorial/composition";
-import { buildEditsGeneratedMetadata } from "@/lib/editorial/telemetry";
+import { buildEditsGeneratedMetadata, buildEditsSnapshot } from "@/lib/editorial/telemetry";
 // The AI Editor — decides which candidate edits deserve to exist at all.
 import {
   decideTimeline,
@@ -953,6 +953,14 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
         durationSeconds: duration ?? undefined,
       },
       overrides: overridesFromToggles(analysisOptions),
+      // The brief's confident deltas ("no CTA", "no captions") shape the run's
+      // policy — but only when the brief will actually run this time.
+      brief: shouldRunDirectorStage(
+        project.directorBrief as ProjectDoc["directorBrief"],
+        analysisOptions.applyDirectorBrief
+      )
+        ? ((project.directorBrief as ProjectDoc["directorBrief"]) ?? null)
+        : null,
     });
     // The template's pacing (e.g. Clean Professional = slow) governs enforce
     // runs; Classic resolutions carry none, so `pacing` stays as loaded.
@@ -1865,8 +1873,10 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     let directorCanvas: OutputCanvas | undefined;
 
     if (shouldRunDirectorStage(directorBrief, analysisOptions.applyDirectorBrief)) {
-      await setStage(ref, "analyzing" as ProjectStatus, "Directing your video");
-      await emitActivity(ref, "info", "Applying your Director brief");
+      // "Framevo AI" is the only user-facing name for the intelligence; the
+      // Director remains internal vocabulary (approved rule 3).
+      await setStage(ref, "analyzing" as ProjectStatus, "Applying your instructions");
+      await emitActivity(ref, "info", "Framevo AI is applying your instructions");
 
       // The Director plans against what analysis JUST learned, not what was on
       // disk when the request came in — so it sees this run's transcript, moments
@@ -1907,6 +1917,14 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
         effects: effectsForDirector,
         prior: project.director as DirectorState | undefined,
         planOnly: analysisOptions.directorPlanOnly === true,
+        // The Editorial Engine's authority extends through the brief: plan ops
+        // of categories the resolved template forbids are rejected in the
+        // pipeline's judgment stage, never executed.
+        policy: {
+          statuses: resolvedPolicy.statuses,
+          mode: resolvedPolicy.mode,
+          templateName: editingTemplate.name,
+        },
       });
 
       for (const line of directed.log) await emitActivity(ref, line.kind, line.text);
@@ -2036,6 +2054,8 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
           editRecipe: editRecipePlan,
           // Explainability: the template + per-category statuses of this run.
           editorialPolicy: policyDigest(resolvedPolicy),
+          // The generation snapshot the export-time outcome diff compares against.
+          editsGeneratedSnapshot: buildEditsSnapshot(cleanMoments),
           // Phase 4 — persist the transcript + audio intelligence (stripUndefined
           // so optional fields never write literal `undefined` to Firestore).
           transcript: stripUndefined(transcript),

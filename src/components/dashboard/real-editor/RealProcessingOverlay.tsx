@@ -53,7 +53,6 @@ export function RealProcessingOverlay() {
     startAnalyze,
     cancelAnalyze,
     cvProgress,
-    processingMinimized,
     setProcessingMinimized,
     chunkedJob,
     selectedVideoType,
@@ -111,13 +110,15 @@ export function RealProcessingOverlay() {
   // open (not minimized) — when minimized (the chunked default) we just let the
   // pill clear + the navbar "AI analysis ready" notification fire, so we don't
   // interrupt the user mid-edit.
+  // FRAMEVO AI UNIFICATION (rule 9): the run's progress lives in the Framevo
+  // AI panel now, and completion is narrated there — this overlay survives ONLY
+  // as the failure/cancelled alert, the two states that genuinely demand
+  // attention wherever the user is. No success popup, no processing modal.
   const terminalKey = failed
     ? `failed:${analysis?.errorKind ?? "unknown"}:${analysis?.completedAt ?? ""}`
     : cancelled
       ? `cancelled:${analysis?.completedAt ?? ""}`
-      : done && !processingMinimized
-        ? `complete:${analysis?.completedAt ?? chunkedJob?.completedAt ?? "now"}`
-        : null;
+      : null;
   const showTerminal = Boolean(terminalKey) && dismissedTerminal !== terminalKey;
 
   // Auto-dismiss the success state after a short confirmation beat.
@@ -128,8 +129,7 @@ export function RealProcessingOverlay() {
     return () => clearTimeout(t);
   }, [isCompleteTerminal, terminalKey]);
 
-  const visible =
-    (effectivelyProcessing && !processingMinimized) || showTerminal;
+  const visible = showTerminal;
 
   // Mount portal only after client-side hydration.
   const [mounted, setMounted] = React.useState(false);

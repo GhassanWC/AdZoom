@@ -88,8 +88,9 @@ test("stage: the activity log tells the user what was understood and what was ch
   const text = logText(result.log);
 
   // It restates the brief in the user's own terms — a misread brief is the failure
-  // mode a user cannot debug on their own.
-  assert.match(text, /Director brief/i);
+  // mode a user cannot debug on their own. The user-facing name is Framevo AI
+  // ("Director" is internal-only vocabulary — Framevo AI unification, rule 3).
+  assert.match(text, /Framevo AI understood/i);
   assert.match(text, /tiktok/i);
   assert.match(text, /9:16/);
   assert.match(text, /energetic/i);
@@ -104,8 +105,12 @@ test("stage: the activity log tells the user what was understood and what was ch
     );
   }
 
-  // And it says what it actually did.
-  assert.match(text, /Director applied \d+ decision/i);
+  // And it says what it actually did — as Framevo AI, the one user-facing name.
+  assert.match(text, /Framevo AI applied \d+ decision/i);
+  assert.ok(
+    !/(^|\n)Director\b/.test(text),
+    "no user-facing activity line may lead with the internal 'Director' name"
+  );
 });
 
 test("stage: the summary the panel renders names every design that landed", async () => {
