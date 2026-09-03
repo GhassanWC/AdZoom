@@ -56,11 +56,27 @@ export type TimelineHealth = "balanced" | "clustered" | "quiet" | "empty";
  * matter how much content sits on either side.
  *
  *   Left:   title · health · Add (primary, stays visible) · Edit ▾ (Split/
- *           Duplicate/Delete) · Layers ▾ (one show/hide per lane) · undo/redo
+ *           Duplicate/Delete) · Layers ▾ (one show/hide per lane) · [undo|redo]
  *   Center: PlaybackTransport (jump/back5/Play/forward5/time) — shared with
  *           the fullscreen overlay pill, one playback implementation.
  *   Right:  View ▾ (workspace mode/Scenes/Insights) · volume · fullscreen ·
  *           ⋯ overflow (zoom, fit, edit review-nav, shortcuts)
+ *
+ * ── What keeps ten controls legible ──────────────────────────────────────────
+ * Three rules, and breaking any one of them is what made this bar feel messy:
+ *
+ *   1. SHAPE ENCODES SYSTEM. Bar chrome is a 32px rounded-lg control
+ *      (BAR_CONTROL); playback is a 36px ROUND button with a 40px Play. You can
+ *      tell what a control belongs to before reading its icon — which matters
+ *      most for undo/redo, whose arrows sit inches from the seek arrows.
+ *   2. SPACING ENCODES GROUPING. gap-1 within a group, gap-2 between groups.
+ *   3. ONE LOUD THING PER SIDE. Add is violet on the left, Play is violet in
+ *      the centre. A warning (hidden layers) is amber in TEXT only — it must
+ *      never outrank the primary action it sits beside.
+ *
+ * Status is not chrome: the health badge is a bare dot + label, because
+ * anything wearing a button's shape in this bar should do something when
+ * pressed.
  *
  * The optional scene/chapter strip itself renders as a sibling BELOW this bar
  * (in RealTimeline) only while `scenesOpen` — the View menu just owns the toggle.
@@ -137,8 +153,11 @@ export function EditorUnifiedControlBar({
           that almost everything lives behind dropdowns, wrapping risk is low
           enough that plain `flex` (nowrap) + hidden labels at narrow widths is
           sufficient. */}
-      <div className="flex min-w-0 items-center gap-1.5">
-        <div className="flex shrink-0 items-center gap-2 pr-0.5">
+      {/* Spacing carries the grouping: gap-2 BETWEEN groups, gap-1 within one.
+          The bar used to run one flat gap-1.5 through every control, which is
+          what made ten buttons read as a single undifferentiated row. */}
+      <div className="flex min-w-0 items-center gap-2 pr-1">
+        <div className="flex shrink-0 items-center gap-2">
           <h3 className="hidden font-display text-[13px] font-semibold tracking-tight text-white sm:inline">
             Timeline
           </h3>
@@ -163,11 +182,16 @@ export function EditorUnifiedControlBar({
           />
         </div>
 
-        <Divider />
-
-        {/* Undo / redo — the same session history the keyboard shortcuts drive. */}
-        <div className="flex shrink-0 items-center gap-0.5">
+        {/* Undo / redo — the same session history the keyboard shortcuts drive.
+            Bordered as a PAIR on purpose: these two circular arrows sit directly
+            beside the transport's seek arrows (⏮ ↺5 ▶ ↻5), and unbordered they
+            blended into them — four near-identical glyphs from two unrelated
+            systems, with the disabled pair reading as broken chrome rather than
+            as history that has nothing to undo yet. The enclosure ends the tool
+            group cleanly and gives the transport its own air. */}
+        <div className="flex h-8 shrink-0 items-center overflow-hidden rounded-lg border border-white/10 bg-white/[0.025]">
           <HistoryBtn Icon={Undo2} label="Undo" shortcut="⌘Z" disabled={!canUndo} onClick={onUndo} />
+          <span aria-hidden className="h-4 w-px shrink-0 bg-white/[0.08]" />
           <HistoryBtn Icon={Redo2} label="Redo" shortcut="⌘⇧Z" disabled={!canRedo} onClick={onRedo} />
         </div>
       </div>
@@ -180,7 +204,7 @@ export function EditorUnifiedControlBar({
       {/* ── Right — View ▾ · volume/fullscreen · ⋯ overflow ──────────────── */}
       {/* Same reasoning as the left group: no overflow-x-auto, so the
           View/Overflow dropdown panels never get vertically clipped. */}
-      <div className="flex min-w-0 items-center justify-end gap-1">
+      <div className="flex min-w-0 items-center justify-end gap-2 pl-1">
         <ViewMenu
           activeMode={activeMode}
           setSplitFraction={setSplitFraction}
@@ -286,8 +310,26 @@ function MenuItem({
 }
 
 function Divider() {
-  return <span aria-hidden className="hidden h-6 w-px shrink-0 bg-white/[0.08] sm:block" />;
+  return <span aria-hidden className="hidden h-5 w-px shrink-0 bg-white/[0.08] sm:block" />;
 }
+
+/**
+ * The one height every piece of bar chrome uses (32px in a 48px bar).
+ *
+ * The bar previously mixed h-9 menu triggers, size-9 history buttons and a
+ * pill-shaped status badge with the transport's size-9 round buttons and its
+ * size-10 Play — five treatments in one row. Chrome is now uniformly h-8 and
+ * the TRANSPORT keeps its larger round shape, so the primary control reads as
+ * the biggest thing in the bar instead of competing with the tools around it.
+ */
+const BAR_CONTROL =
+  "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-lg border px-2 text-[11.5px] font-medium transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/60";
+
+/** Neutral (secondary) bar control — Edit, Layers, View. */
+const BAR_CONTROL_NEUTRAL = cn(
+  BAR_CONTROL,
+  "border-white/10 bg-white/[0.025] text-white/85 hover:border-white/25 hover:bg-white/[0.06] hover:text-white"
+);
 
 // ── Layers dropdown — one show/hide switch per timeline lane ───────────────
 
@@ -337,18 +379,26 @@ function LayersMenu({
         aria-expanded={open}
         aria-haspopup="menu"
         aria-label="Layers"
-        title="Layers — show or hide a whole lane"
-        className={cn(
-          "inline-flex h-9 shrink-0 items-center gap-1.5 rounded-lg border px-2 text-[11.5px] font-medium transition-colors duration-150",
+        title={
           hiddenCount > 0
-            ? "border-amber-300/40 bg-amber-400/[0.08] text-amber-100 hover:border-amber-300/60"
+            ? `Layers — ${hiddenCount} hidden and not rendering`
+            : "Layers — show or hide a whole lane"
+        }
+        // A hidden layer still warrants amber (those edits won't render), but
+        // the old filled amber chip out-shouted the violet Add button beside
+        // it — the loudest thing in the bar was a passive warning, not the
+        // primary action. Amber now lives in the text and border only.
+        className={cn(
+          BAR_CONTROL,
+          hiddenCount > 0
+            ? "border-amber-300/35 bg-transparent text-amber-100/90 hover:border-amber-300/60 hover:bg-amber-400/[0.06]"
             : "border-white/10 bg-white/[0.025] text-white/85 hover:border-white/25 hover:bg-white/[0.06] hover:text-white"
         )}
       >
         <Layers size={13} className="shrink-0" />
         <span className="hidden sm:inline">Layers</span>
         {hiddenCount > 0 && (
-          <span className="rounded bg-amber-400/20 px-1 py-[1px] text-[9.5px] font-bold tabular-nums leading-none">
+          <span className="text-[10.5px] font-semibold tabular-nums text-amber-200/90">
             {hiddenCount} off
           </span>
         )}
@@ -407,7 +457,10 @@ function LayersMenu({
   );
 }
 
-/** Icon-only undo/redo button — sits beside the Add/Edit group in this bar. */
+/**
+ * Icon-only undo/redo button — one half of the bordered history pair that ends
+ * the left group. No radius/border of its own: the enclosure owns both.
+ */
 function HistoryBtn({
   Icon,
   label,
@@ -428,9 +481,9 @@ function HistoryBtn({
       disabled={disabled}
       aria-label={label}
       title={`${label} (${shortcut})`}
-      className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg text-fog transition-colors duration-150 hover:bg-white/[0.06] hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/60 disabled:pointer-events-none disabled:opacity-35"
+      className="inline-flex size-8 shrink-0 items-center justify-center text-fog transition-colors duration-150 hover:bg-white/[0.06] hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-violet-400/60 disabled:pointer-events-none disabled:opacity-30"
     >
-      <Icon size={15} />
+      <Icon size={14} />
     </button>
   );
 }
@@ -464,7 +517,7 @@ function EditMenu({
         aria-haspopup="menu"
         aria-label="Edit actions"
         title="Edit — split, duplicate, delete"
-        className="inline-flex h-9 shrink-0 items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.025] px-2 text-[11.5px] font-medium text-white/85 transition-colors duration-150 hover:border-white/25 hover:bg-white/[0.06] hover:text-white"
+        className={BAR_CONTROL_NEUTRAL}
       >
         <Scissors size={13} className="shrink-0" />
         <span className="hidden sm:inline">Edit</span>
@@ -552,11 +605,18 @@ function ViewMenu({
         aria-expanded={open}
         aria-haspopup="menu"
         aria-label="View options"
-        title="View — workspace layout, scenes, insights"
-        className="inline-flex h-9 shrink-0 items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.025] px-2 text-[11.5px] font-medium text-white/85 transition-colors duration-150 hover:border-white/25 hover:bg-white/[0.06] hover:text-white"
+        // The trigger says "View", NOT the active mode's name. It used to wear
+        // the mode ("Balanced"), which collided word-for-word with the timeline
+        // HEALTH badge on the other side of the same bar — two unrelated
+        // meanings, one word, 1500px apart. The layout is self-evident on
+        // screen (you can see which pane is larger) and the active mode is
+        // check-marked inside the menu, so the label was carrying a duplicate
+        // rather than information. The tooltip still names it.
+        title={`View — ${current ? `${current.short} layout` : "workspace layout"}, scenes, insights`}
+        className={BAR_CONTROL_NEUTRAL}
       >
         <SquareSplitVertical size={13} className="shrink-0" />
-        <span className="hidden md:inline">{current?.short ?? "View"}</span>
+        <span className="hidden md:inline">View</span>
         <ChevronDown size={11} className="shrink-0 opacity-70" />
       </button>
       <MenuPopover state={menu} align="right" width={MENU_W_MD} ariaLabel="View options">
@@ -644,9 +704,12 @@ function OverflowMenu({
         aria-haspopup="menu"
         aria-label="More timeline options"
         title="More options — zoom, fit, edit navigation, shortcuts"
-        className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg text-fog transition-colors duration-150 hover:bg-white/[0.06] hover:text-white"
+        // Chrome size (32px square), not transport size — this is a timeline
+        // menu that happens to sit next to the playback icons, and matching
+        // their round 36px would file it under playback.
+        className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg text-fog transition-colors duration-150 hover:bg-white/[0.06] hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/60"
       >
-        <MoreHorizontal size={17} />
+        <MoreHorizontal size={16} />
       </button>
       <MenuPopover state={menu} align="right" width={MENU_W_LG} ariaLabel="More timeline options">
           <MenuLabel>Timeline zoom</MenuLabel>
@@ -766,7 +829,12 @@ function AddMenu({ onAdd }: { onAdd: (e: EffectType) => void }) {
         aria-expanded={open}
         aria-haspopup="menu"
         title="Insert a new edit at the playhead"
-        className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-violet-400/40 bg-violet-500/15 px-2.5 text-[11.5px] font-semibold text-violet-50 transition-colors duration-150 hover:bg-violet-500/25"
+        // The one primary control in the left group — it keeps the violet fill
+        // and a heavier weight so it stays the obvious first action.
+        className={cn(
+          BAR_CONTROL,
+          "border-violet-400/40 bg-violet-500/15 px-2.5 font-semibold text-violet-50 hover:border-violet-400/60 hover:bg-violet-500/25"
+        )}
       >
         <Plus size={13} />
         <span className="hidden sm:inline">Add</span>
@@ -828,14 +896,23 @@ const HEALTH_PRESENTATION: Record<TimelineHealth, { dot: string; label: string; 
   },
 };
 
+/**
+ * Timeline health — a READ-ONLY status line, deliberately not a pill.
+ *
+ * It used to wear a bordered, filled, fully-rounded badge, which is exactly the
+ * chrome every clickable control in this bar wears: it read as a button that
+ * did nothing when pressed. A coloured dot plus a quiet label says "status"
+ * without borrowing a control's shape. The colour is never the only signal —
+ * the word beside it carries the same meaning for anyone who can't use it.
+ */
 function HealthDot({ health }: { health: TimelineHealth }) {
   const cfg = HEALTH_PRESENTATION[health];
   return (
     <span
       title={cfg.tooltip}
-      className="hidden items-center gap-1.5 rounded-full border border-white/[0.06] bg-white/[0.02] px-2 py-[3px] text-[11px] font-medium text-fog md:inline-flex"
+      className="hidden items-center gap-1.5 text-[11.5px] font-medium text-fog md:inline-flex"
     >
-      <span className={cn("size-1.5 rounded-full", cfg.dot)} />
+      <span className={cn("size-1.5 shrink-0 rounded-full", cfg.dot)} />
       <span>{cfg.label}</span>
     </span>
   );

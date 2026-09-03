@@ -8,7 +8,9 @@
  */
 import * as React from "react";
 import { notFound } from "next/navigation";
+import { Zap, Scissors, Captions as CaptionsIcon, Sparkles } from "lucide-react";
 import { EditorRealProvider } from "@/components/dashboard/real-editor/context";
+import { EditorUnifiedControlBar } from "@/components/dashboard/real-editor/EditorUnifiedControlBar";
 import { FramevoAIPanel } from "@/components/dashboard/real-editor/FramevoAIPanel";
 import { FramevoAISetup } from "@/components/dashboard/real-editor/FramevoAISetup";
 import { DEFAULT_EFFECTS_SETTINGS, type DetectedMoment, type ProjectDoc } from "@/lib/firebase/schema";
@@ -182,6 +184,47 @@ function Frame({
   );
 }
 
+/** The timeline control bar, at a realistic editor width. */
+function ControlBarPreview({ hiddenLayer }: { hiddenLayer: boolean }) {
+  const noop = () => {};
+  return (
+    <EditorRealProvider uid={null} project={DONE_PROJECT} idTokenGetter={async () => null}>
+      <div data-shot={hiddenLayer ? "control-bar" : "control-bar-clean"} className="w-[1400px]">
+        <EditorUnifiedControlBar
+          health="balanced"
+          zoom={1}
+          minZoom={0.5}
+          maxZoom={8}
+          onZoomIn={noop}
+          onZoomOut={noop}
+          onFit={noop}
+          insightsOpen={false}
+          onToggleInsights={noop}
+          hasScenes
+          layerRows={[
+            { id: "camera", label: "Zooms & focus", count: 3, visible: true, Icon: Zap },
+            { id: "cut", label: "Cuts", count: 3, visible: true, Icon: Scissors },
+            { id: "captions", label: "Captions", count: 14, visible: !hiddenLayer, Icon: CaptionsIcon },
+            { id: "hook-text", label: "Hook text", count: 1, visible: true, Icon: Sparkles },
+          ]}
+          onToggleLayer={noop}
+          onShowAllLayers={noop}
+          canUndo={false}
+          canRedo={false}
+          onUndo={noop}
+          onRedo={noop}
+          hasSelection={false}
+          onAdd={noop}
+          onDuplicate={noop}
+          canSplit={false}
+          onSplit={noop}
+          onDelete={noop}
+        />
+      </div>
+    </EditorRealProvider>
+  );
+}
+
 export default function FramevoAIPreviewPage() {
   if (process.env.NODE_ENV === "production") notFound();
   const noop = async () => null;
@@ -191,6 +234,21 @@ export default function FramevoAIPreviewPage() {
       <h1 className="mb-6 text-lg font-semibold text-white">
         Framevo AI — panel states (dev preview)
       </h1>
+
+      <div className="mb-10 space-y-6">
+        <div>
+          <p className="mb-2 text-[12px] font-semibold uppercase tracking-[0.14em] text-white/50">
+            Timeline control bar — a layer hidden (undo/redo disabled)
+          </p>
+          <ControlBarPreview hiddenLayer />
+        </div>
+        <div>
+          <p className="mb-2 text-[12px] font-semibold uppercase tracking-[0.14em] text-white/50">
+            Timeline control bar — all layers visible
+          </p>
+          <ControlBarPreview hiddenLayer={false} />
+        </div>
+      </div>
       <div className="flex flex-wrap items-start gap-8">
         <Frame title="B · First-analysis setup" shot="setup" height={960}>
           <EditorRealProvider uid={null} project={SETUP_PROJECT} idTokenGetter={noop}>
