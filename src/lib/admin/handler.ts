@@ -30,9 +30,13 @@ export type AdminHandler<T> = (
 /**
  * Wrap an admin route body. `label` appears in server logs (e.g. "exports")
  * and must never contain user data.
+ *
+ * A handler normally returns a plain object (sent as JSON). It may instead
+ * return a ready `Response` — e.g. the PDF report download — which is passed
+ * through untouched, still behind the same gate and error mapping.
  */
 export function adminRoute<T extends object>(label: string, handler: AdminHandler<T>) {
-  return async function GET(req: NextRequest): Promise<NextResponse> {
+  return async function GET(req: NextRequest): Promise<Response> {
     const admin = await requireAdmin(req);
     // `requireAdmin` returns a ready 401/403 response when the caller is not an
     // admin. Returning it here means no handler body — and so no Firestore
@@ -41,6 +45,7 @@ export function adminRoute<T extends object>(label: string, handler: AdminHandle
 
     try {
       const data = await handler(req, admin);
+      if (data instanceof Response) return data;
       return NextResponse.json(data);
     } catch (err) {
       if (isIndexError(err)) {

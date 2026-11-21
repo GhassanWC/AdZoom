@@ -40,75 +40,18 @@ import { parseListParams, matchesSearch } from "@/lib/admin/params";
 import { tsToMillis } from "@/lib/admin/serialize";
 import { mapSafe, str, num, numOrNull, bool } from "@/lib/admin/validate";
 import { tally, toSlices, countWhere, averageOf, medianOf, bucketByDay } from "@/lib/admin/aggregate";
+import {
+  NORMALIZED_EXPORT_STATUSES as NORMALIZED_STATUSES,
+  normalizeBrowserStatus,
+  normalizeCloudStatus,
+  resolutionLabel,
+  type NormalizedExportStatus,
+} from "@/lib/admin/export-status";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-/** Shared vocabulary both pipelines normalize into. */
-export type NormalizedExportStatus =
-  | "queued"
-  | "processing"
-  | "ready"
-  | "failed"
-  | "cancelled";
-
-const NORMALIZED_STATUSES: readonly NormalizedExportStatus[] = [
-  "queued",
-  "processing",
-  "ready",
-  "failed",
-  "cancelled",
-];
-
-/** `ExportStatus` (browser) → shared vocabulary. */
-function normalizeBrowserStatus(raw: string): NormalizedExportStatus {
-  switch (raw) {
-    case "ready":
-      return "ready";
-    case "failed":
-      return "failed";
-    case "exporting":
-      return "processing";
-    // "permitted" = permit issued, render not started ⇒ still queued work.
-    case "queued":
-    case "permitted":
-      return "queued";
-    default:
-      return "queued";
-  }
-}
-
-/** `ExportJobStatus` (cloud) → shared vocabulary. Note "canceled", one L. */
-function normalizeCloudStatus(raw: string): NormalizedExportStatus {
-  switch (raw) {
-    case "ready":
-      return "ready";
-    case "failed":
-      return "failed";
-    case "canceled":
-      return "cancelled";
-    case "batch_submitted":
-    case "rendering":
-    case "uploading":
-      return "processing";
-    case "queued":
-      return "queued";
-    default:
-      return "queued";
-  }
-}
-
-/**
- * Height → a resolution label matching the browser pipeline's vocabulary, so
- * both pipelines land in the same chart buckets instead of "1080p" vs "1920x1080".
- */
-function resolutionLabel(height: number): string {
-  if (height >= 2000) return "4K";
-  if (height >= 1000) return "1080p";
-  if (height >= 700) return "720p";
-  if (height > 0) return `${height}p`;
-  return "unknown";
-}
+export type { NormalizedExportStatus };
 
 interface ExportRow {
   id: string;

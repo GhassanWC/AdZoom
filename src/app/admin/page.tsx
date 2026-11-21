@@ -30,6 +30,7 @@ import { BarList, AreaChart, type DayPoint, type Slice } from "@/components/admi
 import { PageFrame, ChartGrid } from "@/components/admin/PageFrame";
 import { MetricGridSkeleton, ChartSkeleton } from "@/components/admin/StatePanels";
 import { Toolbar, DateRangeFilter, RefreshButton } from "@/components/admin/Toolbar";
+import { ExportReportButton } from "@/components/admin/ExportReportButton";
 import { useAdminQuery, useDebounced } from "@/components/admin/useAdminQuery";
 import { fmtNum, fmtPctValue, fmtUsd } from "@/components/admin/format";
 import type { RangeKey } from "@/lib/admin/range";
@@ -142,6 +143,7 @@ export default function AdminOverviewPage() {
             onToChange={setTo}
           />
           <RefreshButton onClick={q.refresh} busy={q.isRefreshing} updatedAt={q.updatedAt} />
+          <ExportReportButton range={range} from={debouncedFrom} to={debouncedTo} />
         </Toolbar>
       }
     >

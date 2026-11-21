@@ -201,3 +201,24 @@ export function groupByFrequency<T>(
     .sort((a, b) => b.count - a.count || a.key.localeCompare(b.key))
     .slice(0, topN);
 }
+
+/**
+ * Nearest-rank percentile (`p` in 0–100) of a per-row value, ignoring nulls.
+ * Used for p90 turnaround/processing times, where the median hides the slow
+ * tail that users actually complain about. `null` when no row contributed.
+ */
+export function percentileOf<T>(
+  rows: readonly T[],
+  valueFn: (row: T) => number | null,
+  p: number
+): number | null {
+  const values: number[] = [];
+  for (const row of rows) {
+    const v = valueFn(row);
+    if (v != null && Number.isFinite(v)) values.push(v);
+  }
+  if (values.length === 0) return null;
+  values.sort((a, b) => a - b);
+  const rank = Math.ceil((Math.min(100, Math.max(0, p)) / 100) * values.length);
+  return values[Math.min(values.length - 1, Math.max(0, rank - 1))];
+}
