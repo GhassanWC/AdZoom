@@ -363,6 +363,22 @@ export interface AdminReport {
     byPlan: Slice[];
     features: FeatureAdoption[];
     desktopFunnel: Slice[];
+    /** Editing assistant: request → applied edit → jump/undo → export → download. */
+    assistant: {
+      requests: number;
+      users: number;
+      byOutcome: Slice[];
+      bySource: Slice[];
+      appliedPct: number | null;
+      undos: number;
+      undoRatePct: number | null;
+      jumps: number;
+      topErrorCodes: Slice[];
+      modelTurns: number;
+      modelFailures: number;
+      medianLatencyMs: number | null;
+      funnel: Slice[];
+    };
   };
   billing: {
     subscriptions: number;
@@ -430,6 +446,7 @@ const FEATURES: { feature: string; events: string[] }[] = [
   { feature: "Download an export", events: ["export_downloaded"] },
   { feature: "Smart clips", events: ["clips_generate_clicked", "clips_generation_started"] },
   { feature: "AI Director pushback", events: ["director_pushback"] },
+  { feature: "Editing assistant (chat edits)", events: ["assistant_request"] },
   { feature: "Upgrade / checkout", events: ["upgrade_clicked", "checkout_started"] },
   { feature: "Desktop app", events: ["desktop_app_opened"] },
 ];
@@ -545,6 +562,51 @@ function unitFor(field: string): PerfMetric["unit"] | null {
   if (/bytes$/i.test(field)) return "bytes";
   if (/(count|chunks)$/i.test(field)) return "count";
   return null;
+}
+
+/**
+ * The editing-assistant funnel. Client events (no `stage`) are the terminal
+ * outcome of one user request; server events carry `stage: "model"` and count
+ * model turns — they are kept apart so a model-handled request isn't counted twice.
+ */
+export function summarizeAssistant(events: readonly ReportEvent[]): AdminReport["usage"]["assistant"] {
+  const req = events.filter((e) => e.name === "assistant_request");
+  const client = req.filter((e) => e.meta.stage !== "model");
+  const server = req.filter((e) => e.meta.stage === "model");
+  const applied = countWhere(client, (e) => e.meta.outcome === "applied");
+  const undos = countWhere(events, (e) => e.name === "assistant_undo");
+  const jumps = countWhere(events, (e) => e.name === "assistant_jump");
+  const codes: Record<string, number> = {};
+  for (const e of client) {
+    const c = typeof e.meta.errorCodes === "string" ? e.meta.errorCodes : "";
+    for (const code of c.split(",")) if (code && code !== "none") codes[code] = (codes[code] ?? 0) + 1;
+  }
+  const latencies = client.map((e) => (typeof e.meta.latencyMs === "number" && e.meta.latencyMs > 0 ? e.meta.latencyMs : null));
+  const assistantUsers = new Set(client.map((e) => e.userId).filter(Boolean));
+  const exportedUsers = new Set(
+    events.filter((e) => (e.name === "export_completed" || e.name === "editframe_export_completed") && assistantUsers.has(e.userId)).map((e) => e.userId)
+  );
+  const downloadedUsers = new Set(events.filter((e) => e.name === "export_downloaded" && assistantUsers.has(e.userId)).map((e) => e.userId));
+  return {
+    requests: client.length,
+    users: assistantUsers.size,
+    byOutcome: toSlices(tally(client, (e) => String(e.meta.outcome ?? "unknown")), { dropZero: true }),
+    bySource: toSlices(tally(client, (e) => String(e.meta.source ?? "unknown")), { dropZero: true }),
+    appliedPct: client.length ? percent(applied, client.length) : null,
+    undos,
+    undoRatePct: applied ? percent(undos, applied) : null,
+    jumps,
+    topErrorCodes: toSlices(codes, { topN: 8, dropZero: true }),
+    modelTurns: server.length,
+    modelFailures: countWhere(server, (e) => e.meta.outcome === "failed"),
+    medianLatencyMs: medianOf(latencies, (v) => v),
+    funnel: [
+      { label: "Users who asked for an edit", value: assistantUsers.size },
+      { label: "…got at least one edit applied", value: new Set(client.filter((e) => e.meta.outcome === "applied").map((e) => e.userId)).size },
+      { label: "…then exported", value: exportedUsers.size },
+      { label: "…then downloaded", value: downloadedUsers.size },
+    ],
+  };
 }
 
 // ── The summarizer ──────────────────────────────────────────────────────────
@@ -1004,6 +1066,7 @@ export function buildAdminReport(input: ReportInput): AdminReport {
       byPlan: toSlices(tally(prodEvents, (e) => e.plan ?? "unknown"), { dropZero: true }),
       features,
       desktopFunnel: DESKTOP_FUNNEL.map((label) => ({ label, value: nameCounts[label] ?? 0 })),
+      assistant: summarizeAssistant(prodEvents),
     },
     billing: {
       subscriptions: subs.length,

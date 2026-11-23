@@ -64,3 +64,41 @@ export function trackDirectorPushback(
     // Deliberately swallowed.
   }
 }
+
+/**
+ * Editing-assistant request telemetry — the request → applied edit → undo path.
+ * Enums and counts only; the user's message never leaves the device here.
+ */
+export function trackAssistantRequest(meta: {
+  source: "local" | "model" | "none";
+  outcome: "applied" | "rejected" | "question" | "duplicate" | "fallback" | "failed" | "reply";
+  ops?: readonly string[];
+  errorCodes?: readonly string[];
+  changes?: number;
+  latencyMs?: number;
+}, projectId?: string): void {
+  try {
+    void trackEvent(
+      EVENTS.ASSISTANT_REQUEST,
+      {
+        source: meta.source,
+        outcome: meta.outcome,
+        ops: [...new Set(meta.ops ?? [])].join(",") || "none",
+        errorCodes: [...new Set(meta.errorCodes ?? [])].join(",") || "none",
+        changes: meta.changes ?? 0,
+        latencyMs: Math.round(meta.latencyMs ?? 0),
+      },
+      projectId ? { projectId } : undefined
+    );
+  } catch {
+    // Telemetry must never break a turn.
+  }
+}
+
+export function trackAssistantAction(kind: "undo" | "jump", projectId?: string): void {
+  try {
+    void trackEvent(kind === "undo" ? EVENTS.ASSISTANT_UNDO : EVENTS.ASSISTANT_JUMP, {}, projectId ? { projectId } : undefined);
+  } catch {
+    // Deliberately swallowed.
+  }
+}

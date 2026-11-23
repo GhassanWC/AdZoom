@@ -53,7 +53,8 @@
     "test:integration": "firebase emulators:exec --only auth,firestore,storage --project framevo-test \"npm run test --prefix desktop\"",
     "desktop:audit": "node scripts/audit-desktop-bundle.mjs",
     "desktop:release": "node scripts/desktop-release.mjs",
-    "desktop:release:upload": "node scripts/desktop-upload-release.mjs"
+    "desktop:release:upload": "node scripts/desktop-upload-release.mjs",
+    "verify:assistant-export": "npm --prefix services/export-worker run build:cli && node --import ./tests/register-resolver.mjs scripts/verify-assistant-export.mts"
   },
   "dependencies": {
     "@editframe/elements": "^0.58.4",

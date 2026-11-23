@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { ArrowLeft, Sparkles, Loader2, AlertCircle } from "lucide-react";
+import { ArrowLeft, Sparkles, Loader2, AlertCircle, RotateCw } from "lucide-react";
 import { useAuth } from "@/lib/firebase/AuthProvider";
 import { useProjectStorage } from "@/lib/platform/useProjectStorage";
 import { isLocalProject } from "@/lib/platform";
@@ -20,7 +20,6 @@ import { RealProcessingOverlay } from "./RealProcessingOverlay";
 import { ProcessingMiniPill } from "./ProcessingMiniPill";
 import { DebugOverlay } from "./DebugOverlay";
 import { EditorTopBar } from "./EditorTopBar";
-import { EditorToolRail } from "./EditorToolRail";
 import { EditorInspectorDock } from "./EditorInspectorDock";
 import { disposeThumbnails } from "./timeline/thumbnails";
 import { restoreEditorScrollLock } from "./scroll-lock";
@@ -145,6 +144,9 @@ function Body() {
     project,
     analyzing,
     analyzeError,
+    canRetryFinishing,
+    retryingFinishing,
+    retryFinishing,
     activeTool,
     setActiveTool,
     cropEditing,
@@ -216,6 +218,19 @@ function Body() {
               Upgrade
             </Link>
           )}
+          {canRetryFinishing && (
+            <button
+              type="button"
+              data-testid="retry-finishing"
+              onClick={() => void retryFinishing()}
+              disabled={retryingFinishing}
+              title="Re-runs only the final step, using the analysis that already finished"
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-rose-300/40 bg-rose-400/15 px-2.5 py-1 text-[11.5px] font-semibold text-rose-50 transition-colors hover:bg-rose-400/25 disabled:opacity-60"
+            >
+              {retryingFinishing ? <Loader2 size={12} className="animate-spin" /> : <RotateCw size={12} />}
+              {retryingFinishing ? "Finishing…" : "Retry finishing"}
+            </button>
+          )}
         </div>
       )}
 
@@ -272,8 +287,9 @@ function Body() {
           />
         </RenderProbe>
 
-        {/* Far-right tool rail — always visible. */}
-        <EditorToolRail isAnalyzingNow={isAnalyzingNow} analyzeTitle={analyzeTitle} />
+        {/* The right-hand tool rail is gone: every one of its actions lives in
+            the timeline Add / Edit menus AND the chat Tools menu (useEditorTools),
+            and "Ask Framevo" on the timeline toolbar reopens the chat. */}
       </div>
 
       {/* ── Editing dialogs (shared shell) ────────────────────────────────── */}

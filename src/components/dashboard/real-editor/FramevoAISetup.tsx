@@ -108,6 +108,7 @@ export function FramevoAISetup({
   analyzeBlockedReason,
   hasExistingEdits,
   onClose,
+  onDirectEdit,
   initialChangeOpen = false,
   initialAdvancedOpen = false,
 }: {
@@ -118,6 +119,11 @@ export function FramevoAISetup({
   hasExistingEdits: boolean;
   /** Present when setup was opened over an existing conversation. */
   onClose?: () => void;
+  /**
+   * Skip the full AI edit and direct the edit yourself in chat ("trim the first
+   * two seconds", "add captions"). Offered whenever setup is the first screen.
+   */
+  onDirectEdit?: () => void;
   /** Dev-preview affordances (screenshot rig) — start with a section expanded. */
   initialChangeOpen?: boolean;
   initialAdvancedOpen?: boolean;
@@ -291,6 +297,17 @@ export function FramevoAISetup({
             </button>
           )}
         </div>
+
+        {onDirectEdit && (
+          <button
+            type="button"
+            onClick={onDirectEdit}
+            data-testid="direct-edit-chat"
+            className="w-full rounded-xl border border-white/[0.07] bg-white/[0.02] px-3 py-2 text-left text-[12px] text-fog transition-colors hover:border-violet-400/40 hover:text-white"
+          >
+            Or direct the edit yourself in chat — “trim the first two seconds”, “add captions”…
+          </button>
+        )}
 
         {/* ── Video row ── */}
         <SetupRow

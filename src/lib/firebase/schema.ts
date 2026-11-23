@@ -64,6 +64,8 @@ export type AnalysisErrorKind =
   | "upload_failed"
   | "video_too_large"
   | "network_interruption"
+  /** Our own database write was rejected (e.g. the project document hit the 1 MiB limit). */
+  | "save_failed"
   | "unknown";
 
 export interface AnalysisActivityEvent {
@@ -90,7 +92,11 @@ export type EffectType =
   | "callout"
   | "blur-redaction"
   | "transition"
-  | "branding-cta";
+  | "branding-cta"
+  /** A composed graphic — text, shapes and lines designed as editable parts. */
+  | "graphic"
+  /** An original effect program (AI-authored or from the user's effect library). */
+  | "fx";
 
 /**
  * The Phase-3 edit types that render as OVERLAYS / framing on top of the video
@@ -108,6 +114,8 @@ export const OVERLAY_EFFECT_TYPES = [
   "blur-redaction",
   "transition",
   "branding-cta",
+  "graphic",
+  "fx",
 ] as const;
 
 /** Overlay types drawn OUTSIDE the camera transform (anchored to the output frame). */
@@ -117,10 +125,11 @@ export const OUTPUT_ANCHORED_OVERLAY_TYPES = [
   "text-overlay",
   "branding-cta",
   "transition",
+  "graphic",
 ] as const;
 
 /** Overlay types drawn INSIDE the camera transform (track the video content). */
-export const IN_CAMERA_OVERLAY_TYPES = ["callout", "blur-redaction"] as const;
+export const IN_CAMERA_OVERLAY_TYPES = ["callout", "blur-redaction", "fx"] as const;
 
 const OVERLAY_EFFECT_TYPE_SET: ReadonlySet<string> = new Set([
   ...OVERLAY_EFFECT_TYPES,
@@ -152,7 +161,9 @@ export type TimelineLayerId =
   | "callout"
   | "branding-cta"
   | "blur-redaction"
-  | "smart-crop";
+  | "smart-crop"
+  | "graphic"
+  | "fx";
 
 /**
  * Which layers are hidden. ABSENT (or `true`) = visible — same absent-means-on
@@ -419,6 +430,78 @@ export interface TextOverlaySettings {
   alignment: TextAlignment;
   backgroundStyle: TextBackgroundStyle;
   animation: OverlayAnimation;
+}
+
+/**
+ * effectType "graphic" — a graphic DESIGNED from editable parts.
+ *
+ * Framevo's AI (and the user, by hand or by chat) composes a graphic out of
+ * text, rectangles and lines. Each part has its own position (0..1 of the
+ * output canvas), style, z-order and an optional entrance animation with a
+ * delay — that is what makes a staggered "accent line, then title, then
+ * price" reveal possible. Everything is data: the parts are what the preview
+ * draws and what every exporter renders (overlay-draw.ts), so a chat revision
+ * like "remove the line but keep the title" is a patch to this array.
+ *
+ * Coordinates are fractions of the canvas, sizes of text follow TextStyle
+ * (fontScale = fraction of canvas height), so one design adapts to any output
+ * resolution without re-authoring.
+ */
+export type GraphicPartKind = "text" | "rect" | "line";
+
+interface GraphicPartBase {
+  /** Stable id — revisions target it ("remove the line", "change the title"). */
+  id: string;
+  kind: GraphicPartKind;
+  /** Anchor X, 0..1 of canvas width. Text: per its `align`; rect: left edge; line: start. */
+  x: number;
+  /** Anchor Y, 0..1 of canvas height. Text: vertical centre; rect: top edge; line: start. */
+  y: number;
+  /** Draw order — higher is on top. Default 0. */
+  z?: number;
+  /** 0..1 multiplier on the part's colour alpha. Default 1. */
+  opacity?: number;
+  /** Seconds after the graphic's start before this part's entrance begins. */
+  delay?: number;
+  /** This part's own motion. Absent ⇒ the moment's `animation` (shared entrance). */
+  animation?: PresetAnimation;
+}
+
+export interface GraphicTextPart extends GraphicPartBase {
+  kind: "text";
+  text: string;
+  /** Styling, resolved over DEFAULT_TEXT_STYLE at draw time. */
+  style?: TextStyle;
+  /** Wrap width, fraction of canvas width. Default 0.6. */
+  maxWidth?: number;
+}
+
+export interface GraphicRectPart extends GraphicPartBase {
+  kind: "rect";
+  /** Size, fractions of canvas width / height. */
+  w: number;
+  h: number;
+  /** Hex `#rrggbb`. */
+  color: string;
+  /** Corner radius as a fraction of the rect's height. 0 = square. */
+  radius?: number;
+}
+
+export interface GraphicLinePart extends GraphicPartBase {
+  kind: "line";
+  /** End point, 0..1 of canvas. */
+  x2: number;
+  y2: number;
+  /** Hex `#rrggbb`. */
+  color: string;
+  /** Stroke width as a fraction of canvas height. */
+  thickness: number;
+}
+
+export type GraphicPart = GraphicTextPart | GraphicRectPart | GraphicLinePart;
+
+export interface GraphicSettings {
+  parts: GraphicPart[];
 }
 
 /** effectType "callout" — an annotation pointing at `focusRegion` (the target). */
@@ -732,6 +815,10 @@ export interface DetectedMoment {
   transition?: TransitionSettings;
   /** Present when `effectType === "branding-cta"`. */
   brandingCta?: BrandingCtaSettings;
+  /** Present when `effectType === "graphic"`. The designed parts — see GraphicSettings. */
+  graphic?: GraphicSettings;
+  /** Present when `effectType === "fx"`. The effect program + this use's settings — see FxSettings. */
+  fx?: FxSettings;
   /**
    * Shared text styling for text-based edits (captions / hook-text /
    * text-overlay / callout / branding-cta). Optional + additive: absent on all
@@ -1161,6 +1248,13 @@ export interface Transcript {
    */
   captionStylePreset?: OverlayTextPreset;
   captionPosition?: CaptionPosition;
+  /**
+   * `false` = transcribe only; do NOT merge caption moments when the job
+   * completes. Set by the editing assistant, which adds the captions itself as
+   * one undoable timeline change. Absent = the classic "Generate AI captions"
+   * behaviour (captions merged automatically).
+   */
+  captionMerge?: boolean;
 }
 
 export type AudioAnalysisStatus = TranscriptStatus;
@@ -1916,6 +2010,64 @@ export interface GeneratedClip {
   updatedAt?: number;
 }
 
+/**
+ * effectType "fx" — one USE of an effect program (src/lib/effects).
+ *
+ * `ref` names the exact library version it came from; `program` is that
+ * version's program, EMBEDDED so preview, every exporter and a reopened
+ * project render the same thing whatever the library later becomes. `params`
+ * are THIS use's settings ("make this one blue" changes only these), and
+ * `inputs` its footage anchors (where the ball is), as fractions of the video
+ * frame. The instance starts at `startTime` and lasts `program.duration`.
+ */
+export interface FxSettings {
+  ref: { effectId: string; version: number; name: string };
+  program: import("@/lib/effects/program").EffectProgram;
+  params: import("@/lib/effects/program").FxParamValues;
+  inputs: import("@/lib/effects/program").FxInstanceInputs;
+}
+
+/**
+ * What the assistant remembers about THIS project's direction: standing
+ * constraints ("keep the original commentary"), approved looks ("the ripple
+ * motion"), and things to avoid. Fed to the model every turn; `lock: "audio"`
+ * also blocks edits that would remove or retime the soundtrack.
+ */
+export interface AssistantMemoryItem {
+  kind: "constraint" | "approved" | "avoid";
+  text: string;
+  lock?: "audio";
+  at: number;
+}
+
+/** One shot/beat of a footage survey — see {@link ProjectDoc.footageSurvey}. */
+export interface FootageShot {
+  start: number;
+  end: number;
+  /** One sentence: what is on screen and what happens. */
+  description: string;
+  /** Short nouns a request might name: "chicken tikka dish", "price", "menu grid". */
+  subjects: string[];
+}
+
+/** One applied assistant edit request — see {@link ProjectDoc.assistantLog}. */
+export interface AssistantLogEntry {
+  /** Client-minted id, stable across retries of the same request. */
+  requestId: string;
+  /** What the user asked, verbatim (trimmed). */
+  message: string;
+  /** Who understood it: the local parser or a model ("gemini", later "claude"). */
+  source: "local" | "model";
+  /** Plain-language "what changed" lines. */
+  lines: string[];
+  /** Element ids the request added or changed — resolves "it"/"that title". */
+  changedIds: string[];
+  /** Source time to jump to (the first change), or null. */
+  jumpTo: number | null;
+  /** Epoch ms. */
+  at: number;
+}
+
 export interface ProjectDoc {
   id: string;
   userId: string;
@@ -2056,6 +2208,35 @@ export interface ProjectDoc {
    * project is unaffected. See src/lib/timeline/layers.ts.
    */
   timelineLayers?: LayerVisibility;
+  /**
+   * Edit requests the assistant applied, newest LAST, bounded (see
+   * `ASSISTANT_LOG_LIMIT` in lib/edit-commands/log.ts).
+   *
+   * Two jobs: (1) IDEMPOTENCY — a retried request whose id is already here is
+   * acknowledged instead of applied twice, even across a reload; (2) the chat's
+   * persistent "what changed" history, so a reopened project still shows which
+   * request made which edit. It is a RECORD, not editable state: undo restores
+   * the timeline but never rewrites history (a retry after an undo is still a
+   * retry, not a new request). Absent on older projects = no history.
+   */
+  assistantLog?: AssistantLogEntry[];
+  /**
+   * Clicks found in this footage, cached so "add zooms on clicks" never scans
+   * the same video twice. Source seconds; x/y are 0..1 of the frame. Written by
+   * the editing assistant from the recording sidecar, the frame analysis, or a
+   * model watching the video (`source`). Absent = not searched yet; an EMPTY
+   * array = searched and none found.
+   */
+  clickMarks?: { t: number; x: number; y: number; source: "recording" | "frames" | "model" }[];
+  /**
+   * What happens in the footage over time — a shot list a model produced by
+   * watching the video once, cached so every later chat request can reason
+   * about "the dish reveal" or "the celebration" without re-watching. Source
+   * seconds. Absent = not surveyed yet.
+   */
+  footageSurvey?: { shots: FootageShot[]; createdAt: number };
+  /** The assistant's memory of this project's direction — see AssistantMemoryItem. */
+  assistantMemory?: AssistantMemoryItem[];
   /**
    * SYNC BOOKKEEPING — owned by the sync engine, never by the editor.
    *

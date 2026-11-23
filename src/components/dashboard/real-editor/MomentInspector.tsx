@@ -26,12 +26,16 @@ import {
   EyeOff,
   Shuffle,
   BadgeCheck,
+  Shapes,
+  Wand2,
 } from "lucide-react";
 import { useActiveMoment, useEditorReal } from "./context";
 import { useClockRef } from "./playback-clock";
 import { useRenderCount } from "@/lib/perf/render-probe";
 import { MenuPopover, useMenuPopover } from "./MenuPopover";
 import { DirectionalPresetRow } from "./DirectionalPresetRow";
+import { FxSettingsEditor } from "./FxSettingsEditor";
+import { GraphicPartsEditor } from "./GraphicPartsEditor";
 import { Slider } from "@/components/ui/Slider";
 import { Toggle } from "@/components/ui/Toggle";
 import { LiveValueScope, useLiveValue } from "./useLiveValue";
@@ -183,6 +187,8 @@ const EFFECTS: EffectSpec[] = [
   { id: "blur-redaction", label: "Blur", Icon: EyeOff, accent: "text-slate-300" },
   { id: "transition", label: "Transition", Icon: Shuffle, accent: "text-purple-300" },
   { id: "branding-cta", label: "CTA", Icon: BadgeCheck, accent: "text-lime-300" },
+  { id: "graphic", label: "Graphic", Icon: Shapes, accent: "text-amber-300" },
+  { id: "fx", label: "Effect", Icon: Wand2, accent: "text-amber-300" },
 ];
 
 const EFFECT_BY_ID: Record<EffectType, EffectSpec> = Object.fromEntries(
@@ -210,6 +216,8 @@ const EFFECT_FULL_NAME: Record<EffectType, string> = {
   "blur-redaction": "Blur / Redaction",
   transition: "Transition",
   "branding-cta": "Branding / CTA",
+  graphic: "Graphic",
+  fx: "Effect",
 };
 
 /**
@@ -238,6 +246,8 @@ const ADVANCED_RELEVANCE: Record<
   "blur-redaction": { keyframes: false, cursor: true },
   transition: { keyframes: false, cursor: false },
   "branding-cta": { keyframes: false, cursor: false },
+  graphic: { keyframes: false, cursor: false },
+  fx: { keyframes: false, cursor: false },
 };
 
 /**
@@ -1622,6 +1632,26 @@ function OverlayControls({
   const styleValues = resolveTextStyleValues(moment);
   const onStyle = (patch: Partial<TextStyle>) =>
     onUpdate({ textStyle: { ...(moment.textStyle ?? {}), ...patch } });
+
+  if (moment.effectType === "fx" && moment.fx) {
+    // One use of an effect program: its own settings, revisable by hand or chat.
+    return (
+      <section className={shell}>
+        {heading}
+        <FxSettingsEditor fx={moment.fx} onChange={(fx) => onUpdate({ fx })} />
+      </section>
+    );
+  }
+
+  if (moment.effectType === "graphic") {
+    // A composed graphic: its parts ARE the design. Same data the chat edits.
+    return (
+      <section className={shell}>
+        {heading}
+        <GraphicPartsEditor graphic={moment.graphic ?? { parts: [] }} onChange={(graphic) => onUpdate({ graphic })} />
+      </section>
+    );
+  }
 
   if (moment.effectType === "captions") {
     const c = moment.captions ?? { text: "", stylePreset: "clean" as OverlayTextPreset, position: "bottom" as CaptionPosition };

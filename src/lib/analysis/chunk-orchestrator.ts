@@ -111,6 +111,24 @@ export interface ChunkedRunResult {
   momentsAdded: number;
   /** Set when the best-effort server refinement pass failed. */
   finalizeError?: string;
+  /**
+   * Everything needed to retry ONLY the finalize step (set with
+   * `finalizeError`). The chunks, CV and audio work are done and already on the
+   * project — a retry re-sends this, it never re-analyzes.
+   */
+  finalizeRetry?: FinalizeRetry;
+}
+
+/** A finalize call, captured so it can be replayed exactly (see `retryFinalize`). */
+export interface FinalizeRetry {
+  uid: string;
+  projectId: string;
+  /** Identifies the run; the server no-ops a key it already finalized. */
+  finalizeKey: string;
+  chunkCount: number;
+  progressiveCount: number;
+  options: AnalysisOptions;
+  audioAnalysis?: AudioAnalysis;
 }
 
 export interface ChunkedRunArgs {
@@ -712,14 +730,19 @@ export async function runChunkedAnalysis(
     // failed to start, which is the opposite of where the fault was. The caller
     // decides whether a zero-edit outcome is worth surfacing.
     let finalizeError: string | undefined;
+    const finalizeCall: FinalizeRetry = {
+      uid,
+      projectId: project.id,
+      // One key per run attempt — a retry of THIS run reuses it.
+      finalizeKey: `${jobId}:${job.startedAt}`,
+      chunkCount: windows.length,
+      progressiveCount: counters.momentsSoFar,
+      // Recipe-gated so the server's gap-fill can't re-add a recipe-disabled layer.
+      options: recipeOptions,
+      audioAnalysis,
+    };
     try {
-      await finalizeWithAi(project.id, idTokenGetter, {
-        chunkCount: windows.length,
-        progressiveCount: counters.momentsSoFar,
-        // Recipe-gated so the server's gap-fill can't re-add a recipe-disabled layer.
-        options: recipeOptions,
-        audioAnalysis,
-      });
+      await finalizeWithAi(finalizeCall, idTokenGetter);
     } catch (finalizeErr) {
       finalizeError =
         finalizeErr instanceof Error ? finalizeErr.message : String(finalizeErr);
@@ -776,7 +799,7 @@ export async function runChunkedAnalysis(
     return {
       outcome: "completed",
       momentsAdded: counters.momentsSoFar,
-      ...(finalizeError ? { finalizeError } : {}),
+      ...(finalizeError ? { finalizeError, finalizeRetry: finalizeCall } : {}),
     };
   } catch (err) {
     if (ac.signal.aborted) {
@@ -955,15 +978,10 @@ async function markCancelled(
  * are passed for the route's before/after diagnostics.
  */
 async function finalizeWithAi(
-  projectId: string,
-  idTokenGetter: () => Promise<string | null>,
-  diag: {
-    chunkCount: number;
-    progressiveCount: number;
-    options: AnalysisOptions;
-    audioAnalysis?: AudioAnalysis;
-  }
+  diag: FinalizeRetry,
+  idTokenGetter: () => Promise<string | null>
 ): Promise<void> {
+  const projectId = diag.projectId;
   const token = await idTokenGetter();
   if (!token) throw new Error("Not signed in.");
   const res = await apiFetch(`/api/projects/${projectId}/analyze`, {
@@ -974,6 +992,7 @@ async function finalizeWithAi(
     },
     body: JSON.stringify({
       mode: "finalize",
+      finalizeKey: diag.finalizeKey,
       chunkCount: diag.chunkCount,
       progressiveCount: diag.progressiveCount,
       // So the finalize pass can't re-introduce a disabled layer via gap-fill.
@@ -1001,6 +1020,46 @@ async function finalizeWithAi(
     console.warn("[finalize] failed", { projectId, status: res.status, detail });
     throw new Error(`Finalize failed (${res.status}): ${detail}`);
   }
+}
+
+/**
+ * Re-run ONLY the finalize step of a completed chunked run — the recovery
+ * action behind "Retry finishing". Reuses the run's captured inputs (same
+ * finalize key), so:
+ *  - nothing is re-analyzed: the progressive timeline already on the project is
+ *    what finalize refines, exactly as on the first attempt;
+ *  - it's safe to press twice: the terminal write is one atomic batch carrying
+ *    the key, and the server no-ops a key it already finalized — an earlier
+ *    attempt that DID land (lost response) can't be applied a second time.
+ *
+ * Whatever happens, the project ends in the completed state: the route marks a
+ * failed attempt `failed`, but the progressive edits are still the valid
+ * timeline, so this re-asserts "complete" the same way the run itself does.
+ */
+export async function retryFinalize(
+  retry: FinalizeRetry,
+  idTokenGetter: () => Promise<string | null>
+): Promise<void> {
+  const { db } = getFirebase();
+  const projectRef = doc(db, "users", retry.uid, "projects", retry.projectId);
+  let failure: unknown;
+  try {
+    await finalizeWithAi(retry, idTokenGetter);
+  } catch (err) {
+    failure = err;
+  }
+  await enqueueProjectWrite(retry.projectId, "finalize-retry-terminal", () =>
+    setDoc(
+      projectRef,
+      {
+        status: "analyzed",
+        analysis: { status: "complete", stage: "Complete", cancelRequested: false },
+        updatedAt: serverTimestamp(),
+      },
+      { merge: true }
+    )
+  );
+  if (failure) throw failure;
 }
 
 function estimateRemaining(times: number[], remaining: number): number | undefined {

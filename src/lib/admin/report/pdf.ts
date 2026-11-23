@@ -730,6 +730,22 @@ function renderUsage(w: Writer, r: AdminReport) {
     u.features.map((f) => [f.feature, n(f.users), pctS(f.pctOfActive), n(f.events)])
   );
   w.slices("Desktop app funnel", u.desktopFunnel);
+  const a = u.assistant;
+  w.heading("Editing assistant (chat edits)", 3);
+  w.stats([
+    ["Requests", n(a.requests)],
+    ["Users", n(a.users)],
+    ["Applied", pctS(a.appliedPct)],
+    ["Undo rate", pctS(a.undoRatePct)],
+    ["Jumps to a change", n(a.jumps)],
+    ["Model turns", n(a.modelTurns)],
+    ["Model failures", n(a.modelFailures)],
+    ["Median latency", fmtDuration(a.medianLatencyMs)],
+  ]);
+  w.slices("Request outcomes", a.byOutcome, { empty: "No assistant requests in this window." });
+  w.slices("Understood by", a.bySource, { empty: "No assistant requests in this window." });
+  w.slices("Rejection reasons (validator error codes)", a.topErrorCodes, { empty: "No rejected requests." });
+  w.slices("Assistant → export funnel (users)", a.funnel);
   w.slices("Events by plan", u.byPlan);
   w.slices("Events by environment", u.byEnvironment);
   w.slices("All events by name (top 40)", u.topEvents);

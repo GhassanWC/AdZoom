@@ -21,6 +21,8 @@ import {
   BadgeCheck,
   Clapperboard,
   type LucideIcon,
+  Shapes,
+  Wand2,
 } from "lucide-react";
 import type {
   DetectedMoment,
@@ -45,6 +47,8 @@ export const EFFECT_ICONS: Record<EffectType, LucideIcon> = {
   "blur-redaction": EyeOff,
   transition: Shuffle,
   "branding-cta": BadgeCheck,
+  graphic: Shapes,
+  fx: Wand2,
 };
 
 /**
@@ -221,6 +225,22 @@ export const EFFECT_TONES: Record<
     label: "CTA",
     glow: "shadow-[0_8px_36px_-12px_rgba(163,230,53,0.9)]",
     hoverGlow: "hover:shadow-[0_8px_36px_-12px_rgba(163,230,53,0.9)]",
+  },
+  graphic: {
+    ai: "from-amber-300/85 via-orange-500/55 to-rose-600/40 border-amber-200/40",
+    user: "from-amber-300/85 via-orange-500/55 to-rose-600/40 border-amber-200/50",
+    dot: "bg-amber-300",
+    label: "Graphic",
+    glow: "shadow-[0_8px_36px_-12px_rgba(251,191,36,0.9)]",
+    hoverGlow: "hover:shadow-[0_8px_36px_-12px_rgba(251,191,36,0.9)]",
+  },
+  fx: {
+    ai: "from-amber-300/85 via-orange-500/55 to-rose-600/40 border-amber-200/40",
+    user: "from-amber-300/85 via-orange-500/55 to-rose-600/40 border-amber-200/50",
+    dot: "bg-amber-300",
+    label: "Effect",
+    glow: "shadow-[0_8px_36px_-12px_rgba(251,191,36,0.9)]",
+    hoverGlow: "hover:shadow-[0_8px_36px_-12px_rgba(251,191,36,0.9)]",
   },
 };
 

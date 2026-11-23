@@ -475,9 +475,12 @@ test("playback advances smoothly while controls are being used", async () => {
   // Hammer the UI while it plays: open a menu, toggle a docked panel.
   await window.getByTitle("Insert a new edit at the playhead").click();
   await window.keyboard.press("Escape");
-  await window.getByRole("button", { name: "Canvas" }).click();
+  // The Canvas panel lives in the timeline's Edit menu (the right-hand tool
+  // rail was removed); open it, then close it with the dock's own button.
+  await window.getByRole("button", { name: "Edit actions" }).click();
+  await window.getByRole("menu").getByText("Canvas & aspect ratio", { exact: true }).click();
   await window.waitForTimeout(300);
-  await window.getByRole("button", { name: "Canvas" }).click();
+  await window.getByRole("button", { name: "Close panel" }).click();
   await window.waitForTimeout(1_200);
 
   const t1 = await video.evaluate((el: HTMLVideoElement) => el.currentTime);

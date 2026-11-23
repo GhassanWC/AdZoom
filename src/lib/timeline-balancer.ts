@@ -1478,6 +1478,8 @@ export function effectTypeBreakdown(
     "blur-redaction": 0,
     transition: 0,
     "branding-cta": 0,
+    graphic: 0,
+    fx: 0,
   };
   for (const m of moments) out[m.effectType]++;
   return out;

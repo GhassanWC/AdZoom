@@ -23,6 +23,9 @@ import { resolveTextStyleValues } from "../render/text-style";
 import { CLASSIC_ZOOM_COMPOSITION } from "../editorial/constants";
 import { zoomDensityPass } from "../editorial/composition";
 import { isDirectorMoment } from "./executor";
+
+/** Edit types the duplicate rule also checks against the pre-existing timeline. */
+const CROSS_CHECKED_TYPES = new Set<string>(["cut", "hook-text", "branding-cta", "text-overlay", "callout", "transition"]);
 import type {
   DirectorPlan,
   DirectorReviewFinding,
@@ -162,12 +165,30 @@ export function reviewDirectorResult(input: ReviewInput): ReviewOutput {
 
   // ── 2. Duplicate edits ───────────────────────────────────────────────────
   if (enabled(plan, "duplicate-clip")) {
-    const seen = new Map<string, string>();
+    const sigOf = (m: DetectedMoment) => `${m.effectType}:${m.startTime.toFixed(2)}:${m.endTime.toFixed(2)}`;
+    // Seeded with what was ALREADY on the timeline (the user's edits and the
+    // analysis's own), so a Director edit repeating one of those — same type,
+    // same window — is a duplicate too. Analysis generates a hook and the
+    // Director planned its own at the identical 0.15–3.0s: two hooks on screen.
+    // The existing edit always wins; only the Director's copy is dropped.
+    // Only types where a repeat is VISIBLE (two texts drawn) or repeated work
+    // (the same range cut twice). Camera moves are excluded on purpose: the
+    // Director re-framing an analysis zoom's window is how it takes that beat
+    // over, and the resolver gives each instant a single camera owner anyway.
+    const existing = moments.filter(
+      (m) => !isDirectorMoment(m) && m.enabled !== false && CROSS_CHECKED_TYPES.has(m.effectType)
+    );
+    const seen = new Map<string, string>(existing.map((m) => [sigOf(m), m.id]));
+    // A video has ONE opening hook and ONE closing CTA: any overlap doubles it.
+    const single = existing.filter((m) => m.effectType === "hook-text" || m.effectType === "branding-cta");
     const dupes: string[] = [];
     for (const m of dir()) {
-      const sig = `${m.effectType}:${m.startTime.toFixed(2)}:${m.endTime.toFixed(2)}`;
+      const sig = sigOf(m);
       const prev = seen.get(sig);
-      if (prev) dupes.push(m.id);
+      const doubledHook = single.some(
+        (h) => h.effectType === m.effectType && h.startTime < m.endTime && h.endTime > m.startTime
+      );
+      if (prev || doubledHook) dupes.push(m.id);
       else seen.set(sig, m.id);
     }
     if (dupes.length) {

@@ -84,6 +84,25 @@ export function fmtElapsed(ms: number): string {
   return `${m}m ${String(s).padStart(2, "0")}s`;
 }
 
+/**
+ * True for a Firestore error about our own document — it names the database
+ * path ("projects/<gcp>/databases/(default)/documents/...") or the document
+ * size limit. Those paths must never reach the UI.
+ */
+export function isDatabaseWriteError(message: string): boolean {
+  return /\/databases\/\(default\)\/documents\/|cannot be written because its size|maximum allowed size of 1,048,576/i.test(message);
+}
+
+/**
+ * The message the CLIENT sees. Database errors are replaced with a plain
+ * explanation (the full text stays in the server log); anything else passes
+ * through with any database path redacted, just in case.
+ */
+export function userFacingAnalysisError(message: string): string {
+  if (isDatabaseWriteError(message)) return ERROR_RECOVERY.save_failed.reason;
+  return message.replace(/projects\/[^\s'"]*\/databases\/\(default\)\/documents\/[^\s'"]*/g, "your project");
+}
+
 /** Human-readable recovery message per error kind. */
 export const ERROR_RECOVERY: Record<
   AnalysisErrorKind,
@@ -124,6 +143,11 @@ export const ERROR_RECOVERY: Record<
     reason: "Framevo couldn't reach the AI service. This is usually a temporary network or connectivity issue.",
     suggestion: "Please retry — or run it in the background and try again in a moment. If it keeps happening, check your network/VPN and try a different browser.",
   },
+  save_failed: {
+    title: "Couldn't save the result",
+    reason: "The analysis finished, but saving its edits to your project failed. Your timeline was not changed.",
+    suggestion: "Use Retry finishing — it reuses the finished analysis, so nothing is analyzed twice.",
+  },
   unknown: {
     title: "Something went wrong",
     reason: "We hit an error we don't recognize. The full message is below.",
@@ -133,6 +157,10 @@ export const ERROR_RECOVERY: Record<
 
 export function classifyError(message: string): AnalysisErrorKind {
   const m = message.toLowerCase();
+  // A Firestore rejection of OUR write. Checked first: it also says
+  // INVALID_ARGUMENT and "exceeds", which would otherwise read as a Gemini or
+  // video-size problem and send the user after the wrong fix.
+  if (isDatabaseWriteError(message)) return "save_failed";
   if (m.includes("timeout") || m.includes("timed out") || m.includes("deadline_exceeded") || m.includes("deadline exceeded"))
     return "gemini_timeout";
   if (m.includes("quota") || m.includes("rate") || m.includes("resource_exhausted"))

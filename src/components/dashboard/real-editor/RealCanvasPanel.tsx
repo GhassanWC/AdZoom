@@ -13,6 +13,7 @@ import { COMMIT_PROFILES } from "./live-commit";
 import {
   resolveOutputCanvas,
   resolveCanvasDims,
+  outputCanvasForAspect,
 } from "@/lib/timeline/canvas-layout";
 import type {
   AspectRatioId,
@@ -42,11 +43,6 @@ const BACKGROUNDS: { id: BackgroundMode; label: string }[] = [
   { id: "dark", label: "Dark" },
   { id: "light", label: "Light" },
 ];
-
-/** Vertical-ish formats default to Smart Fit (best for 16:9 → 9:16). */
-function defaultFitFor(aspect: AspectRatioId): FitMode {
-  return aspect === "9:16" || aspect === "4:5" ? "smart-fit" : "fill";
-}
 
 /**
  * Canvas Fit / Resize controls — the body of `CanvasModal`. Edits the global
@@ -121,20 +117,13 @@ export function RealCanvasPanel() {
   );
 
   const pickAspect = (id: AspectRatioId) => {
-    const dims = canonicalDims(id);
-    if (current) {
-      writeOc({ ...current, aspectRatio: id, ...dims });
-    } else {
-      writeOc({
-        aspectRatio: id,
-        ...dims,
-        fitMode: defaultFitFor(id),
-        scale: 1,
-        offsetX: 0,
-        offsetY: 0,
-        backgroundMode: "blur",
-      });
+    if (id === "custom") {
+      const dims = canonicalDims(id);
+      writeOc({ ...(current ?? outputCanvasForAspect(null, "16:9", srcW, srcH)), aspectRatio: id, ...dims });
+      return;
     }
+    // The shared aspect command: the editing chat's "make it vertical" runs this same one.
+    writeOc(outputCanvasForAspect(current, id, srcW, srcH));
   };
 
   const pickFit = (id: FitMode) => {

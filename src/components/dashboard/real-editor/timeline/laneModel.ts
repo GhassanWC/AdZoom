@@ -91,6 +91,8 @@ export const LANE_DEFS: readonly LaneDef[] = [
   { id: "hook-text", group: "overlays", label: "Hook text", effectTypes: ["hook-text"] },
   { id: "text-overlay", group: "overlays", label: "Text overlays", effectTypes: ["text-overlay"] },
   { id: "callout", group: "overlays", label: "Callouts", effectTypes: ["callout"] },
+  { id: "graphic", group: "overlays", label: "Graphics", effectTypes: ["graphic"] },
+  { id: "fx", group: "overlays", label: "Effects", effectTypes: ["fx"] },
   { id: "branding-cta", group: "overlays", label: "CTA / End card", effectTypes: ["branding-cta"] },
   { id: "blur-redaction", group: "overlays", label: "Blur / Redaction", effectTypes: ["blur-redaction"] },
   { id: "smart-crop", group: "canvas", label: "Smart crop / Canvas", effectTypes: ["smart-crop", "crop"] },

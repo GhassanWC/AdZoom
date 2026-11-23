@@ -66,6 +66,8 @@ test("laneForEffectType routes EVERY effect type to its own lane", () => {
     "blur-redaction": "blur-redaction",
     transition: "transition",
     "branding-cta": "branding-cta",
+    graphic: "graphic",
+    fx: "fx",
   };
   for (const [effect, laneId] of Object.entries(expected)) {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any

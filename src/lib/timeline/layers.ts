@@ -53,6 +53,8 @@ export const EFFECT_TO_LAYER: Record<EffectType, TimelineLayerId> = {
   "blur-redaction": "blur-redaction",
   transition: "transition",
   "branding-cta": "branding-cta",
+  graphic: "graphic",
+  fx: "fx",
 };
 
 /** Every layer id, in timeline order. */
@@ -68,6 +70,8 @@ export const TIMELINE_LAYER_IDS: readonly TimelineLayerId[] = [
   "branding-cta",
   "blur-redaction",
   "smart-crop",
+  "graphic",
+  "fx",
 ] as const;
 
 /** The layer an edit belongs to (by effectType). Unknown/legacy → camera. */

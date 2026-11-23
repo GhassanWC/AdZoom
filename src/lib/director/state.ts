@@ -22,6 +22,44 @@ import type { DirectorFailure, DirectorPlan, DirectorProposal, DirectorRequest, 
 /** Cap history so a project document can't grow without bound. */
 export const MAX_REVISIONS = 20;
 
+/**
+ * The persisted shape of a review — the declared fields ONLY.
+ *
+ * `reviewDirectorResult` returns these PLUS the full reviewed `moments` array
+ * (the pipeline needs it), and TypeScript doesn't flag the extra property on a
+ * non-literal object, so storing `result.review` as-is quietly wrote a whole
+ * timeline into every revision (~120 KB each). Six revisions pushed a 2:39
+ * project past Firestore's 1 MiB document limit and the analysis terminal
+ * write failed with INVALID_ARGUMENT. Every reducer below stores reviews
+ * through this.
+ */
+export function compactReview(review: DirectorReviewResult): DirectorReviewResult;
+export function compactReview(review: DirectorReviewResult | undefined): DirectorReviewResult | undefined;
+export function compactReview(review: DirectorReviewResult | undefined): DirectorReviewResult | undefined {
+  if (!review) return review;
+  return {
+    findings: review.findings,
+    autoFixed: review.autoFixed,
+    warnings: review.warnings,
+    errors: review.errors,
+    parityOk: review.parityOk,
+  };
+}
+
+/**
+ * Strip timeline copies out of a whole state — the current review, every
+ * revision's review, and a pending proposal's. Also repairs a document written
+ * before `compactReview` existed: the next write of that state shrinks it.
+ */
+export function compactDirectorState(state: DirectorState): DirectorState {
+  return {
+    ...state,
+    ...(state.review ? { review: compactReview(state.review) } : {}),
+    revisions: (state.revisions ?? []).map((r) => ({ ...r, review: compactReview(r.review) })),
+    ...(state.proposal ? { proposal: { ...state.proposal, review: compactReview(state.proposal.review) } } : {}),
+  };
+}
+
 export function emptyDirectorState(
   prompt: string,
   request: DirectorRequest
@@ -38,7 +76,7 @@ export function startRun(
   now = Date.now()
 ): DirectorState {
   return {
-    ...(prev ?? emptyDirectorState(prompt, request)),
+    ...(prev ? compactDirectorState(prev) : emptyDirectorState(prompt, request)),
     prompt,
     request,
     status: "running",
@@ -48,7 +86,7 @@ export function startRun(
     errorMessage: undefined,
     // Keep the previous plan/summary visible while the new run works — the panel
     // shouldn't blank out the result the user is currently looking at.
-    revisions: prev?.revisions ?? [],
+    revisions: prev ? compactDirectorState(prev).revisions : [],
   };
 }
 
@@ -88,12 +126,12 @@ export function commitRun(
     createdAt: now,
     plan: input.plan,
     summary: input.summary,
-    review: input.review,
+    review: compactReview(input.review),
     appliedOperationIds: input.appliedOperationIds,
     failures: input.failures,
   };
 
-  const revisions = [...state.revisions, entry].slice(-MAX_REVISIONS);
+  const revisions = [...compactDirectorState(state).revisions, entry].slice(-MAX_REVISIONS);
 
   return {
     ...state,
@@ -101,7 +139,7 @@ export function commitRun(
     stage: undefined,
     plan: input.plan,
     summary: input.summary,
-    review: input.review,
+    review: compactReview(input.review),
     failures: input.failures,
     revisions,
     // Whatever was pending is now either what we just committed, or was
@@ -128,7 +166,7 @@ export function proposeRun(
 ): DirectorState {
   const now = input.now ?? Date.now();
   return {
-    ...state,
+    ...compactDirectorState(state),
     status: "proposed",
     stage: undefined,
     errorMessage: undefined,
@@ -136,7 +174,7 @@ export function proposeRun(
     proposal: {
       plan: input.plan,
       summary: input.summary,
-      review: input.review,
+      review: compactReview(input.review),
       failures: input.failures,
       command: input.command,
       createdAt: now,
@@ -202,7 +240,8 @@ export interface UndoTarget {
  *
  * Returns null when there is nothing to undo.
  */
-export function undoLastRevision(state: DirectorState): UndoTarget | null {
+export function undoLastRevision(stored: DirectorState): UndoTarget | null {
+  const state = compactDirectorState(stored);
   if (!state.revisions.length) return null;
 
   const revisions = state.revisions.slice(0, -1);

@@ -22,6 +22,7 @@
  * `<canvas>` layers can all call it and match. `ctx` is typed against the DOM
  * `CanvasRenderingContext2D`; the worker/Remotion pass API-compatible contexts.
  */
+import { compiledFor, drawEffectProgram } from "@/lib/effects/program";
 import type {
   BrandingCtaSettings,
   CaptionSettings,
@@ -33,6 +34,8 @@ import type {
   TransitionSettings,
 } from "@/lib/firebase/schema";
 import { resolveTextStyle, type ResolvedTextStyle, type TextScript } from "./text-shaping";
+import type { GraphicPart, GraphicSettings } from "@/lib/firebase/schema";
+import { DEFAULT_TEXT_STYLE } from "./text-style";
 import {
   evaluateAnimation,
   revealText,
@@ -139,7 +142,24 @@ function applyPresetAnimation(
   if (!anim) return null;
 
   const f = evaluateAnimation(anim, t, m.startTime, m.endTime);
+  applyAnimationFrame(ctx, f, anchorX, anchorY, canvasW, canvasH);
+  return f;
+}
 
+/**
+ * Apply an evaluated animation frame to the canvas state: alpha, translate,
+ * then scale/rotate about the element's own anchor, then blur. Shared by the
+ * per-moment path above and by each part of a composed graphic, so a part's
+ * staggered entrance moves exactly like a preset's.
+ */
+function applyAnimationFrame(
+  ctx: CanvasRenderingContext2D,
+  f: AnimationFrame,
+  anchorX: number,
+  anchorY: number,
+  canvasW: number,
+  canvasH: number
+): void {
   ctx.globalAlpha *= f.alpha;
 
   if (f.translateX !== 0 || f.translateY !== 0) {
@@ -158,7 +178,77 @@ function applyPresetAnimation(
     // for the Canvas-Fit blurred background.
     ctx.filter = `blur(${(f.blur * canvasH).toFixed(2)}px)`;
   }
-  return f;
+}
+
+// ── Composed graphics ────────────────────────────────────────────────────────
+//
+// A graphic is a list of PARTS (text / rect / line), each with its own anchor,
+// style, z-order and entrance delay. Drawn here — the one module the preview,
+// the browser exporter, the Cloud Run worker and Remotion all call — so a
+// design Framevo's AI composes in chat renders identically everywhere, and a
+// revision ("remove the line but keep the title") is a patch to the parts.
+
+/** The part's entrance window: the graphic's start plus its own delay. */
+function partWindow(p: GraphicPart, m: DetectedMoment): { start: number; end: number } {
+  const start = m.startTime + Math.max(0, p.delay ?? 0);
+  return { start: Math.min(start, m.endTime - 0.05), end: m.endTime };
+}
+
+function drawGraphic(
+  ctx: CanvasRenderingContext2D,
+  g: GraphicSettings,
+  m: DetectedMoment,
+  t: number,
+  { canvasW, canvasH }: OverlayLayout
+): void {
+  if (!g.parts?.length) return;
+  // The moment-level envelope: a graphic with no animation of its own keeps the
+  // legacy 0.25s fade so it never pops; one with a shared `animation` owns it.
+  const envelope = baseAlphaFor(m, t);
+  if (envelope <= 0) return;
+
+  const parts = [...g.parts].sort((a, b) => (a.z ?? 0) - (b.z ?? 0));
+  for (const p of parts) {
+    const w = partWindow(p, m);
+    if (t < w.start) continue; // not entered yet (staggered reveal)
+    const anim = p.animation ?? m.animation;
+    const f = anim ? evaluateAnimation(anim, t, w.start, w.end) : null;
+    const ax = clamp01(p.x) * canvasW;
+    const ay = clamp01(p.y) * canvasH;
+
+    ctx.save();
+    ctx.globalAlpha = envelope * clamp01(p.opacity ?? 1);
+    if (f) applyAnimationFrame(ctx, f, ax, ay, canvasW, canvasH);
+
+    if (p.kind === "text") {
+      const v: TextStyleValues = { ...DEFAULT_TEXT_STYLE, ...(p.style ?? {}) } as TextStyleValues;
+      const text = f && anim?.reveal && anim.reveal.kind !== "none" ? revealText(p.text, anim.reveal.kind, f.revealFraction) : p.text;
+      if (text.trim()) {
+        drawStyledText(ctx, text, withAnimatedTracking(v, f), canvasH, {
+          x: ax,
+          y: ay,
+          vAlign: "center",
+          maxWidth: Math.max(24, clamp01(p.maxWidth ?? 0.6) * canvasW),
+          minFontPx: 10,
+        });
+      }
+    } else if (p.kind === "rect") {
+      const rw = Math.max(1, clamp01(p.w) * canvasW);
+      const rh = Math.max(1, clamp01(p.h) * canvasH);
+      ctx.fillStyle = rgba(p.color, 1);
+      roundRectPath(ctx, ax, ay, rw, rh, Math.max(0, (p.radius ?? 0) * rh));
+      ctx.fill();
+    } else if (p.kind === "line") {
+      ctx.strokeStyle = rgba(p.color, 1);
+      ctx.lineWidth = Math.max(1, p.thickness * canvasH);
+      ctx.lineCap = "round";
+      ctx.beginPath();
+      ctx.moveTo(ax, ay);
+      ctx.lineTo(clamp01(p.x2) * canvasW, clamp01(p.y2) * canvasH);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
 }
 
 /**
@@ -283,10 +373,12 @@ export function activeOverlays(
       case "text-overlay":
       case "branding-cta":
       case "transition":
+      case "graphic":
         output.push(m);
         break;
       case "callout":
       case "blur-redaction":
+      case "fx":
         inCamera.push(m);
         break;
       default:
@@ -306,6 +398,8 @@ export function hasOverlayMoments(moments: DetectedMoment[]): boolean {
       m.effectType === "text-overlay" ||
       m.effectType === "branding-cta" ||
       m.effectType === "transition" ||
+      m.effectType === "graphic" ||
+      m.effectType === "fx" ||
       m.effectType === "callout" ||
       m.effectType === "blur-redaction")
   );
@@ -333,6 +427,7 @@ export function drawOutputOverlays(
       drawTextOverlay(ctx, m.textOverlay, m, t, layout);
     else if (m.effectType === "branding-cta" && m.brandingCta)
       drawBrandingCta(ctx, m.brandingCta, m, t, layout);
+    else if (m.effectType === "graphic" && m.graphic) drawGraphic(ctx, m.graphic, m, t, layout);
   }
   for (const m of output) {
     if (m.effectType === "transition" && m.transition) drawTransition(ctx, m.transition, m, t, layout);
@@ -769,15 +864,37 @@ export function drawInCameraOverlays(
 ): void {
   const { inCamera } = activeOverlays(moments, t);
   if (!inCamera.length) return;
-  // Blur first (redact), callouts on top (annotate).
+  // Blur first (redact), effects on the footage, callouts on top (annotate).
   for (const m of inCamera) {
     if (m.effectType === "blur-redaction" && m.blurRedaction)
       drawBlurRedaction(ctx, m.blurRedaction, m.focusRegion, drawW, drawH);
   }
   for (const m of inCamera) {
+    if (m.effectType === "fx" && m.fx) drawFx(ctx, m, t, drawW, drawH);
+  }
+  for (const m of inCamera) {
     if (m.effectType === "callout" && m.callout)
       drawCallout(ctx, m.callout, m, t, drawW, drawH);
   }
+}
+
+/**
+ * An effect program instance. Origin is the placement centre, so the video
+ * frame spans (-drawW/2, -drawH/2)…(drawW/2, drawH/2) and the program's 0..1
+ * coordinates land on the footage — a camera zoom moves the effect with it.
+ * A program that fails to compile draws nothing (it was validated on save; a
+ * hand-edited doc must not crash an export).
+ */
+function drawFx(ctx: CanvasRenderingContext2D, m: DetectedMoment, t: number, drawW: number, drawH: number): void {
+  const fx = m.fx!;
+  const compiled = compiledFor(fx.program);
+  if (!compiled) return;
+  drawEffectProgram(ctx, compiled, { params: fx.params, inputs: fx.inputs ?? {} }, t - m.startTime, {
+    ox: -drawW / 2,
+    oy: -drawH / 2,
+    W: drawW,
+    H: drawH,
+  });
 }
 
 /** focusRegion (0..1) → pixel rect centred at origin (origin = placement centre). */

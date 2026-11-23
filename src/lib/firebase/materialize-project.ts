@@ -78,6 +78,21 @@ export function materializeProject(
     // layer visible, which is what every project written before this field had.
     timelineLayers:
       (data.timelineLayers as ProjectDoc["timelineLayers"]) ?? undefined,
+    // Applied assistant edit requests (idempotency + chat history). Absent on
+    // older projects; anything that isn't an array is treated as no history.
+    assistantLog: Array.isArray(data.assistantLog)
+      ? (data.assistantLog as ProjectDoc["assistantLog"])
+      : undefined,
+    clickMarks: Array.isArray(data.clickMarks)
+      ? (data.clickMarks as ProjectDoc["clickMarks"])
+      : undefined,
+    assistantMemory: Array.isArray(data.assistantMemory)
+      ? (data.assistantMemory as ProjectDoc["assistantMemory"])
+      : undefined,
+    footageSurvey:
+      data.footageSurvey && typeof data.footageSurvey === "object" && Array.isArray((data.footageSurvey as { shots?: unknown }).shots)
+        ? (data.footageSurvey as ProjectDoc["footageSurvey"])
+        : undefined,
     // Sync bookkeeping. These MUST be carried through: the desktop's
     // compare-and-set push reads `rev` off the materialized document, so
     // dropping it here would make every push look like it was composed against

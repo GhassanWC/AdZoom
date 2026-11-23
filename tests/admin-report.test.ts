@@ -243,3 +243,32 @@ test("PDF renders an empty window without throwing", async () => {
   const bytes = await renderAdminReportPdf(report);
   assert.ok(bytes.byteLength > 1000);
 });
+
+test("assistant funnel: client outcomes counted once (server model turns kept apart), undo rate, finding", () => {
+  const ev = (name: string, userId: string, meta: Record<string, string | number> = {}) => ({
+    name, userId, plan: "free", environment: "production", projectId: "p1", timestamp: NOW - DAY, meta,
+  });
+  const events = [
+    ...Array.from({ length: 4 }, () => ev("assistant_request", "u1", { source: "local", outcome: "applied", latencyMs: 20 })),
+    ev("assistant_request", "u2", { source: "model", outcome: "rejected", errorCodes: "not_found" }),
+    ev("assistant_request", "u2", { source: "model", outcome: "question" }),
+    ev("assistant_request", "u2", { source: "model", outcome: "question" }),
+    ev("assistant_request", "u2", { source: "model", outcome: "question" }),
+    ev("assistant_request", "u2", { stage: "model", outcome: "commands" }),
+    ev("assistant_undo", "u1"),
+    ev("assistant_undo", "u1"),
+    ev("assistant_undo", "u1"),
+    ev("editframe_export_completed", "u1"),
+    ev("export_downloaded", "u1"),
+  ];
+  const r = buildAdminReport(fixture({ events }));
+  const a = r.usage.assistant;
+  assert.equal(a.requests, 8, "server stage:model events are not user requests");
+  assert.equal(a.modelTurns, 1);
+  assert.equal(a.appliedPct, 50);
+  assert.equal(a.undoRatePct, 75);
+  assert.deepEqual(a.topErrorCodes, [{ label: "not_found", value: 1 }]);
+  assert.deepEqual(a.funnel.map((s) => s.value), [2, 1, 1, 1]);
+  assert.ok(r.findings.some((f) => /chat edit requests were applied/.test(f.title)));
+  assert.ok(r.findings.some((f) => /were undone/.test(f.title)));
+});

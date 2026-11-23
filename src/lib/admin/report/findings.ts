@@ -234,6 +234,27 @@ export function deriveFindings(r: AdminReport): Finding[] {
     });
   }
 
+  // ── Editing assistant ────────────────────────────────────────────────────
+  const as = r.usage.assistant;
+  if (as.requests >= MIN_SAMPLE && as.appliedPct != null && as.appliedPct < 60) {
+    add({
+      severity: as.appliedPct < 35 ? "high" : "medium",
+      area: "Editing assistant",
+      title: `Only ${pct(as.appliedPct)} of chat edit requests were applied`,
+      evidence: `Outcomes: ${as.byOutcome.map((s) => `${s.label} ${s.value}`).join(", ")}.${as.topErrorCodes[0] ? ` Top rejection: ${as.topErrorCodes[0].label} (${as.topErrorCodes[0].value}).` : ""}`,
+      recommendation: "Look at the top rejection code and the questions asked; widen the local command parser or the model tools for the most common unmet request.",
+    });
+  }
+  if (as.undoRatePct != null && as.undos >= 3 && as.undoRatePct >= 30) {
+    add({
+      severity: "medium",
+      area: "Editing assistant",
+      title: `${pct(as.undoRatePct)} of applied chat edits were undone`,
+      evidence: `${as.undos} undos after ${Math.round((as.undos * 100) / as.undoRatePct)} applied edits.`,
+      recommendation: "Users are reversing what the assistant did — review which ops are undone most and tighten their defaults or ask a question first.",
+    });
+  }
+
   // ── Growth & activation ──────────────────────────────────────────────────
   const act = r.users.activation;
   if (act.cohort >= MIN_SAMPLE && act.createdProjectPct < LOW_ACTIVATION_PCT) {

@@ -50,6 +50,17 @@ export const EVENTS = {
   /** Phase 2 wiring: Director chat "fewer/none X" pushback (editType + direction). */
   DIRECTOR_PUSHBACK: "director_pushback",
 
+  // ── Editing assistant (structured edit commands, lib/edit-commands) ──
+  // The request → applied edit → preview/revision/undo path. Metadata is
+  // ENUMS AND COUNTS ONLY (source, outcome, op names, error codes, change
+  // count) — never the user's message or any text they typed.
+  /** One user request reached a terminal outcome (applied/rejected/question/duplicate/fallback/failed). */
+  ASSISTANT_REQUEST: "assistant_request",
+  /** The user undid an assistant request (chat Undo or ⌘Z while it was newest). */
+  ASSISTANT_UNDO: "assistant_undo",
+  /** The user clicked "Show" on a change to jump the preview to it. */
+  ASSISTANT_JUMP: "assistant_jump",
+
   // ── Engine options ───────────────────────────────────────────────────
   CAMERA_EDITS_ENABLED: "camera_edits_enabled",
   CUTS_ENABLED: "cuts_enabled",

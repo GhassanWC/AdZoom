@@ -62,8 +62,13 @@ interface ProjectShape {
  * worker IS a caption job by construction. The duplicate guard is the
  * "AI captions already exist" check at the call site, not this function.
  */
-function wantsCaptions(_project: ProjectShape): boolean {
-  return true;
+/**
+ * Whether a completed transcript should also merge caption moments. False when
+ * the request was transcript-only (the editing assistant adds captions itself,
+ * as one undoable change). Read from the PROCESSING transcript the request wrote.
+ */
+function wantsCaptions(project: ProjectShape): boolean {
+  return project.analysis?.transcript?.captionMerge !== false;
 }
 
 function captionVideoType(project: ProjectShape): SelectedVideoType {

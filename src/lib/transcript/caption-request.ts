@@ -63,6 +63,12 @@ export interface CaptionRequestInput {
   force?: boolean;
   stylePreset?: OverlayTextPreset;
   position?: CaptionPosition;
+  /**
+   * Transcribe only — leave the timeline alone. The editing assistant uses
+   * this so that the captions it then adds are ONE undoable change on the
+   * client, instead of moments merged server-side outside the undo stack.
+   */
+  transcriptOnly?: boolean;
 }
 
 export type CaptionRequestResult =
@@ -108,7 +114,7 @@ interface CaptionProjectShape {
 }
 
 export async function requestCaptions(input: CaptionRequestInput): Promise<CaptionRequestResult> {
-  const { uid, projectId, mode, code, locale, force, stylePreset, position } = input;
+  const { uid, projectId, mode, code, locale, force, stylePreset, position, transcriptOnly } = input;
   const { db } = getAdmin();
   const ref = db.collection("users").doc(uid).collection("projects").doc(projectId);
   const snap = await ref.get();
@@ -193,6 +199,9 @@ export async function requestCaptions(input: CaptionRequestInput): Promise<Capti
 
   // ── FREE reuse: a complete transcript for the current source exists but no
   //    AI captions yet → generate them directly, no ASR, no quota. ──
+  if (decision.action === "reuse" && existing && transcriptOnly) {
+    return { status: "reused", captionCount: 0, message: "The transcript is already available." };
+  }
   if (decision.action === "reuse" && existing && existingAiCaptions.length === 0) {
     const gen = generateCaptionMoments(existing, videoType, { stylePreset, position });
     if (gen.moments.length > 0) {
@@ -251,7 +260,7 @@ export async function requestCaptions(input: CaptionRequestInput): Promise<Capti
   // dispatch so the worker regenerates (its dedup guard skips when AI captions
   // exist). Manual captions are preserved.
   const baseMoments =
-    force && existingAiCaptions.length > 0
+    force && !transcriptOnly && existingAiCaptions.length > 0
       ? (project.analysis?.detectedMoments ?? []).filter(
           (m) => !(m.effectType === "captions" && m.source !== "user")
         )
@@ -261,6 +270,10 @@ export async function requestCaptions(input: CaptionRequestInput): Promise<Capti
     status: "processing",
     ...langStamp,
     ...styleStamp,
+    // ALWAYS stated: this write merges into the doc, so leaving the key out
+    // would keep a stale `false` from an earlier assistant (transcript-only)
+    // request and make a later "Retranscribe" silently skip its captions.
+    captionMerge: !transcriptOnly,
     usageKey,
     usagePeriodId,
     usageSeconds: requiredSeconds,

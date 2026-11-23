@@ -639,7 +639,21 @@ export function executePlan(input: ExecutePlanInput): DirectorExecution {
 
   // ── 3. Captions — from the REAL transcript, never invented ───────────────
   let captionCount = 0;
-  if (plan.captionInstructions.enabled) {
+  // Captions the user already has (the "Generate AI Captions" action, or
+  // their own) are the project's captions. Generating the Director's set on
+  // top drew every line TWICE — one caption per transcript segment from each
+  // source, at identical times. Keep theirs; the Director only fills an empty
+  // captions layer. (Its own previous captions aren't in `base`, so re-runs
+  // still replace them.)
+  const hasOwnCaptions = base.some((m) => m.effectType === "captions" && m.enabled !== false);
+  if (plan.captionInstructions.enabled && hasOwnCaptions) {
+    failures.push({
+      operationId: "captions",
+      subject: "captions",
+      reason: "duplicate_operation",
+      detail: "This project already has captions, so Framevo AI kept them instead of adding a second set.",
+    });
+  } else if (plan.captionInstructions.enabled) {
     const transcript = input.transcript;
     if (!transcript || transcript.status !== "complete" || !transcript.segments?.length) {
       failures.push({

@@ -27,6 +27,7 @@ import {
 import {
   classifyError,
   estimateAnalysisSeconds,
+  userFacingAnalysisError,
 } from "@/lib/analysis-stages";
 import {
   balanceTimeline,
@@ -107,7 +108,8 @@ import {
 // user's brief, applied to the understanding this run just produced.
 import { materializeProject } from "@/lib/firebase/materialize-project";
 import { runDirectorStage } from "@/lib/director/analysis-stage";
-import { stripUndefinedDeep } from "@/lib/director/state";
+import { compactDirectorState, stripUndefinedDeep } from "@/lib/director/state";
+import { FIRESTORE_MAX_DOCUMENT_BYTES, fitMergeWrite } from "@/lib/firebase/doc-size";
 import { shouldRunDirectorStage, type DirectorState } from "@/lib/director/types";
 
 export const runtime = "nodejs";
@@ -513,8 +515,21 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       audioAnalysis?: AudioAnalysis | null;
       /** Force re-transcription even if a transcript already exists. */
       forceRetranscribe?: boolean;
+      /**
+       * Finalize only: identifies ONE analysis run. A retry sends the same key,
+       * and a key the project already finalized is a no-op — so a retry whose
+       * earlier attempt actually landed (response lost, tab closed) can never
+       * apply the refinement twice.
+       */
+      finalizeKey?: string;
     } | null;
     const isFinalize = reqBody?.mode === "finalize";
+    const finalizeKey = isFinalize && typeof reqBody?.finalizeKey === "string" ? reqBody.finalizeKey : undefined;
+    const storedAnalysis = project.analysis as { finalizedKey?: string; status?: string } | undefined;
+    if (finalizeKey && storedAnalysis?.finalizedKey === finalizeKey) {
+      console.info("[finalize] already finalized — no-op", { projectId, finalizeKey });
+      return NextResponse.json({ ok: true, alreadyFinalized: true });
+    }
     // Phase 4 audio intelligence: prefer the client's fresh result, else fall
     // back to any previously-stored one (e.g. a re-run) so signals stay stable.
     const audioAnalysis: AudioAnalysis | null =
@@ -2023,8 +2038,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       speed: effectDist["speed-up"] ?? 0,
     });
 
-    await ref.set(
-      {
+    const terminal: Record<string, unknown> = {
         status: "analyzed" as ProjectStatus,
         // Persist the resolved user selection (top-level project field) so it
         // survives + stays the source of truth for a re-analysis.
@@ -2039,8 +2053,8 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
         ...(finalOutputCanvas ? { effectsSettings: { outputCanvas: finalOutputCanvas } } : {}),
         // The plan behind every `source: "ai-director"` edit in `detectedMoments`
         // above. Written in the SAME terminal write as the timeline it produced,
-        // so the two can never be observed out of step.
-        ...(directorState ? { director: stripUndefinedDeep(directorState) } : {}),
+        // so the two can never be observed out of step. (Written below via
+        // `update`, in the same batch — see there.)
         analysis: {
           status: "complete",
           stage: "Complete",
@@ -2071,11 +2085,63 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
           // value could otherwise be raced); powers the timeline's "Disabled
           // for this analysis" labels.
           lastRunOptions: analysisOptions,
+          // Idempotency marker for finalize retries (see `finalizeKey`). In the
+          // SAME write as the timeline, so it can only exist if the timeline does.
+          ...(finalizeKey ? { finalizedKey: finalizeKey } : {}),
         },
         updatedAt: FieldValue.serverTimestamp(),
-      },
-      { merge: true }
-    );
+    };
+
+    // ── Fit the 1 MiB document limit BEFORE writing ─────────────────────────
+    // Firestore limits the MERGED document, and rejects the whole write when
+    // it's over — the run's edits, transcript and Director result all lost to a
+    // bare INVALID_ARGUMENT. Predict the merged size and shed regenerable
+    // diagnostics first (deleting them, so a stale copy doesn't linger). The
+    // Director state is compacted (no timeline copies in its history) and
+    // written with `update`, which REPLACES the map — a merge-set would keep the
+    // old per-revision `review.moments` copies this compaction exists to drop.
+    const directorWrite = directorState
+      ? (stripUndefinedDeep(compactDirectorState(directorState)) as unknown as Record<string, unknown>)
+      : undefined;
+    const sizePatch: Record<string, unknown> = { ...terminal, ...(directorWrite ? { director: directorWrite } : {}) };
+    const fit = fitMergeWrite({
+      path: ref.path,
+      existing: directorWrite ? { ...project, director: undefined } : project,
+      patch: sizePatch,
+      optional: [
+        ["analysis", "rawMoments"],
+        ["analysis", "rejectedPool"],
+        ["analysis", "editDiagnostics"],
+        ["analysis", "clickPipeline"],
+        ["analysis", "editsGeneratedSnapshot"],
+      ],
+      deleted: FieldValue.delete(),
+      // Headroom for the activity events appended after this read.
+      budget: FIRESTORE_MAX_DOCUMENT_BYTES - 48_000,
+    });
+    console.info("[analyze] terminal write size", {
+      projectId,
+      predictedBytes: fit.size,
+      shed: fit.dropped,
+      directorBytesBefore: project.director ? JSON.stringify(project.director).length : 0,
+      directorBytesAfter: directorWrite ? JSON.stringify(directorWrite).length : 0,
+    });
+    if (!fit.fits) {
+      const largest = Object.entries({ ...project, ...sizePatch })
+        .map(([k, v]) => [k, JSON.stringify(v ?? null).length] as const)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 5);
+      console.error("[analyze] project document too large to save", { projectId, predictedBytes: fit.size, largest });
+      throw new Error(
+        `Project document would be ${fit.size} bytes after this run, over the maximum allowed size of 1,048,576 bytes.`
+      );
+    }
+    const { director: _director, ...setPatch } = sizePatch;
+    void _director;
+    const batch = db.batch();
+    batch.set(ref, setPatch, { merge: true });
+    if (directorWrite) batch.update(ref, { director: directorWrite });
+    await batch.commit();
 
     // (Transcription is NOT dispatched here — captions are generated only by
     // the dedicated "Generate AI Captions" action, never by analysis.)
@@ -2142,9 +2208,13 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       return NextResponse.json({ ok: false, cancelled: true }, { status: 200 });
     }
 
-    const msg = err instanceof Error ? err.message : "Analysis failed.";
-    const kind = classifyError(msg);
-    console.error("[analyze] failed", { kind, msg, err });
+    const rawMsg = err instanceof Error ? err.message : "Analysis failed.";
+    const kind = classifyError(rawMsg);
+    // The FULL diagnostic (database path, byte counts, stack) stays here in the
+    // server log. What leaves the server — the response, the persisted
+    // `errorMessage`, the activity feed — is the user-facing version.
+    console.error("[analyze] failed", { kind, msg: rawMsg, err });
+    const msg = userFacingAnalysisError(rawMsg);
 
     if (ref) {
       // Never let the failure-state write throw out of the catch — that would

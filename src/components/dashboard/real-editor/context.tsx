@@ -78,6 +78,12 @@ import {
   FREE_VIDEO_DURATION_LIMIT_MESSAGE,
 } from "@/lib/usage/plan";
 import { usePlanTier } from "@/lib/usage/useStoragePlan";
+import { applyEditCommands } from "@/lib/edit-commands/apply";
+import { appendLog, entryFor, wasApplied } from "@/lib/edit-commands/log";
+import type { EditRequest, EditRequestOutcome } from "@/lib/edit-commands/types";
+import type { ChatMessage } from "@/lib/edit-commands/chat";
+import { starterGraphic } from "@/lib/graphics/design";
+import { isAudioLocked, mergeMemory } from "@/lib/edit-commands/memory";
 import {
   runVisualAnalysis,
   CvAbortError,
@@ -85,8 +91,10 @@ import {
 } from "@/lib/cv/pipeline";
 import {
   runChunkedAnalysis,
+  retryFinalize,
   ChunkedAnalysisError,
   type ChunkedRunResult,
+  type FinalizeRetry,
 } from "@/lib/analysis/chunk-orchestrator";
 import {
   type AnalysisOptions,
@@ -249,6 +257,12 @@ const EMPTY_LAYERS: LayerVisibility = {};
 interface EditorSnapshot {
   moments: DetectedMoment[];
   layers: LayerVisibility;
+  /**
+   * On an UNDO-stack entry: the assistant request id of the commit that came
+   * after this snapshot (null for manual edits). Lets the chat offer "Undo" on
+   * a request only while that request is still the newest history step.
+   */
+  tag?: string | null;
 }
 
 interface EditorRealContextValue {
@@ -534,6 +548,13 @@ interface EditorRealContextValue {
   refiningFraming: boolean;
   analyzing: boolean;
   analyzeError: string | null;
+  /**
+   * The last analysis finished but its finalize step failed — the banner's
+   * "Retry finishing" re-runs ONLY that step (no re-analysis, no duplicates).
+   */
+  canRetryFinishing: boolean;
+  retryingFinishing: boolean;
+  retryFinishing: () => Promise<void>;
   /** 0..1 progress of the client-side CV pass, or null when not scanning. */
   cvProgress: number | null;
   /** Local flag: user clicked "minimize" — keep the analysis running but hide the modal. */
@@ -589,6 +610,37 @@ interface EditorRealContextValue {
   canUndo: boolean;
   canRedo: boolean;
 
+  // ── Assistant edit requests (lib/edit-commands) ─────────────────────────
+  /**
+   * The kept footage span selected on the timeline's Clips row. Clips are
+   * DERIVED from the cuts (lib/edit-commands/clips.ts) — there is no stored
+   * clip — so this is the derived id, kept in sync across renames.
+   */
+  selectedClipId: string | null;
+  setSelectedClipId: (id: string | null) => void;
+  /**
+   * Apply one user request's commands as ONE undo step, against the LIVE
+   * timeline (so manual edits made meanwhile are respected, not overwritten).
+   * A request id that was already applied is acknowledged, never re-applied.
+   */
+  applyEditRequest: (req: EditRequest) => Promise<EditRequestOutcome>;
+  /** Request id of the newest undo step when it is an assistant request, else null. */
+  latestEditRequestId: string | null;
+  /**
+   * The chat conversation for this editing session. Lives HERE, not in the
+   * panel, so closing and reopening the chat keeps it. Applied edits are also
+   * persisted on the project (`assistantLog`) and shown after a reload.
+   */
+  assistantChat: ChatMessage[];
+  setAssistantChat: React.Dispatch<React.SetStateAction<ChatMessage[]>>;
+  /**
+   * Show the full-AI-edit setup (style cards) inside the Framevo AI panel. Off
+   * by default — chat is the default view; the setup is reached on purpose
+   * from the chat Tools menu ("Full AI edit in a style…").
+   */
+  aiSetupOpen: boolean;
+  setAiSetupOpen: (open: boolean) => void;
+
   // ── Recording interactions (lazy-loaded sidecar, shared) ────────────────
   /** Cursor/click/focus events for tab recordings, or null when unavailable. */
   interactions: Interaction[] | null;
@@ -639,6 +691,8 @@ const DEFAULT_EFFECT_LABEL: Record<EffectType, string> = {
   "blur-redaction": "Blur / Redaction",
   transition: "Transition",
   "branding-cta": "Branding / CTA",
+  graphic: "Graphic",
+  fx: "Effect",
 };
 
 function isGoodDuration(d: number | undefined | null): d is number {
@@ -780,8 +834,14 @@ function chunkFailureText(err: unknown, verb: "start" | "resume"): string {
  * otherwise contradicts what the user is looking at.
  */
 function finalizeDegradeText(result: ChunkedRunResult): string | null {
-  if (!result.finalizeError || result.momentsAdded > 0) return null;
-  return `Analysis finished, but this run added no new edits — the AI refinement step failed: ${result.finalizeError}`;
+  if (!result.finalizeError) return null;
+  // With a retry available this is worth saying even when the run streamed in
+  // edits: the failed step carries the AI labels, gap-fill and the user's
+  // Framevo AI brief, and losing those silently is how a regression hides.
+  // Never the raw error — it can name the database path; that stays in logs.
+  return result.momentsAdded > 0
+    ? "Analysis finished, but its final AI step couldn't be saved — your instructions and AI refinements weren't applied."
+    : "Analysis finished, but its final AI step couldn't be saved — this run added no new edits. Your timeline wasn't changed.";
 }
 
 export function EditorRealProvider({
@@ -914,6 +974,27 @@ export function EditorRealProvider({
   const [cvDebug, setCvDebug] = React.useState(false);
   const [analyzing, setAnalyzing] = React.useState(false);
   const [analyzeError, setAnalyzeError] = React.useState<string | null>(null);
+  const [finalizeRetryInfo, setFinalizeRetryInfo] = React.useState<FinalizeRetry | null>(null);
+  const [retryingFinishing, setRetryingFinishing] = React.useState(false);
+  const applyChunkedResult = React.useCallback((result: ChunkedRunResult) => {
+    setFinalizeRetryInfo(result.finalizeRetry ?? null);
+    const degrade = finalizeDegradeText(result);
+    if (degrade) setAnalyzeError(degrade);
+  }, []);
+  const retryFinishing = React.useCallback(async () => {
+    if (!finalizeRetryInfo || retryingFinishing) return;
+    setRetryingFinishing(true);
+    try {
+      await retryFinalize(finalizeRetryInfo, idTokenGetter);
+      setFinalizeRetryInfo(null);
+      setAnalyzeError(null);
+    } catch (err) {
+      console.warn("[finalize] retry failed", { projectId: finalizeRetryInfo.projectId, err });
+      setAnalyzeError("Still couldn't finish the analysis. Your timeline is unchanged — try again in a moment.");
+    } finally {
+      setRetryingFinishing(false);
+    }
+  }, [finalizeRetryInfo, retryingFinishing, idTokenGetter]);
   const [processingMinimized, setProcessingMinimized] = React.useState(false);
   const [cvProgress, setCvProgress] = React.useState<number | null>(null);
   const [chunkedJob, setChunkedJob] = React.useState<AnalysisJob | null>(null);
@@ -1384,7 +1465,7 @@ export function EditorRealProvider({
   // `undefined` anywhere in the doc) — centralising it here removes the
   // earlier inconsistency where only some mutators scrubbed.
   const writeSnapshot = React.useCallback(
-    async (snap: EditorSnapshot, coalesce = false) => {
+    async (snap: EditorSnapshot, coalesce = false, extra?: DocPatch) => {
       // Serialize through the per-project write queue so a user edit can't
       // collide with a chunk append / finalize write ("Another write batch or
       // compaction is already active").
@@ -1422,6 +1503,9 @@ export function EditorRealProvider({
                 detectedMoments: snap.moments,
               }),
               timelineLayers: normalizeLayerVisibility(snap.layers),
+              // Assistant requests write their log entry in the SAME write as
+              // the edit, so "applied" and "recorded" can never disagree.
+              ...(extra ?? {}),
               updatedAt: serverTimestamp(),
             }),
         coalesce ? { coalesceTag: "user-moments-write" } : undefined
@@ -1435,8 +1519,17 @@ export function EditorRealProvider({
   const lastLiveCommitAtRef = React.useRef(0);
   const GESTURE_COALESCE_MS = 600;
 
+  const [latestEditRequestId, setLatestEditRequestId] = React.useState<string | null>(null);
+  const syncLatestTag = React.useCallback(() => {
+    const top = undoStackRef.current[undoStackRef.current.length - 1];
+    setLatestEditRequestId(top?.tag ?? null);
+  }, []);
+
   const commitSnapshot = React.useCallback(
-    async (next: EditorSnapshot, opts?: { coalesce?: boolean }) => {
+    async (
+      next: EditorSnapshot,
+      opts?: { coalesce?: boolean; tag?: string | null; extra?: DocPatch }
+    ) => {
       const now = Date.now();
       // Only skip the undo snapshot when this commit continues an in-progress
       // gesture (coalesced edits arriving within the window); a single undo
@@ -1447,6 +1540,7 @@ export function EditorRealProvider({
         undoStackRef.current.push({
           moments: momentsRef.current,
           layers: layersRef.current,
+          tag: opts?.tag ?? null,
         });
         if (undoStackRef.current.length > HISTORY_LIMIT) {
           undoStackRef.current.shift();
@@ -1454,15 +1548,16 @@ export function EditorRealProvider({
         redoStackRef.current = [];
         setCanUndo(true);
         setCanRedo(false);
+        syncLatestTag();
       }
       if (opts?.coalesce) lastLiveCommitAtRef.current = now;
       // Optimistic ref update so two rapid edits chain off each other's
       // result instead of both reading the same (now stale) snapshot.
       momentsRef.current = next.moments;
       layersRef.current = next.layers;
-      await writeSnapshot(next, opts?.coalesce);
+      await writeSnapshot(next, opts?.coalesce, opts?.extra);
     },
-    [writeSnapshot]
+    [writeSnapshot, syncLatestTag]
   );
 
   /** Commit new moments, carrying the CURRENT layer visibility unchanged. */
@@ -1479,13 +1574,15 @@ export function EditorRealProvider({
     redoStackRef.current.push({
       moments: momentsRef.current,
       layers: layersRef.current,
+      tag: prev.tag ?? null,
     });
     momentsRef.current = prev.moments;
     layersRef.current = prev.layers;
     setCanUndo(undoStackRef.current.length > 0);
     setCanRedo(true);
+    syncLatestTag();
     await writeSnapshot(prev);
-  }, [writeSnapshot]);
+  }, [writeSnapshot, syncLatestTag]);
 
   const redo = React.useCallback(async () => {
     const next = redoStackRef.current.pop();
@@ -1493,13 +1590,15 @@ export function EditorRealProvider({
     undoStackRef.current.push({
       moments: momentsRef.current,
       layers: layersRef.current,
+      tag: next.tag ?? null,
     });
     momentsRef.current = next.moments;
     layersRef.current = next.layers;
     setCanUndo(true);
     setCanRedo(redoStackRef.current.length > 0);
+    syncLatestTag();
     await writeSnapshot(next);
-  }, [writeSnapshot]);
+  }, [writeSnapshot, syncLatestTag]);
 
   /**
    * Show/hide a whole LAYER. Writes only `timelineLayers` — the lane's moments
@@ -1542,8 +1641,78 @@ export function EditorRealProvider({
       redoStackRef.current = [];
       setCanUndo(false);
       setCanRedo(false);
+      setLatestEditRequestId(null);
     }
   }, [project.analysis?.completedAt]);
+
+  // ── Assistant edit requests ─────────────────────────────────────────────
+  const [selectedClipId, setSelectedClipId] = React.useState<string | null>(null);
+  const [assistantChat, setAssistantChat] = React.useState<ChatMessage[]>([]);
+  const [aiSetupOpen, setAiSetupOpen] = React.useState(false);
+  // Covers the window between commit and the document echo, when the log on
+  // `projectRef` doesn't show the request yet: a double-submit must still be
+  // recognised as the same request.
+  const appliedRequestIdsRef = React.useRef(new Set<string>());
+
+  const applyEditRequest = React.useCallback(
+    async (req: EditRequest): Promise<EditRequestOutcome> => {
+      const current = projectRef.current;
+      const prior = wasApplied(current.assistantLog, req.requestId);
+      if (prior || appliedRequestIdsRef.current.has(req.requestId)) {
+        return { status: "duplicate", entry: prior };
+      }
+      const oc = current.effectsSettings?.outputCanvas;
+      // Validate + execute against the LIVE refs, not the state captured when
+      // the request started: if the user dragged a clip while the model was
+      // thinking, the command is checked against that newer timeline (and a
+      // reference to something that no longer exists is rejected, not guessed).
+      const res = applyEditCommands(
+        {
+          moments: momentsRef.current,
+          layers: layersRef.current,
+          sourceDuration: current.duration || videoRef.current?.duration || 0,
+          canvasWidth: oc?.width || current.width || 1920,
+          canvasHeight: oc?.height || current.height || 1080,
+          transcript: req.data?.transcript ?? current.analysis?.transcript ?? null,
+          videoType: normalizeSelectedVideoType(current.selectedVideoType),
+          clicks: req.data?.clicks ?? current.clickMarks ?? [],
+          silences:
+            req.data?.silences ??
+            (current.analysis?.audioAnalysis?.silenceSegments ?? []).map((x) => ({ start: x.startTime, end: x.endTime })),
+          // "Keep the commentary" (said now or earlier in this project) blocks
+          // cuts/trims/speed for this request — enforced here too, not only by the model.
+          audioLocked: isAudioLocked(current.assistantMemory, req.message),
+        },
+        req.commands,
+        req.requestId,
+        { partial: req.partial }
+      );
+      if (!res.ok) return { status: "rejected", errors: res.errors };
+
+      appliedRequestIdsRef.current.add(req.requestId);
+      const entry = entryFor(req.requestId, req.message, req.source, res.changes, Date.now());
+      await commitSnapshot(
+        { moments: res.moments, layers: layersRef.current },
+        {
+          tag: req.requestId,
+          extra: {
+            assistantLog: appendLog(current.assistantLog, entry),
+            ...(req.memory?.length ? { assistantMemory: mergeMemory(current.assistantMemory, req.memory) } : {}),
+          },
+        }
+      );
+      // Selection follows the edit: a trimmed clip keeps its highlight even when
+      // the trim gave it a new boundary id; a new/changed graphic is selected so
+      // the inspector opens on exactly what was just touched.
+      for (const r of res.clipRenames) {
+        setSelectedClipId((id) => (id === r.from ? r.to : id));
+      }
+      const touched = res.changes.find((c) => c.kind !== "removed" && c.effectType !== "cut");
+      if (touched) setSelectedMomentId(touched.elementId);
+      return { status: "applied", entry, changes: res.changes, blocked: res.errors };
+    },
+    [commitSnapshot]
+  );
 
   // Write helpers — all merge-safe writes that the security rules allow.
   const updateMoment: EditorRealContextValue["updateMoment"] = React.useCallback(
@@ -1850,6 +2019,9 @@ export function EditorRealProvider({
           ...(effectType === "smart-crop"
             ? { smartCrop: { aspectRatio: "9:16" as const, focusTarget: "center" as const } }
             : {}),
+          // A starter design the user edits by hand or by chat — never empty,
+          // so the new edit is visible the moment it lands.
+          ...(effectType === "graphic" ? { graphic: starterGraphic() } : {}),
         };
         const next = [...momentsRef.current, m].sort(
           (a, b) => a.startTime - b.startTime
@@ -2161,6 +2333,7 @@ export function EditorRealProvider({
       options
     );
     setAnalyzeError(null);
+    setFinalizeRetryInfo(null); // a new run supersedes the old one's finalize
     setAnalyzing(true);
     setProcessingMinimized(false); // fresh run → show overlay
 
@@ -2247,8 +2420,7 @@ export function EditorRealProvider({
             options,
             carryOver,
           });
-          const degrade = finalizeDegradeText(result);
-          if (degrade) setAnalyzeError(degrade);
+          applyChunkedResult(result);
           return;
         } catch (chunkErr) {
           // User cancelled mid-run — not a failure (the orchestrator wrote its
@@ -2422,7 +2594,7 @@ export function EditorRealProvider({
       setCvProgress(null);
       setAnalyzing(false);
     }
-  }, [idTokenGetter, uid, project, writeProject, videoRef, interactions, planTier, selectedVideoType]);
+  }, [idTokenGetter, uid, project, writeProject, videoRef, interactions, planTier, selectedVideoType, applyChunkedResult]);
 
   // Client → the DEDICATED captions endpoint. Captions are generated ONLY here
   // (analysis never touches them). Returns the server's structured outcome so
@@ -2544,9 +2716,11 @@ export function EditorRealProvider({
     const resumeUid = uid;
     resumeAttemptedRef.current = true;
     let cancelled = false;
+    let claimed = false;
     (async () => {
       const job = await getActiveJobForProject(resumeUid, project.id);
       if (cancelled || !job || analyzing || chunkRunningRef.current) return;
+      claimed = true;
       chunkRunningRef.current = true;
       setAnalyzing(true);
       setProcessingMinimized(true); // resumed jobs run in the background
@@ -2568,8 +2742,7 @@ export function EditorRealProvider({
             (project.analysis?.lastRunOptions as AnalysisOptions | undefined) ??
             DEFAULT_ANALYSIS_OPTIONS,
         });
-        const degrade = finalizeDegradeText(result);
-        if (degrade) setAnalyzeError(degrade);
+        applyChunkedResult(result);
       } catch (err) {
         // Aborted (unmount / user cancel) — not a failure.
         if (err instanceof CvAbortError || abort.signal.aborted) return;
@@ -2598,6 +2771,10 @@ export function EditorRealProvider({
     })();
     return () => {
       cancelled = true;
+      // Unmounted before the job lookup finished (React StrictMode's dev
+      // double-mount, an HMR remount): this attempt never ran, so let the next
+      // mount try. Without this a refresh in dev never resumed an interrupted run.
+      if (!claimed) resumeAttemptedRef.current = false;
     };
     // Run once after interactions resolve; intentionally not re-firing on
     // every project snapshot (the ref guard + getActiveJobForProject gate it).
@@ -2841,6 +3018,9 @@ export function EditorRealProvider({
     refiningFraming,
     analyzing,
     analyzeError,
+    canRetryFinishing: !!finalizeRetryInfo,
+    retryingFinishing,
+    retryFinishing,
     cvProgress,
     processingMinimized,
     setProcessingMinimized,
@@ -2859,6 +3039,14 @@ export function EditorRealProvider({
     redo,
     canUndo,
     canRedo,
+    selectedClipId,
+    setSelectedClipId,
+    applyEditRequest,
+    latestEditRequestId,
+    assistantChat,
+    setAssistantChat,
+    aiSetupOpen,
+    setAiSetupOpen,
     interactions,
     interactionsLoading,
     chunkedJob,
@@ -2883,9 +3071,11 @@ export function EditorRealProvider({
       setRemoveSharingBar, applyPreset, clearSelectedPreset, startAnalyze,
       generateCaptions, retranscribe, deleteAiCaptions, saveDirectorBrief,
       cancelAnalyze, refineFraming, refiningFraming, analyzing, analyzeError,
+      finalizeRetryInfo, retryingFinishing, retryFinishing,
       cvProgress, processingMinimized, seek, togglePlay, seekBy, muted, volume,
       toggleMute, setPreviewVolume, isFullscreen, toggleFullscreen, undo, redo,
-      canUndo, canRedo, interactions, interactionsLoading, chunkedJob,
+      canUndo, canRedo, selectedClipId, applyEditRequest, latestEditRequestId, assistantChat, aiSetupOpen,
+      interactions, interactionsLoading, chunkedJob,
       // `videoRef`/`previewFullscreenRef` are refs and `set*` from useState are
       // identity-stable by contract, so they are deliberately not listed.
     ]

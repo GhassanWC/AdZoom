@@ -48,6 +48,7 @@ const ALL_EFFECT_TYPES: EffectType[] = [
   "blur-redaction",
   "transition",
   "branding-cta",
+  "graphic",
 ];
 
 function moment(

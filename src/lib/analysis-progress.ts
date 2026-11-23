@@ -210,6 +210,8 @@ const EDIT_EFFECT_TYPES: ReadonlySet<EffectType> = new Set<EffectType>([
   "blur-redaction",
   "transition",
   "branding-cta",
+  "graphic",
+  "fx",
 ]);
 
 /** Count generated edits across ALL types (cuts, zooms, speeds, captions, overlays, …). */

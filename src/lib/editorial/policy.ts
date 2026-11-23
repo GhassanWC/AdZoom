@@ -172,6 +172,8 @@ export function categoryForEffectType(t: EffectType): EditCategoryId {
     case "hook-text":
       return "hook_text";
     case "text-overlay":
+    case "graphic":
+    case "fx":
       return "text_overlay";
     case "callout":
       return "callout";

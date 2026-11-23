@@ -351,3 +351,39 @@ export function buildSmartSignals(
 
   return { points };
 }
+
+/** Vertical-ish formats default to Smart Fit (best for 16:9 → 9:16). */
+export function defaultFitFor(aspect: AspectRatioId): FitMode {
+  return aspect === "9:16" || aspect === "4:5" ? "smart-fit" : "fill";
+}
+
+/**
+ * The ONE "change the aspect ratio" command — the Canvas panel's aspect cards
+ * and the editing chat ("make it vertical") both call it, so they can't drift.
+ * Keeps the user's fit/background choices when a canvas already exists; a new
+ * canvas starts from the aspect's default fit on a blurred background. Returns
+ * the full object to write (never a partial merge), with `backgroundColor`
+ * dropped unless the background is solid.
+ */
+export function outputCanvasForAspect(
+  current: OutputCanvas | null | undefined,
+  aspect: Exclude<AspectRatioId, "custom">,
+  sourceW: number,
+  sourceH: number
+): OutputCanvas {
+  const { canvasW, canvasH } = resolveCanvasDims(sourceW, sourceH, aspect, "1080p");
+  const next: OutputCanvas = current
+    ? { ...current, aspectRatio: aspect, width: canvasW, height: canvasH }
+    : {
+        aspectRatio: aspect,
+        width: canvasW,
+        height: canvasH,
+        fitMode: defaultFitFor(aspect),
+        scale: 1,
+        offsetX: 0,
+        offsetY: 0,
+        backgroundMode: "blur",
+      };
+  if (next.backgroundMode !== "solid") delete next.backgroundColor;
+  return next;
+}

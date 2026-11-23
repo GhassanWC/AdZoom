@@ -54,6 +54,9 @@ import { createDragStore, type DragStore } from "./drag-store";
 import { InteractionsLane } from "./InteractionsLane";
 import { AudioLane } from "./AudioLane";
 import { ClipsLane } from "./ClipsLane";
+import { FootageClipsLane } from "./FootageClipsLane";
+import { deriveClips } from "@/lib/edit-commands/clips";
+import { visibleMoments } from "@/lib/timeline/layers";
 import type { TimelineLaneContext } from "./trackModel";
 import { planTimelineLanes } from "./laneModel";
 
@@ -120,6 +123,8 @@ export function RealTimeline() {
     openClip,
     exitClip,
     requestClipExport,
+    selectedClipId,
+    setSelectedClipId,
   } = useEditorReal();
   // Subscribed HERE rather than read off the context value: as a provider field
   // this boolean re-rendered every editor consumer whenever the playhead crossed
@@ -134,6 +139,10 @@ export function RealTimeline() {
   const moments = project.analysis?.detectedMoments ?? [];
   const va = project.visualAnalysis;
   const total = duration > 0 ? duration : project.duration ?? 0;
+  const footageClips = React.useMemo(
+    () => deriveClips(visibleMoments(moments, layers), total),
+    [moments, layers, total]
+  );
   const narrativeSegments = project.analysis?.narrativeStructure ?? [];
   const attentionCurve = project.analysis?.attentionCurve;
 
@@ -670,6 +679,7 @@ export function RealTimeline() {
       } else if (e.key === "Escape") {
         e.preventDefault();
         setSelectedMomentId(null);
+        setSelectedClipId(null);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -683,6 +693,7 @@ export function RealTimeline() {
     deleteMultiSelected,
     clearMultiSelect,
     setSelectedMomentId,
+    setSelectedClipId,
     runSplit,
     zoomIn,
     zoomOut,
@@ -877,6 +888,35 @@ export function RealTimeline() {
   };
 
   const rows: Row[] = [];
+  /**
+   * Clips — the footage that plays, derived from the cuts. First row, because
+   * it is what an editor reads top-down: the shots, then what's on them.
+   * Selecting one gives the assistant (and its references like "the shot
+   * before this one") a subject. Read-only geometry: trims happen through the
+   * cut edges or the assistant, never a second editing model.
+   */
+  if (footageClips.length > 0) {
+    rows.push({
+      id: "footage-clips",
+      label: "Clips",
+      height: TRACK_HEIGHTS.overlay,
+      count: footageClips.length,
+      interactive: true,
+      engineOff: false,
+      renderLane: () => (
+        <FootageClipsLane
+          clips={footageClips}
+          total={total}
+          selectedClipId={selectedClipId}
+          onSelect={(clip) => {
+            setSelectedClipId(clip.id);
+            setSelectedMomentId(null);
+            seek(clip.sourceStart);
+          }}
+        />
+      ),
+    });
+  }
   for (const g of lanePlan) {
     for (const lane of g.lanes) {
       const def = lane.def;
@@ -1553,21 +1593,19 @@ function TrackEmptyAction({
 }
 
 
+/**
+ * One compact line, never a card: the timeline shell is fixed-height, and a
+ * tall empty-state card squeezed the lanes — including the Clips row, which
+ * is exactly what you select to start editing — out of view.
+ */
 function EmptyTimelineHint({ analyzed }: { analyzed: boolean }) {
   return (
-    <div className="relative mt-3 grid place-items-center rounded-2xl border border-white/[0.06] bg-white/[0.015] px-6 py-7 text-center">
-      <div className="inline-flex size-11 items-center justify-center rounded-2xl bg-violet-500/15 text-violet-200 ring-1 ring-violet-400/25 shadow-[0_8px_24px_-12px_rgba(139,92,246,0.6)]">
-        <Film size={18} />
-      </div>
-      <h3 className="mt-3 font-display text-[15px] font-semibold tracking-tight text-white">
-        {analyzed ? "Your timeline is empty" : "Nothing on the timeline yet"}
-      </h3>
-      <p className="mt-1.5 max-w-md text-[12.5px] leading-relaxed text-fog">
-        {analyzed
-          ? "Use the Add button above to insert your first zoom, focus, or click highlight at the playhead."
-          : "Run AI analysis for a first-draft edit, or use the Add button above to place edits manually."}
-      </p>
-    </div>
+    <p className="flex shrink-0 items-center justify-center gap-1.5 px-4 py-2 text-center text-[12px] text-fog">
+      <Film size={13} className="shrink-0 text-violet-300" />
+      {analyzed
+        ? "Your timeline is empty — ask Framevo for a change, or use Add."
+        : "No edits yet — ask Framevo for a change, or use Add."}
+    </p>
   );
 }
 

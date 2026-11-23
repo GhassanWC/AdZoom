@@ -223,11 +223,17 @@ test("generateCaptionMoments falls back to the video-type style when no override
 
 /* ── 5. Server duplicate protection wiring ───────────────────────────────── */
 
-test("the worker only generates captions for the caption flow (wantsCaptions = true)", () => {
+test("the worker merges captions for every caption job unless it was transcript-only", () => {
   const src = readFileSync("src/lib/transcript/run-transcription.ts", "utf8");
-  // Analysis no longer dispatches, so any worker job IS a caption job.
+  // Analysis no longer dispatches, so any worker job IS a caption job — it
+  // merges captions UNLESS the editing assistant asked for the transcript only
+  // (it then adds the captions itself, as one undoable change).
   assert.ok(src.includes("function wantsCaptions"));
-  assert.ok(/function wantsCaptions\([^)]*\): boolean \{\s*return true;/.test(src));
+  assert.ok(/function wantsCaptions\([^)]*\): boolean \{\s*return project\.analysis\?\.transcript\?\.captionMerge !== false;/.test(src));
+  // The request ALWAYS states the flag, so a stale `false` from an earlier
+  // transcript-only request can't make a later Retranscribe skip its captions.
+  const req = readFileSync("src/lib/transcript/caption-request.ts", "utf8");
+  assert.ok(req.includes("captionMerge: !transcriptOnly,"));
 });
 
 test("the captions route reuses the shared processTranscriptionJob (verify+commit)", () => {

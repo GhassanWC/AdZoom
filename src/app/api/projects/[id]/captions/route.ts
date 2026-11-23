@@ -46,6 +46,7 @@ export async function POST(
     force?: boolean;
     stylePreset?: OverlayTextPreset;
     position?: CaptionPosition;
+    transcriptOnly?: boolean;
   } | null;
 
   const result = await requestCaptions({
@@ -57,6 +58,7 @@ export async function POST(
     force: body?.force === true,
     stylePreset: body?.stylePreset,
     position: body?.position,
+    transcriptOnly: body?.transcriptOnly === true,
   });
 
   return NextResponse.json(result, { status: captionResultHttpStatus(result) });

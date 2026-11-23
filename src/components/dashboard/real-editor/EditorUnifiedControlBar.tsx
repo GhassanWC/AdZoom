@@ -36,6 +36,7 @@ import {
   PanelBottom,
   SquareSplitVertical,
   type LucideIcon,
+  Shapes,
 } from "lucide-react";
 import { cn } from "@/lib/cn";
 import type { EffectType, TimelineLayerId } from "@/lib/firebase/schema";
@@ -43,6 +44,7 @@ import { useEditorReal } from "./context";
 import { useRenderCount } from "@/lib/perf/render-probe";
 import { useMomentReview } from "./useMomentReview";
 import { MenuPopover, useMenuPopover } from "./MenuPopover";
+import { useEditorTools } from "./useEditorTools";
 import { PlaybackTransport, PlaybackVolumeFullscreen } from "./PlaybackControls";
 import { MODE_FRACTION, modeForSplitFraction, type WorkspaceMode } from "./workspace-split";
 
@@ -133,38 +135,27 @@ export function EditorUnifiedControlBar({
   onDelete: () => void;
 }) {
   useRenderCount("control-bar");
-  const { splitFraction, setSplitFraction, scenesOpen, toggleScenes } = useEditorReal();
+  const { splitFraction, setSplitFraction, scenesOpen, toggleScenes, activeTool, setActiveTool } = useEditorReal();
   // Edit-review navigation (prev / count / next) — lives in the overflow menu
   // now; still timeline navigation, not an editor tool.
   const review = useMomentReview();
   const activeMode = modeForSplitFraction(splitFraction);
 
   return (
+    // TWO stacked rows, icons only (names live in tooltips + aria-labels):
+    //   top    — editing: health · Add · Edit · Layers · Undo/Redo · Ask Framevo  |  View · ⋯
+    //   bottom — playback: transport + time, centered  |  volume · fullscreen
+    // One row of labelled buttons outgrew the bar: the left group ran into the
+    // centered transport (Ask Framevo overlapped the play controls).
     <div
       // Hold region: pressing any control here must NOT dismiss the floating
       // moment inspector.
       data-editor-dialog-hold
-      className="grid h-12 w-full shrink-0 grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-1.5 border-b border-white/[0.06] bg-surface px-2.5 sm:px-3"
+      className="flex w-full shrink-0 flex-col border-b border-white/[0.06] bg-surface"
     >
-      {/* ── Left — identity + Add + Edit ─────────────────────────────────── */}
-      {/* No overflow-x-auto here: `overflow-x: auto` with no explicit overflow-y
-          makes browsers force overflow-y to `auto` too, which would clip the
-          absolutely-positioned dropdown panels (Add/Edit) below this row. Now
-          that almost everything lives behind dropdowns, wrapping risk is low
-          enough that plain `flex` (nowrap) + hidden labels at narrow widths is
-          sufficient. */}
-      {/* Spacing carries the grouping: gap-2 BETWEEN groups, gap-1 within one.
-          The bar used to run one flat gap-1.5 through every control, which is
-          what made ten buttons read as a single undifferentiated row. */}
-      <div className="flex min-w-0 items-center gap-2 pr-1">
-        <div className="flex shrink-0 items-center gap-2">
-          <h3 className="hidden font-display text-[13px] font-semibold tracking-tight text-white sm:inline">
-            Timeline
-          </h3>
-          <HealthDot health={health} />
-        </div>
-
-        <Divider />
+      {/* ── Row 1 — editing tools ────────────────────────────────────────── */}
+      <div className="flex h-10 items-center gap-2 px-2.5 sm:px-3">
+        <HealthDot health={health} />
 
         <div className="flex shrink-0 items-center gap-1">
           <AddMenu onAdd={onAdd} />
@@ -175,59 +166,63 @@ export function EditorUnifiedControlBar({
             onSplit={onSplit}
             onDelete={onDelete}
           />
-          <LayersMenu
-            rows={layerRows}
-            onToggle={onToggleLayer}
-            onShowAll={onShowAllLayers}
-          />
+          <LayersMenu rows={layerRows} onToggle={onToggleLayer} onShowAll={onShowAllLayers} />
         </div>
 
-        {/* Undo / redo — the same session history the keyboard shortcuts drive.
-            Bordered as a PAIR on purpose: these two circular arrows sit directly
-            beside the transport's seek arrows (⏮ ↺5 ▶ ↻5), and unbordered they
-            blended into them — four near-identical glyphs from two unrelated
-            systems, with the disabled pair reading as broken chrome rather than
-            as history that has nothing to undo yet. The enclosure ends the tool
-            group cleanly and gives the transport its own air. */}
+        {/* Undo / redo — bordered as a pair so they never read as transport arrows. */}
         <div className="flex h-8 shrink-0 items-center overflow-hidden rounded-lg border border-white/10 bg-white/[0.025]">
           <HistoryBtn Icon={Undo2} label="Undo" shortcut="⌘Z" disabled={!canUndo} onClick={onUndo} />
           <span aria-hidden className="h-4 w-px shrink-0 bg-white/[0.08]" />
           <HistoryBtn Icon={Redo2} label="Redo" shortcut="⌘⇧Z" disabled={!canRedo} onClick={onRedo} />
         </div>
+
+        {/* Ask Framevo — chat is the main way to edit; reopens the conversation. */}
+        <button
+          type="button"
+          onClick={() => setActiveTool(activeTool === "ai-chat" ? null : "ai-chat")}
+          aria-pressed={activeTool === "ai-chat"}
+          aria-label="Ask Framevo"
+          title="Ask Framevo — describe the change you want"
+          className={cn(
+            BAR_CONTROL,
+            "shrink-0 border-violet-400/40 bg-violet-500/15 text-violet-50 hover:border-violet-400/60 hover:bg-violet-500/25",
+            activeTool === "ai-chat" && "bg-violet-500/30"
+          )}
+        >
+          <Sparkles size={14} />
+        </button>
+
+        <div className="ml-auto flex shrink-0 items-center gap-1">
+          <ViewMenu
+            activeMode={activeMode}
+            setSplitFraction={setSplitFraction}
+            hasScenes={hasScenes}
+            scenesOpen={scenesOpen}
+            toggleScenes={toggleScenes}
+            insightsOpen={insightsOpen}
+            onToggleInsights={onToggleInsights}
+          />
+          <OverflowMenu
+            zoom={zoom}
+            minZoom={minZoom}
+            maxZoom={maxZoom}
+            onZoomIn={onZoomIn}
+            onZoomOut={onZoomOut}
+            onFit={onFit}
+            review={review}
+          />
+        </div>
       </div>
 
-      {/* ── Center — the transport group stays dead-centered ────────────── */}
-      <div className="flex items-center justify-center gap-1 justify-self-center sm:gap-1.5">
-        <PlaybackTransport />
-      </div>
-
-      {/* ── Right — View ▾ · volume/fullscreen · ⋯ overflow ──────────────── */}
-      {/* Same reasoning as the left group: no overflow-x-auto, so the
-          View/Overflow dropdown panels never get vertically clipped. */}
-      <div className="flex min-w-0 items-center justify-end gap-2 pl-1">
-        <ViewMenu
-          activeMode={activeMode}
-          setSplitFraction={setSplitFraction}
-          hasScenes={hasScenes}
-          scenesOpen={scenesOpen}
-          toggleScenes={toggleScenes}
-          insightsOpen={insightsOpen}
-          onToggleInsights={onToggleInsights}
-        />
-
-        <div className="flex shrink-0 items-center gap-0.5">
+      {/* ── Row 2 — playback ─────────────────────────────────────────────── */}
+      <div className="grid h-11 grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-1.5 border-t border-white/[0.04] px-2.5 sm:px-3">
+        <span aria-hidden />
+        <div className="flex items-center justify-center gap-1 sm:gap-1.5">
+          <PlaybackTransport />
+        </div>
+        <div className="flex min-w-0 items-center justify-end gap-0.5">
           <PlaybackVolumeFullscreen />
         </div>
-
-        <OverflowMenu
-          zoom={zoom}
-          minZoom={minZoom}
-          maxZoom={maxZoom}
-          onZoomIn={onZoomIn}
-          onZoomOut={onZoomOut}
-          onFit={onFit}
-          review={review}
-        />
       </div>
     </div>
   );
@@ -307,10 +302,6 @@ function MenuItem({
       )}
     </button>
   );
-}
-
-function Divider() {
-  return <span aria-hidden className="hidden h-5 w-px shrink-0 bg-white/[0.08] sm:block" />;
 }
 
 /**
@@ -396,7 +387,7 @@ function LayersMenu({
         )}
       >
         <Layers size={13} className="shrink-0" />
-        <span className="hidden sm:inline">Layers</span>
+        <span className="sr-only">Layers</span>
         {hiddenCount > 0 && (
           <span className="text-[10.5px] font-semibold tabular-nums text-amber-200/90">
             {hiddenCount} off
@@ -506,6 +497,7 @@ function EditMenu({
 }) {
   const menu = useMenuPopover();
   const { open, toggle, close } = menu;
+  const tools = useEditorTools().filter((t) => t.timelineMenu === "edit");
 
   return (
     <>
@@ -516,11 +508,11 @@ function EditMenu({
         aria-expanded={open}
         aria-haspopup="menu"
         aria-label="Edit actions"
-        title="Edit — split, duplicate, delete"
+        title="Edit — split, duplicate, delete, crop, canvas, suggestions"
         className={BAR_CONTROL_NEUTRAL}
       >
         <Scissors size={13} className="shrink-0" />
-        <span className="hidden sm:inline">Edit</span>
+        <span className="sr-only">Edit</span>
         <ChevronDown size={11} className="shrink-0 opacity-70" />
       </button>
       <MenuPopover state={menu} width={MENU_W_SM} ariaLabel="Edit actions">
@@ -562,6 +554,20 @@ function EditMenu({
               close();
             }}
           />
+          <MenuDivider />
+          <MenuLabel>Video</MenuLabel>
+          {tools.map((t) => (
+            <MenuItem
+              key={t.id}
+              Icon={t.Icon}
+              label={t.label}
+              tip={t.hint}
+              onClick={() => {
+                close();
+                t.run();
+              }}
+            />
+          ))}
       </MenuPopover>
     </>
   );
@@ -616,7 +622,7 @@ function ViewMenu({
         className={BAR_CONTROL_NEUTRAL}
       >
         <SquareSplitVertical size={13} className="shrink-0" />
-        <span className="hidden md:inline">View</span>
+        <span className="sr-only">View</span>
         <ChevronDown size={11} className="shrink-0 opacity-70" />
       </button>
       <MenuPopover state={menu} align="right" width={MENU_W_MD} ariaLabel="View options">
@@ -812,6 +818,7 @@ const ADD_EFFECTS: AddEffectSpec[] = [
   { id: "blur-redaction", label: "Blur", Icon: EyeOff, hint: "Hide a sensitive region", group: "overlay" },
   { id: "branding-cta", label: "CTA", Icon: BadgeCheck, hint: "End-card call to action", group: "overlay" },
   { id: "transition", label: "Transition", Icon: Shuffle, hint: "Quick fade between scenes", group: "overlay" },
+  { id: "graphic", label: "Graphic", Icon: Shapes, hint: "Title, accent line, price — designed parts", group: "overlay" },
   // NB: smart-crop is applied via the Canvas tool (output framing), not a
   // playhead moment, so it's intentionally not offered here.
 ];
@@ -819,6 +826,7 @@ const ADD_EFFECTS: AddEffectSpec[] = [
 function AddMenu({ onAdd }: { onAdd: (e: EffectType) => void }) {
   const menu = useMenuPopover();
   const { open, toggle, close } = menu;
+  const tools = useEditorTools().filter((t) => t.timelineMenu === "add");
 
   return (
     <>
@@ -837,7 +845,7 @@ function AddMenu({ onAdd }: { onAdd: (e: EffectType) => void }) {
         )}
       >
         <Plus size={13} />
-        <span className="hidden sm:inline">Add</span>
+        <span className="sr-only">Add</span>
         <ChevronDown size={11} className="opacity-70" />
       </button>
       {/* The tallest menu in the bar — 12 items. It's the one that made the bug
@@ -867,6 +875,28 @@ function AddMenu({ onAdd }: { onAdd: (e: EffectType) => void }) {
               </span>
             </button>
           </React.Fragment>
+        ))}
+        <div className="mx-2 my-1 border-t border-white/[0.07] pt-1 text-[9.5px] font-semibold uppercase tracking-[0.14em] text-fog/70">
+          From Framevo
+        </div>
+        {tools.map((t) => (
+          <button
+            key={t.id}
+            type="button"
+            onClick={() => {
+              close();
+              t.run();
+            }}
+            className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors duration-150 hover:bg-white/[0.06]"
+          >
+            <span className="inline-flex size-7 shrink-0 items-center justify-center rounded-md bg-white/[0.05] text-violet-200 ring-1 ring-white/10">
+              <t.Icon size={13} />
+            </span>
+            <span className="min-w-0">
+              <span className="block text-[12px] font-medium text-white">{t.label}</span>
+              <span className="block truncate text-[10.5px] text-fog">{t.hint}</span>
+            </span>
+          </button>
         ))}
       </MenuPopover>
     </>
@@ -910,10 +940,10 @@ function HealthDot({ health }: { health: TimelineHealth }) {
   return (
     <span
       title={cfg.tooltip}
-      className="hidden items-center gap-1.5 text-[11.5px] font-medium text-fog md:inline-flex"
+      className="inline-flex size-6 shrink-0 items-center justify-center"
     >
-      <span className={cn("size-1.5 shrink-0 rounded-full", cfg.dot)} />
-      <span>{cfg.label}</span>
+      <span className={cn("size-2 shrink-0 rounded-full", cfg.dot)} />
+      <span className="sr-only">Timeline {cfg.label}</span>
     </span>
   );
 }

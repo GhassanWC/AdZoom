@@ -28,9 +28,9 @@ const MIN_W = 320;
 const MAX_W_CEILING = 1400;
 /** The requested default open width: ~60% of the viewport. */
 const DEFAULT_FRACTION = 0.6;
-/** Must match EditorToolRail's fixed width (`w-14` = 56px) — the popup anchors
- *  flush against the rail's left edge. */
-const RAIL_WIDTH = 56;
+/** The right-hand tool rail was removed — the dock now sits flush with the
+ *  editor's right edge. Kept as a named constant so the width maths reads the same. */
+const RAIL_WIDTH = 0;
 
 const TOOL_TITLE: Record<RightTool, string> = {
   // The ONE user-facing AI identity (Framevo AI unification, rule 3). The
