@@ -88,6 +88,7 @@ import type { ProjectAsset, Sequence } from "@/lib/timeline/sequence";
 import type { SequencePlayerHandle } from "./SequencePreview";
 import { outputSpanToMomentTimes } from "@/lib/timeline/project-to-output";
 import { uploadProjectAsset } from "@/lib/firebase/assets";
+import { stripUndefined } from "@/lib/firebase/sanitize";
 import { changedElementIds, commandTarget, describeTimelineDiff } from "@/lib/timeline/diff";
 import type { EditError } from "@/lib/edit-commands/types";
 import {
@@ -679,27 +680,7 @@ interface EditorRealContextValue {
 
 const Ctx = React.createContext<EditorRealContextValue | null>(null);
 
-/**
- * Firestore rejects writes that contain `undefined` *values* anywhere in
- * the document. Spreading existing moments (or any doc previously read from
- * Firestore) preserves their explicit-`undefined` optional fields, which is
- * how a copy/duplicate write blows up with "Unsupported field value:
- * undefined". This recursively scrubs them.
- */
-function stripUndefined<T>(value: T): T {
-  if (Array.isArray(value)) {
-    return value.map((v) => stripUndefined(v)) as unknown as T;
-  }
-  if (value && typeof value === "object") {
-    const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      if (v === undefined) continue;
-      out[k] = stripUndefined(v);
-    }
-    return out as T;
-  }
-  return value;
-}
+// `stripUndefined` lives in @/lib/firebase/sanitize (one copy for routes and the editor).
 
 const DEFAULT_EFFECT_LABEL: Record<EffectType, string> = {
   zoom: "Zoom",
@@ -1559,8 +1540,13 @@ export function EditorRealProvider({
               // The sequence and assets travel with every snapshot (an undo
               // restores clip timing, audio and effects together). A legacy
               // project writes nothing here until it is converted.
-              ...(snap.sequence !== undefined ? { sequence: snap.sequence ?? deleteField() } : {}),
-              ...(snap.assets !== undefined ? { assets: snap.assets } : {}),
+              // Scrubbed like `analysis`: sequence ops build items with spread
+              // + `field: undefined` (a moved clip drops its transition-in, a
+              // split drops linkedTo), and Firestore rejects the WHOLE write for
+              // one nested undefined — the chat then reports an edit that never
+              // persisted (the write queue swallows the failure).
+              ...(snap.sequence !== undefined ? { sequence: snap.sequence ? stripUndefined(snap.sequence) : deleteField() } : {}),
+              ...(snap.assets !== undefined ? { assets: stripUndefined(snap.assets) } : {}),
               timelineRev: rev,
               // Assistant requests write their log entry in the SAME write as
               // the edit, so "applied" and "recorded" can never disagree.

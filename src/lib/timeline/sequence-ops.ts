@@ -239,7 +239,7 @@ export function moveItem(state0: SeqState, a: { itemId: string; toIndex: number 
   if (to === index) throw new OpError("no_change", "The clip is already there.");
   const items = state.sequence!.items.filter((i) => i.id !== item.id);
   // A transition belongs to the boundary it was on, not to the moved clip.
-  items.splice(to, 0, { ...item, transitionIn: undefined });
+  items.splice(to, 0, clean({ ...item, transitionIn: undefined }) as SequenceItem);
   const st = withItems(state, items);
   checkCycles(st);
   const at = itemStart(st, item.id);

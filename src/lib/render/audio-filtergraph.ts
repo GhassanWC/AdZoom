@@ -92,7 +92,16 @@ export function buildSequenceAudioGraph(input: SequenceAudioGraphInput): string 
   }
   if (!labels.length) return null;
   const D = f6(input.outputDuration);
-  const mix = labels.length === 1 ? `${labels[0]}anull` : `${labels.join("")}amix=inputs=${labels.length}:normalize=0:duration=longest:dropout_transition=0`;
+  // Several runs mix over a SILENT BASE that spans the whole output. Without
+  // it amix stalls when every run is silent at once (a freeze or a gap between
+  // clips): the finished run has hit EOF and the delayed one hasn't started, so
+  // amix never gets a frame to mix and ffmpeg blocks on its video stdin forever
+  // (the encoder watchdog then kills it — "render_stalled"). The base keeps the
+  // mixer fed, and `duration=first` pins the length to it.
+  const mix =
+    labels.length === 1
+      ? `${labels[0]}anull`
+      : `anullsrc=r=${input.sampleRate}:cl=stereo,atrim=0:${D}[base];[base]${labels.join("")}amix=inputs=${labels.length + 1}:normalize=0:duration=first:dropout_transition=0`;
   chains.push(`${mix},apad,atrim=0:${D},asetpts=PTS-STARTPTS[aout]`);
   return chains.join(";");
 }

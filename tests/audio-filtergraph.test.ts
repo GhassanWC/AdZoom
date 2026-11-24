@@ -36,6 +36,7 @@ test("graph: one chain per run, delays, rate handling, mix padded to the output 
   assert.match(g, /\[1:a\]atrim=start=2\.000000:end=4\.000000,asetpts=PTS-STARTPTS,atempo=2\.000000/);
   assert.match(g, /\[2:a\]atrim=start=0\.000000:end=1\.000000,asetpts=PTS-STARTPTS,aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,volume=0\.500000,adelay=1000:all=1/);
   assert.match(g, /\[3:a\]atrim=start=10\.000000:end=11\.000000.*volume='if\(lt\(t.*adelay=500:all=1/);
-  assert.match(g, /amix=inputs=3:normalize=0:duration=longest:dropout_transition=0,apad,atrim=0:2\.000000,asetpts=PTS-STARTPTS\[aout\]$/);
+  // A silent base spans the output so amix never starves during a gap (freeze / cut between runs) — see audio-filtergraph.ts.
+  assert.match(g, /anullsrc=r=48000:cl=stereo,atrim=0:2\.000000\[base\];\[base\]\[r0\]\[r1\]\[r2\]amix=inputs=4:normalize=0:duration=first:dropout_transition=0,apad,atrim=0:2\.000000,asetpts=PTS-STARTPTS\[aout\]$/);
   assert.equal(buildSequenceAudioGraph({ runs, inputIndexOf: () => null, sampleRate: 48000, outputDuration: 2 }), null, "no audio inputs → caller muxes -an");
 });

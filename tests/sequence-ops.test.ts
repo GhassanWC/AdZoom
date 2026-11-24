@@ -171,3 +171,40 @@ test("the audio lock still blocks footage retiming on a sequence; effects pass",
   assert.deepEqual(res.errors.map((e) => [e.commandIndex, e.code]), [[0, "locked"]], "retiming is blocked; a fade and a hold that keeps the sound playing pass");
   assert.deepEqual(res.sequence!.items.map((i) => i.kind), ["clip", "freeze", "clip"]);
 });
+
+// Regression: Firestore rejects a document that contains `undefined` ANYWHERE,
+// and the editor's write queue swallows the rejection — so a sequence op that
+// spreads `field: undefined` (moveItem's dropped transition-in) looked applied
+// in the chat and preview but never persisted. Every op result must be
+// Firestore-safe as produced.
+const firstUndefinedPath = (v: unknown, path = "$"): string | null => {
+  if (v === undefined) return path;
+  if (Array.isArray(v)) { for (let i = 0; i < v.length; i++) { const p = firstUndefinedPath(v[i], `${path}[${i}]`); if (p) return p; } return null; }
+  if (v && typeof v === "object") { for (const [k, x] of Object.entries(v as Record<string, unknown>)) { const p = firstUndefinedPath(x, `${path}.${k}`); if (p) return p; } }
+  return null;
+};
+
+test("every sequence op result is Firestore-safe (no undefined values anywhere)", () => {
+  const seq: Sequence = {
+    version: 1,
+    items: [
+      { id: "a", kind: "clip", assetId: "source", sourceIn: 0, sourceOut: 6, transitionIn: { kind: "dissolve", duration: 0.5 } },
+      { id: "b", kind: "clip", assetId: "B", sourceIn: 1, sourceOut: 4, opacity: { fadeIn: 0.3, fadeOut: 0.3 }, audio: { gain: 0.8, fadeIn: 0.2, fadeOut: 0.2 } },
+    ],
+  };
+  const st = base({ sequence: seq, moments: [mom({ id: "z", startTime: 1, endTime: 2, effectType: "zoom" })] });
+  const steps: [string, EditCommand[]][] = [
+    ["move_clip", [cap("move_clip", { clip_id: "b", to_index: 0 })]],
+    ["split_clip", [cap("split_clip", { clip_id: "b", at: 2 })]],
+    ["replace_source", [cap("replace_source", { clip_id: "a", asset_id: "B", source_in: 2, picture_only: true })]],
+    ["detach_audio", [cap("detach_audio", { clip_id: "b" })]],
+    ["freeze_frame", [cap("freeze_frame", { clip_id: "a", at: 2, duration: 1 })]],
+    ["set_transition", [cap("set_transition", { clip_id: "a", kind: "none" })]],
+    ["set_fade", [cap("set_fade", { clip_id: "b", fade_in: 0, fade_out: 0 })]],
+    ["trim_item", [cap("trim_item", { clip_id: "a", edge: "end", seconds: 1 })]],
+  ];
+  for (const [name, cmds] of steps) {
+    const r = ok(applyEditCommands(st, cmds, `u_${name}`));
+    assert.equal(firstUndefinedPath({ sequence: r.sequence, moments: r.moments, assets: r.assets ?? null }), null, `${name} left an undefined value`);
+  }
+});
