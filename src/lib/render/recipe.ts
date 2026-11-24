@@ -17,6 +17,7 @@
  * plain numbers + the raw moment/effect inputs the compositor selects from at
  * draw time.
  */
+import { outputDurationOf } from "@/lib/timeline/evaluate";
 import type {
   BackgroundMode,
   DetectedMoment,
@@ -91,6 +92,11 @@ export interface RenderRecipeInput {
   applyWatermark: boolean;
   /** Dev-only red/blue bounds borders. Always false in the worker. */
   debugBorders?: boolean;
+  /** Authored multi-source timeline (absent on legacy projects — derived from cut/speed moments). */
+  sequence?: import("@/lib/timeline/sequence").Sequence | null;
+  assets?: import("@/lib/timeline/sequence").ProjectAsset[];
+  /** Spoken windows of the original asset (source seconds) — music ducking. */
+  speech?: { start: number; end: number }[];
 }
 
 /** The fully-resolved recipe consumed by `composeFrame`. */
@@ -124,8 +130,10 @@ export interface RenderRecipe {
   effects: RenderEffects;
   applyWatermark: boolean;
   debugBorders: boolean;
-  /** Source→output time map (cuts removed, speed remapped). */
+  /** Source→output time map (cuts removed, speed remapped). LEGACY single-source view; `revision` is authoritative. */
   timelineMap: TimelineMap;
+  /** The timing contract's input: what `evaluateTimeline` resolves per output frame. */
+  revision: import("@/lib/timeline/evaluate").TimelineRevision;
 }
 
 /**
@@ -252,6 +260,16 @@ export function buildRenderRecipe(input: RenderRecipeInput): RenderRecipe {
     : { drawW: cover.drawW, drawH: cover.drawH, offsetX: 0, offsetY: 0 };
 
   const timelineMap = buildTimelineMap(moments, sourceDuration);
+  const revision: import("@/lib/timeline/evaluate").TimelineRevision = {
+    sequence: input.sequence ?? null,
+    moments,
+    assets: input.assets ?? [],
+    sourceDuration,
+    speech: input.speech ?? [],
+  };
+  // With an authored sequence the evaluator owns the output length; without one
+  // it reproduces the timeline map exactly (pinned by tests/sequence-evaluate).
+  const outputDuration = input.sequence ? outputDurationOf(revision) : timelineMap.outputDuration;
 
   return {
     sourceWidth,
@@ -260,7 +278,7 @@ export function buildRenderRecipe(input: RenderRecipeInput): RenderRecipe {
     resolution,
     format,
     sourceDuration,
-    outputDuration: timelineMap.outputDuration,
+    outputDuration,
     canvasW,
     canvasH,
     sourceRect,
@@ -289,5 +307,6 @@ export function buildRenderRecipe(input: RenderRecipeInput): RenderRecipe {
     applyWatermark,
     debugBorders: input.debugBorders === true,
     timelineMap,
+    revision,
   };
 }

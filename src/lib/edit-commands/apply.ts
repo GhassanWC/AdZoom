@@ -31,7 +31,11 @@ import type { GraphicPart } from "@/lib/firebase/schema";
 import { composeMove, slowerMove, holdLonger, beatsFromKeyframes, MIN_MOVE_SECONDS } from "./camera";
 import { dishLabelParts } from "@/lib/graphics/design";
 import { compileProgram, parseHex, type EffectProgram, type FxParamValues } from "@/lib/effects/program";
-import { deriveClips, clipAtSource, sourceAtOutput, type Clip } from "./clips";
+import { deriveClips, clipAtSource, sourceAtOutput, clipsFromSequence, type Clip } from "./clips";
+import * as seqOps from "@/lib/timeline/sequence-ops";
+import { isCapabilityOp, runCapability } from "./registry";
+import { SOURCE_ASSET_ID } from "@/lib/timeline/sequence";
+import { outputSecondsFor } from "@/lib/timeline/sequence";
 import type {
   ApplyResult,
   EditChange,
@@ -50,6 +54,8 @@ const MIN_RANGE = 0.05;
 const MIN_ELEMENT = 0.3;
 /** Ops that remove or retime footage — refused while the soundtrack is locked. */
 const AUDIO_CHANGING_OPS: ReadonlySet<string> = new Set(["trim_clip", "delete_clip", "remove_range", "set_speed", "tighten_pauses"]);
+/** Sequence capabilities that cut, reorder, retime or silence the linked sound. */
+const AUDIO_CHANGING_CAPS: ReadonlySet<string> = new Set(["trim_item", "delete_item", "move_clip", "set_clip_speed", "freeze_frame", "detach_audio"]);
 
 /** Only the program's declared params, with valid values (an instance never stores junk keys). */
 function pickParams(program: EffectProgram, values: FxParamValues): FxParamValues {
@@ -103,10 +109,36 @@ export function applyEditCommands(
   const changes: EditChange[] = [];
   const errors: EditError[] = [];
   const clipRenames: { from: string; to: string }[] = [];
+  // The sequence (multi-source timeline). Legacy projects have none until a
+  // sequence op runs; from then on it is the source of truth and the legacy
+  // footage ops below are routed onto it.
+  let seqState: seqOps.SeqState = { sequence: state.sequence ?? null, moments, assets: state.assets ?? [], sourceDuration: dur };
+  let seqTouched = false;
+  const hasSeq = () => !!seqState.sequence && Array.isArray(seqState.sequence.items);
+  /** Run a sequence op against the live moments; sync both ways; map OpError → EditError. */
+  const runSeq = (i: number, op: string, fn: (st: seqOps.SeqState) => seqOps.OpResult): boolean => {
+    try {
+      const converted = !hasSeq();
+      const r = fn({ ...seqState, moments });
+      seqState = r.state;
+      moments = r.state.moments;
+      seqTouched = true;
+      if (converted) changes.push({ kind: "updated", elementId: "sequence", effectType: "clip", summary: "Timeline converted to a sequence (cuts and speed sections are now clips)", at: 0 });
+      for (const c of r.changes) changes.push({ kind: c.kind, elementId: c.id, effectType: c.target === "track" ? "audio-track" : c.target === "asset" ? "asset" : "clip", summary: c.summary, at: c.at });
+      return true;
+    } catch (err) {
+      if (err instanceof seqOps.OpError) {
+        errors.push({ commandIndex: i, op, code: err.code === "unsupported" ? "unsupported" : err.code === "constraint" ? "constraint" : err.code, message: err.message });
+        return false;
+      }
+      throw err;
+    }
+  };
 
   const clipsNow = (): { clips: Clip[]; map: ReturnType<typeof buildTimelineMap> } => {
     const visible = visibleMoments(moments, state.layers ?? {});
     const map = buildTimelineMap(visible, dur);
+    if (hasSeq()) return { clips: clipsFromSequence({ sequence: seqState.sequence!, moments, assets: seqState.assets, sourceDuration: dur }), map };
     return { clips: deriveClips(visible, dur, map), map };
   };
   const findMoment = (id: string) => moments.find((m) => m.id === id) ?? null;
@@ -127,8 +159,78 @@ export function applyEditCommands(
       fail("unknown_op", "Not a command.");
       return;
     }
-    if (state.audioLocked && AUDIO_CHANGING_OPS.has(cmd.op)) {
+    const retimes = cmd.op === "capability" ? AUDIO_CHANGING_CAPS.has((cmd as { capability: string }).capability) && !((cmd as { capability: string; args: Record<string, unknown> }).capability === "freeze_frame" && (cmd as { args: Record<string, unknown> }).args?.audio === "continue") : AUDIO_CHANGING_OPS.has(cmd.op);
+    if (state.audioLocked && retimes) {
       return fail("locked", "You asked to keep the original commentary, so I won't cut, trim or speed up the footage.");
+    }
+
+    // ── Sequence capabilities + legacy footage ops on a sequence ──────────
+    if (cmd.op === "capability") {
+      const cap = (cmd as { capability: string; args: Record<string, unknown> }).capability;
+      if (!isCapabilityOp(cap)) return fail("unknown_op", `Unknown capability "${cap}".`);
+      runSeq(i, cap, (st) => runCapability(cap, st, (cmd as { args: Record<string, unknown> }).args ?? {}, { mint }));
+      return;
+    }
+    if (hasSeq()) {
+      switch (cmd.op) {
+        case "trim_clip":
+          runSeq(i, cmd.op, (st) => seqOps.trimItem(st, { itemId: cmd.clipId, edge: cmd.edge, seconds: cmd.seconds }));
+          return;
+        case "delete_clip":
+          runSeq(i, cmd.op, (st) => seqOps.deleteItem(st, { itemId: cmd.clipId }));
+          return;
+        case "remove_range":
+          runSeq(i, cmd.op, (st) => seqOps.removeSourceRange(st, { assetId: SOURCE_ASSET_ID, start: cmd.start, end: cmd.end, mintId: mint }));
+          return;
+        case "restore_range":
+          return fail("unsupported", "Restoring removed footage isn't available on a multi-source sequence — insert the range again with insert_clip.");
+        case "set_speed": {
+          if (!(cmd.multiplier > 0)) return fail("bad_args", "Speed must be a positive factor.");
+          runSeq(i, cmd.op, (st) => {
+            const iso = seqOps.isolateSourceRange(st, { assetId: SOURCE_ASSET_ID, start: cmd.start, end: cmd.end, mintId: mint });
+            if (!iso.itemIds.length) throw new seqOps.OpError("not_found", "That range isn't on the timeline.");
+            let cur = iso.state;
+            const all: seqOps.SeqChange[] = [];
+            for (const id of iso.itemIds) {
+              const r = seqOps.setSpeed(cur, { itemId: id, rate: cmd.multiplier });
+              cur = r.state;
+              all.push(...r.changes);
+            }
+            return { state: cur, changes: all };
+          });
+          return;
+        }
+        case "tighten_pauses": {
+          const minPause = Math.max(0.4, cmd.minPause ?? 1.0);
+          const keep = Math.min(minPause, Math.max(0.1, cmd.keep ?? 0.35));
+          if (!(state.transcript?.status === "complete" && (state.transcript.words?.length ?? 0) > 1) && !(state.silences?.length)) {
+            return fail("no_audio", "I couldn't measure the pauses in this video.");
+          }
+          const ranges = pauseCuts(state, minPause, keep);
+          const removedTotal = ranges.reduce((s, r) => s + (r.end - r.start), 0);
+          if (removedTotal > dur * 0.6) return fail("no_audio", "There's little or no speech here to pace around — tightening pauses would remove most of the video, so I left it alone.");
+          if (!ranges.length) return fail("no_change", `There are no pauses longer than ${minPause}s to tighten.`);
+          runSeq(i, cmd.op, (st) => {
+            let cur = st;
+            let removed = 0;
+            let count = 0;
+            for (const r of [...ranges].reverse()) {
+              try {
+                cur = seqOps.removeSourceRange(cur, { assetId: SOURCE_ASSET_ID, start: r.start, end: r.end, mintId: mint }).state;
+                removed += r.end - r.start;
+                count++;
+              } catch (err) {
+                if (!(err instanceof seqOps.OpError && err.code === "not_found")) throw err;
+              }
+            }
+            if (!count) throw new seqOps.OpError("no_change", "Those pauses are already removed.");
+            return { state: cur, changes: [{ kind: "removed", id: "pauses", target: "sequence", summary: `Tightened ${count} pause${count === 1 ? "" : "s"} (−${removed.toFixed(1)}s)`, at: 0 }] };
+          });
+          return;
+        }
+        default:
+          break;
+      }
     }
 
     switch (cmd.op) {
@@ -481,13 +583,14 @@ export function applyEditCommands(
         if (fx.program.inputs.includes("anchor") && !(anchor && anchor.x >= 0 && anchor.x <= 1 && anchor.y >= 0 && anchor.y <= 1)) {
           return fail("bad_args", "This effect needs an anchor position (x, y as fractions of the frame).");
         }
-        const end = Math.min(dur, cmd.at + fx.program.duration);
+        const play = fx.duration && fx.duration > 0 ? fx.duration : fx.program.duration;
+        const end = Math.min(dur, cmd.at + play);
         if (end - cmd.at < 0.2) return fail("out_of_range", "No room for the effect there — it would run past the end of the video.");
         const id = mint();
         const params = pickParams(fx.program, fx.params ?? {});
         add({
           ...baseMoment(id, r3(cmd.at), r3(end), fx.ref.name, "fx"),
-          fx: { ref: fx.ref, program: fx.program, params, inputs: fx.inputs ?? {} },
+          fx: { ref: fx.ref, program: fx.program, params, inputs: fx.inputs ?? {}, ...(fx.duration ? { duration: r3(fx.duration) } : {}) },
         } as DetectedMoment);
         changes.push({ kind: "added", elementId: id, effectType: "fx", summary: `Added "${fx.ref.name}" (v${fx.ref.version}) at ${clock(cmd.at)}`, at: cmd.at });
         return;
@@ -534,8 +637,14 @@ export function applyEditCommands(
           if (!fx.inputs.track) delete fx.inputs.track;
           notes.push("moved");
         }
+        if (cmd.duration != null) {
+          if (!(cmd.duration >= 0.2 && cmd.duration <= 30)) return fail("bad_args", "An effect plays between 0.2 and 30 seconds.");
+          const before = fx.duration ?? fx.program.duration;
+          fx = { ...fx, duration: r3(cmd.duration) };
+          notes.push(`plays over ${r3(cmd.duration)}s (was ${r3(before)}s)`);
+        }
         if (!notes.length) return fail("no_change", "Nothing to change on that effect.");
-        const end = Math.min(dur, start + fx.program.duration);
+        const end = Math.min(dur, start + (fx.duration ?? fx.program.duration));
         replace({ ...m, startTime: start, endTime: r3(end), fx, edited: true });
         changes.push({ kind: "updated", elementId: m.id, effectType: "fx", summary: `Updated "${fx.ref.name}": ${notes.join(", ")}`, at: start });
         return;
@@ -702,7 +811,22 @@ export function applyEditCommands(
 
   const realChanges = changes.filter((c) => c.summary);
   if (errors.length > 0 && !(opts.partial && realChanges.length > 0)) return { ok: false, errors };
-  return { ok: true, moments, changes: realChanges, clipRenames, errors };
+  return {
+    ok: true,
+    moments,
+    ...(seqTouched && seqState.sequence ? { sequence: seqState.sequence, assets: seqState.assets } : {}),
+    changes: realChanges,
+    clipRenames,
+    errors,
+  };
+}
+
+/** Output length of the executor's result (sequence-aware). */
+export function outputDurationOfState(state: Pick<EditState, "moments" | "sourceDuration" | "sequence" | "assets">): number {
+  if (state.sequence && Array.isArray(state.sequence.items)) {
+    return state.sequence.items.reduce((acc, it) => acc + (it.kind === "freeze" ? (it.duration ?? 2) : outputSecondsFor(it.speed, it.sourceIn, it.sourceOut)), 0);
+  }
+  return buildTimelineMap(state.moments, state.sourceDuration).outputDuration;
 }
 
 /** Longest a zoom on one click holds (s) — the next click ends it sooner. */

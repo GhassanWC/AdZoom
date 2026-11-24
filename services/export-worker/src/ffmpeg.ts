@@ -586,10 +586,21 @@ export function spawnDecoder(
    *  discards to the exact frame, and rebases PTS to ~0 so the `fps` filter grids
    *  from the seek point. The render loop's decodedIndex must be initialized to
    *  round(startSec*fps)-1 to match. (Parity test guards seam alignment.) */
-  startSec?: number
+  startSec?: number,
+  extra: {
+    /** Stop after this many seconds of output (sequence items decode only their span). */
+    durationSec?: number;
+    /** "pad": keep the asset's aspect inside width×height (letterbox); default stretches like the legacy single source. */
+    fit?: "stretch" | "pad";
+  } = {}
 ): Decoder {
   const seekArgs =
     typeof startSec === "number" && startSec > 0 ? ["-ss", startSec.toFixed(6)] : [];
+  const durArgs = typeof extra.durationSec === "number" && extra.durationSec > 0 ? ["-t", extra.durationSec.toFixed(6)] : [];
+  const scaleFilter =
+    extra.fit === "pad"
+      ? `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black`
+      : `scale=${width}:${height}`;
   const child = spawn(
     ffmpegBin(),
     [
@@ -603,11 +614,12 @@ export function spawnDecoder(
       ...seekArgs,
       "-i",
       path,
+      ...durArgs,
       // Force exact dims so each frame is exactly `width*height*4` bytes (the
       // FrameReader slices on that). Color-matrix parity tuning is deferred —
       // keep the filter minimal to reduce the failure surface.
       "-vf",
-      `fps=${fps},scale=${width}:${height},format=rgba`,
+      `fps=${fps}:start_time=0,${scaleFilter},format=rgba`,
       "-f",
       "rawvideo",
       "-pix_fmt",
@@ -675,7 +687,9 @@ export interface Encoder {
 export type EncoderAudio =
   | { kind: "none" }
   | { kind: "direct" }
-  | { kind: "filter"; filterComplex: string };
+  | { kind: "filter"; filterComplex: string }
+  /** Sequence mix: several asset files as inputs 1..N, one graph yielding [aout]. */
+  | { kind: "graph"; filterComplex: string; inputs: string[] };
 
 /**
  * Which H.264 encoder to drive. Absent ⇒ `libx264 -preset <preset> -crf <crf>`,
@@ -742,7 +756,12 @@ export async function spawnEncoder(opts: EncoderOptions): Promise<Encoder> {
     "pipe:0",
   ];
 
-  if (audio.kind === "filter") {
+  if (audio.kind === "graph") {
+    scriptPath = join(tmpdir(), `framevo-afc-${process.pid}-${Math.floor(Date.now())}.txt`);
+    await writeFile(scriptPath, audio.filterComplex, "utf8");
+    for (const input of audio.inputs) args.push("-i", input);
+    args.push("-filter_complex_script", scriptPath, "-map", "0:v", "-map", "[aout]", "-c:a", "aac", "-b:a", "192k");
+  } else if (audio.kind === "filter") {
     scriptPath = join(
       tmpdir(),
       `framevo-afc-${process.pid}-${Math.floor(Date.now())}.txt`

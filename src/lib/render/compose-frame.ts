@@ -30,7 +30,9 @@ import { resolveCameraFrame, canvasTranslateFor } from "@/lib/timeline/camera";
 import { coverFitDims } from "@/lib/timeline/cover";
 import { drawClickHighlight } from "@/lib/timeline/click-highlight";
 import { resolveClickHighlight } from "./click-highlight";
-import { drawInCameraOverlays, drawOutputOverlays } from "./overlay-draw";
+import { drawInCameraOverlays, drawOutputOverlays, drawInCameraOverlayEntries, drawOutputOverlayEntries, isInCameraOverlay, type OverlayEntry } from "./overlay-draw";
+import { anchorOf, type EvalLayer, type FrameEval } from "@/lib/timeline/evaluate";
+import { SOURCE_ASSET_ID } from "@/lib/timeline/sequence";
 import type { BackgroundMode } from "@/lib/firebase/schema";
 import type { RenderRecipe } from "./recipe";
 
@@ -329,5 +331,100 @@ export function drawWatermark(
   ctx.textBaseline = "middle";
   ctx.fillText(text, x + padX + dotR + Math.round(fontSize * 0.45), y + boxH / 2);
 
+  ctx.restore();
+}
+
+// ── Evaluated (sequence) compositor ──────────────────────────────────────────
+// The multi-layer form of composeFrame: it takes what `evaluateTimeline`
+// resolved for ONE output instant — layers (asset + source time + opacity),
+// the dip plate, and the active overlays with their own times — and a lookup
+// for each layer's decoded frame. The layer stack and every drawer are the
+// same as composeFrame's; a legacy single-source project evaluates to exactly
+// one full-opacity layer, so both forms paint the same picture.
+
+/**
+ * Composite ONE output frame from an evaluation. `frameFor` returns the decoded
+ * frame of a layer (null = not available yet → layer skipped).
+ */
+export function composeEvaluatedFrame(
+  ctx: CanvasRenderingContext2D,
+  ev: FrameEval,
+  frameFor: (layer: EvalLayer) => CanvasImageSource | null,
+  recipe: RenderRecipe
+): void {
+  const { canvasW, canvasH, bgActive, bgMode, backgroundColor, sourceRect, effects, applyWatermark, debugBorders } = recipe;
+
+  ctx.fillStyle = ev.plateColor ?? "#000";
+  ctx.fillRect(0, 0, canvasW, canvasH);
+
+  const dominantFrame = ev.dominant ? frameFor(ev.dominant) : null;
+  if (bgActive && dominantFrame && !ev.plateColor) {
+    drawCanvasBackground(ctx, dominantFrame, bgMode, backgroundColor, canvasW, canvasH, sourceRect.sx, sourceRect.sy, sourceRect.sWidth, sourceRect.sHeight);
+  }
+
+  const inCamera = ev.overlays.filter((o) => isInCameraOverlay(o.moment)).map((o) => ({ m: o.moment, t: o.virtualTime }));
+  for (const layer of ev.layers) {
+    if (layer.opacity <= 0.001) continue;
+    const frame = frameFor(layer);
+    if (!frame) continue;
+    const isDominant = ev.dominant?.itemId === layer.itemId;
+    // Camera moves are footage-anchored: each layer is framed by the camera
+    // moments of ITS asset at ITS source time.
+    const cameraMoments = isDominant && ev.camera ? ev.camera.moments : recipe.revision.moments.filter((m) => anchorOf(m).kind === "source" && assetOfMoment(m) === layer.assetId);
+    ctx.save();
+    ctx.globalAlpha = layer.opacity;
+    applyCameraLayer(ctx, frame, recipe, cameraMoments, layer.sourceTime, isDominant ? inCamera : []);
+    ctx.restore();
+  }
+
+  if (debugBorders) drawDebugCanvasBorder(ctx, canvasW, canvasH);
+  if (effects.vignette) drawVignette(ctx, canvasW, canvasH);
+  drawOutputOverlayEntries(
+    ctx,
+    ev.overlays.filter((o) => !isInCameraOverlay(o.moment)).map((o) => ({ m: o.moment, t: o.virtualTime })),
+    { canvasW, canvasH }
+  );
+  if (applyWatermark) drawWatermark(ctx, canvasW, canvasH);
+}
+
+function assetOfMoment(m: import("@/lib/firebase/schema").DetectedMoment): string {
+  const a = anchorOf(m);
+  return a.kind === "source" ? a.assetId ?? SOURCE_ASSET_ID : SOURCE_ASSET_ID;
+}
+
+/** applyCameraFrame with an explicit camera moment set and in-camera entries. */
+function applyCameraLayer(
+  ctx: CanvasRenderingContext2D,
+  frame: CanvasImageSource,
+  recipe: RenderRecipe,
+  cameraMoments: import("@/lib/firebase/schema").DetectedMoment[],
+  t: number,
+  inCamera: OverlayEntry[]
+): void {
+  const { effects, canvasW, canvasH, base, sourceRect, debugBorders } = recipe;
+  const { camera, moment } = resolveCameraFrame(cameraMoments, t, { autoZoom: effects.autoZoom, preset: effects.zoomPreset, speed: effects.zoomSpeed });
+  const { tx, ty } = canvasTranslateFor(camera, base.drawW, base.drawH);
+  ctx.save();
+  ctx.translate(canvasW / 2 + base.offsetX, canvasH / 2 + base.offsetY);
+  ctx.scale(camera.scale, camera.scale);
+  ctx.translate(tx, ty);
+  ctx.drawImage(frame, sourceRect.sx, sourceRect.sy, sourceRect.sWidth, sourceRect.sHeight, -base.drawW / 2, -base.drawH / 2, base.drawW, base.drawH);
+  if (debugBorders) {
+    ctx.lineWidth = 4 / camera.scale;
+    ctx.strokeStyle = "rgba(255,0,0,0.95)";
+    ctx.strokeRect(-base.drawW / 2, -base.drawH / 2, base.drawW, base.drawH);
+  }
+  const click = resolveClickHighlight(moment, effects);
+  if (click && moment) {
+    const dur = Math.max(0.1, moment.endTime - moment.startTime);
+    drawClickHighlight(
+      ctx,
+      { cx: moment.focusRegion.x + moment.focusRegion.width / 2, cy: moment.focusRegion.y + moment.focusRegion.height / 2, progress: Math.max(0, Math.min(1, (t - moment.startTime) / dur)), style: click.style, sizePct: click.sizePct },
+      base.drawW,
+      base.drawH,
+      canvasW
+    );
+  }
+  if (inCamera.length) drawInCameraOverlayEntries(ctx, inCamera, base.drawW, base.drawH);
   ctx.restore();
 }

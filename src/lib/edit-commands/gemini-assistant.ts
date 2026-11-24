@@ -84,6 +84,14 @@ Creative-brief playbook (a brief names a feel — "calm menu walkthrough", "prem
 5. If a tool result says a move or label was rejected or extended, adjust (extend the end, shorten the hold) and continue — never abandon the plan or ask the user because of a duration.
 6. Then stop. Report in one sentence what you featured.
 
+Footage operations (the sequence):
+- Clips, frozen frames, speed, fades, transitions and audio are SEQUENCE capabilities (get_capabilities lists them with exact semantics). Call get_sequence first: it returns the clip ids every capability takes, in playback order, with sequence (output) seconds and asset seconds.
+- A FREEZE is a footage edit: freeze_frame holds one exact frame while time and overlays keep moving. Never substitute a longer graphic, a slowed clip or a repeated frame for a requested freeze; if freeze_frame fails, report its exact reason.
+- Slow motion is set_clip_speed with rate < 1 (0.25 = quarter speed); a ramp uses ramp_from_rate/ramp_to_rate between two points in the clip. Picture and linked audio retime together; pitch: preserve keeps voices natural.
+- Transitions need handle media on both sides; set_transition reports the maximum feasible duration — use it or trim, never fake a dissolve with an overlay.
+- Several assets: list_assets shows what is available ("source" is the upload). A description of what is SEEN ("the orange shot", "the wide angle") may be another asset: survey_footage / inspect_footage / find_events / locate_elements take asset_id — look at every asset the sequence uses before saying something isn't there. insert_clip adds footage; replace_source with picture_only=true swaps the picture and keeps the original sound (B-roll); add_audio_track lays music/narration with duck_amount so it drops under speech; detach_audio frees a clip's sound from its picture.
+- Plan the WHOLE edit before changing anything (get_sequence → decide every operation → make all the calls in one turn). If any part cannot be done, say exactly which capability or input is missing.
+
 Original effects — the user is the director, you are the editor:
 - When a request calls for a look the standard edits can't produce (a ripple from the ball, sparks, a light sweep, a custom burst), author an EFFECT PROGRAM. First list_effects: reuse a library effect that matches (apply_effect), adapt a close one (update_effect with params or a new program version), and create only when nothing fits. "Create something new" / "something original" means create_effect with distinct=true — never reuse then.
 - Ground it in the footage: find_events for the moment ("the ball crosses the goal line"), then locate_elements at that exact time for the subject ("the ball") and anchor at its cx/cy. Use the event time as at. If the subject moves fast during the effect, track_element and pass track_json.
@@ -183,6 +191,8 @@ export async function runGeminiAssistant(input: {
     clicks: input.project.clickMarks ?? [],
     silences: (input.project.analysis?.audioAnalysis?.silenceSegments ?? []).map((x) => ({ start: x.startTime, end: x.endTime })),
     audioLocked: isAudioLocked(input.memory, input.message),
+    sequence: input.project.sequence ?? null,
+    assets: input.project.assets ?? [],
   };
   // Edits ACCUMULATE across rounds. A plan ("push onto the dish, then label
   // it, then the next dish") arrives as several tool calls, often one per

@@ -98,6 +98,8 @@ export type EditCommand =
       program?: { program: import("@/lib/effects/program").EffectProgram; version: number; note?: string };
       at?: number;
       anchor?: { x: number; y: number };
+      /** Retime this use: play the whole effect over this many seconds (slower/faster drawing). */
+      duration?: number;
     }
   | { op: "add_transition"; at: number; style?: "fade" | "zoom" | "swipe" | "flash" | "smooth_cut"; duration?: number }
   /** One zoom per detected click (EditState.clicks), framed on the click. */
@@ -123,7 +125,15 @@ export type EditCommand =
     }
   | { op: "shift_element"; elementId: string; seconds: number }
   | { op: "split_element"; elementId: string; at: number }
-  | { op: "remove_element"; elementId: string };
+  | { op: "remove_element"; elementId: string }
+  /**
+   * A sequence capability (src/lib/edit-commands/registry.ts): split_clip,
+   * trim_item, delete_item, move_clip, insert_clip, replace_source,
+   * freeze_frame, set_hold, set_clip_speed, set_fade, set_transition,
+   * set_clip_audio, detach_audio, add_audio_track, update_audio_track,
+   * remove_audio_track. `args` are the capability's flat parameters.
+   */
+  | { op: "capability"; capability: string; args: Record<string, unknown> };
 
 export type EditOp = EditCommand["op"];
 
@@ -150,6 +160,9 @@ export interface EditState {
    * would remove or retime footage (cuts, speed, trims) are refused.
    */
   audioLocked?: boolean;
+  /** The authored multi-source timeline (absent on legacy projects). */
+  sequence?: import("@/lib/timeline/sequence").Sequence | null;
+  assets?: import("@/lib/timeline/sequence").ProjectAsset[];
 }
 
 export interface ClickMark {
@@ -163,7 +176,8 @@ export interface ClickMark {
 export interface EditChange {
   kind: "added" | "updated" | "removed";
   elementId: string;
-  effectType: EffectType;
+  /** The edit type, or "clip" / "audio-track" / "asset" for sequence changes. */
+  effectType: EffectType | "clip" | "audio-track" | "asset";
   /** Plain-language line for the chat ("Trimmed 2.0s from the start of clip 1"). */
   summary: string;
   /** Source time to jump to when the user clicks the change. */
@@ -185,6 +199,9 @@ export interface EditError {
     | "no_audio"
     | "prep_failed"
     | "locked"
+    | "constraint"
+    | "unsupported"
+    | "conflict"
     | "no_change";
   message: string;
 }
@@ -193,6 +210,9 @@ export type ApplyResult =
   | {
       ok: true;
       moments: DetectedMoment[];
+      /** Present when the request touched the sequence (or converted a legacy timeline to one). */
+      sequence?: import("@/lib/timeline/sequence").Sequence;
+      assets?: import("@/lib/timeline/sequence").ProjectAsset[];
       changes: EditChange[];
       /** A clip whose boundary was created by this edit got a new id. */
       clipRenames: { from: string; to: string }[];
@@ -211,6 +231,12 @@ export interface EditRequest {
   commands: EditCommand[];
   /** Apply what validates and report the rest (multi-part requests). */
   partial?: boolean;
+  /**
+   * The project's `timelineRev` when the request was composed. A commit onto a
+   * newer revision re-validates and reports property conflicts instead of
+   * overwriting a change made in between.
+   */
+  baseRev?: number;
   /** Direction to remember with this edit ("I like the ripple"), saved in the same write. */
   memory?: import("@/lib/firebase/schema").AssistantMemoryItem[];
   /**

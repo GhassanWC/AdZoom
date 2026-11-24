@@ -20,6 +20,7 @@
 
 import type { DetectedMoment } from "@/lib/firebase/schema";
 import { buildTimelineMap, isActiveCut, type TimelineMap } from "@/lib/timeline/crop-speed";
+import { describeLayout, type TimelineRevision } from "@/lib/timeline/evaluate";
 
 /** Boundary tolerance (seconds) when matching a cut edge to a clip edge. */
 const EDGE_EPS = 1e-3;
@@ -37,6 +38,35 @@ export interface Clip {
   leftBoundary: string;
   /** Id of the cut starting at `sourceEnd`, or "out" (end of the video). */
   rightBoundary: string;
+  /** Sequence projects: which asset the clip plays ("source" = the original) and whether it is a frozen frame. */
+  assetId?: string;
+  kind?: "clip" | "freeze";
+  label?: string;
+}
+
+/**
+ * Clips of an authored SEQUENCE (multi-source timeline): one per item, in
+ * playback order, with sequence positions from the evaluator's layout. The
+ * clip id IS the item id, so every sequence capability addresses it directly.
+ */
+export function clipsFromSequence(rev: TimelineRevision): Clip[] {
+  const items = rev.sequence?.items ?? [];
+  return describeLayout(rev).map((l, i) => {
+    const it = items.find((x) => x.id === l.itemId)!;
+    return {
+      id: l.itemId,
+      index: i + 1,
+      sourceStart: it.kind === "clip" ? it.sourceIn : it.sourceAt,
+      sourceEnd: it.kind === "clip" ? it.sourceOut : it.sourceAt,
+      outputStart: l.cut,
+      outputEnd: l.end,
+      leftBoundary: i === 0 ? "in" : items[i - 1].id,
+      rightBoundary: i === items.length - 1 ? "out" : items[i + 1].id,
+      assetId: it.assetId,
+      kind: it.kind,
+      ...(it.label ? { label: it.label } : {}),
+    };
+  });
 }
 
 export function clipId(left: string, right: string): string {

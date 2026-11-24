@@ -89,6 +89,12 @@ export function materializeProject(
     assistantMemory: Array.isArray(data.assistantMemory)
       ? (data.assistantMemory as ProjectDoc["assistantMemory"])
       : undefined,
+    assets: Array.isArray(data.assets) ? (data.assets as ProjectDoc["assets"]) : undefined,
+    sequence:
+      data.sequence && typeof data.sequence === "object" && Array.isArray((data.sequence as { items?: unknown }).items)
+        ? (data.sequence as ProjectDoc["sequence"])
+        : undefined,
+    timelineRev: typeof data.timelineRev === "number" ? data.timelineRev : undefined,
     footageSurvey:
       data.footageSurvey && typeof data.footageSurvey === "object" && Array.isArray((data.footageSurvey as { shots?: unknown }).shots)
         ? (data.footageSurvey as ProjectDoc["footageSurvey"])

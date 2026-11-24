@@ -40,6 +40,8 @@ export interface EnqueueParams {
   chunkSeconds?: number;
   workerCount?: number;
   durationSeconds?: number;
+  /** The recipe has a multi-source sequence — only the canvas worker (cloudtasks/vm) renders those. */
+  hasSequence?: boolean;
 }
 
 /** Dispatch a created export job to the worker. Throws on failure so the caller
@@ -52,7 +54,7 @@ export async function enqueueExportJob(params: EnqueueParams): Promise<void> {
   // already CREATED + reserved the job; this only starts the container. Throws on
   // failure so the caller rolls back the reservation + fails the job. Chunk/render-
   // mode params are ignored (the Remotion path never shards).
-  if (backend === "remotion") {
+  if (backend === "remotion" && !params.hasSequence) {
     await runRemotionJob({ uid: params.uid, jobId: params.jobId, priority: params.priority });
     return;
   }
@@ -61,7 +63,7 @@ export async function enqueueExportJob(params: EnqueueParams): Promise<void> {
   // .NET worker in single-job mode (claim one job, render, exit). This is the
   // production path: near-zero idle cost. Throws on failure so the caller rolls
   // back the reservation + fails the job (same contract as the other backends).
-  if (backend === "batch") {
+  if (backend === "batch" && !params.hasSequence) {
     await submitBatchJob(params);
     return;
   }

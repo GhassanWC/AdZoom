@@ -84,6 +84,12 @@ import type { EditRequest, EditRequestOutcome } from "@/lib/edit-commands/types"
 import type { ChatMessage } from "@/lib/edit-commands/chat";
 import { starterGraphic } from "@/lib/graphics/design";
 import { isAudioLocked, mergeMemory } from "@/lib/edit-commands/memory";
+import type { ProjectAsset, Sequence } from "@/lib/timeline/sequence";
+import type { SequencePlayerHandle } from "./SequencePreview";
+import { outputSpanToMomentTimes } from "@/lib/timeline/project-to-output";
+import { uploadProjectAsset } from "@/lib/firebase/assets";
+import { changedElementIds, commandTarget, describeTimelineDiff } from "@/lib/timeline/diff";
+import type { EditError } from "@/lib/edit-commands/types";
 import {
   runVisualAnalysis,
   CvAbortError,
@@ -257,6 +263,11 @@ const EMPTY_LAYERS: LayerVisibility = {};
 interface EditorSnapshot {
   moments: DetectedMoment[];
   layers: LayerVisibility;
+  /** The multi-source timeline + its assets (undefined on a legacy project until converted). */
+  sequence?: Sequence | null;
+  assets?: ProjectAsset[];
+  /** The revision this snapshot was committed as (for conflict detection). */
+  rev?: number;
   /**
    * On an UNDO-stack entry: the assistant request id of the commit that came
    * after this snapshot (null for manual edits). Lets the chat offer "Undo" on
@@ -561,6 +572,10 @@ interface EditorRealContextValue {
   processingMinimized: boolean;
   setProcessingMinimized: (v: boolean) => void;
   seek: (t: number) => void;
+  /** True when the project has an authored multi-source sequence (the preview and ruler run in SEQUENCE time). */
+  sequenceMode: boolean;
+  /** The sequence preview registers its transport here; seek/togglePlay drive it instead of the <video>. */
+  registerSequencePlayer: (h: SequencePlayerHandle | null) => void;
   /**
    * Toggle playback of the live preview. Drives the <video> element directly
    * (the single source of truth) — if the playhead is parked at the end, play
@@ -624,6 +639,16 @@ interface EditorRealContextValue {
    * A request id that was already applied is acknowledged, never re-applied.
    */
   applyEditRequest: (req: EditRequest) => Promise<EditRequestOutcome>;
+  /**
+   * A MANUAL sequence operation (inspector / menus): the same registry
+   * capability, validator and executor the chat uses, committed as one undo
+   * step — without a chat log entry. Returns the blocking error, or null.
+   */
+  runCapability: (capability: string, args: Record<string, unknown>) => Promise<string | null>;
+  /** Upload a media file into this project's assets (second angle, music, narration). */
+  addAsset: (file: File) => Promise<ProjectAsset | null>;
+  /** True while an asset upload is in flight. */
+  addingAsset: boolean;
   /** Request id of the newest undo step when it is an assistant request, else null. */
   latestEditRequestId: string | null;
   /**
@@ -974,6 +999,15 @@ export function EditorRealProvider({
   const [cvDebug, setCvDebug] = React.useState(false);
   const [analyzing, setAnalyzing] = React.useState(false);
   const [analyzeError, setAnalyzeError] = React.useState<string | null>(null);
+  // Live sequence/assets/revision refs — the mutator surface reads these, like momentsRef.
+  const sequenceRef = React.useRef<Sequence | null | undefined>(project.sequence ?? undefined);
+  const assetsRef = React.useRef<ProjectAsset[] | undefined>(project.assets ?? undefined);
+  const timelineRevRef = React.useRef<number>(project.timelineRev ?? 0);
+  React.useEffect(() => {
+    sequenceRef.current = project.sequence ?? undefined;
+    assetsRef.current = project.assets ?? undefined;
+    if ((project.timelineRev ?? 0) > timelineRevRef.current) timelineRevRef.current = project.timelineRev ?? 0;
+  }, [project.sequence, project.assets, project.timelineRev]);
   const [finalizeRetryInfo, setFinalizeRetryInfo] = React.useState<FinalizeRetry | null>(null);
   const [retryingFinishing, setRetryingFinishing] = React.useState(false);
   const applyChunkedResult = React.useCallback((result: ChunkedRunResult) => {
@@ -1057,7 +1091,16 @@ export function EditorRealProvider({
   // timeline, the preview and the control bar. As hooks, the subscription lands
   // only in the handful of components that actually read the value.
 
+  const sequencePlayerRef = React.useRef<SequencePlayerHandle | null>(null);
+  const registerSequencePlayer = React.useCallback((h: SequencePlayerHandle | null) => {
+    sequencePlayerRef.current = h;
+  }, []);
   const seek = React.useCallback((t: number) => {
+    const sp = sequencePlayerRef.current;
+    if (sp) {
+      sp.seek(Math.max(0, t));
+      return;
+    }
     const v = videoRef.current;
     if (!v) return;
     // Snap seeks out of active cuts (removed ranges) so the playhead can't land
@@ -1073,6 +1116,12 @@ export function EditorRealProvider({
   const bufferHoldRef = React.useRef<{ active: boolean; cancel: () => void } | null>(null);
 
   const togglePlay = React.useCallback(() => {
+    const sp = sequencePlayerRef.current;
+    if (sp) {
+      if (sp.isPlaying()) sp.pause();
+      else sp.play();
+      return;
+    }
     const v = videoRef.current;
     if (!v) return;
     const hold = bufferHoldRef.current;
@@ -1493,6 +1542,10 @@ export function EditorRealProvider({
       // updateMoment/addMoment/split/… on every single edit. Now the whole
       // mutator surface keeps one identity for the life of the editor.
       const current = projectRef.current;
+      // Every committed revision gets the next number. Kept in a ref so two
+      // rapid commits don't both read the same document value.
+      const rev = (timelineRevRef.current = Math.max(timelineRevRef.current, current.timelineRev ?? 0) + 1);
+      snap.rev = rev;
       await enqueueProjectWrite(
         current.id,
         "user-moments-write",
@@ -1503,6 +1556,12 @@ export function EditorRealProvider({
                 detectedMoments: snap.moments,
               }),
               timelineLayers: normalizeLayerVisibility(snap.layers),
+              // The sequence and assets travel with every snapshot (an undo
+              // restores clip timing, audio and effects together). A legacy
+              // project writes nothing here until it is converted.
+              ...(snap.sequence !== undefined ? { sequence: snap.sequence ?? deleteField() } : {}),
+              ...(snap.assets !== undefined ? { assets: snap.assets } : {}),
+              timelineRev: rev,
               // Assistant requests write their log entry in the SAME write as
               // the edit, so "applied" and "recorded" can never disagree.
               ...(extra ?? {}),
@@ -1540,6 +1599,9 @@ export function EditorRealProvider({
         undoStackRef.current.push({
           moments: momentsRef.current,
           layers: layersRef.current,
+          sequence: sequenceRef.current,
+          assets: assetsRef.current,
+          rev: timelineRevRef.current,
           tag: opts?.tag ?? null,
         });
         if (undoStackRef.current.length > HISTORY_LIMIT) {
@@ -1555,6 +1617,10 @@ export function EditorRealProvider({
       // result instead of both reading the same (now stale) snapshot.
       momentsRef.current = next.moments;
       layersRef.current = next.layers;
+      if (next.sequence !== undefined) sequenceRef.current = next.sequence;
+      else next.sequence = sequenceRef.current;
+      if (next.assets !== undefined) assetsRef.current = next.assets;
+      else next.assets = assetsRef.current;
       await writeSnapshot(next, opts?.coalesce, opts?.extra);
     },
     [writeSnapshot, syncLatestTag]
@@ -1574,10 +1640,14 @@ export function EditorRealProvider({
     redoStackRef.current.push({
       moments: momentsRef.current,
       layers: layersRef.current,
+      sequence: sequenceRef.current,
+      assets: assetsRef.current,
       tag: prev.tag ?? null,
     });
     momentsRef.current = prev.moments;
     layersRef.current = prev.layers;
+    sequenceRef.current = prev.sequence;
+    assetsRef.current = prev.assets;
     setCanUndo(undoStackRef.current.length > 0);
     setCanRedo(true);
     syncLatestTag();
@@ -1590,10 +1660,14 @@ export function EditorRealProvider({
     undoStackRef.current.push({
       moments: momentsRef.current,
       layers: layersRef.current,
+      sequence: sequenceRef.current,
+      assets: assetsRef.current,
       tag: next.tag ?? null,
     });
     momentsRef.current = next.moments;
     layersRef.current = next.layers;
+    sequenceRef.current = next.sequence;
+    assetsRef.current = next.assets;
     setCanUndo(true);
     setCanRedo(redoStackRef.current.length > 0);
     syncLatestTag();
@@ -1662,6 +1736,26 @@ export function EditorRealProvider({
         return { status: "duplicate", entry: prior };
       }
       const oc = current.effectsSettings?.outputCanvas;
+      // Base-revision check: the request was composed against `req.baseRev`.
+      // If the timeline moved on since (a manual edit while the model was
+      // thinking), commands that touch an element whose properties changed in
+      // between are CONFLICTS — reported, not applied over the newer change.
+      // Everything else is re-validated against the live timeline below.
+      const liveRev = timelineRevRef.current || current.timelineRev || 0;
+      const baseSnap = req.baseRev != null && req.baseRev !== liveRev ? [...undoStackRef.current].reverse().find((s) => s.rev === req.baseRev) : null;
+      const conflicts: EditError[] = [];
+      let commandsAfterConflicts = req.commands;
+      if (req.baseRev != null && req.baseRev !== liveRev) {
+        const changedSince = baseSnap ? changedElementIds({ moments: baseSnap.moments, sequence: baseSnap.sequence ?? null }, { moments: momentsRef.current, sequence: sequenceRef.current ?? null }) : null;
+        commandsAfterConflicts = req.commands.filter((c, i) => {
+          const target = commandTarget(c);
+          if (!target) return true;
+          const hit = changedSince ? changedSince.get(target) : null;
+          if (!hit && changedSince) return true;
+          conflicts.push({ commandIndex: i, op: c.op, code: "conflict", message: hit ? `"${target}" was changed while this edit was being prepared (${hit.join(", ")}). Your newer change was kept; ask again to apply this on top of it.` : `"${target}" may have changed since this edit was prepared (revision ${req.baseRev} → ${liveRev}); it was skipped. Ask again to apply it to the current timeline.` });
+          return false;
+        });
+      }
       // Validate + execute against the LIVE refs, not the state captured when
       // the request started: if the user dragged a clip while the model was
       // thinking, the command is checked against that newer timeline (and a
@@ -1682,17 +1776,25 @@ export function EditorRealProvider({
           // "Keep the commentary" (said now or earlier in this project) blocks
           // cuts/trims/speed for this request — enforced here too, not only by the model.
           audioLocked: isAudioLocked(current.assistantMemory, req.message),
+          sequence: sequenceRef.current,
+          assets: assetsRef.current,
         },
-        req.commands,
+        commandsAfterConflicts,
         req.requestId,
-        { partial: req.partial }
+        { partial: req.partial || conflicts.length > 0 }
       );
-      if (!res.ok) return { status: "rejected", errors: res.errors };
+      if (!res.ok) return { status: "rejected", errors: [...conflicts, ...res.errors] };
 
       appliedRequestIdsRef.current.add(req.requestId);
-      const entry = entryFor(req.requestId, req.message, req.source, res.changes, Date.now());
+      // The chat line comes from the COMMITTED diff, not from what the commands
+      // claimed: what actually changed between the revisions.
+      const diffLines = describeTimelineDiff(
+        { moments: momentsRef.current, sequence: sequenceRef.current ?? null, sourceDuration: current.duration || 0 },
+        { moments: res.moments, sequence: res.sequence ?? sequenceRef.current ?? null, sourceDuration: current.duration || 0 }
+      );
+      const entry = entryFor(req.requestId, req.message, req.source, res.changes, Date.now(), diffLines);
       await commitSnapshot(
-        { moments: res.moments, layers: layersRef.current },
+        { moments: res.moments, layers: layersRef.current, ...(res.sequence ? { sequence: res.sequence, assets: res.assets ?? assetsRef.current } : {}) },
         {
           tag: req.requestId,
           extra: {
@@ -1707,11 +1809,56 @@ export function EditorRealProvider({
       for (const r of res.clipRenames) {
         setSelectedClipId((id) => (id === r.from ? r.to : id));
       }
-      const touched = res.changes.find((c) => c.kind !== "removed" && c.effectType !== "cut");
+      const touched = res.changes.find((c) => c.kind !== "removed" && c.effectType !== "cut" && c.effectType !== "clip" && c.effectType !== "audio-track" && c.effectType !== "asset");
       if (touched) setSelectedMomentId(touched.elementId);
-      return { status: "applied", entry, changes: res.changes, blocked: res.errors };
+      return { status: "applied", entry, changes: res.changes, blocked: [...conflicts, ...res.errors] };
     },
     [commitSnapshot]
+  );
+
+  const runCapability = React.useCallback(
+    async (capability: string, args: Record<string, unknown>): Promise<string | null> => {
+      const current = projectRef.current;
+      const oc = current.effectsSettings?.outputCanvas;
+      const requestId = `manual_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+      const res = applyEditCommands(
+        {
+          moments: momentsRef.current,
+          layers: layersRef.current,
+          sourceDuration: current.duration || videoRef.current?.duration || 0,
+          canvasWidth: oc?.width || current.width || 1920,
+          canvasHeight: oc?.height || current.height || 1080,
+          transcript: current.analysis?.transcript ?? null,
+          videoType: normalizeSelectedVideoType(current.selectedVideoType),
+          sequence: sequenceRef.current,
+          assets: assetsRef.current,
+        },
+        [{ op: "capability", capability, args }],
+        requestId
+      );
+      if (!res.ok) return res.errors[0]?.message ?? "That change couldn't be made.";
+      await commitSnapshot({ moments: res.moments, layers: layersRef.current, ...(res.sequence ? { sequence: res.sequence, assets: res.assets ?? assetsRef.current } : {}) });
+      return null;
+    },
+    [commitSnapshot]
+  );
+
+  const [addingAsset, setAddingAsset] = React.useState(false);
+  const addAsset = React.useCallback(
+    async (file: File): Promise<ProjectAsset | null> => {
+      if (!uid || !cloudAvailable) return null;
+      setAddingAsset(true);
+      try {
+        const asset = await uploadProjectAsset(uid, projectRef.current.id, file);
+        const next = [...(assetsRef.current ?? []), asset];
+        // Adding media is a revision too (undo removes it from the project).
+        await commitSnapshot({ moments: momentsRef.current, layers: layersRef.current, sequence: sequenceRef.current ?? null, assets: next });
+        return asset;
+      } finally {
+        setAddingAsset(false);
+      }
+    },
+    [uid, cloudAvailable, commitSnapshot]
   );
 
   // Write helpers — all merge-safe writes that the security rules allow.
@@ -1893,7 +2040,27 @@ export function EditorRealProvider({
 
         const current = momentsRef.current;
         const at = clock.get();
-        const res = splitMomentsAt(current, targets, at, newMomentId);
+        const seqRev = sequenceRef.current ? { sequence: sequenceRef.current, moments: current, assets: assetsRef.current ?? [], sourceDuration: projectRef.current.duration || 0 } : null;
+        let res: ReturnType<typeof splitMomentsAt> = null;
+        if (seqRev) {
+          // One split per target at the playhead mapped into that edit's base.
+          let working = current;
+          const newIds: string[] = [];
+          for (const id of targets) {
+            const m = working.find((x) => x.id === id);
+            if (!m) continue;
+            const times = outputSpanToMomentTimes(seqRev, m, at, at + 0.05);
+            if (!times) continue;
+            const r = splitMomentsAt(working, [id], times.startTime, newMomentId);
+            if (r) {
+              working = r.moments;
+              newIds.push(...r.newIds);
+            }
+          }
+          res = newIds.length ? { moments: working, newIds } : null;
+        } else {
+          res = splitMomentsAt(current, targets, at, newMomentId);
+        }
 
         if (!res) {
           // Nothing split — say WHY. A Split button that silently does nothing
@@ -2022,6 +2189,7 @@ export function EditorRealProvider({
           // A starter design the user edits by hand or by chat — never empty,
           // so the new edit is visible the moment it lands.
           ...(effectType === "graphic" ? { graphic: starterGraphic() } : {}),
+          ...(sequenceRef.current ? { anchor: { kind: "sequence" as const } } : {}),
         };
         const next = [...momentsRef.current, m].sort(
           (a, b) => a.startTime - b.startTime
@@ -3021,6 +3189,8 @@ export function EditorRealProvider({
     canRetryFinishing: !!finalizeRetryInfo,
     retryingFinishing,
     retryFinishing,
+    sequenceMode: !!project.sequence,
+    registerSequencePlayer,
     cvProgress,
     processingMinimized,
     setProcessingMinimized,
@@ -3042,6 +3212,9 @@ export function EditorRealProvider({
     selectedClipId,
     setSelectedClipId,
     applyEditRequest,
+    runCapability,
+    addAsset,
+    addingAsset,
     latestEditRequestId,
     assistantChat,
     setAssistantChat,
@@ -3071,10 +3244,10 @@ export function EditorRealProvider({
       setRemoveSharingBar, applyPreset, clearSelectedPreset, startAnalyze,
       generateCaptions, retranscribe, deleteAiCaptions, saveDirectorBrief,
       cancelAnalyze, refineFraming, refiningFraming, analyzing, analyzeError,
-      finalizeRetryInfo, retryingFinishing, retryFinishing,
+      finalizeRetryInfo, retryingFinishing, retryFinishing, registerSequencePlayer,
       cvProgress, processingMinimized, seek, togglePlay, seekBy, muted, volume,
       toggleMute, setPreviewVolume, isFullscreen, toggleFullscreen, undo, redo,
-      canUndo, canRedo, selectedClipId, applyEditRequest, latestEditRequestId, assistantChat, aiSetupOpen,
+      canUndo, canRedo, selectedClipId, applyEditRequest, runCapability, addAsset, addingAsset, latestEditRequestId, assistantChat, aiSetupOpen,
       interactions, interactionsLoading, chunkedJob,
       // `videoRef`/`previewFullscreenRef` are refs and `set*` from useState are
       // identity-stable by contract, so they are deliberately not listed.

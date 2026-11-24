@@ -12,7 +12,8 @@
 import type { DetectedMoment, ProjectDoc } from "@/lib/firebase/schema";
 import { buildTimelineMap } from "@/lib/timeline/crop-speed";
 import { visibleMoments, type LayerVisibility } from "@/lib/timeline/layers";
-import { deriveClips, clipAtSource, outputAtSource, type Clip } from "./clips";
+import { deriveClips, clipAtSource, outputAtSource, clipsFromSequence, type Clip } from "./clips";
+import { outputDurationOf, outputTimeForSource } from "@/lib/timeline/evaluate";
 import { describe, textOf } from "./apply";
 
 export interface AssistantSelection {
@@ -21,7 +22,7 @@ export interface AssistantSelection {
 }
 
 export interface AssistantInput {
-  project: Pick<ProjectDoc, "analysis" | "duration" | "directorBrief" | "selectedVideoType">;
+  project: Pick<ProjectDoc, "analysis" | "duration" | "directorBrief" | "selectedVideoType"> & Partial<Pick<ProjectDoc, "sequence" | "assets">>;
   moments: DetectedMoment[];
   layers: LayerVisibility;
   sourceDuration: number;
@@ -82,18 +83,19 @@ function digestElement(m: DetectedMoment): DigestElement {
 export function buildAssistantDigest(input: AssistantInput): AssistantDigest {
   const visible = visibleMoments(input.moments, input.layers);
   const map = buildTimelineMap(visible, input.sourceDuration);
-  const clips = deriveClips(visible, input.sourceDuration, map);
+  const seqRev = input.project.sequence ? { sequence: input.project.sequence, moments: input.moments, assets: input.project.assets ?? [], sourceDuration: input.sourceDuration } : null;
+  const clips = seqRev ? clipsFromSequence(seqRev) : deriveClips(visible, input.sourceDuration, map);
   const byId = new Map(input.moments.map((m) => [m.id, m]));
   const captions = input.moments.filter((m) => m.effectType === "captions");
   const selEl = input.selection.elementId ? byId.get(input.selection.elementId) : undefined;
   const transcript = input.project.analysis?.transcript;
   return {
     sourceDuration: r2(input.sourceDuration),
-    outputDuration: r2(map.outputDuration),
+    outputDuration: r2(seqRev ? outputDurationOf(seqRev) : map.outputDuration),
     playhead: {
       source: r2(input.playhead),
-      output: r2(outputAtSource(map, input.playhead)),
-      clipId: clipAtSource(clips, input.playhead)?.id ?? null,
+      output: r2(seqRev ? outputTimeForSource(seqRev, "source", input.playhead) ?? 0 : outputAtSource(map, input.playhead)),
+      clipId: (seqRev ? clips.find((c) => c.assetId === "source" && input.playhead >= c.sourceStart && input.playhead < c.sourceEnd) : clipAtSource(clips, input.playhead))?.id ?? null,
     },
     selection: {
       clip: clips.find((c) => c.id === input.selection.clipId) ?? null,

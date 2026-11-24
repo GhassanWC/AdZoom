@@ -21,6 +21,7 @@
 
 import type { EditCommand, GraphicPosition, EntranceAnimation } from "./types";
 import { entranceAnimation } from "./apply";
+import { capabilityTools, isCapabilityOp } from "./registry";
 
 export interface ToolDef {
   name: string;
@@ -39,7 +40,7 @@ const obj = (properties: Record<string, unknown>, required: string[] = []) => ({
   required,
 });
 
-export const EDIT_TOOLS: readonly ToolDef[] = [
+const BASE_TOOLS: readonly ToolDef[] = [
   // ── Read ──────────────────────────────────────────────────────────────────
   {
     name: "get_timeline",
@@ -74,14 +75,14 @@ export const EDIT_TOOLS: readonly ToolDef[] = [
   {
     name: "survey_footage",
     kind: "read",
-    description: "Watch the whole clip and get a shot list: what is on screen when (source seconds), with the subjects in each shot. The first call for any creative brief on footage without a transcript — it is how you find 'the dish reveal', 'the celebration' or 'the buildup'.",
-    parameters: obj({}),
+    description: "Watch an asset and get a shot list: what is on screen when (asset seconds), with the subjects in each shot. The first call for any creative brief on footage without a transcript — it is how you find 'the dish reveal', 'the celebration' or 'the buildup'. asset_id defaults to 'source'; use another asset's id to look at that footage.",
+    parameters: obj({ asset_id: str("Asset to watch ('source' or an added asset id).") }),
   },
   {
     name: "locate_elements",
     kind: "read",
     description: "Find where things are in the frame around a source time — the dish, the price, a button, a face. Returns each element's bounding box (0..1 of the frame) and centre. Use before composing a camera move or placing a graphic, so the focal point and the text position come from the footage.",
-    parameters: obj({ at: num("Source seconds."), elements: { type: "array", items: { type: "string" }, description: "What to find, e.g. ['the dish photo', 'the price']." } }, ["at", "elements"]),
+    parameters: obj({ at: num("Asset seconds."), elements: { type: "array", items: { type: "string" }, description: "What to find, e.g. ['the dish photo', 'the price']." }, asset_id: str("Asset to look at (default 'source').") }, ["at", "elements"]),
   },
   {
     name: "framing_check",
@@ -105,7 +106,7 @@ export const EDIT_TOOLS: readonly ToolDef[] = [
     name: "inspect_footage",
     kind: "read",
     description: "Watch a SHORT source range closely (max 60s) and answer a precise visual question, e.g. 'at what second does the ball cross the line?'. Use to place a cut exactly on a visible event after find_footage gave an approximate range.",
-    parameters: obj({ start: num("Source seconds."), end: num("Source seconds."), question: str("What to determine.") }, ["start", "end", "question"]),
+    parameters: obj({ start: num("Asset seconds."), end: num("Asset seconds."), question: str("What to determine."), asset_id: str("Asset to look at (default 'source').") }, ["start", "end", "question"]),
   },
   {
     name: "list_graphics",
@@ -333,6 +334,30 @@ export const EDIT_TOOLS: readonly ToolDef[] = [
   },
 ];
 
+/** Every tool: the base set, the sequence READ tools, and one edit tool per registry capability. */
+export const EDIT_TOOLS: readonly ToolDef[] = [
+  ...BASE_TOOLS,
+  {
+    name: "get_sequence",
+    kind: "read",
+    description: "The multi-source timeline: clips in playback order (id, asset, source in/out, sequence start/end, speed, fades, transition, audio), frozen frames, independent audio tracks, and the project's assets. Call before any clip/freeze/speed/transition/audio operation — those take the clip ids returned here.",
+    parameters: obj({}),
+  },
+  {
+    name: "list_assets",
+    kind: "read",
+    description: "Media available to this project: 'source' (the original upload) plus added assets (second angles, music, narration) with duration and whether they have audio.",
+    parameters: obj({}),
+  },
+  {
+    name: "get_capabilities",
+    kind: "read",
+    description: "The editor's operation matrix: every sequence capability with its inputs, timing semantics and what it affects. Use it to plan a compound edit or to answer 'can you…'.",
+    parameters: obj({}),
+  },
+  ...capabilityTools(),
+];
+
 export const TOOL_KIND = new Map(EDIT_TOOLS.map((t) => [t.name, t.kind]));
 
 type Args = Record<string, unknown>;
@@ -459,6 +484,9 @@ export function toolCallToCommand(name: string, args: Args): EditCommand | strin
     case "remove_element":
       return need(s(args, "element_id"), "element_id") ?? { op: "remove_element", elementId: s(args, "element_id")! };
     default:
+      // Registry capabilities carry their flat args straight to the executor,
+      // which validates them against the live sequence.
+      if (isCapabilityOp(name)) return { op: "capability", capability: name, args };
       return `Unknown edit tool "${name}".`;
   }
 }

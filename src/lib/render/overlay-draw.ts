@@ -419,8 +419,23 @@ export function drawOutputOverlays(
 ): void {
   const { output } = activeOverlays(moments, t);
   if (!output.length) return;
-  // Text first, transition LAST so a dip darkens everything uniformly.
-  for (const m of output) {
+  drawOutputOverlayEntries(ctx, output.map((m) => ({ m, t })), layout);
+}
+
+/**
+ * One active overlay and the time to draw it at. `t` is the moment's OWN time
+ * base (`m.startTime + localTime`): for a source-anchored moment that is the
+ * source time; for a sequence- or item-anchored one the evaluator supplies a
+ * virtual time (see evaluate.ts), so the same drawers animate it correctly.
+ */
+export interface OverlayEntry {
+  m: DetectedMoment;
+  t: number;
+}
+
+/** Draw the given output-anchored overlays. Text first, transition LAST so a dip darkens everything uniformly. */
+export function drawOutputOverlayEntries(ctx: CanvasRenderingContext2D, entries: readonly OverlayEntry[], layout: OverlayLayout): void {
+  for (const { m, t } of entries) {
     if (m.effectType === "captions" && m.captions) drawCaption(ctx, m.captions, m, t, layout);
     else if (m.effectType === "hook-text" && m.hookText) drawHookText(ctx, m.hookText, m, t, layout);
     else if (m.effectType === "text-overlay" && m.textOverlay)
@@ -429,7 +444,7 @@ export function drawOutputOverlays(
       drawBrandingCta(ctx, m.brandingCta, m, t, layout);
     else if (m.effectType === "graphic" && m.graphic) drawGraphic(ctx, m.graphic, m, t, layout);
   }
-  for (const m of output) {
+  for (const { m, t } of entries) {
     if (m.effectType === "transition" && m.transition) drawTransition(ctx, m.transition, m, t, layout);
   }
 }
@@ -864,15 +879,24 @@ export function drawInCameraOverlays(
 ): void {
   const { inCamera } = activeOverlays(moments, t);
   if (!inCamera.length) return;
-  // Blur first (redact), effects on the footage, callouts on top (annotate).
-  for (const m of inCamera) {
+  drawInCameraOverlayEntries(ctx, inCamera.map((m) => ({ m, t })), drawW, drawH);
+}
+
+/** The in-camera subset of overlay types (drawn inside the camera transform). */
+export function isInCameraOverlay(m: DetectedMoment): boolean {
+  return m.effectType === "callout" || m.effectType === "blur-redaction" || m.effectType === "fx";
+}
+
+/** Draw the given in-camera overlays. Blur first (redact), effects on the footage, callouts on top (annotate). */
+export function drawInCameraOverlayEntries(ctx: CanvasRenderingContext2D, entries: readonly OverlayEntry[], drawW: number, drawH: number): void {
+  for (const { m } of entries) {
     if (m.effectType === "blur-redaction" && m.blurRedaction)
       drawBlurRedaction(ctx, m.blurRedaction, m.focusRegion, drawW, drawH);
   }
-  for (const m of inCamera) {
+  for (const { m, t } of entries) {
     if (m.effectType === "fx" && m.fx) drawFx(ctx, m, t, drawW, drawH);
   }
-  for (const m of inCamera) {
+  for (const { m, t } of entries) {
     if (m.effectType === "callout" && m.callout)
       drawCallout(ctx, m.callout, m, t, drawW, drawH);
   }
@@ -889,7 +913,10 @@ function drawFx(ctx: CanvasRenderingContext2D, m: DetectedMoment, t: number, dra
   const fx = m.fx!;
   const compiled = compiledFor(fx.program);
   if (!compiled) return;
-  drawEffectProgram(ctx, compiled, { params: fx.params, inputs: fx.inputs ?? {} }, t - m.startTime, {
+  // An instance retimed to `fx.duration` plays the program's timeline stretched to that length.
+  const play = fx.duration && fx.duration > 0 ? fx.duration : fx.program.duration;
+  const local = (t - m.startTime) * (fx.program.duration / play);
+  drawEffectProgram(ctx, compiled, { params: fx.params, inputs: fx.inputs ?? {} }, local, {
     ox: -drawW / 2,
     oy: -drawH / 2,
     W: drawW,

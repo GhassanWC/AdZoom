@@ -177,6 +177,9 @@ export function DirectorChatPanel({
     setBusy(true);
     // ONE id per user request, reused by Retry — a retry can never apply twice.
     const requestId = retryRequestId ?? newRequestId();
+    // The revision this request is composed against: a manual edit made while
+    // the model thinks is detected at apply time (conflicts are reported).
+    const baseRev = project.timelineRev ?? 0;
     const t0 = clockMs();
     let prepared: FootageNeed[] = [];
     let data: PreparedData = {};
@@ -198,7 +201,7 @@ export function DirectorChatPanel({
     const applyAndReport = async (source: "local" | "model", commands: EditCommand[], notes: string[], approvals: string[] = []) => {
       const ops = commands.map((c) => c.op);
       const memory = approvals.map((text) => ({ kind: "approved" as const, text, at: Date.now() }));
-      const out = await assistant.apply({ requestId, message: command, source, commands, partial: true, data, ...(memory.length ? { memory } : {}) });
+      const out = await assistant.apply({ requestId, message: command, source, commands, partial: true, data, baseRev, ...(memory.length ? { memory } : {}) });
       clearProgress();
       if (out.status === "applied") {
         push({
@@ -210,7 +213,7 @@ export function DirectorChatPanel({
         });
         // A visual change is SHOWN, not just described: replay the section from
         // just before it, so the follow-up question is about what they just saw.
-        const visual = out.changes.find((c) => c.kind !== "removed" && (c.effectType === "fx" || c.effectType === "graphic" || c.effectType === "zoom"));
+        const visual = out.changes.find((c) => c.kind !== "removed" && (c.effectType === "fx" || c.effectType === "graphic" || c.effectType === "zoom" || c.effectType === "clip" || c.effectType === "audio-track"));
         if (visual) {
           seek(Math.max(0, visual.at - 0.8));
           if (!playing) togglePlay();

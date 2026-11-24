@@ -9,16 +9,18 @@ import { PRESETS } from "@/lib/presets/registry";
 import { findFootage, findIntroductions, findRepeatedTakes, takeCutRange } from "./footage";
 import type { AssistantDigest } from "./context";
 import { framingCheck, framingAt, beatsFromKeyframes } from "./camera";
+import { describeLayout, outputDurationOf, outputSpansForSource, resolveSequence } from "@/lib/timeline/evaluate";
+import { describeCapabilities } from "./registry";
 
 export interface ReadToolContext {
-  project: Pick<ProjectDoc, "analysis"> & Partial<Pick<ProjectDoc, "clickMarks">>;
+  project: Pick<ProjectDoc, "analysis"> & Partial<Pick<ProjectDoc, "clickMarks" | "sequence" | "assets" | "duration">>;
   digest: AssistantDigest;
   /** Close visual inspection of a source range; absent ⇒ the tool reports unavailable. */
-  inspect?: (start: number, end: number, question: string) => Promise<string>;
+  inspect?: (start: number, end: number, question: string, assetId?: string) => Promise<string>;
   /** Locate named elements in the frame at a source time; absent ⇒ unavailable. */
-  locate?: (at: number, elements: string[]) => Promise<LocatedElement[]>;
+  locate?: (at: number, elements: string[], assetId?: string) => Promise<LocatedElement[]>;
   /** Watch the whole clip once and return a shot list (cached by the route); absent ⇒ unavailable. */
-  survey?: () => Promise<import("@/lib/firebase/schema").FootageShot[]>;
+  survey?: (assetId?: string) => Promise<import("@/lib/firebase/schema").FootageShot[]>;
 }
 
 export interface LocatedElement {
@@ -44,6 +46,28 @@ export async function executeReadTool(
   switch (name) {
     case "get_timeline":
       return ctx.digest;
+    case "get_sequence": {
+      const rev = { sequence: ctx.project.sequence ?? null, moments: ctx.project.analysis?.detectedMoments ?? [], assets: ctx.project.assets ?? [], sourceDuration: ctx.digest.sourceDuration };
+      const seq = resolveSequence(rev);
+      const lay = describeLayout(rev);
+      return {
+        authored: !!ctx.project.sequence,
+        outputDuration: r2(outputDurationOf(rev)),
+        clips: seq.items.map((it, i) => {
+          const l = lay[i];
+          return it.kind === "freeze"
+            ? { id: it.id, kind: "freeze", assetId: it.assetId, sourceAt: r2(it.sourceAt), start: r2(l.start), end: r2(l.end), ...(it.linkedTo ? { linkedTo: it.linkedTo } : { duration: it.duration ?? 2 }), ...(it.transitionIn ? { transitionIn: it.transitionIn } : {}) }
+            : { id: it.id, kind: "clip", assetId: it.assetId, sourceIn: r2(it.sourceIn), sourceOut: r2(it.sourceOut), start: r2(l.start), end: r2(l.end), ...(it.speed ? { speed: it.speed } : {}), ...(it.opacity ? { fades: it.opacity } : {}), ...(it.transitionIn ? { transitionIn: it.transitionIn } : {}), ...(it.audio ? { audio: it.audio } : {}) };
+        }),
+        audioTracks: (seq.audioTracks ?? []).map((t) => ({ ...t, outputStart: r2(t.outputStart), sourceIn: r2(t.sourceIn), sourceOut: r2(t.sourceOut) })),
+        assets: [{ id: "source", kind: "video", duration: r2(ctx.digest.sourceDuration) }, ...(ctx.project.assets ?? []).map((a) => ({ id: a.id, kind: a.kind, title: a.title, duration: r2(a.duration), hasAudio: a.hasAudio ?? null }))],
+        note: ctx.project.sequence ? "Clip ids are what every sequence capability takes. start/end are sequence (output) seconds; sourceIn/out are asset seconds." : "This project has a single-source timeline; the clips above are derived from its cuts/speed. The first sequence operation converts it (cuts and speed sections become clips).",
+      };
+    }
+    case "list_assets":
+      return { assets: [{ id: "source", kind: "video", duration: r2(ctx.digest.sourceDuration), hasAudio: true }, ...(ctx.project.assets ?? []).map((a) => ({ id: a.id, kind: a.kind, title: a.title, duration: r2(a.duration), hasAudio: a.hasAudio ?? null, width: a.width, height: a.height }))] };
+    case "get_capabilities":
+      return { capabilities: describeCapabilities(), note: "Operations that cannot be performed return the precise missing input or constraint; nothing is substituted." };
     case "find_footage": {
       const query = typeof args.query === "string" ? args.query : "";
       const kind = args.kind === "speech" || args.kind === "visual" ? args.kind : "any";
@@ -82,8 +106,26 @@ export async function executeReadTool(
     case "survey_footage": {
       if (!ctx.survey) return { error: "Watching the footage isn't available for this project." };
       try {
-        const shots = await ctx.survey();
-        return { shots: shots.map((s) => ({ start: r2(s.start), end: r2(s.end), description: s.description, subjects: s.subjects })), note: "Times are source seconds. Pick the shot that matches the request, then locate_elements inside it for exact framing." };
+        const explicit = typeof args.asset_id === "string" && args.asset_id ? args.asset_id : null;
+        // A sequence can play several assets: with no asset named, survey EVERY
+        // asset it uses and say where each plays, so "the orange shot" is
+        // findable whichever file it lives in.
+        const used = ctx.project.sequence
+          ? [...new Set([...ctx.project.sequence.items.map((i) => i.assetId), ...(ctx.project.sequence.audioTracks ?? []).map((t) => t.assetId)])].filter((id) => id === "source" || (ctx.project.assets ?? []).some((a) => a.id === id && a.kind !== "audio"))
+          : ["source"];
+        const ids = explicit ? [explicit] : used;
+        const rev = { sequence: ctx.project.sequence ?? null, moments: ctx.project.analysis?.detectedMoments ?? [], assets: ctx.project.assets ?? [], sourceDuration: ctx.digest.sourceDuration };
+        const perAsset = [];
+        for (const assetId of ids) {
+          const shots = await ctx.survey(assetId);
+          perAsset.push({
+            assetId,
+            title: assetId === "source" ? "the original upload" : (ctx.project.assets ?? []).find((a) => a.id === assetId)?.title ?? assetId,
+            shots: shots.map((s) => ({ start: r2(s.start), end: r2(s.end), description: s.description, subjects: s.subjects, playsAt: ctx.project.sequence ? outputSpansForSource(rev, assetId, s.start, s.end).map((sp) => ({ start: r2(sp.start), end: r2(sp.end), clipId: sp.itemId })) : undefined })),
+          });
+        }
+        if (perAsset.length === 1) return { assetId: perAsset[0].assetId, shots: perAsset[0].shots, note: `Times are seconds of asset "${perAsset[0].assetId}". Pick the shot that matches the request, then locate_elements inside it for exact framing.` };
+        return { assets: perAsset, note: "Shot times are seconds of each ASSET; playsAt gives where that footage sits in the sequence (clipId = the clip to edit). Pass asset_id to locate_elements / inspect_footage / find_events for an asset other than 'source'." };
       } catch (err) {
         return { error: err instanceof Error ? err.message : "Survey failed." };
       }
@@ -103,7 +145,7 @@ export async function executeReadTool(
       if (!Number.isFinite(at) || !elements.length) return { error: "Need a source time and at least one element to find." };
       if (!ctx.locate) return { error: "Locating elements in the frame isn't available for this project." };
       try {
-        const found = await ctx.locate(at, elements);
+        const found = await ctx.locate(at, elements, typeof args.asset_id === "string" && args.asset_id ? args.asset_id : "source");
         return {
           at: r2(at),
           elements: found.map((e) => ({
@@ -141,7 +183,8 @@ export async function executeReadTool(
       if (!(end > start) || end - start > 60) return { error: "Range must be positive and at most 60 seconds." };
       if (!ctx.inspect) return { error: "Close inspection isn't available for this project." };
       try {
-        return { answer: await ctx.inspect(start, end, question), range: { start: r2(start), end: r2(end) } };
+        const assetId = typeof args.asset_id === "string" && args.asset_id ? args.asset_id : "source";
+        return { assetId, answer: await ctx.inspect(start, end, question, assetId), range: { start: r2(start), end: r2(end) } };
       } catch (err) {
         return { error: err instanceof Error ? err.message : "Inspection failed." };
       }

@@ -28,6 +28,9 @@ interface CloudExportBody {
   effects?: EffectsSettings;
   sourceCrop?: SourceCrop | null;
   visualAnalysis?: VisualAnalysis;
+  sequence?: import("@/lib/timeline/sequence").Sequence | null;
+  assets?: import("@/lib/timeline/sequence").ProjectAsset[];
+  speech?: { start: number; end: number }[];
 }
 
 /**
@@ -102,6 +105,10 @@ export async function POST(req: NextRequest) {
       effects: body.effects,
       sourceCrop: body.sourceCrop,
       visualAnalysis: body.visualAnalysis,
+      // Multi-source timeline inputs (absent on legacy projects).
+      sequence: body.sequence ?? null,
+      assets: Array.isArray(body.assets) ? body.assets : [],
+      speech: Array.isArray(body.speech) ? body.speech : [],
     });
 
     if (!result.ok) {

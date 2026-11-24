@@ -12,6 +12,8 @@ import { FREE_VIDEO_DURATION_LIMIT_MESSAGE } from "@/lib/usage/plan";
 import { Button } from "@/components/ui/Button";
 import { EditorRealProvider, useEditorReal } from "./context";
 import { RealVideoPlayer } from "./RealVideoPlayer";
+import { SequencePreview } from "./SequencePreview";
+import { ClipInspectorModal } from "./ClipInspectorModal";
 import { EditorSplitWorkspace } from "./EditorSplitWorkspace";
 import { RealTimeline } from "./RealTimeline";
 import { MomentInspectorModal } from "./MomentInspectorModal";
@@ -116,6 +118,7 @@ export function RealEditorPage({ projectId }: { projectId: string }) {
       <RealProcessingOverlay />
       <ProcessingMiniPill />
       <MomentInspectorModal />
+      <ClipInspectorModal />
     </EditorRealProvider>
   );
 }
@@ -264,7 +267,7 @@ function Body() {
           <EditorSplitWorkspace
             preview={
               <RenderProbe id="preview">
-                <RealVideoPlayer fill />
+                {project.sequence ? <SequencePreview fill /> : <RealVideoPlayer fill />}
               </RenderProbe>
             }
             timeline={

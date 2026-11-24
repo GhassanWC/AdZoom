@@ -102,6 +102,10 @@ export interface CreateCloudExportInput {
   effects: EffectsSettings;
   sourceCrop?: SourceCrop | null;
   visualAnalysis?: VisualAnalysis;
+  /** Multi-source timeline (absent on legacy projects). */
+  sequence?: import("@/lib/timeline/sequence").Sequence | null;
+  assets?: import("@/lib/timeline/sequence").ProjectAsset[];
+  speech?: { start: number; end: number }[];
 }
 
 export type CreateCloudExportResult =
@@ -167,6 +171,14 @@ export async function createCloudExportJob(
     };
   }
 
+  if (input.sequence && process.env.CLOUD_SEQUENCE_EXPORT_ENABLED !== "1") {
+    return {
+      ok: false,
+      status: 409,
+      error: "Cloud export for multi-source timelines isn't enabled on this server yet (the render worker must be updated first). The in-browser export renders this project.",
+      kind: "cloud_sequence_disabled",
+    };
+  }
   const sourceWidth = numOr(project.width, input.sourceWidth);
   const sourceHeight = numOr(project.height, input.sourceHeight);
   const sourceDuration = numOr(project.duration, input.sourceDuration);
@@ -395,6 +407,9 @@ export async function createCloudExportJob(
     visualAnalysis: input.visualAnalysis,
     sourceCrop: effectiveCrop,
     applyWatermark,
+    sequence: input.sequence ?? null,
+    assets: input.assets ?? [],
+    speech: input.speech ?? [],
   });
   const outputDurationSeconds = recipe.outputDuration;
   const estimate = estimateExportMinutes(outputDurationSeconds);
@@ -429,7 +444,10 @@ export async function createCloudExportJob(
     sourceCrop: effectiveCrop,
     applyWatermark,
     ...(input.visualAnalysis != null ? { visualAnalysis: input.visualAnalysis } : {}),
+    ...(input.sequence ? { sequence: input.sequence, assets: input.assets ?? [], speech: input.speech ?? [] } : {}),
   };
+  // Assets the worker must download next to the source (storage-backed only).
+  const jobAssets = (input.sequence ? input.assets ?? [] : []).filter((a) => a.storagePath).map((a) => ({ id: a.id, storagePath: a.storagePath! }));
 
   // Stage log #1 of the caption-integrity chain: what the immutable snapshot
   // contains. The SAME summary is logged again by the render worker and the
@@ -617,6 +635,7 @@ export async function createCloudExportJob(
         normalizedPreset,
         monthlyUsageApplied: true,
         sourceStoragePath,
+        ...(jobAssets.length ? { assets: jobAssets } : {}),
         outputPath,
         format: "mp4",
         exportPath: "cloud",
@@ -725,6 +744,7 @@ export async function createCloudExportJob(
 
   try {
     await enqueueExportJob({
+      hasSequence: !!input.sequence,
       uid,
       jobId,
       priority: priorityLabel,

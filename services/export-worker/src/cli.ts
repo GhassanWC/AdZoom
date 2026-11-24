@@ -68,6 +68,8 @@ interface JobSpec {
   /** Job id for log correlation (diagnostics only). */
   jobId?: string;
   sourcePath: string;
+  /** Additional assets of a multi-source sequence (local files), by asset id. */
+  assets?: { id: string; path: string }[];
   outputPath: string;
   serializedRecipe: SerializedRenderRecipe;
   crf?: number;
@@ -686,6 +688,7 @@ async function main(): Promise<void> {
       serialized: spec.serializedRecipe,
       jobId: spec.jobId,
       sourcePath: renderSource,
+      assetPaths: Object.fromEntries((spec.assets ?? []).map((a) => [a.id, a.path])),
       outputPath: spec.outputPath,
       crf,
       preset,

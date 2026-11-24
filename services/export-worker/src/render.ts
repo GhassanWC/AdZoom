@@ -26,6 +26,7 @@ import {
   type VideoEncoderChoice,
 } from "./ffmpeg.js";
 import { buildAudioFilterComplex } from "./audio.js";
+import { renderSequenceToMp4 } from "./render-sequence.js";
 import { AUDIO_UNSUPPORTED_WARNING, isUnsupportedAudioCodec } from "./preflight.js";
 
 export type RenderStage = "decoding" | "rendering" | "encoding";
@@ -43,6 +44,8 @@ export interface RenderOptions {
   jobId?: string;
   /** Local path of the downloaded source video. */
   sourcePath: string;
+  /** Local paths of the project's additional assets (multi-source sequences), by asset id. */
+  assetPaths?: Record<string, string>;
   /** Local path to write the MP4 to. */
   outputPath: string;
   crf: number;
@@ -153,6 +156,10 @@ export interface RenderResult {
 export async function renderToMp4(opts: RenderOptions): Promise<RenderResult> {
   const warnings: string[] = [];
   const recipe = buildRenderRecipe({ ...opts.serialized, debugBorders: false });
+  // An authored sequence (several assets, freezes, ramps, fades, audio mix)
+  // renders through the evaluator-driven path; legacy single-source projects
+  // keep this loop (the evaluator reproduces it exactly — see tests/sequence-evaluate).
+  if (recipe.revision.sequence) return renderSequenceToMp4(opts, recipe);
   const { canvasW, canvasH, sourceWidth, sourceHeight, fps, outputDuration, timelineMap } =
     recipe;
 

@@ -55,7 +55,17 @@ import { InteractionsLane } from "./InteractionsLane";
 import { AudioLane } from "./AudioLane";
 import { ClipsLane } from "./ClipsLane";
 import { FootageClipsLane } from "./FootageClipsLane";
-import { deriveClips } from "@/lib/edit-commands/clips";
+import { deriveClips, clipsFromSequence } from "@/lib/edit-commands/clips";
+import { outputDurationOf, type TimelineRevision } from "@/lib/timeline/evaluate";
+import { outputSpanToMomentTimes, projectMomentsToOutput } from "@/lib/timeline/project-to-output";
+
+function safeOutputDuration(rev: TimelineRevision): number {
+  try {
+    return outputDurationOf(rev);
+  } catch {
+    return 0;
+  }
+}
 import { visibleMoments } from "@/lib/timeline/layers";
 import type { TimelineLaneContext } from "./trackModel";
 import { planTimelineLanes } from "./laneModel";
@@ -136,20 +146,38 @@ export function RealTimeline() {
     ? clips.find((c) => c.id === focusedClipId) ?? null
     : null;
 
-  const moments = project.analysis?.detectedMoments ?? [];
+  const rawMoments = project.analysis?.detectedMoments ?? [];
   const va = project.visualAnalysis;
-  const total = duration > 0 ? duration : project.duration ?? 0;
-  const footageClips = React.useMemo(
-    () => deriveClips(visibleMoments(moments, layers), total),
-    [moments, layers, total]
+  // Sequence projects: the ruler is SEQUENCE time (the preview sets `duration`
+  // to the output length) and every edit is shown where it plays; drags are
+  // converted back to each edit's own time base on commit.
+  const sequenceRev: TimelineRevision | null = React.useMemo(
+    () => (project.sequence ? { sequence: project.sequence, moments: rawMoments, assets: project.assets ?? [], sourceDuration: project.duration ?? 0 } : null),
+    [project.sequence, rawMoments, project.assets, project.duration]
   );
+  const projected = React.useMemo(() => (sequenceRev ? projectMomentsToOutput(sequenceRev, rawMoments) : null), [sequenceRev, rawMoments]);
+  const moments = projected ? projected.moments : rawMoments;
+  const total = sequenceRev ? (duration > 0 ? duration : safeOutputDuration(sequenceRev)) : duration > 0 ? duration : project.duration ?? 0;
+  const footageClips = React.useMemo(
+    () => (sequenceRev ? clipsFromSequence(sequenceRev) : deriveClips(visibleMoments(rawMoments, layers), total)),
+    [sequenceRev, rawMoments, layers, total]
+  );
+  const sequenceRevRef = React.useRef(sequenceRev);
+  const rawMomentsRef = React.useRef(rawMoments);
+  React.useEffect(() => {
+    sequenceRevRef.current = sequenceRev;
+    rawMomentsRef.current = rawMoments;
+  });
   const narrativeSegments = project.analysis?.narrativeStructure ?? [];
   const attentionCurve = project.analysis?.attentionCurve;
 
   // The Audio lane appears only when there is REAL audio analysis to draw. No
   // data → no lane, rather than an empty row implying the audio is silent.
   const audioAnalysis = project.analysis?.audioAnalysis;
+  // Source-time analysis lanes (audio, narrative, generated clips, cursor
+  // data) stay off a SEQUENCE ruler: they describe the original asset's time.
   const hasAudioData =
+    !sequenceRev &&
     !!audioAnalysis &&
     ((audioAnalysis.loudness?.length ?? 0) > 0 ||
       (audioAnalysis.silenceSegments?.length ?? 0) > 0 ||
@@ -521,10 +549,15 @@ export function RealTimeline() {
 
         const deps = dragDeps.current;
         if (drag.moved && d) {
-          void deps.updateMoment(drag.id, {
-            startTime: Number(d.startTime.toFixed(3)),
-            endTime: Number(d.endTime.toFixed(3)),
-          });
+          const rev = sequenceRevRef.current;
+          const raw = rev ? rawMomentsRef.current.find((m) => m.id === drag.id) : null;
+          const times = rev && raw ? outputSpanToMomentTimes(rev, raw, d.startTime, d.endTime) : { startTime: d.startTime, endTime: d.endTime };
+          if (times) {
+            void deps.updateMoment(drag.id, {
+              startTime: Number(times.startTime.toFixed(3)),
+              endTime: Number(times.endTime.toFixed(3)),
+            });
+          }
         } else if (drag.multiKey) {
           deps.toggleMultiSelect(drag.id);
         } else {
@@ -752,7 +785,7 @@ export function RealTimeline() {
   // and nothing else reads them.)
 
   const hasMoments = moments.length > 0;
-  const showNarrative = narrativeSegments.length > 0;
+  const showNarrative = narrativeSegments.length > 0 && !sequenceRev;
 
   // Single-signal AI health for the toolbar dot. Priority:
   // empty → quiet (any empty quartile) → clustered → balanced.
@@ -911,7 +944,7 @@ export function RealTimeline() {
           onSelect={(clip) => {
             setSelectedClipId(clip.id);
             setSelectedMomentId(null);
-            seek(clip.sourceStart);
+            seek(clip.kind ? clip.outputStart : clip.sourceStart);
           }}
         />
       ),
@@ -965,7 +998,7 @@ export function RealTimeline() {
    * the source, not an edit, so it has no drag handles. Clicking one opens it
    * (which is what actually scopes the preview + export to that window).
    */
-  if (clips.length > 0) {
+  if (clips.length > 0 && !sequenceRev) {
     rows.push({
       id: "clips",
       label: "Generated clips",
@@ -1018,7 +1051,7 @@ export function RealTimeline() {
 
   // Cursor / Focus — read-only cursor data, appended (ungrouped) at the bottom
   // and only when real cursor data exists.
-  if (showInteractionsTrack) {
+  if (showInteractionsTrack && !sequenceRev) {
     rows.push({
       id: "interactions",
       label: "Cursor / Focus",

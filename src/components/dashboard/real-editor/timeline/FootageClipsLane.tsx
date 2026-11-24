@@ -61,13 +61,13 @@ export function FootageClipsLane({
                 : "border-white/10 bg-white/[0.05] text-fog hover:border-white/25 hover:text-white"
             )}
             style={{
-              left: `${(clip.sourceStart / total) * 100}%`,
-              width: `${((clip.sourceEnd - clip.sourceStart) / total) * 100}%`,
+              left: `${((clip.kind ? clip.outputStart : clip.sourceStart) / total) * 100}%`,
+              width: `${((clip.kind ? clip.outputEnd - clip.outputStart : clip.sourceEnd - clip.sourceStart) / total) * 100}%`,
               minWidth: `${MIN_PILL_PX}px`,
             }}
           >
             <Film size={10} aria-hidden className="shrink-0 opacity-70" />
-            <span className="truncate font-medium">Clip {clip.index}</span>
+            <span className="truncate font-medium">{clip.kind === "freeze" ? "Freeze" : clip.assetId && clip.assetId !== "source" ? clip.label ?? clip.assetId : `Clip ${clip.index}`}</span>
             <span className="truncate font-mono tabular-nums opacity-70">{len.toFixed(1)}s</span>
           </button>
         );

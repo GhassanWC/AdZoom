@@ -23,7 +23,7 @@
 import type { EditCommand, GraphicPosition } from "./types";
 import { resolveClipRef, resolveElementRef, type AssistantInput } from "./context";
 import { findIntroductions, findRepeatedTakes, takeCutRange } from "./footage";
-import { deriveClips } from "./clips";
+import { deriveClips, clipsFromSequence } from "./clips";
 import { visibleMoments } from "@/lib/timeline/layers";
 import { parseEffectRevision } from "@/lib/effects/revise";
 import type { DetectedMoment } from "@/lib/firebase/schema";
@@ -186,6 +186,12 @@ function parseClause(
       setLast(rev.elementId);
       // The change summary already says "Spark fade 1.6 → 2.88" — no second note.
       return one({ op: "update_effect", elementId: rev.elementId, params: rev.params });
+    }
+    if (rev.kind === "duration") {
+      const m = input.moments.find((x) => x.id === rev.elementId);
+      const current = m?.fx?.duration ?? m?.fx?.program.duration ?? 2;
+      setLast(rev.elementId);
+      return one({ op: "update_effect", elementId: rev.elementId, duration: Math.round(current * rev.factor * 100) / 100 });
     }
   }
 
@@ -521,6 +527,7 @@ function zoomUnderPlayheadOrOnly(input: AssistantInput): DetectedMomentLike | nu
 type DetectedMomentLike = AssistantInput["moments"][number];
 
 /** Clips for the UI and tests, from the live (layer-filtered) timeline. */
-export function clipsFor(input: Pick<AssistantInput, "moments" | "layers" | "sourceDuration">) {
+export function clipsFor(input: Pick<AssistantInput, "moments" | "layers" | "sourceDuration"> & { project?: Partial<Pick<AssistantInput["project"], "sequence" | "assets">> }) {
+  if (input.project?.sequence) return clipsFromSequence({ sequence: input.project.sequence, moments: input.moments, assets: input.project.assets ?? [], sourceDuration: input.sourceDuration });
   return deriveClips(visibleMoments(input.moments, input.layers), input.sourceDuration);
 }

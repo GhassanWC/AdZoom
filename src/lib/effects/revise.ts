@@ -39,7 +39,7 @@ const AXES: Axis[] = [
   // Fading: a decay RATE goes up for "fade faster"; a lifetime goes down.
   { verbs: /\b(fade|fades|fading|decay|die out|disappear|vanish|linger|last)\b/, keys: /fade|decay|life|linger|duration|hold/, up: /\b(faster|quicker|sooner|more quickly)\b/, down: /\b(slower|longer|more slowly|later|linger)\b/, inverse: /life|linger|duration|hold/ },
   // Motion speed.
-  { verbs: /\b(move|moves|expand|expands|spread|spreads|grow|grows|travel|fly|flies|spin|spins|ripple|burst)\b.*\b(faster|slower|quicker)\b|\b(faster|slower|quicker)\b/, keys: /speed|rate|velocity/, up: /\b(faster|quicker)\b/, down: /\b(slower)\b/ },
+  { verbs: /\b(faster|slower|quicker|slow(?: \w+){0,3} down|speed(?: \w+){0,3} up)\b/, keys: /speed|rate|velocity/, up: /\b(faster|quicker|speed(?: \w+){0,3} up)\b/, down: /\b(slower|slow(?: \w+){0,3} down)\b/ },
   // Size / reach.
   { verbs: /\b(bigger|larger|smaller|wider|narrower|further|farther|reach|size)\b/, keys: /size|radius|scale|spread|reach|width|distance/, up: /\b(bigger|larger|wider|further|farther)\b/, down: /\b(smaller|narrower|shorter)\b/ },
   // Brightness.
@@ -61,6 +61,8 @@ const PART_STOP = new Set(["make", "only", "the", "this", "that", "one", "it", "
 
 export type EffectRevision =
   | { kind: "params"; elementId: string; params: FxParamValues; note: string }
+  /** Retime the whole instance (its program timeline stretched); factor > 1 = slower. */
+  | { kind: "duration"; elementId: string; factor: number; note: string }
   | { kind: "question"; question: string }
   | { kind: "none" };
 
@@ -75,7 +77,7 @@ export function parseEffectRevision(text: string, target: DetectedMoment | null,
     .find((w) => new RegExp(`\\b${w}\\b`).test(t));
   const axis = AXES.find((a) => a.verbs.test(t) && (a.up.test(t) || a.down.test(t)));
   if (!colorWord && !axis) return { kind: "none" };
-  if (!/^(please\s+)?(make|let|have|turn|change|set|can you make|could you make)\b|\b(fade|faster|slower|bigger|smaller|brighter)\b/.test(t)) return { kind: "none" };
+  if (!/^(please\s+)?(make|let|have|turn|change|set|slow|speed|can you make|could you make)\b|\b(fade|faster|slower|bigger|smaller|brighter|slow(?: \w+){0,3} down|speed(?: \w+){0,3} up)\b/.test(t)) return { kind: "none" };
   if (!target?.fx) {
     return fxCount > 1 ? { kind: "question", question: "Which effect? Select it on the timeline (or move the playhead onto it) and ask again." } : { kind: "none" };
   }
@@ -99,6 +101,15 @@ export function parseEffectRevision(text: string, target: DetectedMoment | null,
   }
 
   const ax = axis!;
+  // "Slow the drawing / the animation / the whole thing down": the WHOLE
+  // effect retimes (every part, and a linked freeze follows). A specific
+  // part ("the sparks") still maps to its own param below.
+  const wholeWords = /\b(drawing|draw|animation|animate|strokes?|whole|entire|all of it|the effect|everything)\b/;
+  if (ax.keys.test("speed") && wholeWords.test(t) && !anyPartNamed) {
+    const slower = ax.down.test(t);
+    const strengthW = /\b(much|a lot|way|far)\b/.test(t) ? 2 : /\b(a bit|slightly|a little|a touch)\b/.test(t) ? 1.25 : 1.5;
+    return { kind: "duration", elementId: target.id, factor: slower ? strengthW : 1 / strengthW, note: slower ? "slower" : "faster" };
+  }
   const candidates = params
     .filter((p) => p.type === "number" && ax.keys.test(words(p).replace(/\s+/g, "")))
     .map((p) => ({ p, score: partScore(p) }))

@@ -39,10 +39,14 @@ export function buildEditframeComposition(
     sourceCrop: project.sourceCrop ?? null,
     applyWatermark: project.applyWatermark,
     debugBorders: false,
+    sequence: project.sequence ?? null,
+    assets: project.assets ?? [],
+    speech: project.speech ?? [],
   });
 
   return {
     sourceUrl: project.originalVideoUrl,
+    assetUrls: Object.fromEntries((project.assets ?? []).map((a) => [a.id, a.url])),
     projectId: project.id,
     projectTitle: project.title,
     resolution: timeline.resolution,

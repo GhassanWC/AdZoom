@@ -300,3 +300,32 @@ test("'Save this look as Matchday Gold …' is not hijacked by the Looks panel",
   const ui = parseEditRequest("open the looks", parseInput([]));
   assert.equal(ui.kind, "ui");
 });
+
+test("retiming an instance stretches its program timeline and lengthens a linked hold; 'slow the drawing down' parses locally", async () => {
+  const { applyEditCommands } = await import("../src/lib/edit-commands/apply.ts");
+  const { parseEditRequest } = await import("../src/lib/edit-commands/parse.ts");
+  const { outputDurationOf } = await import("../src/lib/timeline/evaluate.ts");
+  const st = { moments: [] as DetectedMoment[], sourceDuration: 120, canvasWidth: 1920, canvasHeight: 1080, sequence: { version: 1 as const, items: [{ id: "a", kind: "clip" as const, assetId: "source", sourceIn: 0, sourceOut: 10 }] }, assets: [] };
+  const added = applyEditCommands(st, [{ op: "add_effect", at: 4, fx: { ref: { effectId: "e", version: 1, name: "Strokes" }, program: GOLD_RIPPLE, params: {}, inputs: { anchor: { x: 0.5, y: 0.5 } } } }], "d1");
+  assert.ok(added.ok);
+  const fxm = (added as { moments: DetectedMoment[] }).moments.find((m) => m.effectType === "fx")!;
+  const frozen = applyEditCommands({ ...st, moments: (added as { moments: DetectedMoment[] }).moments }, [{ op: "capability", capability: "freeze_frame", args: { clip_id: "a", at: 4, link_moment_id: fxm.id } }], "d2");
+  assert.ok(frozen.ok);
+  const s2 = { ...st, moments: (frozen as { moments: DetectedMoment[] }).moments, sequence: (frozen as { sequence: typeof st.sequence }).sequence };
+  assert.ok(Math.abs(outputDurationOf({ ...s2, sequence: s2.sequence }) - (10 + 2.4)) < 1e-6, "hold = the effect's 2.4 s");
+  const parsed = parseEditRequest("Slow the drawing down", { project: { analysis: { detectedMoments: s2.moments }, sequence: s2.sequence }, moments: s2.moments, layers: {}, sourceDuration: 120, playhead: 0, selection: {}, recentElementIds: [] } as never);
+  assert.equal(parsed.kind, "commands");
+  const cmd = (parsed as { commands: { op: string; duration: number }[] }).commands[0];
+  assert.equal(cmd.op, "update_effect");
+  assert.ok(Math.abs(cmd.duration - 3.6) < 1e-9, "1.5× slower → 3.6 s");
+  const slowed = applyEditCommands(s2, [cmd as never], "d3");
+  assert.ok(slowed.ok);
+  const after = (slowed as { moments: DetectedMoment[] }).moments.find((m) => m.id === fxm.id)!;
+  assert.equal(after.fx!.duration, 3.6);
+  assert.ok(Math.abs(after.endTime - after.startTime - 3.6) < 1e-6);
+  assert.ok(Math.abs(outputDurationOf({ ...s2, moments: (slowed as { moments: DetectedMoment[] }).moments }) - 13.6) < 1e-6, "the linked hold extended to 3.6 s");
+  // The drawer maps output-local time through the stretch: at 1.8 s into a 3.6 s play the program is at 1.2 s.
+  const { drawInCameraOverlays } = await import("../src/lib/render/overlay-draw.ts");
+  const arcsAt = (moments: DetectedMoment[], t: number) => { const c = new CountingCtx(); drawInCameraOverlays(c as unknown as CanvasRenderingContext2D, moments, t, 1920, 1080); return c.arcs.map((a) => Math.round(a.r)); };
+  assert.deepEqual(arcsAt((slowed as { moments: DetectedMoment[] }).moments, after.startTime + 1.8), arcsAt((added as { moments: DetectedMoment[] }).moments, fxm.startTime + 1.2));
+});

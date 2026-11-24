@@ -1,5 +1,6 @@
 "use client";
 
+import { speechWindowsOf } from "@/lib/timeline/speech";
 import * as React from "react";
 import Link from "next/link";
 import {
@@ -418,6 +419,9 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
     effects,
     sourceCrop: project.sourceCrop,
     visualAnalysis: project.visualAnalysis,
+    sequence: project.sequence ?? null,
+    assets: project.assets ?? [],
+    speech: speechWindowsOf(project),
   };
 
   // ── Export handlers ────────────────────────────────────────────────────────
@@ -490,6 +494,9 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
         visualAnalysis: project.visualAnalysis,
         // Free-tier watermark, drawn by the shared composeFrame layer (no billing).
         applyWatermark: plan.tier === "free",
+        sequence: project.sequence ?? null,
+        assets: project.assets ?? [],
+        speech: speechWindowsOf(project),
       },
       timeline: {
         moments,
@@ -562,6 +569,10 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
    */
   const runDesktopExport = async (): Promise<boolean> => {
     if (!desktop) return false;
+    // The local renderer has only the project's own media file on disk; a
+    // sequence that uses added assets renders in the browser engine instead.
+    const seqAssets = [...(project.sequence?.items ?? []).map((i) => i.assetId), ...(project.sequence?.audioTracks ?? []).map((t) => t.assetId)];
+    if (seqAssets.some((id) => id !== "source")) return false;
     const mediaId = localMediaId(project.originalVideoUrl);
     if (!mediaId) {
       requestSourceDownload();
@@ -583,6 +594,9 @@ export function RealExportPanel({ onClose }: { onClose?: () => void }) {
       // free-tier watermark rule still follows the plan, exactly as the
       // in-browser engine does.
       applyWatermark: plan.tier === "free",
+      sequence: project.sequence ?? null,
+      assets: project.assets ?? [],
+      speech: speechWindowsOf(project),
       resolution,
       fps,
       format,

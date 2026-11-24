@@ -823,6 +823,39 @@ const ADD_EFFECTS: AddEffectSpec[] = [
   // playhead moment, so it's intentionally not offered here.
 ];
 
+function AddMediaItem() {
+  const { addAsset, addingAsset, cloudAvailable } = useEditorReal();
+  const inputRef = React.useRef<HTMLInputElement | null>(null);
+  if (!cloudAvailable) return null;
+  return (
+    <>
+      <div className="mx-2 my-1 border-t border-white/[0.07] pt-1 text-[9.5px] font-semibold uppercase tracking-[0.14em] text-fog/70">Media</div>
+      <button
+        type="button"
+        role="menuitem"
+        data-testid="add-media"
+        disabled={addingAsset}
+        onClick={() => inputRef.current?.click()}
+        className="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-[12px] text-white/90 transition-colors hover:bg-white/[0.06] disabled:opacity-60"
+      >
+        <Film size={13} className="shrink-0 text-amber-300" />
+        <span className="flex-1">{addingAsset ? "Uploading…" : "Media file…"}</span>
+      </button>
+      <input
+        ref={inputRef}
+        type="file"
+        accept="video/*,audio/*"
+        className="hidden"
+        onChange={(e) => {
+          const f = e.target.files?.[0];
+          e.target.value = "";
+          if (f) void addAsset(f);
+        }}
+      />
+    </>
+  );
+}
+
 function AddMenu({ onAdd }: { onAdd: (e: EffectType) => void }) {
   const menu = useMenuPopover();
   const { open, toggle, close } = menu;
@@ -876,6 +909,7 @@ function AddMenu({ onAdd }: { onAdd: (e: EffectType) => void }) {
             </button>
           </React.Fragment>
         ))}
+        <AddMediaItem />
         <div className="mx-2 my-1 border-t border-white/[0.07] pt-1 text-[9.5px] font-semibold uppercase tracking-[0.14em] text-fog/70">
           From Framevo
         </div>

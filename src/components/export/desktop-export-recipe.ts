@@ -30,6 +30,10 @@ export interface DesktopExportInput {
   visualAnalysis?: VisualAnalysis;
   sourceCrop?: SourceCrop | null;
   applyWatermark: boolean;
+  /** Multi-source timeline (absent on legacy projects). Assets must be local on this machine. */
+  sequence?: import("@/lib/timeline/sequence").Sequence | null;
+  assets?: import("@/lib/timeline/sequence").ProjectAsset[];
+  speech?: { start: number; end: number }[];
   resolution: "720p" | "1080p" | "4K";
   fps: 30 | 60;
   format: ExportFormat;
@@ -49,5 +53,6 @@ export function serializeRecipeInput(input: DesktopExportInput): SerializedRende
     sourceCrop: input.sourceCrop ?? null,
     applyWatermark: input.applyWatermark,
     ...(input.visualAnalysis != null ? { visualAnalysis: input.visualAnalysis } : {}),
+    ...(input.sequence ? { sequence: input.sequence, assets: input.assets ?? [], speech: input.speech ?? [] } : {}),
   };
 }

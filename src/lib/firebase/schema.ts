@@ -820,6 +820,13 @@ export interface DetectedMoment {
   /** Present when `effectType === "fx"`. The effect program + this use's settings — see FxSettings. */
   fx?: FxSettings;
   /**
+   * Which time base `startTime`/`endTime` live in. Absent = source seconds of
+   * the original upload (every legacy moment). "sequence" = output seconds;
+   * "item" = seconds from that sequence item's cut, travelling with it. See
+   * src/lib/timeline/evaluate.ts.
+   */
+  anchor?: import("@/lib/timeline/evaluate").MomentAnchor;
+  /**
    * Shared text styling for text-based edits (captions / hook-text /
    * text-overlay / callout / branding-cta). Optional + additive: absent on all
    * older docs, which resolve to legacy-preset defaults at draw time. Holds only
@@ -2025,6 +2032,12 @@ export interface FxSettings {
   program: import("@/lib/effects/program").EffectProgram;
   params: import("@/lib/effects/program").FxParamValues;
   inputs: import("@/lib/effects/program").FxInstanceInputs;
+  /**
+   * THIS use plays over this many seconds (default: the program's duration).
+   * The program's own timeline is stretched to it, so "slow the drawing down"
+   * is a retime of the instance — and a freeze linked to it holds longer.
+   */
+  duration?: number;
 }
 
 /**
@@ -2237,6 +2250,25 @@ export interface ProjectDoc {
   footageSurvey?: { shots: FootageShot[]; createdAt: number };
   /** The assistant's memory of this project's direction — see AssistantMemoryItem. */
   assistantMemory?: AssistantMemoryItem[];
+  /**
+   * Additional media (second angles, music, narration). The original upload
+   * is always asset "source" and is NOT listed here. See src/lib/timeline/sequence.ts.
+   */
+  assets?: import("@/lib/timeline/sequence").ProjectAsset[];
+  /**
+   * The authored multi-source timeline. Absent on legacy projects, whose
+   * timeline is derived from cut/speed moments; once present it is the ONLY
+   * source of truth for footage order, trims, speed, freezes, fades and audio
+   * (cut/speed moments are ignored by the evaluator).
+   */
+  sequence?: import("@/lib/timeline/sequence").Sequence;
+  /**
+   * EDIT REVISION — increments with every committed timeline edit (manual or
+   * assistant). An edit request carries the revision it was composed against;
+   * a commit onto a newer revision is re-validated and property conflicts are
+   * surfaced instead of silently overwritten. Distinct from `rev` (sync).
+   */
+  timelineRev?: number;
   /**
    * SYNC BOOKKEEPING — owned by the sync engine, never by the editor.
    *
@@ -2554,6 +2586,10 @@ export interface SerializedRenderRecipe {
   sourceCrop?: SourceCrop | null;
   /** Always false for paid cloud exports (Free has no cloud export). */
   applyWatermark: boolean;
+  /** Multi-source timeline inputs (absent on legacy jobs). */
+  sequence?: import("@/lib/timeline/sequence").Sequence | null;
+  assets?: import("@/lib/timeline/sequence").ProjectAsset[];
+  speech?: { start: number; end: number }[];
 }
 
 /**
@@ -2609,6 +2645,8 @@ export interface ExportJobDoc {
   priority: "normal" | "priority";
   /** Source video Storage path (users/{uid}/projects/{pid}/original/<file>). */
   sourceStoragePath: string;
+  /** Additional assets a multi-source sequence references (downloaded next to the source). */
+  assets?: { id: string; storagePath: string }[];
   /** Storage path the worker writes the MP4 to. */
   outputPath: string;
   /** Public download URL — set once the upload finishes. */

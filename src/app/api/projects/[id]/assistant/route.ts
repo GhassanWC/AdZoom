@@ -19,6 +19,7 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { getAdmin } from "@/lib/firebase/admin";
 import { materializeProject } from "@/lib/firebase/materialize-project";
+import { hydrateProjectDoc } from "@/lib/firebase/payload-store";
 import { Type } from "@google/genai";
 import { getGemini, uploadVideoToGemini, waitForGeminiFileActive, type GeminiVideoRef } from "@/lib/gemini";
 import { buildAssistantDigest } from "@/lib/edit-commands/context";
@@ -91,7 +92,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
   const ref = db.doc(`users/${uid}/projects/${projectId}`);
   const snap = await ref.get();
   if (!snap.exists) return NextResponse.json({ error: "Project not found" }, { status: 404 });
-  const raw = snap.data() as Record<string, unknown>;
+  const raw = await hydrateProjectDoc(snap.data() as Record<string, unknown>);
   const project = materializeProject(projectId, raw);
 
   const sel = body.selection ?? {};
@@ -115,32 +116,49 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
 
   // Close visual inspection: the source video, uploaded to Gemini at most once
   // per ~40h, then queried with start/end offsets so only the range is watched.
-  let videoRef: GeminiVideoRef | null = null;
-  const ensureVideo = async (): Promise<GeminiVideoRef> => {
-    if (videoRef) return videoRef;
-    const mimeType = project.mimeType || "video/mp4";
-    const cached = raw.assistantMedia as { uri?: string; mimeType?: string; expiresAt?: number } | undefined;
-    if (cached?.uri && (cached.expiresAt ?? 0) > Date.now()) {
-      videoRef = { kind: "file", uri: cached.uri, mimeType: cached.mimeType || mimeType };
-      return videoRef;
+  // One media reference per ASSET ("source" = the original; others from the
+  // project's assets). The source's upload is cached on the document; added
+  // assets are small enough to inline in practice and are re-uploaded otherwise.
+  const videoRefs = new Map<string, GeminiVideoRef>();
+  const assetStoragePath = (assetId: string): { path: string; mimeType: string } => {
+    if (assetId === "source") {
+      if (!project.storagePath) throw new Error("The source video isn't in cloud storage.");
+      return { path: project.storagePath, mimeType: project.mimeType || "video/mp4" };
     }
-    if (!project.storagePath) throw new Error("The source video isn't in cloud storage.");
-    const [buffer] = await storage.bucket().file(project.storagePath).download();
+    const a = (project.assets ?? []).find((x) => x.id === assetId);
+    if (!a?.storagePath) throw new Error(`Asset "${assetId}" isn't in cloud storage.`);
+    return { path: a.storagePath, mimeType: a.mimeType || "video/mp4" };
+  };
+  const ensureVideo = async (assetId = "source"): Promise<GeminiVideoRef> => {
+    const hit = videoRefs.get(assetId);
+    if (hit) return hit;
+    const { path, mimeType } = assetStoragePath(assetId);
+    if (assetId === "source") {
+      const cached = raw.assistantMedia as { uri?: string; mimeType?: string; expiresAt?: number } | undefined;
+      if (cached?.uri && (cached.expiresAt ?? 0) > Date.now()) {
+        const v: GeminiVideoRef = { kind: "file", uri: cached.uri, mimeType: cached.mimeType || mimeType };
+        videoRefs.set(assetId, v);
+        return v;
+      }
+    }
+    const [buffer] = await storage.bucket().file(path).download();
     if (buffer.length <= INLINE_BYTE_LIMIT) {
-      videoRef = { kind: "inline", buffer, mimeType };
-      return videoRef;
+      const v: GeminiVideoRef = { kind: "inline", buffer, mimeType };
+      videoRefs.set(assetId, v);
+      return v;
     }
     const uploaded = await uploadVideoToGemini(buffer, mimeType, { retries: 1, perAttemptTimeoutMs: 60_000 });
     await waitForGeminiFileActive(uploaded.name, { timeoutMs: 60_000 });
-    videoRef = { kind: "file", uri: uploaded.uri, mimeType: uploaded.mimeType };
-    await ref.set(
-      { assistantMedia: { uri: uploaded.uri, name: uploaded.name, mimeType: uploaded.mimeType, expiresAt: Date.now() + FILE_TTL_MS } },
-      { merge: true }
-    );
-    return videoRef;
+    const v: GeminiVideoRef = { kind: "file", uri: uploaded.uri, mimeType: uploaded.mimeType };
+    videoRefs.set(assetId, v);
+    if (assetId === "source") {
+      await ref.set({ assistantMedia: { uri: uploaded.uri, name: uploaded.name, mimeType: uploaded.mimeType, expiresAt: Date.now() + FILE_TTL_MS } }, { merge: true });
+    }
+    return v;
   };
-  const inspect = async (start: number, end: number, question: string): Promise<string> => {
-    const v = await ensureVideo();
+  const assetDurationOf = (assetId: string): number => (assetId === "source" ? digest.sourceDuration : (project.assets ?? []).find((x) => x.id === assetId)?.duration ?? 0);
+  const inspect = async (start: number, end: number, question: string, assetId = "source"): Promise<string> => {
+    const v = await ensureVideo(assetId);
     const part =
       v.kind === "file"
         ? { fileData: { fileUri: v.uri, mimeType: v.mimeType } }
@@ -236,14 +254,14 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
   // Where things are in the frame — the model grounds focal points and label
   // positions in the footage instead of guessing. One short look at the frame
   // around `at`, boxes as fractions of the frame.
-  const locate = async (at: number, elements: string[]) => {
-    const v = await ensureVideo();
+  const locate = async (at: number, elements: string[], assetId = "source") => {
+    const v = await ensureVideo(assetId);
     const part =
       v.kind === "file"
         ? { fileData: { fileUri: v.uri, mimeType: v.mimeType } }
         : { inlineData: { data: v.buffer.toString("base64"), mimeType: v.mimeType } };
     const s0 = Math.max(0, at - 0.25);
-    const s1 = Math.min(digest.sourceDuration, at + 0.25);
+    const s1 = Math.min(assetDurationOf(assetId) || digest.sourceDuration, at + 0.25);
     const res = await getGemini().models.generateContent({
       model: ASSISTANT_MODEL,
       contents: [
@@ -287,15 +305,15 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
   };
 
   // One watch of the whole clip → a shot list, cached on the project.
-  const survey = async () => {
-    const cached = project.footageSurvey?.shots;
+  const survey = async (assetId = "source") => {
+    const cached = assetId === "source" ? project.footageSurvey?.shots : undefined;
     if (cached && cached.length) return cached;
-    const v = await ensureVideo();
+    const v = await ensureVideo(assetId);
     const part =
       v.kind === "file"
         ? { fileData: { fileUri: v.uri, mimeType: v.mimeType } }
         : { inlineData: { data: v.buffer.toString("base64"), mimeType: v.mimeType } };
-    const dur = digest.sourceDuration;
+    const dur = assetDurationOf(assetId) || digest.sourceDuration;
     const WINDOW = 45;
     const shots: { start: number; end: number; description: string; subjects: string[] }[] = [];
     for (let s0 = 0; s0 < dur; s0 += WINDOW) {
@@ -356,19 +374,19 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       }
     }
     const merged = mergeSurveyShots(shots);
-    await ref.set({ footageSurvey: { shots: merged, createdAt: Date.now() } }, { merge: true });
+    if (assetId === "source") await ref.set({ footageSurvey: { shots: merged, createdAt: Date.now() } }, { merge: true });
     return merged;
   };
 
   // Events in the footage ("the ball crosses the goal line"), with where the
   // key object is at that instant. Watched in windows so long videos fit.
-  const events = async (query: string): Promise<FoundEvent[]> => {
-    const v = await ensureVideo();
+  const events = async (query: string, assetId = "source"): Promise<FoundEvent[]> => {
+    const v = await ensureVideo(assetId);
     const part =
       v.kind === "file"
         ? { fileData: { fileUri: v.uri, mimeType: v.mimeType } }
         : { inlineData: { data: v.buffer.toString("base64"), mimeType: v.mimeType } };
-    const dur = digest.sourceDuration;
+    const dur = assetDurationOf(assetId) || digest.sourceDuration;
     const WINDOW = 45;
     const found: FoundEvent[] = [];
     for (let s0 = 0; s0 < dur; s0 += WINDOW) {
@@ -417,14 +435,14 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
   };
 
   // Where one element is, ~4×/s across a short window (an effect that follows the ball).
-  const track = async (element: string, start: number, duration: number) => {
-    const v = await ensureVideo();
+  const track = async (element: string, start: number, duration: number, assetId = "source") => {
+    const v = await ensureVideo(assetId);
     const part =
       v.kind === "file"
         ? { fileData: { fileUri: v.uri, mimeType: v.mimeType } }
         : { inlineData: { data: v.buffer.toString("base64"), mimeType: v.mimeType } };
     const s0 = Math.max(0, start);
-    const s1 = Math.min(digest.sourceDuration, start + duration);
+    const s1 = Math.min(assetDurationOf(assetId) || digest.sourceDuration, start + duration);
     const times: number[] = [];
     for (let t = s0; t <= s1 + 1e-6; t += 0.25) times.push(Math.round(t * 100) / 100);
     const res = await getGemini().models.generateContent({

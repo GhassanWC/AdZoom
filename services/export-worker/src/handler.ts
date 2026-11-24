@@ -318,7 +318,14 @@ export async function processJob(uid: string, jobId: string): Promise<string> {
     await patch({ stage: "downloading", progress: 0.02 });
     const dlStart = Date.now();
     await bucket().file(job.sourceStoragePath).download({ destination: srcPath });
-    console.info("[worker:timing] download", { jobId, ms: Date.now() - dlStart });
+    // Multi-source sequences: every additional asset the timeline references.
+    const assetPaths: Record<string, string> = {};
+    for (const a of job.assets ?? []) {
+      const p = join(workDir, `asset-${a.id}${extname(a.storagePath) || ".mp4"}`);
+      await bucket().file(a.storagePath).download({ destination: p });
+      assetPaths[a.id] = p;
+    }
+    console.info("[worker:timing] download", { jobId, ms: Date.now() - dlStart, assets: Object.keys(assetPaths).length });
 
     // ── Preflight + (conditional) normalization ─────────────────────────
     // Risky sources (exotic video codec / non-AAC / undecodable audio) are
@@ -346,6 +353,7 @@ export async function processJob(uid: string, jobId: string): Promise<string> {
     const result = await renderToMp4({
       serialized: job.renderRecipe,
       sourcePath: prepared.renderSourcePath,
+      assetPaths,
       outputPath: outPath,
       crf: cfg.crf,
       preset: cfg.preset,

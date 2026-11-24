@@ -59,7 +59,7 @@ export function useEditAssistant() {
         ? { ...(project.analysis ?? {}), transcript: data.transcript }
         : project.analysis;
       return {
-        project: { ...project, analysis: analysis as typeof project.analysis },
+        project: { ...project, analysis: analysis as typeof project.analysis, sequence: project.sequence, assets: project.assets },
         moments: project.analysis?.detectedMoments ?? [],
         layers,
         sourceDuration: duration || project.duration || 0,

@@ -48,9 +48,9 @@ export interface FxToolContext {
   momentsNow: () => DetectedMoment[];
   sourceDuration: number;
   /** Watch the video for events matching a description (absent ⇒ unavailable). */
-  events?: (query: string) => Promise<FoundEvent[]>;
+  events?: (query: string, assetId?: string) => Promise<FoundEvent[]>;
   /** Positions of an element across a short window (absent ⇒ unavailable). */
-  track?: (element: string, start: number, duration: number) => Promise<{ t: number; x: number; y: number }[]>;
+  track?: (element: string, start: number, duration: number, assetId?: string) => Promise<{ t: number; x: number; y: number }[]>;
   memory: AssistantMemoryItem[];
   memoryWrites: AssistantMemoryItem[];
   now: number;
@@ -86,13 +86,13 @@ export const FX_TOOLS: readonly ToolDef[] = [
     name: "find_events",
     kind: "read",
     description: "Watch the footage for a described event ('the ball crosses the goal line', 'the second goal', 'the car passes the camera'). Returns each occurrence with its source time and where the key object is in the frame (x, y fractions). Confirm the exact position with locate_elements at the returned time.",
-    parameters: obj({ query: str("The event to find, specific enough to recognise.") }, ["query"]),
+    parameters: obj({ query: str("The event to find, specific enough to recognise."), asset_id: str("Asset to watch (default 'source').") }, ["query"]),
   },
   {
     name: "track_element",
     kind: "read",
     description: "Positions of one element (e.g. 'the ball') every ~0.25s over a short window, as fractions of the frame — pass the result as track_json to create_effect/apply_effect so the effect follows it.",
-    parameters: obj({ element: str("What to track."), start: num("Source seconds."), duration: num("Seconds to track (≤ 4).") }, ["element", "start"]),
+    parameters: obj({ element: str("What to track."), start: num("Asset seconds."), duration: num("Seconds to track (≤ 4)."), asset_id: str("Asset to watch (default 'source').") }, ["element", "start"]),
   },
   {
     name: "test_effect",
@@ -146,6 +146,7 @@ export const FX_TOOLS: readonly ToolDef[] = [
         program_json: str("Optional full replacement program (an adaptation)."),
         note: str("What changed, for the version history."),
         at: num("Optional new start (source seconds)."),
+        duration: num("Optional: play the WHOLE effect over this many seconds (slower drawing = longer). A freeze linked to the effect holds for the new length."),
         anchor_x: num("Optional new anchor x."),
         anchor_y: num("Optional new anchor y."),
       },
@@ -242,7 +243,7 @@ export async function handleFxTool(name: string, args: Record<string, unknown>, 
       if (!query) return { kind: "error", message: "Say which event to find." };
       if (!ctx.events) return { kind: "read", result: { error: "Watching the footage isn't available for this project." } };
       try {
-        const events = await ctx.events(query);
+        const events = await ctx.events(query, typeof args.asset_id === "string" && args.asset_id ? args.asset_id : "source");
         return {
           kind: "read",
           result: {
@@ -262,7 +263,7 @@ export async function handleFxTool(name: string, args: Record<string, unknown>, 
       if (!element || !Number.isFinite(start)) return { kind: "error", message: "element and start are required." };
       if (!ctx.track) return { kind: "read", result: { error: "Tracking isn't available for this project." } };
       try {
-        const samples = await ctx.track(element, start, duration);
+        const samples = await ctx.track(element, start, duration, typeof args.asset_id === "string" && args.asset_id ? args.asset_id : "source");
         return { kind: "read", result: { samples: samples.map((s) => ({ t: r3(s.t - start), x: r3(s.x), y: r3(s.y) })), note: "t is seconds after `start` — pass this array as track_json with at = start." } };
       } catch (err) {
         return { kind: "read", result: { error: err instanceof Error ? err.message : "Tracking failed." } };
@@ -367,8 +368,9 @@ export async function handleFxTool(name: string, args: Record<string, unknown>, 
         note = `new version v${version} of "${entry.name}"`;
       }
       if (typeof args.at === "number") cmd.at = r3(args.at);
+      if (typeof args.duration === "number") cmd.duration = r3(args.duration);
       if (in01(args.anchor_x) && in01(args.anchor_y)) cmd.anchor = { x: r3(args.anchor_x), y: r3(args.anchor_y) };
-      if (!cmd.params && !cmd.program && cmd.at == null && !cmd.anchor) return { kind: "error", message: "Nothing to change — pass params_json (or program_json, at, anchor)." };
+      if (!cmd.params && !cmd.program && cmd.at == null && !cmd.anchor && cmd.duration == null) return { kind: "error", message: "Nothing to change — pass params_json (or program_json, at, anchor, duration)." };
       return { kind: "command", cmd, note, stage };
     }
 

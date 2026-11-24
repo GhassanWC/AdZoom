@@ -39,6 +39,11 @@ export interface EditframeProjectInput {
    * watermark layer exactly like every other engine.
    */
   applyWatermark: boolean;
+  /** Multi-source timeline (absent on legacy projects). */
+  sequence?: import("@/lib/timeline/sequence").Sequence | null;
+  assets?: import("@/lib/timeline/sequence").ProjectAsset[];
+  /** Spoken windows of the original (source seconds) — ducking. */
+  speech?: { start: number; end: number }[];
 }
 
 /** Timeline/output inputs for `buildEditframeComposition`. */
@@ -61,6 +66,8 @@ export interface EditframeTimelineInput {
 /** The isolated, serializable render spec the browser engine consumes. */
 export interface EditframePlan {
   sourceUrl: string;
+  /** Playable URLs of the additional assets, by asset id. */
+  assetUrls: Record<string, string>;
   projectId: string;
   projectTitle: string;
   resolution: EditframeResolution;

@@ -35,8 +35,11 @@ try {
 const dims = /(\d{3,5})x(\d{3,5})/.exec(probe);
 const sourceWidth = doc.width || Number(dims?.[1]) || 1920;
 const sourceHeight = doc.height || Number(dims?.[2]) || 1080;
+const assets = (doc.assets ?? []) as { id: string; url: string; path?: string }[];
 const spec = {
   sourcePath,
+  // Harness convention: an asset's `path` (or a file-path `url`) is a local file.
+  assets: assets.map((a) => ({ id: a.id, path: a.path ?? a.url })),
   outputPath: outPath,
   crf: 20,
   preset: "veryfast",
@@ -52,6 +55,9 @@ const spec = {
     effects: { ...DEFAULT_EFFECTS_SETTINGS, ...(doc.effectsSettings ?? {}) },
     sourceCrop: doc.sourceCrop ?? null,
     applyWatermark: false,
+    sequence: doc.sequence ?? null,
+    assets,
+    speech: doc.speech ?? [],
   },
 };
 const specPath = outPath.replace(/\.mp4$/i, "") + ".spec.json";

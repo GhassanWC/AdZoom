@@ -25,14 +25,16 @@ export function entryFor(
   message: string,
   source: AssistantLogEntry["source"],
   changes: readonly EditChange[],
-  now: number
+  now: number,
+  /** Lines derived from the COMMITTED diff; when given they replace the commands' own summaries. */
+  diffLines?: readonly string[]
 ): AssistantLogEntry {
   const changedIds = [...new Set(changes.filter((c) => c.kind !== "removed").map((c) => c.elementId))];
   return {
     requestId,
     message: message.trim().slice(0, 500),
     source,
-    lines: changes.map((c) => c.summary),
+    lines: diffLines && diffLines.length ? [...diffLines] : changes.map((c) => c.summary),
     changedIds,
     jumpTo: changes.length ? Math.round(changes[0].at * 1000) / 1000 : null,
     at: now,
