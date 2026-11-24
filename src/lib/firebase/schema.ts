@@ -2053,6 +2053,40 @@ export interface AssistantMemoryItem {
   at: number;
 }
 
+/**
+ * A visual event the assistant resolved in the footage ("goal" #2 at 27.2 s),
+ * either verified against nearby frames (`verified`) or chosen by the user
+ * from timestamped candidates (`user`). Effects placed "on the second goal"
+ * and their revisions reuse the mark, so the instant never drifts between
+ * turns. `query` is the normalized event type (see effects/event-marks.ts).
+ */
+export interface EventMark {
+  id: string;
+  query: string;
+  ordinal?: number;
+  /** Source seconds of the asset. */
+  time: number;
+  x: number;
+  y: number;
+  assetId: string;
+  source: "user" | "verified";
+  label: string;
+  at: number;
+}
+
+/** A timestamped candidate offered to the user when an event is ambiguous. */
+export interface EventCandidate {
+  id: string;
+  time: number;
+  x: number;
+  y: number;
+  label: string;
+  query: string;
+  ordinal?: number;
+  assetId: string;
+  confidence: number;
+}
+
 /** One shot/beat of a footage survey — see {@link ProjectDoc.footageSurvey}. */
 export interface FootageShot {
   start: number;
@@ -2250,6 +2284,8 @@ export interface ProjectDoc {
   footageSurvey?: { shots: FootageShot[]; createdAt: number };
   /** The assistant's memory of this project's direction — see AssistantMemoryItem. */
   assistantMemory?: AssistantMemoryItem[];
+  /** Visual events resolved in the footage (goals, hits) — see EventMark. */
+  eventMarks?: EventMark[];
   /**
    * Additional media (second angles, music, narration). The original upload
    * is always asset "source" and is NOT listed here. See src/lib/timeline/sequence.ts.

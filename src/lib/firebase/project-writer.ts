@@ -60,44 +60,69 @@ async function withRetry<T>(label: string, task: () => Promise<T>): Promise<T> {
   throw lastErr;
 }
 
+/** What became of a queued write — callers that OWN user data must look. */
+export type WriteOutcome<T> =
+  | { status: "completed"; value: T }
+  /** Superseded by a newer write with the same coalesce tag before it started. */
+  | { status: "skipped" }
+  /** Failed after retries. The chain stays healthy; the caller decides what to show. */
+  | { status: "failed"; error: unknown };
+
 /**
- * Enqueue a project-scoped write. Resolves with the task result, or `undefined`
- * if the write was skipped (stale) or failed after retries (swallowed).
+ * Enqueue a project-scoped write and learn how it ended. A rejected save
+ * (Firestore validation, permissions, a document over 1 MiB) is NOT swallowed
+ * silently any more: the outcome says `failed` so the editor can keep the
+ * local state, show the error and offer a retry. Nothing ever rejects — a
+ * persistence race must never crash the page.
  */
-export function enqueueProjectWrite<T>(
+export function enqueueProjectWriteOutcome<T>(
   projectId: string,
   label: string,
   task: () => Promise<T>,
   opts: EnqueueOpts = {}
-): Promise<T | undefined> {
+): Promise<WriteOutcome<T>> {
   const id = ++seq;
   const tagKey = opts.coalesceTag ? `${projectId}::${opts.coalesceTag}` : null;
   if (tagKey) latestCoalesceSeq.set(tagKey, id);
   log(`queued #${id} ${label} (${projectId})`);
 
   const prev = chains.get(projectId) ?? Promise.resolve();
-  const run = prev
+  const run: Promise<WriteOutcome<T>> = prev
     .catch(() => undefined) // a prior failure must not break the chain
     .then(async () => {
       if (tagKey && latestCoalesceSeq.get(tagKey) !== id) {
         log(`skipped #${id} ${label} (stale)`);
-        return undefined;
+        return { status: "skipped" } as const;
       }
       log(`started #${id} ${label}`);
       try {
-        const result = await withRetry(label, task);
+        const value = await withRetry(label, task);
         log(`completed #${id} ${label}`);
-        return result;
-      } catch (err) {
-        // Swallow — a persistence race must never crash the page (req #6).
+        return { status: "completed", value } as const;
+      } catch (error) {
         // eslint-disable-next-line no-console
-        console.warn(`[write-queue] failed #${id} ${label} (swallowed)`, err);
-        return undefined;
+        console.warn(`[write-queue] failed #${id} ${label}`, error);
+        return { status: "failed", error } as const;
       }
     });
 
   chains.set(projectId, run);
   return run;
+}
+
+/**
+ * Enqueue a project-scoped write. Resolves with the task result, or `undefined`
+ * if the write was skipped (stale) or failed after retries (swallowed). Use
+ * `enqueueProjectWriteOutcome` where a lost write must be surfaced to the user.
+ */
+export async function enqueueProjectWrite<T>(
+  projectId: string,
+  label: string,
+  task: () => Promise<T>,
+  opts: EnqueueOpts = {}
+): Promise<T | undefined> {
+  const out = await enqueueProjectWriteOutcome(projectId, label, task, opts);
+  return out.status === "completed" ? out.value : undefined;
 }
 
 /** Wait until all currently-queued writes for a project have drained. */

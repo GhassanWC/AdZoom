@@ -55,7 +55,7 @@ export async function renderSequenceToMp4(opts: RenderOptions, recipe: RenderRec
     if (l.item.kind === "clip" && l.item.audio?.assetId) referenced.add(l.item.audio.assetId);
   }
   for (const tr of rev.sequence?.audioTracks ?? []) referenced.add(tr.assetId);
-  const probes = new Map<string, { width: number; height: number; audio: boolean; sampleRate: number }>();
+  const probes = new Map<string, { width: number; height: number; audio: boolean; sampleRate: number; channels: number }>();
   for (const id of referenced) {
     const path = assetPaths[id];
     if (!path) throw new Error(`missing_asset: no local file for asset "${id}"`);
@@ -65,7 +65,7 @@ export async function renderSequenceToMp4(opts: RenderOptions, recipe: RenderRec
       audio = false;
       warnings.push(`The audio of "${id}" couldn't be decoded and was left out of the mix.`);
     }
-    probes.set(id, { width: info.width, height: info.height, audio, sampleRate: info.audioSampleRate || 48000 });
+    probes.set(id, { width: info.width, height: info.height, audio, sampleRate: info.audioSampleRate || 48000, channels: info.audioChannels || 0 });
   }
 
   // ── Audio graph ───────────────────────────────────────────────────────────
@@ -77,7 +77,7 @@ export async function renderSequenceToMp4(opts: RenderOptions, recipe: RenderRec
     audioInputs.push(assetPaths[id]);
   }
   const SAMPLE_RATE = 48000;
-  const graph = buildSequenceAudioGraph({ runs: planAudio(rev), inputIndexOf: (id) => inputIndex.get(id) ?? null, sampleRate: SAMPLE_RATE, outputDuration });
+  const graph = buildSequenceAudioGraph({ runs: planAudio(rev), inputIndexOf: (id) => inputIndex.get(id) ?? null, channelsOf: (id) => probes.get(id)?.channels || undefined, sampleRate: SAMPLE_RATE, outputDuration });
   const audio: EncoderAudio = graph ? { kind: "graph", filterComplex: graph, inputs: audioInputs } : { kind: "none" };
   if (!graph) warnings.push("No audible track in this sequence — the export is silent.");
   console.info("[worker:audio]", { mode: audio.kind, inputs: audioInputs.length, runs: graph ? graph.split(";").length - 1 : 0 });

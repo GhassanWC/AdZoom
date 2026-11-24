@@ -266,3 +266,47 @@ test("layout boundaries: the later item owns an exact cut tick", () => {
   assert.equal(evaluateTimeline(rev, 1 - 1 / TICKS_PER_SECOND).layers[0].itemId, "a");
   assert.equal(sequenceFromMoments([cut("c", 1, 5)], 6).items.length, 2);
 });
+
+// Motion ON a freeze: a zoom anchored to the freeze item runs on elapsed time
+// within the hold while the held frame stays fixed; the clip after the freeze
+// falls back to its own source-anchored camera from its first frame.
+test("freeze: an item-anchored zoom progresses over the hold while the picture stays fixed", async () => {
+  const { cameraForLayer } = await import("../src/lib/timeline/evaluate.ts");
+  const { resolveCameraFrame } = await import("../src/lib/timeline/camera.ts");
+  const seq: Sequence = {
+    version: 1,
+    items: [
+      { id: "a", kind: "clip", assetId: "source", sourceIn: 0, sourceOut: 4 },
+      { id: "hold", kind: "freeze", assetId: "source", sourceAt: 4, duration: 3 },
+      { id: "b", kind: "clip", assetId: "source", sourceIn: 4, sourceOut: 8 },
+    ],
+  };
+  const zoomOnHold = mom({ id: "z", startTime: 0, endTime: 3, effectType: "zoom", anchor: { kind: "item", itemId: "hold" }, focusRegion: { x: 0.25, y: 0.25, width: 0.5, height: 0.5 } });
+  const sourceZoom = mom({ id: "s", startTime: 1, endTime: 2, effectType: "zoom", focusRegion: { x: 0.25, y: 0.25, width: 0.5, height: 0.5 } });
+  const rev: TimelineRevision = { sequence: seq, moments: [zoomOnHold, sourceZoom], sourceDuration: 12 };
+  const scaleAt = (t: number) => {
+    const ev = evaluateTimeline(rev, t);
+    const layer = ev.layers[ev.layers.length - 1];
+    const cam = cameraForLayer(rev.moments, layer);
+    return { layer, cam, scale: resolveCameraFrame(cam.moments, cam.t, { autoZoom: true }).camera.scale };
+  };
+  const early = scaleAt(4.3);
+  const mid = scaleAt(5.5);
+  const late = scaleAt(6.9);
+  assert.equal(early.layer.sourceTime, 4, "held frame");
+  assert.equal(mid.layer.sourceTime, 4, "held frame");
+  assert.equal(early.cam.base, "item");
+  assert.ok(Math.abs(early.cam.t - 0.3) < 1e-9 && Math.abs(mid.cam.t - 1.5) < 1e-9, "camera time = elapsed time in the hold");
+  assert.ok(mid.scale > early.scale && mid.scale > 1.05, `zoom progresses over the hold (${early.scale.toFixed(3)} → ${mid.scale.toFixed(3)})`);
+  assert.ok(late.scale < mid.scale, "and eases back out before the hold ends");
+  const resume = scaleAt(7.0);
+  assert.equal(resume.layer.sourceTime, 4, "first frame after the hold is the frozen frame");
+  assert.equal(resume.cam.base, "source", "the clip after the freeze uses its own source camera");
+  assert.ok(Math.abs(resume.scale - 1) < 1e-6, "no zoom carried over");
+  // Stable identities per moments array: the schedule cache in camera.ts keys on the array.
+  assert.equal(cameraForLayer(rev.moments, early.layer).moments, early.cam.moments);
+  // The source zoom on clip a still works as before.
+  const onA = scaleAt(1.5);
+  assert.equal(onA.cam.base, "source");
+  assert.ok(onA.scale > 1.05);
+});

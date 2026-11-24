@@ -208,3 +208,35 @@ test("every sequence op result is Firestore-safe (no undefined values anywhere)"
     assert.equal(firstUndefinedPath({ sequence: r.sequence, moments: r.moments, assets: r.assets ?? null }), null, `${name} left an undefined value`);
   }
 });
+
+test("add_zoom / add_effect with clip_id anchor to the item (a zoom ON a freeze) and are bounded by its length", () => {
+  const seq: Sequence = {
+    version: 1,
+    items: [
+      { id: "a", kind: "clip", assetId: "source", sourceIn: 0, sourceOut: 4 },
+      { id: "hold", kind: "freeze", assetId: "source", sourceAt: 4, duration: 3 },
+      { id: "b", kind: "clip", assetId: "source", sourceIn: 4, sourceOut: 8 },
+    ],
+  };
+  const st = base({ sequence: seq });
+  const r = ok(applyEditCommands(st, [{ op: "add_zoom", start: 0, end: 3, scale: 1.5, clipId: "hold" }], "fz1"));
+  const z = r.moments.find((m) => m.effectType === "zoom")!;
+  assert.deepEqual(z.anchor, { kind: "item", itemId: "hold" });
+  assert.deepEqual([z.startTime, z.endTime], [0, 3]);
+  assert.match(r.changes[0].summary, /on the hold/);
+  assert.equal(r.changes[0].at, 4, "reported at the hold's output position");
+  const tooLong = applyEditCommands(st, [{ op: "add_zoom", start: 0, end: 10, scale: 1.5, clipId: "hold" }], "fz2");
+  assert.ok(tooLong.ok, "clamped to the hold, not refused");
+  assert.equal((tooLong as { moments: DetectedMoment[] }).moments.find((m) => m.effectType === "zoom")!.endTime, 3);
+  const missing = applyEditCommands(st, [{ op: "add_zoom", start: 0, end: 1, clipId: "nope" }], "fz3");
+  assert.equal(missing.ok, false);
+  assert.match((missing as { errors: { message: string }[] }).errors[0].message, /No clip or freeze "nope"/);
+  const program = { api: "fxp/1" as const, duration: 2, inputs: ["anchor"] as ["anchor"], params: [], layers: [{ id: "ring", shape: "ring" as const, x: "ax", y: "ay", r: "0.1*t", width: "0.01", alpha: "1-p", color: "#fff" }] };
+  const fx = ok(applyEditCommands(st, [{ op: "add_effect", at: 0.5, clipId: "hold", fx: { ref: { effectId: "fx_t", version: 1, name: "Ring" }, program, params: {}, inputs: { anchor: { x: 0.5, y: 0.5 } } } }], "fz4"));
+  const e = fx.moments.find((m) => m.effectType === "fx")!;
+  assert.deepEqual(e.anchor, { kind: "item", itemId: "hold" });
+  assert.deepEqual([e.startTime, e.endTime], [0.5, 2.5]);
+  const ev = evaluateTimeline(revOf(fx, st), 5.0); // 1.0 s into the hold
+  assert.equal(ev.layers[0].sourceTime, 4);
+  assert.ok(ev.overlays.some((o) => o.moment.id === e.id && Math.abs(o.localTime - 0.5) < 1e-9), "the effect animates on elapsed hold time");
+});

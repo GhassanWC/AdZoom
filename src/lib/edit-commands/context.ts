@@ -48,6 +48,8 @@ export interface DigestElement {
   start: number;
   end: number;
   enabled: boolean;
+  /** "item:<id>" when start/end are seconds into that sequence item (a zoom/effect on a freeze); "sequence" for output seconds; absent = source seconds. */
+  anchor?: string;
 }
 
 /** Compact, model-friendly snapshot of the editable state. */
@@ -77,6 +79,7 @@ function digestElement(m: DetectedMoment): DigestElement {
     start: r2(m.startTime),
     end: r2(m.endTime),
     enabled: m.enabled !== false,
+    ...(m.anchor && m.anchor.kind !== "source" ? { anchor: m.anchor.kind === "item" ? `item:${m.anchor.itemId}` : "sequence" } : {}),
   };
 }
 

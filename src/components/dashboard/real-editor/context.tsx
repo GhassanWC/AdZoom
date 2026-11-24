@@ -114,6 +114,7 @@ import { logFramevoEvent } from "@/lib/firebase/analytics";
 import { EVENTS } from "@/lib/analytics/events";
 import {
   enqueueProjectWrite,
+  enqueueProjectWriteOutcome,
   isAnalysisActive,
 } from "@/lib/firebase/project-writer";
 import { isProcessing } from "@/lib/analysis-stages";
@@ -567,6 +568,13 @@ interface EditorRealContextValue {
   canRetryFinishing: boolean;
   retryingFinishing: boolean;
   retryFinishing: () => Promise<void>;
+  /**
+   * The last project write was rejected after retries (validation, permission,
+   * size). The edit is still in the editor; `retrySave` resends the same write.
+   */
+  saveError: string | null;
+  retryingSave: boolean;
+  retrySave: () => Promise<boolean>;
   /** 0..1 progress of the client-side CV pass, or null when not scanning. */
   cvProgress: number | null;
   /** Local flag: user clicked "minimize" — keep the analysis running but hide the modal. */
@@ -991,6 +999,11 @@ export function EditorRealProvider({
   }, [project.sequence, project.assets, project.timelineRev]);
   const [finalizeRetryInfo, setFinalizeRetryInfo] = React.useState<FinalizeRetry | null>(null);
   const [retryingFinishing, setRetryingFinishing] = React.useState(false);
+  // A rejected project write (see writeSnapshot): message for the banner and
+  // the exact write to resend. Null while every save has landed.
+  const [saveError, setSaveError] = React.useState<string | null>(null);
+  const [retryingSave, setRetryingSave] = React.useState(false);
+  const lastFailedSaveRef = React.useRef<{ snap: EditorSnapshot; extra?: DocPatch } | null>(null);
   const applyChunkedResult = React.useCallback((result: ChunkedRunResult) => {
     setFinalizeRetryInfo(result.finalizeRetry ?? null);
     const degrade = finalizeDegradeText(result);
@@ -1527,11 +1540,21 @@ export function EditorRealProvider({
       // rapid commits don't both read the same document value.
       const rev = (timelineRevRef.current = Math.max(timelineRevRef.current, current.timelineRev ?? 0) + 1);
       snap.rev = rev;
-      await enqueueProjectWrite(
+      const outcome = await enqueueProjectWriteOutcome(
         current.id,
         "user-moments-write",
-        () =>
-          writeProject({
+        () => {
+          // Dev-only fault injection for the save-failure path (verification
+          // harness): `window.__framevoFailSaves = 3` rejects the next three
+          // attempts, which exhausts the queue's retries.
+          if (process.env.NODE_ENV !== "production" && typeof window !== "undefined") {
+            const w = window as unknown as { __framevoFailSaves?: number };
+            if ((w.__framevoFailSaves ?? 0) > 0) {
+              w.__framevoFailSaves = (w.__framevoFailSaves ?? 0) - 1;
+              return Promise.reject(new Error("Simulated save failure (dev hook)"));
+            }
+          }
+          return writeProject({
               analysis: stripUndefined({
                 ...(projectRef.current.analysis ?? {}),
                 detectedMoments: snap.moments,
@@ -1552,12 +1575,41 @@ export function EditorRealProvider({
               // the edit, so "applied" and "recorded" can never disagree.
               ...(extra ?? {}),
               updatedAt: serverTimestamp(),
-            }),
+            });
+        },
         coalesce ? { coalesceTag: "user-moments-write" } : undefined
       );
+      if (outcome.status === "failed") {
+        // The edit stays in the editor (refs/undo already hold it); the server
+        // does not have it. Keep the whole write so "Retry save" can resend it
+        // verbatim — including the assistant log entry it carries.
+        lastFailedSaveRef.current = { snap, extra };
+        const raw = outcome.error instanceof Error ? outcome.error.message : String(outcome.error);
+        setSaveError(`Your last change couldn't be saved (${raw.replace(/^FirebaseError:\s*/, "").slice(0, 160)}). It is still in the editor — retry, or it will be lost when you leave.`);
+        return false;
+      }
+      if (outcome.status === "completed") {
+        lastFailedSaveRef.current = null;
+        setSaveError(null);
+      }
+      // "skipped" = superseded by a newer full-snapshot write (coalesced drag),
+      // which carries this state too.
+      return true;
     },
     [writeProject]
   );
+
+  /** Resend the last rejected project write (same snapshot + log entry). */
+  const retrySave = React.useCallback(async (): Promise<boolean> => {
+    const last = lastFailedSaveRef.current;
+    if (!last) return true;
+    setRetryingSave(true);
+    try {
+      return await writeSnapshot(last.snap, false, last.extra);
+    } finally {
+      setRetryingSave(false);
+    }
+  }, [writeSnapshot]);
 
   // Group rapid successive edits (a single slider/colour drag) into ONE undo
   // step, so a drag doesn't evict 50 real edits from the bounded history.
@@ -1607,7 +1659,7 @@ export function EditorRealProvider({
       else next.sequence = sequenceRef.current;
       if (next.assets !== undefined) assetsRef.current = next.assets;
       else next.assets = assetsRef.current;
-      await writeSnapshot(next, opts?.coalesce, opts?.extra);
+      return writeSnapshot(next, opts?.coalesce, opts?.extra);
     },
     [writeSnapshot, syncLatestTag]
   );
@@ -1779,7 +1831,7 @@ export function EditorRealProvider({
         { moments: res.moments, sequence: res.sequence ?? sequenceRef.current ?? null, sourceDuration: current.duration || 0 }
       );
       const entry = entryFor(req.requestId, req.message, req.source, res.changes, Date.now(), diffLines);
-      await commitSnapshot(
+      const saved = await commitSnapshot(
         { moments: res.moments, layers: layersRef.current, ...(res.sequence ? { sequence: res.sequence, assets: res.assets ?? assetsRef.current } : {}) },
         {
           tag: req.requestId,
@@ -1797,7 +1849,11 @@ export function EditorRealProvider({
       }
       const touched = res.changes.find((c) => c.kind !== "removed" && c.effectType !== "cut" && c.effectType !== "clip" && c.effectType !== "audio-track" && c.effectType !== "asset");
       if (touched) setSelectedMomentId(touched.elementId);
-      return { status: "applied", entry, changes: res.changes, blocked: [...conflicts, ...res.errors] };
+      // `saved: false` = applied in the editor, rejected by the server. The
+      // request id stays in the applied set on purpose: the recovery is "Retry
+      // save" (resend the same write), never re-running the commands on top of
+      // a timeline that already contains them.
+      return { status: "applied", entry, changes: res.changes, blocked: [...conflicts, ...res.errors], saved, ...(saved ? {} : { saveError: "The project write was rejected." }) };
     },
     [commitSnapshot]
   );
@@ -3175,6 +3231,9 @@ export function EditorRealProvider({
     canRetryFinishing: !!finalizeRetryInfo,
     retryingFinishing,
     retryFinishing,
+    saveError,
+    retryingSave,
+    retrySave,
     sequenceMode: !!project.sequence,
     registerSequencePlayer,
     cvProgress,
@@ -3230,7 +3289,7 @@ export function EditorRealProvider({
       setRemoveSharingBar, applyPreset, clearSelectedPreset, startAnalyze,
       generateCaptions, retranscribe, deleteAiCaptions, saveDirectorBrief,
       cancelAnalyze, refineFraming, refiningFraming, analyzing, analyzeError,
-      finalizeRetryInfo, retryingFinishing, retryFinishing, registerSequencePlayer,
+      finalizeRetryInfo, retryingFinishing, retryFinishing, saveError, retryingSave, retrySave, registerSequencePlayer,
       cvProgress, processingMinimized, seek, togglePlay, seekBy, muted, volume,
       toggleMute, setPreviewVolume, isFullscreen, toggleFullscreen, undo, redo,
       canUndo, canRedo, selectedClipId, applyEditRequest, runCapability, addAsset, addingAsset, latestEditRequestId, assistantChat, aiSetupOpen,

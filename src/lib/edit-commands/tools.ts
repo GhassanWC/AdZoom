@@ -173,7 +173,7 @@ const BASE_TOOLS: readonly ToolDef[] = [
     name: "add_zoom",
     kind: "edit",
     description: "Zoom the camera into part of the frame for a source range.",
-    parameters: obj({ start: num("Source seconds."), end: num("Source seconds."), scale: num("1.1–4, default 1.6."), x: num("Focus centre 0..1 of width."), y: num("Focus centre 0..1 of height.") }, ["start", "end"]),
+    parameters: obj({ start: num("Source seconds (or seconds into clip_id when given)."), end: num("Source seconds (or seconds into clip_id)."), scale: num("1.1–4, default 1.6."), x: num("Focus centre 0..1 of width."), y: num("Focus centre 0..1 of height."), clip_id: str("Optional sequence item id from get_sequence — REQUIRED for a zoom on a freeze: start/end become seconds into that item and the zoom plays while the frame is held.") }, ["start", "end"]),
   },
   {
     name: "add_click_zooms",
@@ -196,7 +196,7 @@ const BASE_TOOLS: readonly ToolDef[] = [
           type: "array",
           description: "Beats in order. at = seconds into the move; x,y = focal centre 0..1; zoom = 1.0 (full frame) to 1.75; ease into the beat.",
           items: obj({ at: num("Seconds into the move."), x: num("0..1"), y: num("0..1"), zoom: num("1.0–1.75"), ease: { type: "string", enum: ["linear", "ease-in", "ease-out", "ease-in-out"] } }, ["at", "x", "y", "zoom"]),
-        }, element_id: str("Existing zoom to recompose (optional).") }, ["start", "end", "beats"]),
+        }, element_id: str("Existing zoom to recompose (optional)."), clip_id: str("Optional sequence item id (a freeze or clip): start/end are then seconds into that item — use it for a move on a held frame.") }, ["start", "end", "beats"]),
   },
   {
     name: "update_camera",
@@ -401,7 +401,7 @@ export function toolCallToCommand(name: string, args: Args): EditCommand | strin
       };
     }
     case "add_zoom":
-      return need(n(args, "start"), "start") ?? need(n(args, "end"), "end") ?? { op: "add_zoom", start: n(args, "start")!, end: n(args, "end")!, scale: n(args, "scale"), x: n(args, "x"), y: n(args, "y") };
+      return need(n(args, "start"), "start") ?? need(n(args, "end"), "end") ?? { op: "add_zoom", start: n(args, "start")!, end: n(args, "end")!, scale: n(args, "scale"), x: n(args, "x"), y: n(args, "y"), ...(s(args, "clip_id") ? { clipId: s(args, "clip_id") } : {}) };
     case "set_camera": {
       const e = need(n(args, "start"), "start") ?? need(n(args, "end"), "end");
       if (e) return e;
@@ -412,7 +412,7 @@ export function toolCallToCommand(name: string, args: Args): EditCommand | strin
           }))
         : [];
       if (!beats.length) return "Missing beats.";
-      return { op: "set_camera", start: n(args, "start")!, end: n(args, "end")!, beats, ...(s(args, "element_id") ? { elementId: s(args, "element_id") } : {}) };
+      return { op: "set_camera", start: n(args, "start")!, end: n(args, "end")!, beats, ...(s(args, "element_id") ? { elementId: s(args, "element_id") } : {}), ...(s(args, "clip_id") ? { clipId: s(args, "clip_id") } : {}) };
     }
     case "update_camera": {
       const id = s(args, "element_id");

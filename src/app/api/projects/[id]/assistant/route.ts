@@ -30,7 +30,8 @@ import { EVENTS } from "@/lib/analytics/events";
 import type { EffectLibraryEntry } from "@/lib/effects/library";
 import type { FoundEvent } from "@/lib/effects/assistant-tools";
 import { audioLockFromMessage, mergeMemory } from "@/lib/edit-commands/memory";
-import type { AssistantMemoryItem } from "@/lib/firebase/schema";
+import type { AssistantMemoryItem, EventMark } from "@/lib/firebase/schema";
+import { markId, mergeMarks, parseEventQuery } from "@/lib/effects/event-marks";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -72,6 +73,8 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     prepared?: unknown;
     /** Dev only: include the tool-call trace in the response. */
     debug?: unknown;
+    /** The user's pick among timestamped event candidates (kept as an EventMark). */
+    pick?: unknown;
   };
   try {
     body = await req.json();
@@ -380,7 +383,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
 
   // Events in the footage ("the ball crosses the goal line"), with where the
   // key object is at that instant. Watched in windows so long videos fit.
-  const events = async (query: string, assetId = "source"): Promise<FoundEvent[]> => {
+  const events = async (query: string, assetId = "source", offset = 0): Promise<FoundEvent[]> => {
     const v = await ensureVideo(assetId);
     const part =
       v.kind === "file"
@@ -389,17 +392,21 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     const dur = assetDurationOf(assetId) || digest.sourceDuration;
     const WINDOW = 45;
     const found: FoundEvent[] = [];
-    for (let s0 = 0; s0 < dur; s0 += WINDOW) {
+    // `offset` shifts the window grid (a second pass offset by half a window
+    // sees events that sit on the first grid's edges whole).
+    for (let s0 = offset > 0 ? offset - WINDOW : 0; s0 < dur; s0 += WINDOW) {
+      const w0 = Math.max(0, s0);
       const s1 = Math.min(dur, s0 + WINDOW);
+      if (s1 - w0 < 1) continue;
       const res = await getGemini().models.generateContent({
         model: ASSISTANT_MODEL,
         contents: [
           {
             role: "user",
             parts: [
-              { ...part, videoMetadata: { startOffset: `${s0.toFixed(2)}s`, endOffset: `${s1.toFixed(2)}s`, fps: 4 } } as never,
+              { ...part, videoMetadata: { startOffset: `${w0.toFixed(2)}s`, endOffset: `${s1.toFixed(2)}s`, fps: 5 } } as never,
               {
-                text: `This is seconds ${s0.toFixed(1)}–${s1.toFixed(1)} of a video. Find every occurrence of: ${JSON.stringify(query)}. For each, give the ABSOLUTE time in seconds of the full video at the exact instant it happens (e.g. the frame the ball crosses the line), where the key object (e.g. the ball) is at that instant as fractions of the frame (x from the left, y from the top, 0..1), one sentence describing it (say "replay" if it is a replay of an earlier moment), and your confidence 0..1. Return an empty list if it does not happen in this range.`,
+                text: `This is seconds ${w0.toFixed(1)}–${s1.toFixed(1)} of a video. Find every occurrence of: ${JSON.stringify(query)}. Include EVERY real occurrence, even quick ones (a shot that crosses the line in a few frames counts; the celebration afterwards is NOT the event — the instant is the crossing/impact itself). For each, give the ABSOLUTE time in seconds of the full video at the exact instant it happens (e.g. the frame the ball crosses the line), where the key object (e.g. the ball) is at that instant as fractions of the frame (x from the left, y from the top, 0..1), one sentence describing it (say "replay" if it is a replay of an earlier moment), and your confidence 0..1. Return an empty list if it does not happen in this range.`,
               },
             ],
           },
@@ -426,12 +433,95 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       const parsed = JSON.parse(res.text ?? "{}") as { events?: Record<string, unknown>[] };
       for (const e of parsed.events ?? []) {
         const time = Number(e.time), x = Number(e.x), y = Number(e.y);
-        if (![time, x, y].every(Number.isFinite) || time < s0 - 1 || time > s1 + 1) continue;
+        if (![time, x, y].every(Number.isFinite) || time < w0 - 1 || time > s1 + 1) continue;
         found.push({ time: Math.max(0, Math.min(dur, time)), x: Math.min(1, Math.max(0, x)), y: Math.min(1, Math.max(0, y)), description: String(e.description ?? "").slice(0, 200), confidence: Math.min(1, Math.max(0, Number(e.confidence) || 0)) });
       }
     }
     found.sort((a, b) => a.time - b.time);
     return found.filter((e, i) => i === 0 || e.time - found[i - 1].time > 1);
+  };
+
+  // Verify ONE candidate against the frames around it: does the event really
+  // happen there (not a replay, not a near miss), and at which exact instant?
+  const verifyEvent = async (query: string, time: number, assetId = "source") => {
+    const v = await ensureVideo(assetId);
+    const part =
+      v.kind === "file"
+        ? { fileData: { fileUri: v.uri, mimeType: v.mimeType } }
+        : { inlineData: { data: v.buffer.toString("base64"), mimeType: v.mimeType } };
+    const dur = assetDurationOf(assetId) || digest.sourceDuration;
+    const s0 = Math.max(0, time - 2);
+    // Scoring events: the window runs to +5 s so the score graphic's update is
+    // visible — a "goal" whose on-screen score does not change is a replay.
+    const scoring = /\b(goal|score[sd]?|scoring|point|basket|touchdown|try)\b/i.test(query);
+    const s1 = Math.min(dur, time + (scoring ? 5 : 2));
+    const res = await getGemini().models.generateContent({
+      model: ASSISTANT_MODEL,
+      contents: [
+        {
+          role: "user",
+          parts: [
+            { ...part, videoMetadata: { startOffset: `${s0.toFixed(2)}s`, endOffset: `${s1.toFixed(2)}s`, fps: 8 } } as never,
+            {
+              text: `These are seconds ${s0.toFixed(1)}–${s1.toFixed(1)} of a video, watched closely. An earlier pass suggested that ${JSON.stringify(query)} happens at about ${time.toFixed(1)}s. Verify it frame by frame: does the event ACTUALLY occur inside this window (not a near miss, not a build-up)? Decide whether this is the LIVE first showing or a REPLAY: a replay is a repeat from another camera angle or in slow motion, often with a replay graphic, and the on-screen score already counts the goal before the shot — set replay=true for those. Also read the on-screen score graphic (e.g. "ARG 1 - 0 CRO") at the START of the window and at the END of the window into scoreBefore/scoreAfter (empty string if no score graphic is visible). If yes, give the exact ABSOLUTE time in seconds of the decisive instant (e.g. the frame the ball crosses the line), the key object's position at that instant as fractions of the frame (x from the left, y from the top), one sentence of evidence, and your confidence 0..1. If it does not occur here, set happens=false.`,
+            },
+          ],
+        },
+      ],
+      config: {
+        temperature: 0.1,
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: { happens: { type: Type.BOOLEAN }, replay: { type: Type.BOOLEAN }, time: { type: Type.NUMBER }, x: { type: Type.NUMBER }, y: { type: Type.NUMBER }, evidence: { type: Type.STRING }, confidence: { type: Type.NUMBER }, scoreBefore: { type: Type.STRING }, scoreAfter: { type: Type.STRING } },
+          required: ["happens", "replay", "time", "x", "y", "evidence", "confidence", "scoreBefore", "scoreAfter"],
+        } as never,
+      },
+    });
+    const r = JSON.parse(res.text ?? "{}") as { happens?: unknown; replay?: unknown; time?: unknown; x?: unknown; y?: unknown; evidence?: unknown; confidence?: unknown; scoreBefore?: unknown; scoreAfter?: unknown };
+    const t = Number(r.time);
+    const norm = (v: unknown) => String(v ?? "").replace(/\s+/g, "").toUpperCase();
+    const before = norm(r.scoreBefore), after = norm(r.scoreAfter);
+    // A live scoring event changes the score graphic inside the window; an
+    // unchanged (readable) score means a replay or no goal at all.
+    const scoreSaysReplay = scoring && before !== "" && after !== "" && before === after;
+    // The score reading is kept as evidence only: in highlight reels the graphic
+    // often updates after the window, and rejecting on it dropped a real goal.
+    void scoreSaysReplay;
+    const ok = r.happens === true && r.replay !== true && Number.isFinite(t) && t >= s0 - 0.5 && t <= s1 + 0.5;
+    const c01 = (n: unknown) => Math.min(1, Math.max(0, Number(n) || 0));
+    return { ok, time: ok ? Math.max(0, Math.min(dur, t)) : time, x: c01(r.x), y: c01(r.y), evidence: String(r.evidence ?? "").slice(0, 160), confidence: Math.min(1, Math.max(0, Number(r.confidence) || 0)), scoreBefore: before, scoreAfter: after };
+  };
+
+  // Candidates from a pass over the whole asset, each verified in its own
+  // narrow window; replays and unconfirmed ones dropped; time order.
+  const locateLog: Record<string, unknown>[] = [];
+  const locateEvent = async (query: string, assetId = "source"): Promise<FoundEvent[]> => {
+    // Recall: two passes with windows offset by half a window, so an event
+    // near a window edge is seen whole by one of them; union by time.
+    const [a, b] = await Promise.all([events(query, assetId, 0), events(query, assetId, 22.5)]);
+    const raw = [...a, ...b].sort((x, y) => x.time - y.time).filter((e, i, arr) => i === 0 || e.time - arr[i - 1].time > 1);
+    locateLog.push({ query, assetId, candidates: raw.map((e) => ({ time: Math.round(e.time * 10) / 10, confidence: e.confidence, description: e.description.slice(0, 60) })) });
+    // The first pass labels replays ("replay of the first goal") — they are
+    // not occurrences, and counting them would make "the second goal" land on
+    // a replay of the first. Drop them before the close look.
+    const live = raw.filter((e) => !/(replay|slow[- ]?motion|slo-?mo|repeat(?:ed)?|again|another angle|different angle)/i.test(e.description));
+    locateLog.push({ droppedAsReplay: raw.filter((e) => !live.includes(e)).map((e) => e.time) });
+    const top = [...live].sort((x, y) => y.confidence - x.confidence).slice(0, 6);
+    const verified: FoundEvent[] = [];
+    for (const cand of top) {
+      const v = await verifyEvent(query, cand.time, assetId);
+      locateLog.push({ verify: cand.time, ok: v.ok, time: Math.round(v.time * 100) / 100, confidence: v.confidence, score: `${v.scoreBefore}→${v.scoreAfter}`, evidence: v.evidence.slice(0, 80) });
+      console.info("[assistant] locate_event verify", { query, candidate: cand.time, ok: v.ok, time: v.time, confidence: v.confidence });
+      if (!v.ok || v.confidence < 0.5) continue;
+      verified.push({ time: v.time, x: v.x || cand.x, y: v.y || cand.y, description: v.evidence || cand.description, confidence: v.confidence });
+    }
+    verified.sort((x, y) => x.time - y.time);
+    const distinct = verified.filter((e, i) => i === 0 || e.time - verified[i - 1].time > 1.5);
+    // No automatic replay clustering: a highlights reel can hold two real goals
+    // 13 s apart. Close candidates make the ordinal AMBIGUOUS instead (the tool
+    // then offers them to the user) — see locate_event in assistant-tools.
+    return distinct;
   };
 
   // Where one element is, ~4×/s across a short window (an effect that follows the ball).
@@ -484,12 +574,31 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     await ref.set({ assistantMemory: memory }, { merge: true });
   }
 
+  // The user picked one of the timestamped candidates we offered: keep it as a
+  // USER mark before the model runs, so locate_event resolves to it (now and
+  // for every later revision or reuse of "that goal").
+  let eventMarks: EventMark[] = project.eventMarks ?? [];
+  const pickRaw = body.pick && typeof body.pick === "object" ? (body.pick as { query?: unknown; ordinal?: unknown; time?: unknown; x?: unknown; y?: unknown; assetId?: unknown; label?: unknown }) : null;
+  if (pickRaw && typeof pickRaw.query === "string" && Number.isFinite(Number(pickRaw.time))) {
+    const { query: q, ordinal: parsedOrd } = parseEventQuery(pickRaw.query);
+    const ordinal = typeof pickRaw.ordinal === "number" ? pickRaw.ordinal : parsedOrd;
+    const time = Number(pickRaw.time);
+    const assetId = typeof pickRaw.assetId === "string" && pickRaw.assetId ? pickRaw.assetId : "source";
+    const mark: EventMark = { id: markId(q, time), query: q, ...(ordinal != null ? { ordinal } : {}), time, x: Math.min(1, Math.max(0, Number(pickRaw.x) || 0.5)), y: Math.min(1, Math.max(0, Number(pickRaw.y) || 0.5)), assetId, source: "user", label: typeof pickRaw.label === "string" ? pickRaw.label.slice(0, 120) : "", at: Date.now() };
+    eventMarks = mergeMarks(eventMarks, [mark]);
+    await ref.set({ eventMarks }, { merge: true });
+  }
+
   const started = Date.now();
   try {
     const prepared = Array.isArray(body.prepared) ? body.prepared.filter((x): x is string => typeof x === "string").slice(0, 5) : [];
     const debug = body.debug === true && process.env.NODE_ENV !== "production";
-    const full = await runGeminiAssistant({ message, requestId, digest, project, inspect, locate, survey, prepared, debug, library, events, track, memory });
+    const full = await runGeminiAssistant({ message, requestId, digest, project, inspect, locate, survey, prepared, debug, library, events, locateEvent, track, memory, eventMarks });
     const { sideEffects, ...result } = full;
+    console.info("[assistant] turn", { requestId, kind: result.kind, tools: result.toolsUsed ?? [] });
+    if (sideEffects?.eventMarks.length) {
+      await ref.set({ eventMarks: mergeMarks(eventMarks, sideEffects.eventMarks) }, { merge: true });
+    }
     // Persist what the turn produced. Ids/versions derive from the request id,
     // so a retried request rewrites the same records (no duplicates).
     if (sideEffects?.library.length) {
@@ -512,7 +621,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
         model: result.model,
       },
     });
-    return NextResponse.json({ ...result, ...(libraryChanges.length ? { libraryChanges } : {}) });
+    return NextResponse.json({ ...result, ...(libraryChanges.length ? { libraryChanges } : {}), ...(debug && locateLog.length ? { locateLog } : {}) });
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
     console.error("[assistant] model turn failed:", detail);

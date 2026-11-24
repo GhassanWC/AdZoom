@@ -17,7 +17,7 @@
  * cut tick — the same rule `buildTimelineMap` applies to legacy cuts.
  */
 
-import type { DetectedMoment } from "@/lib/firebase/schema";
+import { isOverlayEffectType, type DetectedMoment } from "@/lib/firebase/schema";
 import {
   DEFAULT_FREEZE_SECONDS,
   SOURCE_ASSET_ID,
@@ -113,8 +113,56 @@ export interface FrameEval {
   plateColor: string | null;
   transition: { kind: "dissolve" | "dip"; progress: number; fromItemId: string; toItemId: string } | null;
   overlays: EvalOverlay[];
-  camera: { assetId: string; sourceTime: number; moments: DetectedMoment[] } | null;
+  /**
+   * Camera inputs for the dominant layer. `moments` are its asset's
+   * source-anchored camera moments at `sourceTime`; `itemMoments` are camera
+   * moments anchored to the item itself, evaluated at `localTime` (seconds
+   * since the item's cut) — the only way a zoom can progress over a FREEZE,
+   * whose source time never moves. See cameraForLayer.
+   */
+  camera: { assetId: string; sourceTime: number; moments: DetectedMoment[]; itemMoments: DetectedMoment[]; localTime: number } | null;
   audio: EvalAudioStem[];
+}
+
+// Camera moment lists are cached per moments-array identity: camera.ts keys
+// its schedule cache on the ARRAY, so a fresh filter() per frame would miss
+// every time and rebuild the schedule for every frame of an export.
+const cameraListCache = new WeakMap<DetectedMoment[], Map<string, DetectedMoment[]>>();
+function cachedList(moments: DetectedMoment[], key: string, build: () => DetectedMoment[]): DetectedMoment[] {
+  let byKey = cameraListCache.get(moments);
+  if (!byKey) cameraListCache.set(moments, (byKey = new Map()));
+  let list = byKey.get(key);
+  if (!list) byKey.set(key, (list = build()));
+  return list;
+}
+
+/** Source-anchored camera moments of one asset (stable identity per moments array). */
+export function sourceCameraMoments(moments: DetectedMoment[], assetId: string): DetectedMoment[] {
+  return cachedList(moments, `source:${assetId}`, () => moments.filter((m) => anchorOf(m).kind === "source" && momentAsset(m) === assetId));
+}
+
+/** Camera moments anchored to one sequence item (zooms placed ON a freeze or clip, in item-local seconds). */
+export function itemCameraMoments(moments: DetectedMoment[], itemId: string): DetectedMoment[] {
+  return cachedList(moments, `item:${itemId}`, () =>
+    moments.filter((m) => {
+      const a = anchorOf(m);
+      return a.kind === "item" && a.itemId === itemId && m.enabled !== false && !isOverlayEffectType(m.effectType);
+    })
+  );
+}
+
+/**
+ * Which camera moments frame a layer, and the time to resolve them at. Item-
+ * anchored camera moments win when the item has any: they run on elapsed
+ * output time within the item, so the background frame of a freeze stays
+ * fixed while the zoom progresses, and the clip after the freeze falls back to
+ * its own source-anchored camera from its first frame. Shared by every
+ * renderer (preview, in-browser export, worker) through composeEvaluatedFrame.
+ */
+export function cameraForLayer(moments: DetectedMoment[], layer: EvalLayer): { moments: DetectedMoment[]; t: number; base: "item" | "source" } {
+  const item = itemCameraMoments(moments, layer.itemId);
+  if (item.length) return { moments: item, t: layer.localTime, base: "item" };
+  return { moments: sourceCameraMoments(moments, layer.assetId), t: layer.sourceTime, base: "source" };
 }
 
 // ── resolution ──────────────────────────────────────────────────────────────
@@ -344,12 +392,15 @@ export function evaluateTimeline(rev: TimelineRevision, outputTime: number): Fra
   }
   void dominantLaid;
 
-  // Camera: source-anchored camera moments of the dominant layer's asset.
+  // Camera: the dominant layer's source-anchored camera moments plus any
+  // anchored to the item itself (see cameraForLayer for which one applies).
   const camera = dominant
     ? {
         assetId: dominant.assetId,
         sourceTime: dominant.sourceTime,
-        moments: rev.moments.filter((m) => anchorOf(m).kind === "source" && momentAsset(m) === dominant.assetId),
+        moments: sourceCameraMoments(rev.moments, dominant.assetId),
+        itemMoments: itemCameraMoments(rev.moments, dominant.itemId),
+        localTime: dominant.localTime,
       }
     : null;
 

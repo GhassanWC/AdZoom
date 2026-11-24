@@ -11,7 +11,7 @@
  * Pure (no React) — tested in tests/edit-commands-chat.test.ts.
  */
 
-import type { AssistantLogEntry, ProjectDoc } from "@/lib/firebase/schema";
+import type { AssistantLogEntry, EventCandidate, ProjectDoc } from "@/lib/firebase/schema";
 import type { EditError } from "./types";
 import type { FootageNeed } from "./parse";
 
@@ -35,6 +35,19 @@ export interface ChatMessage {
   notes?: string[];
   /** Candidate answers — clicking one fills the message box. */
   options?: string[];
+  /**
+   * Timestamped moments the user can pick (an ambiguous visual event). Picking
+   * one seeks the preview there and re-sends `pickFor` with the choice, which
+   * the project keeps as an event mark.
+   */
+  candidates?: EventCandidate[];
+  pickFor?: string;
+  /**
+   * On an edit: whether the project write that carries it succeeded. An edit
+   * is APPLIED the moment it shows; it is SAVED only when Firestore accepted
+   * the write. `failed` renders "Not saved · Retry" instead of a quiet check.
+   */
+  save?: "saved" | "failed";
 }
 
 const SCREEN_TYPES = new Set(["screen-recording", "product-demo", "tutorial"]);

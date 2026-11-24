@@ -28,6 +28,7 @@
  */
 
 import * as React from "react";
+import type { EventCandidate } from "@/lib/firebase/schema";
 import { createPortal } from "react-dom";
 import { AlertTriangle, ArrowUp, Check, Crosshair, ListChecks, Loader2, Undo2, Wrench, X, Zap } from "lucide-react";
 import { cn } from "@/lib/cn";
@@ -92,6 +93,7 @@ export function DirectorChatPanel({
     cloudAvailable,
     assistantChat: messages,
     setAssistantChat: setMessages,
+    retrySave,
     updateEffects,
     clearOutputCanvas,
   } = useEditorReal();
@@ -169,11 +171,16 @@ export function DirectorChatPanel({
     return tool ? `Opened ${tool.label}.` : "Opened it.";
   };
 
+  // A picked event candidate travels with the NEXT send of the same command.
+  const pickRef = React.useRef<EventCandidate | null>(null);
   const send = async (raw: string, retryRequestId?: string) => {
     const command = raw.trim();
     if (!command || busy) return;
     setDraft("");
-    if (!retryRequestId) push({ role: "user", kind: "text", text: command });
+    const pick = pickRef.current;
+    pickRef.current = null;
+    if (!retryRequestId && !pick) push({ role: "user", kind: "text", text: command });
+    if (pick) push({ role: "user", kind: "text", text: `${pick.label} — ${command}` });
     setBusy(true);
     // ONE id per user request, reused by Retry — a retry can never apply twice.
     const requestId = retryRequestId ?? newRequestId();
@@ -210,6 +217,9 @@ export function DirectorChatPanel({
           edit: out.entry,
           blocked: blockedLines(out.blocked, prepFailures),
           notes: [...prepNotes, ...notes],
+          // Applied ≠ saved: a rejected write shows "Not saved · Retry" on the
+          // bubble (and the editor banner) instead of a quiet green check.
+          save: out.saved ? "saved" : "failed",
         });
         // A visual change is SHOWN, not just described: replay the section from
         // just before it, so the follow-up question is about what they just saw.
@@ -283,21 +293,22 @@ export function DirectorChatPanel({
         trackAssistantRequest({ source: "none", outcome: "failed" }, project.id);
         return;
       }
-      let turn = await assistant.askModel(command, requestId, prepared);
+      let turn = await assistant.askModel(command, requestId, prepared, pick ?? undefined);
       for (let i = 0; i < 2 && turn.kind === "prepare"; i++) {
         await runPrep(turn.needs);
-        turn = await assistant.askModel(command, requestId, prepared);
+        turn = await assistant.askModel(command, requestId, prepared, pick ?? undefined);
       }
+      const toolNote = (turn.kind === "commands" || turn.kind === "reply" || turn.kind === "question") && turn.toolsUsed?.length ? [`Looked with: ${[...new Set(turn.toolsUsed)].join(", ")}.`] : [];
       const saved = (turn.kind === "commands" || turn.kind === "reply") && turn.libraryChanges?.length
         ? [`Effect library: ${turn.libraryChanges.map((c) => `${c.name} v${c.version}`).join(", ")}.`]
         : [];
       if (turn.kind === "commands") {
-        await applyAndReport("model", turn.commands, [...(turn.reply ? [turn.reply] : []), ...saved]);
+        await applyAndReport("model", turn.commands, [...(turn.reply ? [turn.reply] : []), ...saved, ...toolNote]);
         return;
       }
       clearProgress();
       if (turn.kind === "question") {
-        push({ role: "assistant", kind: "text", text: turn.question, options: turn.options });
+        push({ role: "assistant", kind: "text", text: turn.question, options: turn.candidates?.length ? undefined : turn.options, ...(turn.candidates?.length ? { candidates: turn.candidates, pickFor: command } : {}) });
         trackAssistantRequest({ source: "model", outcome: "question", latencyMs: msSince(t0) }, project.id);
       } else if (turn.kind === "reply") {
         const blocked = blockedLines([], prepFailures);
@@ -411,6 +422,15 @@ export function DirectorChatPanel({
               entry={m.edit}
               blocked={m.blocked}
               notes={m.notes}
+              save={m.save}
+              onRetrySave={
+                m.save === "failed"
+                  ? async () => {
+                      const ok = await retrySave();
+                      if (ok) setMessages((prev) => prev.map((x) => (x.id === m.id ? { ...x, save: "saved" } : x)));
+                    }
+                  : undefined
+              }
               onShow={() => showEdit(m.edit!)}
               onUndo={latestEditRequestId === m.edit.requestId && !busy ? undoEdit : undefined}
             />
@@ -424,6 +444,28 @@ export function DirectorChatPanel({
           ) : (
             <React.Fragment key={m.id}>
               {m.text && <TextBubble text={m.text} warn={m.kind === "blocked"} />}
+              {m.candidates && m.candidates.length > 0 && (
+                <div className="flex flex-wrap gap-1.5 pl-1" data-testid="assistant-candidates">
+                  {m.candidates.map((c) => (
+                    <button
+                      key={c.id}
+                      type="button"
+                      data-testid="assistant-candidate"
+                      data-time={c.time}
+                      disabled={busy}
+                      title="Show this moment and use it"
+                      onClick={() => {
+                        seek(Math.max(0, c.time - 0.5));
+                        pickRef.current = c;
+                        void send(m.pickFor ?? "", undefined);
+                      }}
+                      className="max-w-full truncate rounded-full border border-violet-400/30 bg-violet-400/[0.08] px-2.5 py-1 text-left text-[11.5px] text-violet-100 transition-colors hover:border-violet-300/60 hover:text-white disabled:opacity-60"
+                    >
+                      {c.label}
+                    </button>
+                  ))}
+                </div>
+              )}
               {m.options && m.options.length > 0 && (
                 <div className="flex flex-wrap gap-1.5 pl-1">
                   {m.options.map((o) => (
@@ -677,17 +719,33 @@ function EditBubble({
   entry,
   blocked = [],
   notes = [],
+  save,
+  onRetrySave,
   onShow,
   onUndo,
 }: {
   entry: AssistantLogEntry;
   blocked?: string[];
   notes?: string[];
+  /** Undefined for entries read back from the project document (saved by definition). */
+  save?: "saved" | "failed";
+  onRetrySave?: () => void | Promise<void>;
   onShow: () => void;
   onUndo?: () => void;
 }) {
   return (
-    <div className="rounded-2xl rounded-bl-md border border-white/[0.07] bg-white/[0.03] px-3 py-2.5" data-testid="assistant-edit" data-request-id={entry.requestId}>
+    <div className="rounded-2xl rounded-bl-md border border-white/[0.07] bg-white/[0.03] px-3 py-2.5" data-testid="assistant-edit" data-request-id={entry.requestId} data-save={save ?? "saved"}>
+      {save === "failed" && (
+        <p className="mb-1.5 flex items-center gap-1.5 text-[11.5px] leading-relaxed text-amber-100" data-testid="assistant-edit-unsaved">
+          <AlertTriangle size={12} className="shrink-0 text-amber-300" />
+          Applied in the editor, but not saved — the server rejected the write.
+          {onRetrySave && (
+            <button type="button" onClick={() => void onRetrySave()} data-testid="assistant-edit-retry-save" className="ml-1 rounded-md border border-amber-300/40 bg-amber-400/10 px-1.5 py-0.5 text-[11px] font-semibold text-amber-50 transition-colors hover:bg-amber-400/20">
+              Retry save
+            </button>
+          )}
+        </p>
+      )}
       <ul className="space-y-1 text-white/90">
         {entry.lines.map((line, i) => (
           <li key={i} className="flex gap-2 text-[12.5px] leading-relaxed">
@@ -711,6 +769,11 @@ function EditBubble({
           </button>
         )}
         <span className="ml-auto" />
+        {save === "saved" && (
+          <span className="mr-1 text-[10.5px] text-fog/70" data-testid="assistant-edit-saved">
+            Saved
+          </span>
+        )}
         {onUndo && (
           <button type="button" onClick={onUndo} className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] text-fog transition-colors hover:text-white">
             <Undo2 size={11} />

@@ -49,13 +49,18 @@ export type EditCommand =
       backgroundColor?: string;
       animation?: EntranceAnimation;
     }
-  | { op: "add_zoom"; start: number; end: number; scale?: number; x?: number; y?: number }
+  /**
+   * `clipId` (sequence projects): anchor the zoom to that item — `start`/`end`
+   * are then seconds INTO the item. The way to put a zoom on a FREEZE: the
+   * held frame stays fixed while the zoom progresses over the hold.
+   */
+  | { op: "add_zoom"; start: number; end: number; scale?: number; x?: number; y?: number; clipId?: string }
   /**
    * A composed camera move: beats in viewer terms (seconds into the move,
    * focal centre, zoom factor, easing). `elementId` replaces an existing zoom's
    * move instead of adding one. See edit-commands/camera.ts.
    */
-  | { op: "set_camera"; start: number; end: number; beats: import("./camera").CameraBeat[]; elementId?: string }
+  | { op: "set_camera"; start: number; end: number; beats: import("./camera").CameraBeat[]; elementId?: string; clipId?: string }
   /** Targeted camera revisions — each touches only the property named. */
   | { op: "update_camera"; elementId: string; slower?: boolean; faster?: boolean; holdSeconds?: number; zoom?: number }
   /**
@@ -85,7 +90,7 @@ export type EditCommand =
    * exact library version and its program (resolved server-side), this use's
    * params and its footage anchors. See src/lib/effects.
    */
-  | { op: "add_effect"; at: number; fx: import("@/lib/firebase/schema").FxSettings }
+  | { op: "add_effect"; at: number; fx: import("@/lib/firebase/schema").FxSettings; clipId?: string }
   /**
    * Revise ONE effect instance: `params` changes only the named settings
    * ("make the sparks fade faster"); `program` swaps in a new library version
@@ -100,6 +105,8 @@ export type EditCommand =
       anchor?: { x: number; y: number };
       /** Retime this use: play the whole effect over this many seconds (slower/faster drawing). */
       duration?: number;
+      /** With `at`: anchor this use to a sequence item (freeze/clip); `at` is then seconds into it. */
+      clipId?: string;
     }
   | { op: "add_transition"; at: number; style?: "fade" | "zoom" | "swipe" | "flash" | "smooth_cut"; duration?: number }
   /** One zoom per detected click (EditState.clicks), framed on the click. */
@@ -257,6 +264,13 @@ export type EditRequestOutcome =
       changes: EditChange[];
       /** Parts that were blocked (partial requests). */
       blocked: EditError[];
+      /**
+       * Applied is not saved: the edit is in the editor, but the project write
+       * may have been rejected (`saved: false`). The editor keeps the local state
+       * and offers "Retry save"; the chat must not present it as done.
+       */
+      saved: boolean;
+      saveError?: string;
     }
   /** Already applied (a retry) — nothing changed. */
   | { status: "duplicate"; entry: import("@/lib/firebase/schema").AssistantLogEntry | null }

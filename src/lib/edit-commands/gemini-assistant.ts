@@ -20,7 +20,7 @@ import { EDIT_TOOLS, TOOL_KIND, toolCallToCommand } from "./tools";
 import { executeReadTool, type ReadToolContext } from "./read-tools";
 import type { AssistantDigest } from "./context";
 import type { EditCommand } from "./types";
-import type { AssistantMemoryItem } from "@/lib/firebase/schema";
+import type { AssistantMemoryItem, EventCandidate, EventMark } from "@/lib/firebase/schema";
 import { FX_TOOLS, FX_TOOL_NAMES, handleFxTool, type FoundEvent, type FxToolContext } from "@/lib/effects/assistant-tools";
 import type { EffectLibraryEntry } from "@/lib/effects/library";
 import { FX_DOCS } from "@/lib/effects/docs";
@@ -39,7 +39,7 @@ export interface ToolTrace {
 export type AssistantResponse = (
   | { kind: "commands"; commands: EditCommand[]; reply: string | null; model: string }
   | { kind: "prepare"; needs: ("transcript" | "clicks" | "pauses")[]; model: string }
-  | { kind: "question"; question: string; options: string[]; model: string }
+  | { kind: "question"; question: string; options: string[]; model: string; candidates?: EventCandidate[] }
   | { kind: "reply"; reply: string; model: string }
 ) & {
   trace?: ToolTrace[];
@@ -48,7 +48,9 @@ export type AssistantResponse = (
    * (never sent to the client as-is). Present whatever the response kind: a
    * "save this look" turn changes the library without touching the timeline.
    */
-  sideEffects?: { library: EffectLibraryEntry[]; memory: AssistantMemoryItem[] };
+  sideEffects?: { library: EffectLibraryEntry[]; memory: AssistantMemoryItem[]; eventMarks: EventMark[] };
+  /** Names of every tool the model called this turn (read + edit), in order. */
+  toolsUsed?: string[];
 };
 
 const SYSTEM = `You are Framevo's video editor. The user is the director: they control story, tone, pacing and which footage is used. You carry out their requests precisely and use professional editorial judgment only for details they leave to you.
@@ -87,6 +89,7 @@ Creative-brief playbook (a brief names a feel — "calm menu walkthrough", "prem
 Footage operations (the sequence):
 - Clips, frozen frames, speed, fades, transitions and audio are SEQUENCE capabilities (get_capabilities lists them with exact semantics). Call get_sequence first: it returns the clip ids every capability takes, in playback order, with sequence (output) seconds and asset seconds.
 - A FREEZE is a footage edit: freeze_frame holds one exact frame while time and overlays keep moving. Never substitute a longer graphic, a slowed clip or a repeated frame for a requested freeze; if freeze_frame fails, report its exact reason.
+- Motion ON a freeze: a zoom, camera move or effect that should play WHILE the picture is held must be anchored to the freeze item — pass clip_id = the freeze's id from get_sequence to add_zoom / set_camera / create_effect / apply_effect, with start/end/at as seconds INTO the hold (0 = the first held frame). Source seconds cannot progress during a hold, so a source-time zoom there would stand still. The clip after the freeze keeps its own camera. When you create the freeze in the same turn, its id is in the freeze_frame tool result ("New sequence ids this turn") — use it right away; never tell the user an id is "not yet available".
 - Slow motion is set_clip_speed with rate < 1 (0.25 = quarter speed); a ramp uses ramp_from_rate/ramp_to_rate between two points in the clip. Picture and linked audio retime together; pitch: preserve keeps voices natural.
 - Transitions need handle media on both sides; set_transition reports the maximum feasible duration — use it or trim, never fake a dissolve with an overlay.
 - Several assets: list_assets shows what is available ("source" is the upload). A description of what is SEEN ("the orange shot", "the wide angle") may be another asset: survey_footage / inspect_footage / find_events / locate_elements take asset_id — look at every asset the sequence uses before saying something isn't there. insert_clip adds footage; replace_source with picture_only=true swaps the picture and keeps the original sound (B-roll); add_audio_track lays music/narration with duck_amount so it drops under speech; detach_audio frees a clip's sound from its picture.
@@ -94,11 +97,11 @@ Footage operations (the sequence):
 
 Original effects — the user is the director, you are the editor:
 - When a request calls for a look the standard edits can't produce (a ripple from the ball, sparks, a light sweep, a custom burst), author an EFFECT PROGRAM. First list_effects: reuse a library effect that matches (apply_effect), adapt a close one (update_effect with params or a new program version), and create only when nothing fits. "Create something new" / "something original" means create_effect with distinct=true — never reuse then.
-- Ground it in the footage: find_events for the moment ("the ball crosses the goal line"), then locate_elements at that exact time for the subject ("the ball") and anchor at its cx/cy. Use the event time as at. If the subject moves fast during the effect, track_element and pass track_json.
+- Ground it in the footage: EVERY request tied to a moment in the footage (a goal, a hit, a save, a reveal, "when X happens") starts with locate_event — even when eventMarks already exist (it returns known marks instantly and tells you when the user must choose). Never place on an event from memory or from locate_elements alone. locate_event for the moment ("the first goal", "the ball hits the net") — it verifies candidates against nearby frames and remembers the user's choice. status unique → use its time as at, then locate_elements at that exact time for the subject ("the ball") and anchor at its cx/cy. status ambiguous → call ask_user with EXACTLY the options it returned and stop (the user picks a timestamped moment; your next turn gets it as a unique event). status none → ask_user for the time; never guess an instant. find_events is only for listing every occurrence, not for placement. If the subject moves fast during the effect, track_element and pass track_json.
 - Expose every property the user may revise as a param, one per part (rippleSpeed, rippleColor, sparkDecay, sparkCount-like spread…), so revisions never regenerate the effect.
 - Revisions change only what was named: "make only the sparks fade faster" = get_effects, then update_effect with params_json {"<the spark decay param>": a clearly faster value} — the ripple's params, the timing and the anchor stay exactly as they are.
-- "Save this look as X" = save_effect on that instance (its current settings become X's defaults). "Use it on the second goal" = find_events for that goal, locate the ball there, apply_effect effect="X" at that time — never re-create it.
-- Respect the project memory below. When the user states a standing rule ("keep the commentary") or approves something ("I like the ripple"), call remember. Effects never touch the soundtrack; with the commentary locked, never cut, trim or retime footage.
+- "Save this look as X" = save_effect on that instance (its current settings become X's defaults). "Use it on the second goal" = locate_event "the second goal" (ordinals are resolved in time order and kept), locate the ball there, apply_effect effect="X" at that time — never re-create it. Revisions of an effect keep its time.
+- Respect the project memory below. When the user states a standing rule ("keep the commentary") or approves something ("I like the ripple"), call remember. An audio rule ("keep the original sound / commentary") constrains ONLY operations that change the soundtrack: cuts, trims, deletes, speed changes, mutes, freezes that silence it. It never blocks reordering a clip (its sound moves with it), picture-only replacement (replace_source picture_only=true keeps the sound), detaching audio, effects, zooms, graphics or captions — do those without hesitation; the executor enforces the lock precisely and reports anything it holds back. "…but keep its original sound" inside a picture-only request is an instruction for THAT edit, not a standing rule.
 
 ${FX_DOCS}`;
 
@@ -127,8 +130,10 @@ export async function runGeminiAssistant(input: {
   /** The user's effect library (loaded by the route). */
   library?: EffectLibraryEntry[];
   events?: (query: string) => Promise<FoundEvent[]>;
+  locateEvent?: FxToolContext["locateEvent"];
   track?: FxToolContext["track"];
   memory?: AssistantMemoryItem[];
+  eventMarks?: EventMark[];
 }): Promise<AssistantResponse> {
   const trace: ToolTrace[] = [];
   // Effect library + memory, staged for the turn (see effects/assistant-tools).
@@ -144,11 +149,17 @@ export async function runGeminiAssistant(input: {
     memoryWrites: [],
     now: Date.now(),
     seq: { create: 0 },
+    locateEvent: input.locateEvent,
+    eventMarks: [...(input.eventMarks ?? [])],
+    eventMarkWrites: [],
+    lastCandidates: null,
   };
+  const toolsUsed: string[] = [];
   const traced = (r: AssistantResponse): AssistantResponse => ({
     ...r,
     ...(input.debug ? { trace } : {}),
-    sideEffects: { library: [...fxCtx.writes.values()], memory: fxCtx.memoryWrites },
+    sideEffects: { library: [...fxCtx.writes.values()], memory: fxCtx.memoryWrites, eventMarks: fxCtx.eventMarkWrites },
+    toolsUsed: [...toolsUsed],
   });
   const ai = getGemini();
   const model = ASSISTANT_MODEL;
@@ -172,6 +183,7 @@ export async function runGeminiAssistant(input: {
             sourceDuration: input.digest.sourceDuration,
             outputDuration: input.digest.outputDuration,
             projectMemory: (input.memory ?? []).map((m) => ({ kind: m.kind, text: m.text })),
+            eventMarks: (input.eventMarks ?? []).map((m) => ({ query: m.query, ...(m.ordinal != null ? { ordinal: m.ordinal } : {}), time: m.time, source: m.source, label: m.label })),
             effectLibrary: (input.library ?? []).map((e) => e.name),
             effectsOnTimeline: (input.project.analysis?.detectedMoments ?? []).filter((m) => m.effectType === "fx").length,
           })}${input.prepared?.length ? `\nAlready prepared for this request: ${input.prepared.join(", ")} (do not prepare these again).` : ""}\n\nRequest: ${input.message}`,
@@ -207,12 +219,18 @@ export async function runGeminiAssistant(input: {
     return dry.ok ? dry.moments : state.moments;
   };
   let lastText = "";
-  const finishWith = (): AssistantResponse =>
-    traced(
-      accepted.length
-        ? { kind: "commands", commands: accepted, reply: lastText || null, model }
-        : { kind: "reply", reply: lastText || "I'm not sure what to change — can you say it another way?", model }
-    );
+  const finishWith = (): AssistantResponse => {
+    if (accepted.length) return traced({ kind: "commands", commands: accepted, reply: lastText || null, model });
+    // locate_event was ambiguous and the model wrote the choice out as prose
+    // instead of calling ask_user: the user still gets pickable, timestamped
+    // candidates (the structured path is what persists the choice).
+    const cands = fxCtx.lastCandidates;
+    if (cands?.length) {
+      toolsUsed.push("ask_user");
+      return traced({ kind: "question", question: lastText || "Which moment do you mean?", options: cands.map((c) => c.label), candidates: cands, model });
+    }
+    return traced({ kind: "reply", reply: lastText || "I'm not sure what to change — can you say it another way?", model });
+  };
 
   for (let round = 0; round < MAX_ROUNDS; round++) {
     const res = await ai.models.generateContent({
@@ -256,10 +274,15 @@ export async function runGeminiAssistant(input: {
     const ask = calls.find((c) => c.name === "ask_user");
     if (ask && accepted.length === 0) {
       const a = (ask.args ?? {}) as { question?: unknown; options?: unknown };
+      toolsUsed.push("ask_user");
+      // An ambiguous locate_event hands its timestamped candidates to the user
+      // as pickable moments (the picked one comes back as `pick` and is kept).
+      const cands = fxCtx.lastCandidates;
       return traced({
         kind: "question",
         question: typeof a.question === "string" ? a.question : "Can you tell me a bit more?",
-        options: Array.isArray(a.options) ? a.options.filter((o): o is string => typeof o === "string").slice(0, 6) : [],
+        options: cands ? cands.map((c) => c.label) : Array.isArray(a.options) ? a.options.filter((o): o is string => typeof o === "string").slice(0, 6) : [],
+        ...(cands ? { candidates: cands } : {}),
         model,
       });
     }
@@ -270,6 +293,7 @@ export async function runGeminiAssistant(input: {
       const name = call.name ?? "";
       const args = (call.args ?? {}) as Record<string, unknown>;
       const kind = TOOL_KIND.get(name);
+      toolsUsed.push(name);
       if (FX_TOOL_NAMES.has(name)) {
         const r = await handleFxTool(name, args, fxCtx);
         if (r.kind === "command") {
@@ -306,6 +330,11 @@ export async function runGeminiAssistant(input: {
       const failed = new Map<number, string>();
       const errors = dry.ok ? dry.errors : dry.errors;
       for (const e of errors) failed.set(e.commandIndex, `${e.code}: ${e.message}`);
+      // Ids minted this turn (a freeze just created, a new clip) — the model
+      // needs them for a follow-up call in the SAME turn ("zoom in on it while
+      // it is frozen" → add_zoom clip_id=<the new freeze>).
+      const created = (dry.ok ? dry.changes : []).filter((c) => c.kind === "added" && (c.effectType === "clip" || c.effectType === "audio-track")).map((c) => `${c.elementId} (${c.summary})`);
+      const createdNote = created.length ? ` New sequence ids this turn: ${created.join("; ")} — use them as clip_id where the plan continues on them.` : "";
       batch.forEach((b, i) => {
         const idx = accepted.length + i;
         const fr = responses[b.at]?.functionResponse;
@@ -315,7 +344,7 @@ export async function runGeminiAssistant(input: {
           trace.push({ tool: b.cmd.op, args: b.cmd as unknown as Record<string, unknown>, result: `REJECTED ${err}` });
         } else {
           b.stage?.();
-          if (fr) fr.response = { result: `accepted — ${b.note ?? describeCommand(b.cmd)}. Continue with the next step, or stop if the request is complete.` };
+          if (fr) fr.response = { result: `accepted — ${b.note ?? describeCommand(b.cmd)}.${createdNote} Continue with the next step, or stop if the request is complete.` };
           trace.push({ tool: b.cmd.op, args: b.cmd as unknown as Record<string, unknown>, result: "accepted" });
         }
       });

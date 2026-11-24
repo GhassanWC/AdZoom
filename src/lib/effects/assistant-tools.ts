@@ -12,7 +12,8 @@
  * retried request rewrites the same records instead of duplicating them.
  */
 
-import type { AssistantMemoryItem, DetectedMoment } from "@/lib/firebase/schema";
+import type { AssistantMemoryItem, DetectedMoment, EventCandidate, EventMark } from "@/lib/firebase/schema";
+import { candidateFromMark, candidateLabel, markId, mergeMarks, parseEventQuery, resolveFromMarks } from "./event-marks";
 import type { EditCommand } from "@/lib/edit-commands/types";
 import type { ToolDef } from "@/lib/edit-commands/tools";
 import { mergeMemory } from "@/lib/edit-commands/memory";
@@ -56,6 +57,14 @@ export interface FxToolContext {
   now: number;
   /** Per-turn counter for deterministic ids. */
   seq: { create: number };
+  /** Verified event finder (route): candidates confirmed against nearby frames, sorted by time. */
+  locateEvent?: (query: string, assetId?: string) => Promise<FoundEvent[]>;
+  /** Event marks already on the project (user picks + verified instants). */
+  eventMarks: EventMark[];
+  /** Marks this turn resolved — the route persists them. */
+  eventMarkWrites: EventMark[];
+  /** Candidates of the last ambiguous locate_event — attached to an ask_user question. */
+  lastCandidates: EventCandidate[] | null;
 }
 
 export type FxToolResult =
@@ -81,6 +90,12 @@ export const FX_TOOLS: readonly ToolDef[] = [
     kind: "read",
     description: "Effect instances on the timeline: element id, library name/id/version, start/end, anchor, and each param's CURRENT value with its range. Call before revising an effect.",
     parameters: obj({}),
+  },
+  {
+    name: "locate_event",
+    kind: "read",
+    description: "THE way to place something on a visual event (\"when the first goal goes in\", \"the second goal\", \"when the ball hits the net\"). Finds candidates, VERIFIES each against the frames around it (drops replays and false positives), reuses the user's earlier choice for the same event, and returns status unique (one instant: time, x, y), ambiguous (several plausible instants — then call ask_user with the given options so the user picks) or none. Ordinals (\"second\") pick the nth occurrence in time order.",
+    parameters: obj({ query: str("The event, e.g. 'the second goal' or 'the ball hits the net'."), asset_id: str("Asset to watch (default 'source').") }, ["query"]),
   },
   {
     name: "find_events",
@@ -109,7 +124,8 @@ export const FX_TOOLS: readonly ToolDef[] = [
         name: str("Short library name, e.g. 'Gold Ripple Burst'."),
         description: str("One sentence: what it looks like and when to use it."),
         program_json: str("The effect program as a JSON string."),
-        at: num("Source seconds the effect starts (the event moment)."),
+        at: num("Source seconds the effect starts (the event moment) — or seconds into clip_id when given."),
+        clip_id: str("Optional sequence item id (a FREEZE or clip from get_sequence): the effect is anchored to it and plays while the frame is held; at = seconds into the item."),
         anchor_x: num("Anchor x, 0..1 of the frame (e.g. the ball's cx)."),
         anchor_y: num("Anchor y, 0..1 of the frame."),
         track_json: str("Optional: track_element samples as JSON, times relative to `at`."),
@@ -126,7 +142,8 @@ export const FX_TOOLS: readonly ToolDef[] = [
       {
         effect: str("Library name or id."),
         version: num("Optional exact version; default latest."),
-        at: num("Source seconds."),
+        at: num("Source seconds — or seconds into clip_id when given."),
+        clip_id: str("Optional sequence item id (a freeze or clip): anchor this use to it; at = seconds into the item."),
         anchor_x: num("0..1"),
         anchor_y: num("0..1"),
         params_json: str("Optional JSON object of param overrides for THIS use."),
@@ -145,7 +162,8 @@ export const FX_TOOLS: readonly ToolDef[] = [
         params_json: str("JSON object of param id → new value."),
         program_json: str("Optional full replacement program (an adaptation)."),
         note: str("What changed, for the version history."),
-        at: num("Optional new start (source seconds)."),
+        at: num("Optional new start (source seconds, or seconds into clip_id)."),
+        clip_id: str("Optional: with at, anchor this use to a sequence item (freeze/clip)."),
         duration: num("Optional: play the WHOLE effect over this many seconds (slower drawing = longer). A freeze linked to the effect holds for the new length."),
         anchor_x: num("Optional new anchor x."),
         anchor_y: num("Optional new anchor y."),
@@ -238,6 +256,75 @@ export async function handleFxTool(name: string, args: Record<string, unknown>, 
         },
       };
 
+    case "locate_event": {
+      const raw = typeof args.query === "string" ? args.query.trim() : "";
+      if (!raw) return { kind: "error", message: "Say which event to locate." };
+      const asset = typeof args.asset_id === "string" && args.asset_id ? args.asset_id : "source";
+      const { query, ordinal } = parseEventQuery(raw);
+      // 1. Something already resolved for this event (a user pick always wins).
+      const known = resolveFromMarks(ctx.eventMarks, query, ordinal, asset);
+      if (known) {
+        ctx.lastCandidates = null;
+        return { kind: "read", result: { status: "unique", from: known.source === "user" ? "the user's earlier choice" : "an earlier verified instant", event: { time: r3(known.time), x: r3(known.x), y: r3(known.y), label: known.label, ...(known.ordinal != null ? { ordinal: known.ordinal } : {}) }, note: "Use this exact time as at; confirm the subject with locate_elements there if you need a tighter anchor." } };
+      }
+      // Several verified instants for this event and no ordinal: the user must
+      // choose — offer the known marks, do not re-watch.
+      const knownSet = ctx.eventMarks.filter((m) => m.assetId === asset && m.query === query).sort((a, b) => a.time - b.time);
+      if (ordinal == null && knownSet.length >= 2) {
+        const cands = knownSet.map((m) => candidateFromMark(m));
+        ctx.lastCandidates = cands;
+        return { kind: "read", result: { status: "ambiguous", candidates: cands.map((x) => ({ time: x.time, label: x.label, ordinal: x.ordinal })), note: "Several known instants. Call ask_user NOW with question 'Which moment do you mean?' and EXACTLY these options (verbatim) — do not pick one yourself and do not edit in this turn.", options: cands.map((x) => x.label) } };
+      }
+      if (!ctx.locateEvent) return { kind: "read", result: { error: "Watching the footage isn't available for this project." } };
+      // 2. Watch + verify.
+      let found: FoundEvent[];
+      try {
+        found = await ctx.locateEvent(raw, asset);
+      } catch (err) {
+        return { kind: "read", result: { error: err instanceof Error ? err.message : "Locating the event failed." } };
+      }
+      const candidates: EventCandidate[] = found.map((e, i) => ({ id: markId(query, e.time), time: r3(e.time), x: r3(e.x), y: r3(e.y), label: candidateLabel(e), query, assetId: asset, confidence: r3(e.confidence), ordinal: i + 1 }));
+      const record = (c: EventCandidate, ord?: number) => {
+        const mark: EventMark = { id: c.id, query, ...(ord != null ? { ordinal: ord } : {}), time: c.time, x: c.x, y: c.y, assetId: asset, source: "verified", label: c.label, at: ctx.now };
+        ctx.eventMarkWrites.push(mark);
+        ctx.eventMarks = mergeMarks(ctx.eventMarks, [mark]);
+      };
+      // Candidates closer than 25 s may be replays of one another (verification
+      // cannot always tell a replay from a highlights-reel goal), so counting
+      // them would mislead "the second goal": offer them to the user instead.
+      const crowded = candidates.some((c, i) => i > 0 && c.time - candidates[i - 1].time < 25);
+      // The FIRST occurrence is safe to resolve even when crowded: replays only
+      // ever follow the live event, so the earliest verified instant is live.
+      if (ordinal != null && ordinal !== 1 && crowded && candidates.length >= 2) {
+        ctx.lastCandidates = candidates;
+        const nth = ordinal === -1 ? "last" : ordinal === 1 ? "first" : ordinal === 2 ? "second" : ordinal === 3 ? "third" : `${ordinal}th`;
+        return { kind: "read", result: { status: "ambiguous", candidates: candidates.map((x) => ({ time: x.time, label: x.label, confidence: x.confidence })), note: `${candidates.length} verified instants, some close together (possible replays) — the ordinal cannot be trusted. Call ask_user NOW with question 'Which moment is the ${nth} one?' and EXACTLY these options (verbatim); do not pick one yourself and do not edit in this turn.`, options: candidates.map((x) => x.label) } };
+      }
+      if (ordinal != null) {
+        const idx = ordinal === -1 ? candidates.length - 1 : ordinal - 1;
+        const c = candidates[idx];
+        if (!c) {
+          ctx.lastCandidates = candidates.length ? candidates : null;
+          return { kind: "read", result: { status: candidates.length ? "ambiguous" : "none", found: candidates.length, candidates: candidates.map((x) => ({ time: x.time, label: x.label, confidence: x.confidence })), note: candidates.length ? `Only ${candidates.length} verified occurrence(s) — ask_user with the options below so the user points at the right one.` : "No verified occurrence. Ask the user for the time with ask_user rather than guessing.", options: candidates.map((x) => x.label) } };
+        }
+        // Record the whole ordered set so "the third one" later needs no re-watch.
+        candidates.forEach((x, i) => record(x, i + 1));
+        ctx.lastCandidates = null;
+        return { kind: "read", result: { status: "unique", event: { time: c.time, x: c.x, y: c.y, label: c.label, ordinal: idx + 1 }, verifiedOccurrences: candidates.map((x) => ({ ordinal: x.ordinal, time: x.time })), note: "Use this exact time as at (source seconds)." } };
+      }
+      if (candidates.length === 1) {
+        record(candidates[0], 1);
+        ctx.lastCandidates = null;
+        return { kind: "read", result: { status: "unique", event: { time: candidates[0].time, x: candidates[0].x, y: candidates[0].y, label: candidates[0].label }, note: "Verified against the surrounding frames. Use this exact time as at." } };
+      }
+      if (candidates.length === 0) {
+        ctx.lastCandidates = null;
+        return { kind: "read", result: { status: "none", note: "No verified occurrence in the footage. Ask the user for the time with ask_user (do not guess)." } };
+      }
+      ctx.lastCandidates = candidates;
+      return { kind: "read", result: { status: "ambiguous", candidates: candidates.map((x) => ({ time: x.time, label: x.label, confidence: x.confidence })), note: "Several plausible instants. Call ask_user NOW with question 'Which moment do you mean?' and EXACTLY these options (verbatim) — do not pick one yourself and do not edit in this turn.", options: candidates.map((x) => x.label) } };
+    }
+
     case "find_events": {
       const query = typeof args.query === "string" ? args.query.trim() : "";
       if (!query) return { kind: "error", message: "Say which event to find." };
@@ -282,8 +369,10 @@ export async function handleFxTool(name: string, args: Record<string, unknown>, 
       const nm = typeof args.name === "string" ? args.name.trim() : "";
       const description = typeof args.description === "string" ? args.description.trim() : "";
       const at = Number(args.at);
+      const clipId = typeof args.clip_id === "string" && args.clip_id ? args.clip_id : undefined;
       if (!nm) return { kind: "error", message: "Give the effect a short name." };
-      if (!(at >= 0 && at < ctx.sourceDuration)) return { kind: "error", message: `at must be inside the video (0–${ctx.sourceDuration.toFixed(2)}s).` };
+      if (!clipId && !(at >= 0 && at < ctx.sourceDuration)) return { kind: "error", message: `at must be inside the video (0–${ctx.sourceDuration.toFixed(2)}s).` };
+      if (clipId && !(at >= 0)) return { kind: "error", message: "at must be seconds into the item (0 or more)." };
       const program = parseJson<EffectProgram>(args.program_json, "program_json");
       if (typeof program === "string") return { kind: "error", message: program };
       const needsAnchor = Array.isArray(program.inputs) && program.inputs.includes("anchor");
@@ -306,6 +395,7 @@ export async function handleFxTool(name: string, args: Record<string, unknown>, 
         op: "add_effect",
         at: r3(at),
         fx: { ref: { effectId: id, version: 1, name: entry.name }, program, params: {}, inputs },
+        ...(clipId ? { clipId } : {}),
       };
       return {
         kind: "command",
@@ -322,7 +412,9 @@ export async function handleFxTool(name: string, args: Record<string, unknown>, 
       const v = versionOf(entry, typeof args.version === "number" ? args.version : undefined);
       if (!v) return { kind: "error", message: `"${entry.name}" has no version ${String(args.version)}.` };
       const at = Number(args.at);
-      if (!(at >= 0 && at < ctx.sourceDuration)) return { kind: "error", message: `at must be inside the video (0–${ctx.sourceDuration.toFixed(2)}s).` };
+      const clipId = typeof args.clip_id === "string" && args.clip_id ? args.clip_id : undefined;
+      if (!clipId && !(at >= 0 && at < ctx.sourceDuration)) return { kind: "error", message: `at must be inside the video (0–${ctx.sourceDuration.toFixed(2)}s).` };
+      if (clipId && !(at >= 0)) return { kind: "error", message: "at must be seconds into the item (0 or more)." };
       const anchor = in01(args.anchor_x) && in01(args.anchor_y) ? { x: r3(args.anchor_x), y: r3(args.anchor_y) } : undefined;
       if (v.program.inputs.includes("anchor") && !anchor) return { kind: "error", message: `"${entry.name}" is anchored — pass anchor_x/anchor_y for this use.` };
       const overrides = args.params_json ? parseJson<FxParamValues>(args.params_json, "params_json") : {};
@@ -335,6 +427,7 @@ export async function handleFxTool(name: string, args: Record<string, unknown>, 
           op: "add_effect",
           at: r3(at),
           fx: { ref: { effectId: entry.id, version: v.version, name: entry.name }, program: v.program, params: overrides, inputs: { ...(anchor ? { anchor } : {}), ...(track ? { track } : {}) } },
+          ...(clipId ? { clipId } : {}),
         },
         note: `reused "${entry.name}" v${v.version} from the library`,
       };
@@ -368,6 +461,7 @@ export async function handleFxTool(name: string, args: Record<string, unknown>, 
         note = `new version v${version} of "${entry.name}"`;
       }
       if (typeof args.at === "number") cmd.at = r3(args.at);
+      if (typeof args.at === "number" && typeof args.clip_id === "string" && args.clip_id) cmd.clipId = args.clip_id;
       if (typeof args.duration === "number") cmd.duration = r3(args.duration);
       if (in01(args.anchor_x) && in01(args.anchor_y)) cmd.anchor = { x: r3(args.anchor_x), y: r3(args.anchor_y) };
       if (!cmd.params && !cmd.program && cmd.at == null && !cmd.anchor && cmd.duration == null) return { kind: "error", message: "Nothing to change — pass params_json (or program_json, at, anchor, duration)." };

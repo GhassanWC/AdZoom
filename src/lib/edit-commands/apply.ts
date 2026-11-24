@@ -33,9 +33,12 @@ import { dishLabelParts } from "@/lib/graphics/design";
 import { compileProgram, parseHex, type EffectProgram, type FxParamValues } from "@/lib/effects/program";
 import { deriveClips, clipAtSource, sourceAtOutput, clipsFromSequence, type Clip } from "./clips";
 import * as seqOps from "@/lib/timeline/sequence-ops";
+import { lockedAudioOperation } from "./memory";
 import { isCapabilityOp, runCapability } from "./registry";
 import { SOURCE_ASSET_ID } from "@/lib/timeline/sequence";
 import { outputSecondsFor } from "@/lib/timeline/sequence";
+import { layoutOf } from "@/lib/timeline/evaluate";
+import { fromTicks } from "@/lib/timeline/ticks";
 import type {
   ApplyResult,
   EditChange,
@@ -52,10 +55,6 @@ export const MIN_KEEP_SECONDS = 0.3;
 const MIN_RANGE = 0.05;
 /** Shortest element an update may leave (matches the timeline's MIN_MOMENT_LEN). */
 const MIN_ELEMENT = 0.3;
-/** Ops that remove or retime footage — refused while the soundtrack is locked. */
-const AUDIO_CHANGING_OPS: ReadonlySet<string> = new Set(["trim_clip", "delete_clip", "remove_range", "set_speed", "tighten_pauses"]);
-/** Sequence capabilities that cut, reorder, retime or silence the linked sound. */
-const AUDIO_CHANGING_CAPS: ReadonlySet<string> = new Set(["trim_item", "delete_item", "move_clip", "set_clip_speed", "freeze_frame", "detach_audio"]);
 
 /** Only the program's declared params, with valid values (an instance never stores junk keys). */
 function pickParams(program: EffectProgram, values: FxParamValues): FxParamValues {
@@ -150,6 +149,22 @@ export function applyEditCommands(
   };
   const inVideo = (start: number, end: number) =>
     Number.isFinite(start) && Number.isFinite(end) && start >= -1e-6 && end <= dur + 1e-6 && end - start >= MIN_RANGE;
+  /**
+   * A moment targeted at a sequence ITEM (`clipId`): its times are seconds into
+   * that item and it is anchored there. This is how a zoom or effect plays ON a
+   * freeze — the held frame has no source time to progress, so only elapsed
+   * time within the item can drive the motion (see cameraForLayer).
+   */
+  type ItemTarget = { itemId: string; length: number; kind: "clip" | "freeze"; noun: string; cut: number; linkedMomentId?: string };
+  const itemTarget = (clipId: string | undefined): ItemTarget | { error: string } | null => {
+    if (!clipId) return null;
+    if (!hasSeq()) return { error: `There is no sequence item "${clipId}" — this project has no sequence yet.` };
+    const laid = layoutOf({ sequence: seqState.sequence, moments, assets: seqState.assets, sourceDuration: dur }).items.find((l) => l.item.id === clipId);
+    if (!laid) return { error: `No clip or freeze "${clipId}" in the sequence — call get_sequence for the current ids.` };
+    const kind = laid.item.kind;
+    const linkedMomentId = laid.item.kind === "freeze" && laid.item.linkedTo && "momentId" in laid.item.linkedTo ? laid.item.linkedTo.momentId : undefined;
+    return { itemId: clipId, length: fromTicks(laid.durationTicks), kind, noun: kind === "freeze" ? "hold" : "clip", cut: fromTicks(laid.cut), linkedMomentId };
+  };
 
   const cutsHidden = !isLayerVisible(state.layers ?? {}, "cut");
 
@@ -159,9 +174,12 @@ export function applyEditCommands(
       fail("unknown_op", "Not a command.");
       return;
     }
-    const retimes = cmd.op === "capability" ? AUDIO_CHANGING_CAPS.has((cmd as { capability: string }).capability) && !((cmd as { capability: string; args: Record<string, unknown> }).capability === "freeze_frame" && (cmd as { args: Record<string, unknown> }).args?.audio === "continue") : AUDIO_CHANGING_OPS.has(cmd.op);
-    if (state.audioLocked && retimes) {
-      return fail("locked", "You asked to keep the original commentary, so I won't cut, trim or speed up the footage.");
+    // The audio lock ("keep the commentary") is scoped to operations that
+    // change the original soundtrack; it names the operation it refuses so the
+    // model and the user see exactly what was held back.
+    const lockedOp = state.audioLocked ? lockedAudioOperation(cmd as { op: string; capability?: string; args?: Record<string, unknown> }) : null;
+    if (lockedOp) {
+      return fail("locked", `You asked to keep the original sound, so I didn't apply ${lockedOp} — that would change it. Say "you can change the sound" to lift that.`);
     }
 
     // ── Sequence capabilities + legacy footage ops on a sequence ──────────
@@ -391,18 +409,28 @@ export function applyEditCommands(
       }
 
       case "add_zoom": {
-        if (!inVideo(cmd.start, cmd.end) || cmd.end - cmd.start < MIN_ELEMENT) return fail("out_of_range", "Zoom range is outside the video or too short.");
+        const tgt = itemTarget(cmd.clipId);
+        if (tgt && "error" in tgt) return fail("not_found", tgt.error);
+        let start = cmd.start;
+        let end = cmd.end;
+        if (tgt) {
+          start = Math.max(0, cmd.start);
+          end = Math.min(tgt.length, cmd.end);
+          if (!(Number.isFinite(start) && Number.isFinite(end)) || end - start < MIN_ELEMENT) return fail("out_of_range", `That zoom does not fit inside the ${fmtS(tgt.length)} ${tgt.noun} — give start/end as seconds into it.`);
+        } else if (!inVideo(cmd.start, cmd.end) || cmd.end - cmd.start < MIN_ELEMENT) return fail("out_of_range", "Zoom range is outside the video or too short.");
         const scale = Math.min(4, Math.max(1.1, cmd.scale ?? 1.6));
         const w = 1 / scale;
         const cx = Math.min(1 - w / 2, Math.max(w / 2, cmd.x ?? 0.5));
         const cy = Math.min(1 - w / 2, Math.max(w / 2, cmd.y ?? 0.5));
         const id = mint();
         add({
-          ...baseMoment(id, r3(cmd.start), r3(cmd.end), `Zoom ${scale.toFixed(1)}×`, "zoom"),
+          ...baseMoment(id, r3(start), r3(end), `Zoom ${scale.toFixed(1)}×`, "zoom"),
           focusRegion: { x: cx - w / 2, y: cy - w / 2, width: w, height: w },
           targetRegionSource: "user",
+          ...(tgt ? { anchor: { kind: "item" as const, itemId: tgt.itemId } } : {}),
         } as DetectedMoment);
-        changes.push({ kind: "added", elementId: id, effectType: "zoom", summary: `Added a ${scale.toFixed(1)}× zoom at ${clock(cmd.start)}`, at: cmd.start });
+        const outAt = tgt ? tgt.cut + start : cmd.start;
+        changes.push({ kind: "added", elementId: id, effectType: "zoom", summary: tgt ? `Added a ${scale.toFixed(1)}× zoom on the ${tgt.noun} (${fmtS(start)}–${fmtS(end)} into it)` : `Added a ${scale.toFixed(1)}× zoom at ${clock(cmd.start)}`, at: outAt });
         return;
       }
 
@@ -497,14 +525,19 @@ export function applyEditCommands(
         // A move shorter than the minimum is extended to it (the subject is
         // usually still on screen a moment longer) rather than refused —
         // refusing made the model abandon otherwise-correct plans.
+        const tgt = itemTarget(cmd.clipId);
+        if (tgt && "error" in tgt) return fail("not_found", tgt.error);
+        // Item-anchored: the move lives in seconds into the item, bounded by its length.
+        const limit = tgt ? tgt.length : dur;
         let moveEnd = cmd.end;
         let extended = false;
-        if (cmd.end - cmd.start < MIN_MOVE_SECONDS && cmd.start + MIN_MOVE_SECONDS <= dur) {
+        if (cmd.end - cmd.start < MIN_MOVE_SECONDS && cmd.start + MIN_MOVE_SECONDS <= limit) {
           moveEnd = r3(cmd.start + MIN_MOVE_SECONDS);
           extended = true;
         }
-        if (!inVideo(cmd.start, moveEnd) || moveEnd - cmd.start < MIN_MOVE_SECONDS) {
-          return fail("out_of_range", `A camera move needs at least ${MIN_MOVE_SECONDS}s inside the video.`);
+        const fits = tgt ? cmd.start >= -1e-6 && moveEnd <= limit + 1e-6 : inVideo(cmd.start, moveEnd);
+        if (!fits || moveEnd - cmd.start < MIN_MOVE_SECONDS) {
+          return fail("out_of_range", tgt ? `A camera move needs at least ${MIN_MOVE_SECONDS}s inside the ${fmtS(tgt.length)} ${tgt.noun} (start/end are seconds into it).` : `A camera move needs at least ${MIN_MOVE_SECONDS}s inside the video.`);
         }
         const beats = Array.isArray(cmd.beats) ? cmd.beats.filter((b) => b && [b.at, b.x, b.y, b.zoom].every((v) => typeof v === "number" && Number.isFinite(v))) : [];
         const move = composeMove(beats, moveEnd - cmd.start);
@@ -521,6 +554,8 @@ export function applyEditCommands(
           cameraMotion: { ...(existing?.cameraMotion ?? {}), preset: move.preset },
           targetRegionSource: "user" as const,
           edited: true,
+          // A recompose keeps the existing anchor unless a new item target is given.
+          ...(tgt ? { anchor: { kind: "item" as const, itemId: tgt.itemId } } : {}),
         };
         const where = `${clock(cmd.start)}–${clock(moveEnd)}${extended ? " (extended to the 2s minimum)" : ""}`;
         const what = `${move.keyframes.length} beat${move.keyframes.length === 1 ? "" : "s"}, up to ${move.maxZoom.toFixed(2)}×`;
@@ -575,7 +610,10 @@ export function applyEditCommands(
       // ── Effect programs ───────────────────────────────────────────────────
       case "add_effect": {
         const fx = cmd.fx;
-        if (!(cmd.at >= 0 && cmd.at < dur)) return fail("out_of_range", `${clock(cmd.at)} is outside the video.`);
+        const tgt = itemTarget(cmd.clipId);
+        if (tgt && "error" in tgt) return fail("not_found", tgt.error);
+        const limit = tgt ? tgt.length : dur;
+        if (!(cmd.at >= 0 && cmd.at < limit)) return fail("out_of_range", tgt ? `${fmtS(cmd.at)} is past the end of the ${fmtS(tgt.length)} ${tgt.noun} (at = seconds into it).` : `${clock(cmd.at)} is outside the video.`);
         if (!fx || !fx.program || !fx.ref?.effectId) return fail("bad_args", "An effect needs a program and a library reference.");
         const compiled = compileProgram(fx.program);
         if (!compiled.ok) return fail("bad_args", `The effect program is invalid: ${compiled.issues.slice(0, 3).map((x) => `${x.path} ${x.message}`).join("; ")}`);
@@ -584,15 +622,17 @@ export function applyEditCommands(
           return fail("bad_args", "This effect needs an anchor position (x, y as fractions of the frame).");
         }
         const play = fx.duration && fx.duration > 0 ? fx.duration : fx.program.duration;
-        const end = Math.min(dur, cmd.at + play);
-        if (end - cmd.at < 0.2) return fail("out_of_range", "No room for the effect there — it would run past the end of the video.");
+        const end = Math.min(limit, cmd.at + play);
+        if (end - cmd.at < 0.2) return fail("out_of_range", tgt ? `No room for the effect there — the ${tgt.noun} ends ${fmtS(limit - cmd.at)} later.` : "No room for the effect there — it would run past the end of the video.");
         const id = mint();
         const params = pickParams(fx.program, fx.params ?? {});
         add({
           ...baseMoment(id, r3(cmd.at), r3(end), fx.ref.name, "fx"),
           fx: { ref: fx.ref, program: fx.program, params, inputs: fx.inputs ?? {}, ...(fx.duration ? { duration: r3(fx.duration) } : {}) },
+          ...(tgt ? { anchor: { kind: "item" as const, itemId: tgt.itemId } } : {}),
         } as DetectedMoment);
-        changes.push({ kind: "added", elementId: id, effectType: "fx", summary: `Added "${fx.ref.name}" (v${fx.ref.version}) at ${clock(cmd.at)}`, at: cmd.at });
+        const outAt = tgt ? tgt.cut + cmd.at : cmd.at;
+        changes.push({ kind: "added", elementId: id, effectType: "fx", summary: tgt ? `Added "${fx.ref.name}" (v${fx.ref.version}) on the ${tgt.noun}, ${fmtS(cmd.at)} in` : `Added "${fx.ref.name}" (v${fx.ref.version}) at ${clock(cmd.at)}`, at: outAt });
         return;
       }
 
@@ -626,10 +666,19 @@ export function applyEditCommands(
           }
         }
         let start = m.startTime;
+        let anchor = m.anchor;
+        const tgt = itemTarget(cmd.clipId);
+        if (tgt && "error" in tgt) return fail("not_found", tgt.error);
+        if (tgt && cmd.at != null) anchor = { kind: "item", itemId: tgt.itemId };
+        // The length the effect may run within: its item when item-anchored, else
+        // the source. A freeze LINKED to this effect follows its length, so it
+        // never bounds it (that would be circular: the hold is the effect).
+        const limitFor = anchor?.kind === "item" ? (itemTarget(anchor.itemId) as ItemTarget | { error: string } | null) : null;
+        const limit = limitFor && !("error" in limitFor) ? (limitFor.linkedMomentId === m.id ? Number.POSITIVE_INFINITY : limitFor.length) : dur;
         if (cmd.at != null) {
-          if (!(cmd.at >= 0 && cmd.at < dur)) return fail("out_of_range", `${clock(cmd.at)} is outside the video.`);
+          if (!(cmd.at >= 0 && cmd.at < limit)) return fail("out_of_range", tgt ? `${fmtS(cmd.at)} is past the end of the ${tgt.noun}.` : `${clock(cmd.at)} is outside the video.`);
           start = r3(cmd.at);
-          notes.push(`starts at ${clock(start)}`);
+          notes.push(tgt ? `starts ${fmtS(start)} into the ${tgt.noun}` : `starts at ${clock(start)}`);
         }
         if (cmd.anchor) {
           if (!(cmd.anchor.x >= 0 && cmd.anchor.x <= 1 && cmd.anchor.y >= 0 && cmd.anchor.y <= 1)) return fail("bad_args", "Anchor x/y are fractions of the frame (0..1).");
@@ -644,8 +693,8 @@ export function applyEditCommands(
           notes.push(`plays over ${r3(cmd.duration)}s (was ${r3(before)}s)`);
         }
         if (!notes.length) return fail("no_change", "Nothing to change on that effect.");
-        const end = Math.min(dur, start + (fx.duration ?? fx.program.duration));
-        replace({ ...m, startTime: start, endTime: r3(end), fx, edited: true });
+        const end = Math.min(limit, start + (fx.duration ?? fx.program.duration));
+        replace({ ...m, startTime: start, endTime: r3(end), fx, edited: true, ...(anchor ? { anchor } : {}) });
         changes.push({ kind: "updated", elementId: m.id, effectType: "fx", summary: `Updated "${fx.ref.name}": ${notes.join(", ")}`, at: start });
         return;
       }

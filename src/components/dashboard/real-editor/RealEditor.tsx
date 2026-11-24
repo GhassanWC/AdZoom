@@ -150,6 +150,9 @@ function Body() {
     canRetryFinishing,
     retryingFinishing,
     retryFinishing,
+    saveError,
+    retryingSave,
+    retrySave,
     activeTool,
     setActiveTool,
     cropEditing,
@@ -207,6 +210,25 @@ function Body() {
       <EditorTopBar onExport={openExportModal} />
 
       {/* ── 2. Transient strips (error / first-run CTA) — compact, shrink-0 ── */}
+      {saveError && (
+        <div className="flex shrink-0 items-center gap-2 border-b border-rose-400/25 bg-rose-500/[0.06] px-4 py-2 text-[12.5px] text-rose-200" data-testid="save-error">
+          <AlertCircle size={13} className="shrink-0" />
+          <span className="min-w-0 flex-1 truncate" title={saveError}>
+            {saveError}
+          </span>
+          <button
+            type="button"
+            data-testid="retry-save"
+            onClick={() => void retrySave()}
+            disabled={retryingSave}
+            title="Sends the same change to the server again"
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-rose-300/40 bg-rose-400/15 px-2.5 py-1 text-[11.5px] font-semibold text-rose-50 transition-colors hover:bg-rose-400/25 disabled:opacity-60"
+          >
+            {retryingSave ? <Loader2 size={12} className="animate-spin" /> : <RotateCw size={12} />}
+            {retryingSave ? "Saving…" : "Retry save"}
+          </button>
+        </div>
+      )}
       {analyzeError && (
         <div className="flex shrink-0 items-center gap-2 border-b border-rose-400/25 bg-rose-500/[0.06] px-4 py-2 text-[12.5px] text-rose-200">
           <AlertCircle size={13} className="shrink-0" />

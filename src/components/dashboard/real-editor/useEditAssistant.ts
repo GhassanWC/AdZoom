@@ -14,6 +14,7 @@
  */
 
 import * as React from "react";
+import type { EventCandidate } from "@/lib/firebase/schema";
 import { useAuth } from "@/lib/firebase/AuthProvider";
 import { apiFetch } from "@/lib/platform/api";
 import { useEditorReal } from "./context";
@@ -33,10 +34,10 @@ export interface LibraryChange {
 }
 
 export type ModelTurn =
-  | { kind: "commands"; commands: EditCommand[]; reply: string | null; libraryChanges?: LibraryChange[] }
+  | { kind: "commands"; commands: EditCommand[]; reply: string | null; libraryChanges?: LibraryChange[]; toolsUsed?: string[] }
   | { kind: "prepare"; needs: FootageNeed[] }
-  | { kind: "question"; question: string; options: string[] }
-  | { kind: "reply"; reply: string; libraryChanges?: LibraryChange[] }
+  | { kind: "question"; question: string; options: string[]; candidates?: EventCandidate[]; toolsUsed?: string[] }
+  | { kind: "reply"; reply: string; libraryChanges?: LibraryChange[]; toolsUsed?: string[] }
   | { kind: "unavailable"; reason: string; retryable: boolean };
 
 export function useEditAssistant() {
@@ -80,7 +81,7 @@ export function useEditAssistant() {
   );
 
   const askModel = React.useCallback(
-    async (message: string, requestId: string, prepared: FootageNeed[] = []): Promise<ModelTurn> => {
+    async (message: string, requestId: string, prepared: FootageNeed[] = [], pick?: EventCandidate): Promise<ModelTurn> => {
       if (!cloudAvailable) {
         return { kind: "unavailable", reason: "AI understanding needs a signed-in cloud project.", retryable: false };
       }
@@ -98,6 +99,7 @@ export function useEditAssistant() {
             playhead: input.playhead,
             recentElementIds: input.recentElementIds,
             prepared,
+            ...(pick ? { pick: { query: pick.query, ordinal: pick.ordinal, time: pick.time, x: pick.x, y: pick.y, assetId: pick.assetId, label: pick.label } } : {}),
           }),
         });
         if (!res.ok) return { kind: "unavailable", reason: `The AI request failed (${res.status}).`, retryable: res.status >= 500 };

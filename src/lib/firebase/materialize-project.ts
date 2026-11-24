@@ -89,6 +89,7 @@ export function materializeProject(
     assistantMemory: Array.isArray(data.assistantMemory)
       ? (data.assistantMemory as ProjectDoc["assistantMemory"])
       : undefined,
+    eventMarks: Array.isArray(data.eventMarks) ? (data.eventMarks as ProjectDoc["eventMarks"]) : undefined,
     assets: Array.isArray(data.assets) ? (data.assets as ProjectDoc["assets"]) : undefined,
     sequence:
       data.sequence && typeof data.sequence === "object" && Array.isArray((data.sequence as { items?: unknown }).items)

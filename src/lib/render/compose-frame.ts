@@ -31,7 +31,7 @@ import { coverFitDims } from "@/lib/timeline/cover";
 import { drawClickHighlight } from "@/lib/timeline/click-highlight";
 import { resolveClickHighlight } from "./click-highlight";
 import { drawInCameraOverlays, drawOutputOverlays, drawInCameraOverlayEntries, drawOutputOverlayEntries, isInCameraOverlay, type OverlayEntry } from "./overlay-draw";
-import { anchorOf, type EvalLayer, type FrameEval } from "@/lib/timeline/evaluate";
+import { cameraForLayer, type EvalLayer, type FrameEval } from "@/lib/timeline/evaluate";
 import { SOURCE_ASSET_ID } from "@/lib/timeline/sequence";
 import type { BackgroundMode } from "@/lib/firebase/schema";
 import type { RenderRecipe } from "./recipe";
@@ -368,12 +368,13 @@ export function composeEvaluatedFrame(
     const frame = frameFor(layer);
     if (!frame) continue;
     const isDominant = ev.dominant?.itemId === layer.itemId;
-    // Camera moves are footage-anchored: each layer is framed by the camera
-    // moments of ITS asset at ITS source time.
-    const cameraMoments = isDominant && ev.camera ? ev.camera.moments : recipe.revision.moments.filter((m) => anchorOf(m).kind === "source" && assetOfMoment(m) === layer.assetId);
+    // Each layer is framed by ITS camera moments: those anchored to the item
+    // (a zoom ON a freeze, elapsed time within the hold) when it has any, else
+    // its asset's source-anchored moments at its source time.
+    const cam = cameraForLayer(recipe.revision.moments, layer);
     ctx.save();
     ctx.globalAlpha = layer.opacity;
-    applyCameraLayer(ctx, frame, recipe, cameraMoments, layer.sourceTime, isDominant ? inCamera : []);
+    applyCameraLayer(ctx, frame, recipe, cam.moments, cam.t, isDominant ? inCamera : []);
     ctx.restore();
   }
 
@@ -387,10 +388,6 @@ export function composeEvaluatedFrame(
   if (applyWatermark) drawWatermark(ctx, canvasW, canvasH);
 }
 
-function assetOfMoment(m: import("@/lib/firebase/schema").DetectedMoment): string {
-  const a = anchorOf(m);
-  return a.kind === "source" ? a.assetId ?? SOURCE_ASSET_ID : SOURCE_ASSET_ID;
-}
 
 /** applyCameraFrame with an explicit camera moment set and in-camera entries. */
 function applyCameraLayer(
